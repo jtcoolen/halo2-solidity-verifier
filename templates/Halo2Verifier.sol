@@ -5,6 +5,10 @@ pragma solidity ^0.8.0;
 contract Halo2Verifier {
     {%- match self.expected_vk_codehash %}
     {%- when Some with (expected_vk_codehash) %}
+    // In separate-VK mode the verifier is bound to one authorized VK at deployment.
+    // This removes the caller-controlled `vk` parameter, so callers can no longer
+    // choose which statement/circuit is verified (issue 1), and it also means the
+    // verifier never `extcodecopy`s attacker-chosen contracts as VK data (issue 3).
     address public immutable AUTHORIZED_VK;
     uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
     bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
