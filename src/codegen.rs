@@ -10,6 +10,7 @@ use halo2_proofs::{
 };
 use itertools::{chain, Itertools};
 use ruint::aliases::U256;
+use sha3::{Digest, Keccak256};
 use std::fmt::{self, Debug};
 
 mod evaluator;
@@ -227,6 +228,10 @@ impl<'a> SolidityGenerator<'a> {
         let proof_cptr = Ptr::calldata(if separate { 0x84 } else { 0x64 });
 
         let vk = self.generate_vk();
+        let expected_vk_codehash = separate.then(|| {
+            let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
+            U256::from_be_bytes(digest)
+        });
         let vk_len = vk.len();
         let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
         let data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
@@ -256,6 +261,7 @@ impl<'a> SolidityGenerator<'a> {
         Halo2Verifier {
             scheme: self.scheme,
             embedded_vk: (!separate).then_some(vk),
+            expected_vk_codehash,
             vk_len,
             vk_mptr,
             num_neg_lagranges: self.meta.rotation_last.unsigned_abs() as usize,

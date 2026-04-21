@@ -130,11 +130,25 @@ fn pbt_solidity_rejects_wrong_verifying_keys() {
 }
 
 #[test]
+#[ignore = "expensive property test; run in release mode"]
+fn pbt_separate_vk_digest_prefix_affects_verification() {
+    let mut runner = new_property_test_runner();
+    let strategy = (any::<u64>(), 10u32..12);
+
+    runner
+        .run(&strategy, |(seed, k)| {
+            run_separate_vk_digest_prefix_affects_verification_case(k, seed);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 #[ignore = "solidity/EVM-heavy; run in release mode"]
 fn malformed_embedded_calldata_variants_are_rejected() {
     let fixture = create_property_standard_plonk_fixture(10, 0);
     let valid = encode_calldata(None, &fixture.proof, &fixture.instances);
-    let valid_true = call_embedded_verifier_raw(&fixture.verifier_solidity, valid.clone());
+    let valid_true = call_embedded_verifier_raw(&fixture.embedded_verifier_solidity, valid.clone());
     assert_solidity_accepts(valid_true, "valid embedded calldata");
 
     let mut wrong_selector = valid.clone();
@@ -163,7 +177,7 @@ fn malformed_embedded_calldata_variants_are_rejected() {
         ("wrong selector", wrong_selector),
         ("wrong instance array length", wrong_instance_array_length),
     ] {
-        let output = call_embedded_verifier_raw(&fixture.verifier_solidity, calldata);
+        let output = call_embedded_verifier_raw(&fixture.embedded_verifier_solidity, calldata);
         assert_solidity_rejects(output, name);
     }
 }
@@ -174,7 +188,7 @@ fn mutated_separate_vk_contract_is_rejected() {
     let fixture = create_property_standard_plonk_fixture(10, 0);
     let mutated_vk_solidity = mutate_first_large_hex_literal(&fixture.vk_solidity);
     let output = call_separate_verifier(
-        &fixture.verifier_solidity,
+        &fixture.separate_verifier_solidity,
         &mutated_vk_solidity,
         &fixture.proof,
         &fixture.instances,
@@ -190,7 +204,14 @@ fn standard_plonk_render_is_deterministic_for_same_seed() {
 
     assert_eq!(fixture_a.instances, fixture_b.instances);
     assert_eq!(fixture_a.proof, fixture_b.proof);
-    assert_eq!(fixture_a.verifier_solidity, fixture_b.verifier_solidity);
+    assert_eq!(
+        fixture_a.embedded_verifier_solidity,
+        fixture_b.embedded_verifier_solidity
+    );
+    assert_eq!(
+        fixture_a.separate_verifier_solidity,
+        fixture_b.separate_verifier_solidity
+    );
     assert_eq!(fixture_a.vk_solidity, fixture_b.vk_solidity);
 }
 
@@ -198,8 +219,8 @@ fn standard_plonk_render_is_deterministic_for_same_seed() {
 #[ignore = "solidity/EVM-heavy; run in release mode"]
 fn compile_solidity_is_deterministic_for_same_source() {
     let fixture = create_property_standard_plonk_fixture(10, 1);
-    let bytecode_a = compile_solidity(&fixture.verifier_solidity);
-    let bytecode_b = compile_solidity(&fixture.verifier_solidity);
+    let bytecode_a = compile_solidity(&fixture.embedded_verifier_solidity);
+    let bytecode_b = compile_solidity(&fixture.embedded_verifier_solidity);
 
     assert_eq!(bytecode_a, bytecode_b);
 }
@@ -389,7 +410,8 @@ impl halo2_proofs::plonk::Circuit<Fr> for PropertyStandardPlonk<Fr> {
 struct PropertyStandardPlonkFixture {
     proof: Vec<u8>,
     instances: Vec<Fr>,
-    verifier_solidity: String,
+    embedded_verifier_solidity: String,
+    separate_verifier_solidity: String,
     vk_solidity: String,
 }
 
@@ -443,13 +465,14 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     );
 
     let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
-    let verifier_solidity = generator.render().unwrap();
-    let (_, vk_solidity) = generator.render_separately().unwrap();
+    let embedded_verifier_solidity = generator.render().unwrap();
+    let (separate_verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 
     PropertyStandardPlonkFixture {
         proof,
         instances,
-        verifier_solidity,
+        embedded_verifier_solidity,
+        separate_verifier_solidity,
         vk_solidity,
     }
 }
@@ -458,14 +481,14 @@ fn run_property_standard_plonk_positive_case(k: u32, separate: bool, seed: u64) 
     let fixture = create_property_standard_plonk_fixture(k, seed);
     let output = if separate {
         call_separate_verifier(
-            &fixture.verifier_solidity,
+            &fixture.separate_verifier_solidity,
             &fixture.vk_solidity,
             &fixture.proof,
             &fixture.instances,
         )
     } else {
         call_embedded_verifier(
-            &fixture.verifier_solidity,
+            &fixture.embedded_verifier_solidity,
             &fixture.proof,
             &fixture.instances,
         )
@@ -482,13 +505,17 @@ fn run_property_standard_plonk_wrong_instance_case(k: u32, separate: bool, seed:
 
     let output = if separate {
         call_separate_verifier(
-            &fixture.verifier_solidity,
+            &fixture.separate_verifier_solidity,
             &fixture.vk_solidity,
             &fixture.proof,
             &bad_instances,
         )
     } else {
-        call_embedded_verifier(&fixture.verifier_solidity, &fixture.proof, &bad_instances)
+        call_embedded_verifier(
+            &fixture.embedded_verifier_solidity,
+            &fixture.proof,
+            &bad_instances,
+        )
     };
     assert_solidity_rejects(
         output,
@@ -510,13 +537,17 @@ fn run_property_standard_plonk_malleated_proof_case(
 
     let output = if separate {
         call_separate_verifier(
-            &fixture.verifier_solidity,
+            &fixture.separate_verifier_solidity,
             &fixture.vk_solidity,
             &bad_proof,
             &fixture.instances,
         )
     } else {
-        call_embedded_verifier(&fixture.verifier_solidity, &bad_proof, &fixture.instances)
+        call_embedded_verifier(
+            &fixture.embedded_verifier_solidity,
+            &bad_proof,
+            &fixture.instances,
+        )
     };
     assert_solidity_rejects(
         output,
@@ -528,12 +559,34 @@ fn run_property_standard_plonk_wrong_vk_case(k: u32, seed: u64) {
     let fixture = create_property_standard_plonk_fixture(k, seed);
     let wrong_fixture = create_property_standard_plonk_fixture(k + 1, seed ^ 0x5a5a_5a5a_5a5a_5a5a);
     let output = call_separate_verifier(
-        &fixture.verifier_solidity,
+        &fixture.separate_verifier_solidity,
         &wrong_fixture.vk_solidity,
         &fixture.proof,
         &fixture.instances,
     );
     assert_solidity_rejects(output, &format!("wrong vk seed={seed} k={k}"));
+}
+
+fn run_separate_vk_digest_prefix_affects_verification_case(k: u32, seed: u64) {
+    let fixture = create_property_standard_plonk_fixture(k, seed);
+    let original = call_separate_verifier(
+        &fixture.separate_verifier_solidity,
+        &fixture.vk_solidity,
+        &fixture.proof,
+        &fixture.instances,
+    );
+    assert_solidity_accepts(original, &format!("valid separate vk seed={seed} k={k}"));
+
+    let mutated = call_separate_verifier(
+        &fixture.separate_verifier_solidity,
+        &mutate_vk_digest_literal_only(&fixture.vk_solidity),
+        &fixture.proof,
+        &fixture.instances,
+    );
+    assert_solidity_rejects(
+        mutated,
+        &format!("digest-only mutated separate vk seed={seed} k={k}"),
+    );
 }
 
 fn call_embedded_verifier(
@@ -604,6 +657,35 @@ fn mutate_first_large_hex_literal(solidity: &str) -> String {
         }
     }
     panic!("no 64-byte hex literal found to mutate");
+}
+
+fn mutate_vk_digest_literal_only(solidity: &str) -> String {
+    let marker = "// vk_digest";
+    let marker_idx = solidity.find(marker).expect("vk_digest marker not found");
+    let line_start = solidity[..marker_idx]
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let line_end = solidity[line_start..]
+        .find('\n')
+        .map(|pos| line_start + pos)
+        .unwrap_or(solidity.len());
+    let line = &solidity[line_start..line_end];
+    let value_start = line
+        .find(',')
+        .and_then(|idx| line[idx..].find("0x").map(|off| idx + off))
+        .expect("vk_digest line missing value hex literal");
+    let abs_hex_start = line_start + value_start + 2;
+    let hex_len = solidity[abs_hex_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit())
+        .count();
+    assert!(hex_len >= 64, "vk_digest literal shorter than expected");
+
+    let mut mutated = solidity.as_bytes().to_vec();
+    let last = abs_hex_start + hex_len - 1;
+    mutated[last] = if mutated[last] == b'0' { b'1' } else { b'0' };
+    String::from_utf8(mutated).unwrap()
 }
 
 #[allow(dead_code)]

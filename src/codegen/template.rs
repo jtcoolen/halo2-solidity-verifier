@@ -19,6 +19,16 @@ impl Halo2VerifyingKey {
         (self.constants.len() * 0x20)
             + (self.fixed_comms.len() + self.permutation_comms.len()) * 0x40
     }
+
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.constants
+            .iter()
+            .map(|(_, value)| *value)
+            .chain(self.fixed_comms.iter().flat_map(|(x, y)| [*x, *y]))
+            .chain(self.permutation_comms.iter().flat_map(|(x, y)| [*x, *y]))
+            .flat_map(|value| value.to_be_bytes::<32>())
+            .collect()
+    }
 }
 
 #[derive(Template)]
@@ -26,6 +36,7 @@ impl Halo2VerifyingKey {
 pub(crate) struct Halo2Verifier {
     pub(crate) scheme: BatchOpenScheme,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
+    pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
     pub(crate) proof_len: usize,
     pub(crate) vk_mptr: Ptr,

@@ -3,6 +3,13 @@
 pragma solidity ^0.8.0;
 
 contract Halo2Verifier {
+    {%- match self.expected_vk_codehash %}
+    {%- when Some with (expected_vk_codehash) %}
+    uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
+    bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
+    {%- when None %}
+    {%- endmatch %}
+
     uint256 internal constant    PROOF_LEN_CPTR = {{ proof_cptr - 1 }};
     uint256 internal constant        PROOF_CPTR = {{ proof_cptr }};
     uint256 internal constant NUM_INSTANCE_CPTR = {{ proof_cptr + (proof_len / 32) }};
@@ -79,6 +86,13 @@ contract Halo2Verifier {
         bytes calldata proof,
         uint256[] calldata instances
     ) public view returns (bool) {
+        {%- match self.embedded_vk %}
+        {%- when None %}
+        if (vk.code.length != EXPECTED_VK_LENGTH || vk.codehash != EXPECTED_VK_CODEHASH) {
+            return false;
+        }
+        {%- else %}
+        {%- endmatch %}
         assembly {
             // Read EC point (x, y) at (proof_cptr, proof_cptr + 0x20),
             // and check if the point is on affine plane,
