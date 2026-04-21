@@ -31,3 +31,7 @@ required-features = ["evm"]
 [[example]]
 name = "trace"
 required-features = ["evm"]
+
+[[example]]
+name = "compare_trace"
+required-features = ["evm"]
