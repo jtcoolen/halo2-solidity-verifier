@@ -15,7 +15,7 @@ use proptest::{
 };
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha3::Digest;
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, panic::AssertUnwindSafe};
 
 #[test]
 fn function_signature() {
@@ -75,16 +75,55 @@ fn render_separately_gwc19_maingate() {
 
 #[test]
 #[ignore = "expensive property test; run in release mode"]
-fn pbt_solidity_verifies_standard_plonk_proofs() {
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases: 8,
-        ..ProptestConfig::default()
-    });
-    let strategy = (any::<u64>(), 10u32..14, any::<bool>());
+fn pbt_solidity_verifies_standard_plonk_embedded_vk_proofs() {
+    let mut runner = new_property_test_runner();
+    let strategy = (any::<u64>(), 10u32..13);
+
+    runner
+        .run(&strategy, |(seed, k)| {
+            run_property_standard_plonk_positive_case(k, false, seed);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "expensive property test; run in release mode"]
+fn pbt_solidity_rejects_wrong_instances() {
+    let mut runner = new_property_test_runner();
+    let strategy = (any::<u64>(), 10u32..13, any::<bool>());
 
     runner
         .run(&strategy, |(seed, k, separate)| {
-            run_property_standard_plonk_case(k, separate, seed);
+            run_property_standard_plonk_wrong_instance_case(k, separate, seed);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "expensive property test; run in release mode"]
+fn pbt_solidity_rejects_malleated_proofs() {
+    let mut runner = new_property_test_runner();
+    let strategy = (any::<u64>(), 10u32..13, any::<bool>(), 0usize..64);
+
+    runner
+        .run(&strategy, |(seed, k, separate, bit_idx)| {
+            run_property_standard_plonk_malleated_proof_case(k, separate, seed, bit_idx);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "expensive property test; run in release mode"]
+fn pbt_solidity_rejects_wrong_verifying_keys() {
+    let mut runner = new_property_test_runner();
+    let strategy = (any::<u64>(), 10u32..12);
+
+    runner
+        .run(&strategy, |(seed, k)| {
+            run_property_standard_plonk_wrong_vk_case(k, seed);
             Ok(())
         })
         .unwrap();
@@ -156,6 +195,13 @@ fn run_render_separately<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
 
 fn std_rng() -> impl RngCore + Clone {
     StdRng::seed_from_u64(0)
+}
+
+fn new_property_test_runner() -> TestRunner {
+    TestRunner::new(ProptestConfig {
+        cases: 8,
+        ..ProptestConfig::default()
+    })
 }
 
 #[derive(Clone)]
@@ -266,7 +312,15 @@ impl halo2_proofs::plonk::Circuit<Fr> for PropertyStandardPlonk<Fr> {
     }
 }
 
-fn run_property_standard_plonk_case(k: u32, separate: bool, seed: u64) {
+#[derive(Clone)]
+struct PropertyStandardPlonkFixture {
+    proof: Vec<u8>,
+    instances: Vec<Fr>,
+    verifier_solidity: String,
+    vk_solidity: String,
+}
+
+fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandardPlonkFixture {
     use crate::transcript::Keccak256Transcript;
     use halo2_proofs::{
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof},
@@ -312,33 +366,139 @@ fn run_property_standard_plonk_case(k: u32, separate: bool, seed: u64) {
     };
     assert!(
         result.is_ok(),
-        "native verification failed for seed={seed} k={k} separate={separate}"
+        "native verification failed for seed={seed} k={k}"
     );
 
     let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
-    let mut evm = Evm::default();
-    let expected_true = [vec![0; 31], vec![1]].concat();
+    let verifier_solidity = generator.render().unwrap();
+    let (_, vk_solidity) = generator.render_separately().unwrap();
+
+    PropertyStandardPlonkFixture {
+        proof,
+        instances,
+        verifier_solidity,
+        vk_solidity,
+    }
+}
+
+fn run_property_standard_plonk_positive_case(k: u32, separate: bool, seed: u64) {
+    let fixture = create_property_standard_plonk_fixture(k, seed);
+    let output = if separate {
+        call_separate_verifier(&fixture.verifier_solidity, &fixture.vk_solidity, &fixture.proof, &fixture.instances)
+    } else {
+        call_embedded_verifier(&fixture.verifier_solidity, &fixture.proof, &fixture.instances)
+    };
+    assert_solidity_accepts(output, &format!("seed={seed} k={k} separate={separate}"));
+}
+
+fn run_property_standard_plonk_wrong_instance_case(k: u32, separate: bool, seed: u64) {
+    use halo2_proofs::arithmetic::Field;
+
+    let fixture = create_property_standard_plonk_fixture(k, seed);
+    let mut bad_instances = fixture.instances.clone();
+    bad_instances[0] += Fr::ONE;
 
     let output = if separate {
-        let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
-        let verifier_address = evm.create(compile_solidity(&verifier_solidity));
-        let vk_address = evm.create(compile_solidity(&vk_solidity));
+        call_separate_verifier(
+            &fixture.verifier_solidity,
+            &fixture.vk_solidity,
+            &fixture.proof,
+            &bad_instances,
+        )
+    } else {
+        call_embedded_verifier(&fixture.verifier_solidity, &fixture.proof, &bad_instances)
+    };
+    assert_solidity_rejects(
+        output,
+        &format!("wrong instance seed={seed} k={k} separate={separate}"),
+    );
+}
+
+fn run_property_standard_plonk_malleated_proof_case(
+    k: u32,
+    separate: bool,
+    seed: u64,
+    bit_idx: usize,
+) {
+    let fixture = create_property_standard_plonk_fixture(k, seed);
+    let mut bad_proof = fixture.proof.clone();
+    let byte_idx = bit_idx / 8 % bad_proof.len();
+    let bit_mask = 1u8 << (bit_idx % 8);
+    bad_proof[byte_idx] ^= bit_mask;
+
+    let output = if separate {
+        call_separate_verifier(
+            &fixture.verifier_solidity,
+            &fixture.vk_solidity,
+            &bad_proof,
+            &fixture.instances,
+        )
+    } else {
+        call_embedded_verifier(&fixture.verifier_solidity, &bad_proof, &fixture.instances)
+    };
+    assert_solidity_rejects(
+        output,
+        &format!("malleated proof seed={seed} k={k} separate={separate}"),
+    );
+}
+
+fn run_property_standard_plonk_wrong_vk_case(k: u32, seed: u64) {
+    let fixture = create_property_standard_plonk_fixture(k, seed);
+    let wrong_fixture = create_property_standard_plonk_fixture(k + 1, seed ^ 0x5a5a_5a5a_5a5a_5a5a);
+    let output = call_separate_verifier(
+        &fixture.verifier_solidity,
+        &wrong_fixture.vk_solidity,
+        &fixture.proof,
+        &fixture.instances,
+    );
+    assert_solidity_rejects(output, &format!("wrong vk seed={seed} k={k}"));
+}
+
+fn call_embedded_verifier(
+    verifier_solidity: &str,
+    proof: &[u8],
+    instances: &[Fr],
+) -> Result<Vec<u8>, ()> {
+    let mut evm = Evm::default();
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let verifier_address = evm.create(compile_solidity(verifier_solidity));
+        evm.call(verifier_address, encode_calldata(None, proof, instances)).1
+    }))
+    .map_err(|_| ())
+}
+
+fn call_separate_verifier(
+    verifier_solidity: &str,
+    vk_solidity: &str,
+    proof: &[u8],
+    instances: &[Fr],
+) -> Result<Vec<u8>, ()> {
+    let mut evm = Evm::default();
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let verifier_address = evm.create(compile_solidity(verifier_solidity));
+        let vk_address = evm.create(compile_solidity(vk_solidity));
         evm.call(
             verifier_address,
-            encode_calldata(Some(vk_address.into()), &proof, &instances),
+            encode_calldata(Some(vk_address.into()), proof, instances),
         )
         .1
-    } else {
-        let verifier_solidity = generator.render().unwrap();
-        let verifier_address = evm.create(compile_solidity(&verifier_solidity));
-        evm.call(verifier_address, encode_calldata(None, &proof, &instances))
-            .1
-    };
+    }))
+    .map_err(|_| ())
+}
 
-    assert_eq!(
-        output, expected_true,
-        "seed={seed} k={k} separate={separate}"
-    );
+fn assert_solidity_accepts(output: Result<Vec<u8>, ()>, context: &str) {
+    let expected_true = [vec![0; 31], vec![1]].concat();
+    match output {
+        Ok(bytes) => assert_eq!(bytes, expected_true, "{context}"),
+        Err(()) => panic!("solidity call panicked unexpectedly: {context}"),
+    }
+}
+
+fn assert_solidity_rejects(output: Result<Vec<u8>, ()>, context: &str) {
+    let expected_true = [vec![0; 31], vec![1]].concat();
+    if let Ok(bytes) = output {
+        assert_ne!(bytes, expected_true, "{context}");
+    }
 }
 
 #[allow(dead_code)]
