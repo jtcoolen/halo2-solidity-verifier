@@ -18,13 +18,7 @@ fn main() {
     let (verifier_solidity, _) = generator.render_separately().unwrap();
     save_solidity("Halo2Verifier.sol", &verifier_solidity);
 
-    let verifier_creation_code = compile_solidity(&verifier_solidity);
-    let verifier_creation_code_size = verifier_creation_code.len();
-    println!("Verifier creation code size: {verifier_creation_code_size}");
-
     let mut evm = Evm::default();
-    let verifier_address = evm.create(verifier_creation_code);
-
     let deployed_verifier_solidity = verifier_solidity;
 
     for k in K_RANGE {
@@ -41,11 +35,15 @@ fn main() {
 
         let vk_creation_code = compile_solidity(&vk_solidity);
         let vk_address = evm.create(vk_creation_code);
+        let verifier_creation_code = compile_solidity(&verifier_solidity);
+        let verifier_creation_code_size = verifier_creation_code.len();
+        println!("Verifier creation code size: {verifier_creation_code_size}");
+        let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
 
         let calldata = {
             let instances = circuit.instances();
             let proof = create_proof_checked(&params[&k], &pk, circuit, &instances, &mut rng);
-            encode_calldata(Some(vk_address.into()), &proof, &instances)
+            encode_calldata(&proof, &instances)
         };
         let (gas_cost, output) = evm.call(verifier_address, calldata);
         assert_eq!(output, [vec![0; 31], vec![1]].concat());

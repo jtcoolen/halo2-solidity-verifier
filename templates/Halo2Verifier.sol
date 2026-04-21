@@ -5,6 +5,7 @@ pragma solidity ^0.8.0;
 contract Halo2Verifier {
     {%- match self.expected_vk_codehash %}
     {%- when Some with (expected_vk_codehash) %}
+    address public immutable AUTHORIZED_VK;
     uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
     bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
     {%- when None %}
@@ -77,17 +78,23 @@ contract Halo2Verifier {
     uint256 internal constant   PAIRING_RHS_X_MPTR = {{ theta_mptr + 24 }};
     uint256 internal constant   PAIRING_RHS_Y_MPTR = {{ theta_mptr + 25 }};
 
-    function verifyProof(
+    {%- match self.embedded_vk %}
+    {%- when None %}
+    constructor(address authorizedVk) {
+        require(
+            authorizedVk.code.length == EXPECTED_VK_LENGTH
+                && authorizedVk.codehash == EXPECTED_VK_CODEHASH,
+            "invalid vk"
+        );
+        AUTHORIZED_VK = authorizedVk;
+    }
+    {%- else %}
+    {%- endmatch %}
+
+    function verifyProof(bytes calldata proof, uint256[] calldata instances) public view returns (bool) {
         {%- match self.embedded_vk %}
         {%- when None %}
-        address vk,
-        {%- else %}
-        {%- endmatch %}
-        bytes calldata proof,
-        uint256[] calldata instances
-    ) public view returns (bool) {
-        {%- match self.embedded_vk %}
-        {%- when None %}
+        address vk = AUTHORIZED_VK;
         if (vk.code.length != EXPECTED_VK_LENGTH || vk.codehash != EXPECTED_VK_CODEHASH) {
             return false;
         }

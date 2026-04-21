@@ -225,7 +225,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn generate_verifier(&self, separate: bool) -> Halo2Verifier {
-        let proof_cptr = Ptr::calldata(if separate { 0x84 } else { 0x64 });
+        let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
         let expected_vk_codehash = separate.then(|| {

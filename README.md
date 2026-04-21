@@ -37,7 +37,7 @@ let verifier_solidity = generator.render().unwrap();
 ### Encode proof into calldata to invoke `verifyProof`
 
 ```rust
-let calldata = encode_calldata(vk_address, &proof, &instances);
+let calldata = encode_calldata(&proof, &instances);
 ```
 
 Note that function selector is already included.

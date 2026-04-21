@@ -1,41 +1,16 @@
 use crate::codegen::util::{fr_to_u256, to_u256_be_bytes};
 use halo2_proofs::halo2curves::bn256;
 use itertools::chain;
-use ruint::aliases::U256;
 
 /// Function signature of `verifyProof(bytes,uint256[])`.
 pub const FN_SIG_VERIFY_PROOF: [u8; 4] = [0x1e, 0x8e, 0x1e, 0x13];
 
-/// Function signature of `verifyProof(address,bytes,uint256[])`.
-pub const FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS: [u8; 4] = [0xaf, 0x83, 0xa1, 0x8d];
-
 /// Encode proof into calldata to invoke `Halo2Verifier.verifyProof`.
-///
-/// For `vk_address`:
-/// - Pass `None` if verifying key is embedded in `Halo2Verifier`
-/// - Pass `Some(vk_address)` if verifying key is separated and deployed at `vk_address`
-pub fn encode_calldata(
-    vk_address: Option<[u8; 20]>,
-    proof: &[u8],
-    instances: &[bn256::Fr],
-) -> Vec<u8> {
-    let (fn_sig, offset) = if vk_address.is_some() {
-        (FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS, 0x60)
-    } else {
-        (FN_SIG_VERIFY_PROOF, 0x40)
-    };
-    let vk_address = if let Some(vk_address) = vk_address {
-        U256::try_from_be_slice(&vk_address)
-            .unwrap()
-            .to_be_bytes::<0x20>()
-            .to_vec()
-    } else {
-        Vec::new()
-    };
+pub fn encode_calldata(proof: &[u8], instances: &[bn256::Fr]) -> Vec<u8> {
+    let offset = 0x40;
     let num_instances = instances.len();
     chain![
-        fn_sig,                                                      // function signature
-        vk_address,                                                  // verifying key address
+        FN_SIG_VERIFY_PROOF,                                         // function signature
         to_u256_be_bytes(offset),                                    // offset of proof
         to_u256_be_bytes(offset + 0x20 + proof.len()),               // offset of instances
         to_u256_be_bytes(proof.len()),                               // length of proof
@@ -53,6 +28,7 @@ pub(crate) mod test {
         primitives::{Address, CreateScheme, ExecutionResult, Output, TransactTo, TxEnv},
         InMemoryDB, EVM,
     };
+    use ruint::aliases::U256;
     use std::{
         fmt::{self, Debug, Formatter},
         io::{self, Write},
@@ -165,6 +141,21 @@ pub(crate) mod test {
                 Output::Create(_, Some(address)) => address,
                 _ => unreachable!(),
             }
+        }
+
+        /// Apply create transaction with an address constructor argument appended to creation
+        /// bytecode and return created `address`.
+        pub fn create_with_address_arg(
+            &mut self,
+            mut bytecode: Vec<u8>,
+            address_arg: Address,
+        ) -> Address {
+            bytecode.extend_from_slice(
+                &U256::try_from_be_slice(address_arg.as_slice())
+                    .unwrap()
+                    .to_be_bytes::<0x20>(),
+            );
+            self.create(bytecode)
         }
 
         /// Apply call transaction to given `address` with `calldata`.

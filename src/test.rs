@@ -6,7 +6,7 @@ use crate::{
     },
     encode_calldata,
     evm::test::{compile_solidity, Evm},
-    FN_SIG_VERIFY_PROOF, FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS,
+    FN_SIG_VERIFY_PROOF,
 };
 use halo2_proofs::halo2curves::bn256::{Bn256, Fr};
 use proptest::{
@@ -19,18 +19,10 @@ use std::{fs::File, io::Write, panic::AssertUnwindSafe};
 
 #[test]
 fn function_signature() {
-    for (fn_name, fn_sig) in [
-        ("verifyProof(bytes,uint256[])", FN_SIG_VERIFY_PROOF),
-        (
-            "verifyProof(address,bytes,uint256[])",
-            FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS,
-        ),
-    ] {
-        assert_eq!(
-            <[u8; 32]>::from(sha3::Keccak256::digest(fn_name))[..4],
-            fn_sig,
-        );
-    }
+    assert_eq!(
+        <[u8; 32]>::from(sha3::Keccak256::digest("verifyProof(bytes,uint256[])"))[..4],
+        FN_SIG_VERIFY_PROOF,
+    );
 }
 
 #[test]
@@ -147,14 +139,14 @@ fn pbt_separate_vk_digest_prefix_affects_verification() {
 #[ignore = "solidity/EVM-heavy; run in release mode"]
 fn malformed_embedded_calldata_variants_are_rejected() {
     let fixture = create_property_standard_plonk_fixture(10, 0);
-    let valid = encode_calldata(None, &fixture.proof, &fixture.instances);
+    let valid = encode_calldata(&fixture.proof, &fixture.instances);
     let valid_true = call_embedded_verifier_raw(&fixture.embedded_verifier_solidity, valid.clone());
     assert_solidity_accepts(valid_true, "valid embedded calldata");
 
     let mut wrong_selector = valid.clone();
     wrong_selector[0] ^= 0x01;
 
-    let empty_proof = encode_calldata(None, &[], &fixture.instances);
+    let empty_proof = encode_calldata(&[], &fixture.instances);
 
     let truncated_proof = valid[..valid.len() - 1].to_vec();
 
@@ -243,30 +235,14 @@ fn run_render<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
     println!("Verifier creation code size: {verifier_creation_code_size}");
     println!("Verifier runtime code size: {verifier_runtime_code_size}");
 
-    let (gas_cost, output) = evm.call(verifier_address, encode_calldata(None, &proof, &instances));
+    let (gas_cost, output) = evm.call(verifier_address, encode_calldata(&proof, &instances));
     assert_eq!(output, [vec![0; 31], vec![1]].concat());
     println!("Gas cost: {gas_cost}");
 }
 
 fn run_render_separately<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
     let acc_encoding = AccumulatorEncoding::new(0, 4, 68).into();
-    let (params, vk, instances, _) =
-        halo2::create_testdata::<C>(C::min_k(), scheme, acc_encoding, std_rng());
-
-    let generator = SolidityGenerator::new(&params, &vk, scheme, instances.len())
-        .set_acc_encoding(acc_encoding);
-    let (verifier_solidity, _vk_solidity) = generator.render_separately().unwrap();
-    let verifier_creation_code = compile_solidity(&verifier_solidity);
-    let verifier_creation_code_size = verifier_creation_code.len();
-
     let mut evm = Evm::default();
-    let verifier_address = evm.create(verifier_creation_code);
-    let verifier_runtime_code_size = evm.code_size(verifier_address);
-
-    println!("Verifier creation code size: {verifier_creation_code_size}");
-    println!("Verifier runtime code size: {verifier_runtime_code_size}");
-
-    let deployed_verifier_solidity = verifier_solidity;
 
     for k in C::min_k()..C::min_k() + 4 {
         let (params, vk, instances, proof) =
@@ -275,15 +251,16 @@ fn run_render_separately<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
             .set_acc_encoding(acc_encoding);
 
         let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
-        assert_eq!(deployed_verifier_solidity, verifier_solidity);
-
         let vk_creation_code = compile_solidity(&vk_solidity);
         let vk_address = evm.create(vk_creation_code);
+        let verifier_creation_code = compile_solidity(&verifier_solidity);
+        let verifier_creation_code_size = verifier_creation_code.len();
+        let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
+        let verifier_runtime_code_size = evm.code_size(verifier_address);
 
-        let (gas_cost, output) = evm.call(
-            verifier_address,
-            encode_calldata(Some(vk_address.into()), &proof, &instances),
-        );
+        println!("Verifier creation code size: {verifier_creation_code_size}");
+        println!("Verifier runtime code size: {verifier_runtime_code_size}");
+        let (gas_cost, output) = evm.call(verifier_address, encode_calldata(&proof, &instances));
         assert_eq!(output, [vec![0; 31], vec![1]].concat());
         println!("Gas cost: {gas_cost}");
     }
@@ -594,7 +571,7 @@ fn call_embedded_verifier(
     proof: &[u8],
     instances: &[Fr],
 ) -> Result<Vec<u8>, ()> {
-    call_embedded_verifier_raw(verifier_solidity, encode_calldata(None, proof, instances))
+    call_embedded_verifier_raw(verifier_solidity, encode_calldata(proof, instances))
 }
 
 fn call_embedded_verifier_raw(verifier_solidity: &str, calldata: Vec<u8>) -> Result<Vec<u8>, ()> {
@@ -614,13 +591,11 @@ fn call_separate_verifier(
 ) -> Result<Vec<u8>, ()> {
     let mut evm = Evm::default();
     std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let verifier_address = evm.create(compile_solidity(verifier_solidity));
         let vk_address = evm.create(compile_solidity(vk_solidity));
-        evm.call(
-            verifier_address,
-            encode_calldata(Some(vk_address.into()), proof, instances),
-        )
-        .1
+        let verifier_address =
+            evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
+        evm.call(verifier_address, encode_calldata(proof, instances))
+            .1
     }))
     .map_err(|_| ())
 }

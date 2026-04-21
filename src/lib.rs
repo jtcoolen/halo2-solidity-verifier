@@ -14,7 +14,7 @@ mod transcript;
 mod test;
 
 pub use codegen::{AccumulatorEncoding, BatchOpenScheme, SolidityGenerator};
-pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF, FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS};
+pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF};
 pub use transcript::Keccak256Transcript;
 
 #[cfg(feature = "evm")]
