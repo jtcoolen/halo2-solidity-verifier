@@ -241,6 +241,10 @@ contract Halo2Verifier {
                 // Check valid length of instances
                 let num_instances := mload(NUM_INSTANCES_MPTR)
                 success := and(success, eq(num_instances, calldataload(NUM_INSTANCE_CPTR)))
+                success := and(
+                    success,
+                    eq(calldatasize(), add(INSTANCE_CPTR, mul(0x20, num_instances)))
+                )
 
                 // Absorb vk diegst
                 mstore(0x00, mload(VK_DIGEST_MPTR))

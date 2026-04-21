@@ -159,19 +159,13 @@ fn malformed_embedded_calldata_variants_are_rejected() {
     for (name, calldata) in [
         ("empty proof", empty_proof),
         ("truncated proof", truncated_proof),
+        ("extra trailing bytes", extra_trailing_bytes),
         ("wrong selector", wrong_selector),
         ("wrong instance array length", wrong_instance_array_length),
     ] {
         let output = call_embedded_verifier_raw(&fixture.verifier_solidity, calldata);
         assert_solidity_rejects(output, name);
     }
-
-    let trailing_output =
-        call_embedded_verifier_raw(&fixture.verifier_solidity, extra_trailing_bytes);
-    assert_solidity_accepts(
-        trailing_output,
-        "extra trailing bytes are currently tolerated by the verifier",
-    );
 }
 
 #[test]
@@ -317,14 +311,7 @@ impl PropertyStandardPlonkConfig {
                 let [q_l, q_r, q_o, q_m, q_c] = [q_l, q_r, q_o, q_m, q_c]
                     .map(|column| meta.query_fixed(column, Rotation::cur()));
                 let pi = meta.query_instance(pi, Rotation::cur());
-                Some(
-                    q_l * w_l.clone()
-                        + q_r * w_r.clone()
-                        + q_o * w_o
-                        + q_m * w_l * w_r
-                        + q_c
-                        + pi,
-                )
+                Some(q_l * w_l.clone() + q_r * w_r.clone() + q_o * w_o + q_m * w_l * w_r + q_c + pi)
             },
         );
         Self {
@@ -470,9 +457,18 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
 fn run_property_standard_plonk_positive_case(k: u32, separate: bool, seed: u64) {
     let fixture = create_property_standard_plonk_fixture(k, seed);
     let output = if separate {
-        call_separate_verifier(&fixture.verifier_solidity, &fixture.vk_solidity, &fixture.proof, &fixture.instances)
+        call_separate_verifier(
+            &fixture.verifier_solidity,
+            &fixture.vk_solidity,
+            &fixture.proof,
+            &fixture.instances,
+        )
     } else {
-        call_embedded_verifier(&fixture.verifier_solidity, &fixture.proof, &fixture.instances)
+        call_embedded_verifier(
+            &fixture.verifier_solidity,
+            &fixture.proof,
+            &fixture.instances,
+        )
     };
     assert_solidity_accepts(output, &format!("seed={seed} k={k} separate={separate}"));
 }
