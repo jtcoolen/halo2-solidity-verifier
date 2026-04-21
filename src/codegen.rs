@@ -126,7 +126,7 @@ impl<'a> SolidityGenerator<'a> {
 impl<'a> SolidityGenerator<'a> {
     /// Render `Halo2Verifier.sol` with verifying key embedded into writer.
     pub fn render_into(&self, verifier_writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
-        self.generate_verifier(false).render(verifier_writer)
+        self.generate_verifier(false, false).render(verifier_writer)
     }
 
     /// Render `Halo2Verifier.sol` with verifying key embedded and return it as `String`.
@@ -136,13 +136,30 @@ impl<'a> SolidityGenerator<'a> {
         Ok(verifier_output)
     }
 
+    /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded into writer.
+    pub fn render_trace_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(false, true).render(verifier_writer)
+    }
+
+    /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded and return it as a
+    /// `String`.
+    pub fn render_trace(&self) -> Result<String, fmt::Error> {
+        let mut verifier_output = String::new();
+        self.render_trace_into(&mut verifier_output)?;
+        Ok(verifier_output)
+    }
+
     /// Render `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
     pub fn render_separately_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true).render(verifier_writer)?;
+        self.generate_verifier(true, false)
+            .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
     }
@@ -152,6 +169,26 @@ impl<'a> SolidityGenerator<'a> {
         let mut verifier_output = String::new();
         let mut vk_output = String::new();
         self.render_separately_into(&mut verifier_output, &mut vk_output)?;
+        Ok((verifier_output, vk_output))
+    }
+
+    /// Render a trace-enabled `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
+    pub fn render_trace_separately_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(true, true).render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        Ok(())
+    }
+
+    /// Render a trace-enabled `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` and return them as
+    /// `String`s.
+    pub fn render_trace_separately(&self) -> Result<(String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        self.render_trace_separately_into(&mut verifier_output, &mut vk_output)?;
         Ok((verifier_output, vk_output))
     }
 
@@ -224,7 +261,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn generate_verifier(&self, separate: bool) -> Halo2Verifier {
+    fn generate_verifier(&self, separate: bool, trace: bool) -> Halo2Verifier {
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
@@ -260,6 +297,7 @@ impl<'a> SolidityGenerator<'a> {
 
         Halo2Verifier {
             scheme: self.scheme,
+            trace,
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,

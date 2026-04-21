@@ -25,7 +25,7 @@ pub fn encode_calldata(proof: &[u8], instances: &[bn256::Fr]) -> Vec<u8> {
 pub(crate) mod test {
     pub use revm;
     use revm::{
-        primitives::{Address, CreateScheme, ExecutionResult, Output, TransactTo, TxEnv},
+        primitives::{Address, CreateScheme, ExecutionResult, Log, Output, TransactTo, TxEnv},
         InMemoryDB, EVM,
     };
     use ruint::aliases::U256;
@@ -131,7 +131,7 @@ pub(crate) mod test {
         /// # Panics
         /// Panics if execution reverts or halts unexpectedly.
         pub fn create(&mut self, bytecode: Vec<u8>) -> Address {
-            let (_, output) = self.transact_success_or_panic(TxEnv {
+            let (_, output, _) = self.transact_success_or_panic(TxEnv {
                 gas_limit: u64::MAX,
                 transact_to: TransactTo::Create(CreateScheme::Create),
                 data: bytecode.into(),
@@ -164,7 +164,7 @@ pub(crate) mod test {
         /// # Panics
         /// Panics if execution reverts or halts unexpectedly.
         pub fn call(&mut self, address: Address, calldata: Vec<u8>) -> (u64, Vec<u8>) {
-            let (gas_used, output) = self.transact_success_or_panic(TxEnv {
+            let (gas_used, output, _) = self.transact_success_or_panic(TxEnv {
                 gas_limit: u64::MAX,
                 transact_to: TransactTo::Call(address),
                 data: calldata.into(),
@@ -176,7 +176,25 @@ pub(crate) mod test {
             }
         }
 
-        fn transact_success_or_panic(&mut self, tx: TxEnv) -> (u64, Output) {
+        /// Apply call transaction and return gas, return data, and emitted logs.
+        pub fn call_with_logs(
+            &mut self,
+            address: Address,
+            calldata: Vec<u8>,
+        ) -> (u64, Vec<u8>, Vec<Log>) {
+            let (gas_used, output, logs) = self.transact_success_or_panic(TxEnv {
+                gas_limit: u64::MAX,
+                transact_to: TransactTo::Call(address),
+                data: calldata.into(),
+                ..Default::default()
+            });
+            match output {
+                Output::Call(output) => (gas_used, output.into(), logs),
+                _ => unreachable!(),
+            }
+        }
+
+        fn transact_success_or_panic(&mut self, tx: TxEnv) -> (u64, Output, Vec<Log>) {
             self.evm.env.tx = tx;
             let result = self.evm.transact_commit().unwrap();
             self.evm.env.tx = Default::default();
@@ -197,7 +215,7 @@ pub(crate) mod test {
                         }
                         println!("--- end ---");
                     }
-                    (gas_used, output)
+                    (gas_used, output, logs)
                 }
                 ExecutionResult::Revert { gas_used, output } => {
                     panic!("Transaction reverts with gas_used {gas_used} and output {output:#x}")

@@ -27,3 +27,7 @@ evm = ["dep:revm"]
 [[example]]
 name = "separately"
 required-features = ["evm"]
+
+[[example]]
+name = "trace"
+required-features = ["evm"]

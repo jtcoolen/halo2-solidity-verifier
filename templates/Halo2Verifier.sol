@@ -95,7 +95,10 @@ contract Halo2Verifier {
     {%- else %}
     {%- endmatch %}
 
-    function verifyProof(bytes calldata proof, uint256[] calldata instances) public view returns (bool) {
+    function verifyProof(
+        bytes calldata proof,
+        uint256[] calldata instances
+    ) public {%- if self.trace %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
         {%- match self.embedded_vk %}
         {%- when None %}
         address vk = AUTHORIZED_VK;
@@ -240,6 +243,21 @@ contract Halo2Verifier {
                 ret := and(success, staticcall(gas(), 0x08, 0x00, 0x180, 0x00, 0x20))
                 ret := and(ret, mload(0x00))
             }
+
+            {%- if self.trace %}
+            // Emit a uint256 trace entry with topic = trace id and data = value.
+            function trace_u256(id, value) {
+                mstore(0x00, value)
+                log1(0x00, 0x20, id)
+            }
+
+            // Emit an EC point trace entry with topic = trace id and data = (x, y).
+            function trace_point(id, x, y) {
+                mstore(0x00, x)
+                mstore(0x20, y)
+                log1(0x00, 0x40, id)
+            }
+            {%- endif %}
 
             // Modulus
             let q := 21888242871839275222246405745257275088696311157297823662689037894645226208583 // BN254 base field
@@ -590,8 +608,47 @@ contract Halo2Verifier {
             }
 
             // Return 1 as result if everything succeeds
+            {%- if self.trace %}
+            trace_u256(1, mload(VK_DIGEST_MPTR))
+            trace_u256(2, mload(NUM_INSTANCES_MPTR))
+            trace_u256(3, mload(K_MPTR))
+            trace_u256(4, mload(N_INV_MPTR))
+            trace_u256(5, mload(OMEGA_MPTR))
+            trace_u256(6, mload(OMEGA_INV_MPTR))
+            trace_u256(7, mload(THETA_MPTR))
+            trace_u256(8, mload(BETA_MPTR))
+            trace_u256(9, mload(GAMMA_MPTR))
+            trace_u256(10, mload(Y_MPTR))
+            trace_u256(11, mload(X_MPTR))
+            {%- match scheme %}
+            {%- when Bdfg21 %}
+            trace_u256(12, mload(ZETA_MPTR))
+            trace_u256(13, mload(NU_MPTR))
+            trace_u256(14, mload(MU_MPTR))
+            {%- when Gwc19 %}
+            trace_u256(13, mload(NU_MPTR))
+            trace_u256(14, mload(MU_MPTR))
+            {%- endmatch %}
+            trace_u256(15, mload(X_N_MPTR))
+            trace_u256(16, mload(X_N_MINUS_1_INV_MPTR))
+            trace_u256(17, mload(L_LAST_MPTR))
+            trace_u256(18, mload(L_BLIND_MPTR))
+            trace_u256(19, mload(L_0_MPTR))
+            trace_u256(20, mload(INSTANCE_EVAL_MPTR))
+            trace_u256(21, mload(QUOTIENT_EVAL_MPTR))
+            trace_point(22, mload(QUOTIENT_X_MPTR), mload(QUOTIENT_Y_MPTR))
+            trace_point(23, mload(PAIRING_LHS_X_MPTR), mload(PAIRING_LHS_Y_MPTR))
+            trace_point(24, mload(PAIRING_RHS_X_MPTR), mload(PAIRING_RHS_Y_MPTR))
+            if mload(HAS_ACCUMULATOR_MPTR) {
+                trace_point(25, mload(ACC_LHS_X_MPTR), mload(ACC_LHS_Y_MPTR))
+                trace_point(26, mload(ACC_RHS_X_MPTR), mload(ACC_RHS_Y_MPTR))
+            }
             mstore(0x00, 1)
             return(0x00, 0x20)
+            {%- else %}
+            mstore(0x00, 1)
+            return(0x00, 0x20)
+            {%- endif %}
         }
     }
 }
