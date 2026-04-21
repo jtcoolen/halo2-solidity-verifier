@@ -129,6 +129,71 @@ fn pbt_solidity_rejects_wrong_verifying_keys() {
         .unwrap();
 }
 
+#[test]
+#[ignore = "solidity/EVM-heavy; run in release mode"]
+fn malformed_embedded_calldata_variants_are_rejected() {
+    let fixture = create_property_standard_plonk_fixture(10, 0);
+    let valid = encode_calldata(None, &fixture.proof, &fixture.instances);
+
+    let mut wrong_selector = valid.clone();
+    wrong_selector[0] ^= 0x01;
+
+    let truncated_by_word = valid[..valid.len() - 32].to_vec();
+
+    let mut zero_proof_len = valid.clone();
+    overwrite_u256_word(&mut zero_proof_len, 4 + 0x40, 0);
+
+    let mut bad_instances_offset = valid.clone();
+    overwrite_u256_word(&mut bad_instances_offset, 4 + 0x20, 0x40);
+
+    for (name, calldata) in [
+        ("empty calldata", Vec::new()),
+        ("wrong selector", wrong_selector),
+        ("truncated by word", truncated_by_word),
+        ("zero proof len", zero_proof_len),
+        ("bad instances offset", bad_instances_offset),
+    ] {
+        let output = call_embedded_verifier_raw(&fixture.verifier_solidity, calldata);
+        assert_solidity_rejects(output, name);
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run in release mode"]
+fn mutated_separate_vk_contract_is_rejected() {
+    let fixture = create_property_standard_plonk_fixture(10, 0);
+    let mutated_vk_solidity = mutate_first_large_hex_literal(&fixture.vk_solidity);
+    let output = call_separate_verifier(
+        &fixture.verifier_solidity,
+        &mutated_vk_solidity,
+        &fixture.proof,
+        &fixture.instances,
+    );
+    assert_solidity_rejects(output, "mutated separate vk");
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run in release mode"]
+fn standard_plonk_render_is_deterministic_for_same_seed() {
+    let fixture_a = create_property_standard_plonk_fixture(10, 7);
+    let fixture_b = create_property_standard_plonk_fixture(10, 7);
+
+    assert_eq!(fixture_a.instances, fixture_b.instances);
+    assert_eq!(fixture_a.proof, fixture_b.proof);
+    assert_eq!(fixture_a.verifier_solidity, fixture_b.verifier_solidity);
+    assert_eq!(fixture_a.vk_solidity, fixture_b.vk_solidity);
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run in release mode"]
+fn compile_solidity_is_deterministic_for_same_source() {
+    let fixture = create_property_standard_plonk_fixture(10, 1);
+    let bytecode_a = compile_solidity(&fixture.verifier_solidity);
+    let bytecode_b = compile_solidity(&fixture.verifier_solidity);
+
+    assert_eq!(bytecode_a, bytecode_b);
+}
+
 fn run_render<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
     let acc_encoding = AccumulatorEncoding::new(0, 4, 68).into();
     let (params, vk, instances, proof) =
@@ -202,6 +267,11 @@ fn new_property_test_runner() -> TestRunner {
         cases: 8,
         ..ProptestConfig::default()
     })
+}
+
+fn overwrite_u256_word(bytes: &mut [u8], start: usize, value: u64) {
+    bytes[start..start + 32].fill(0);
+    bytes[start + 24..start + 32].copy_from_slice(&value.to_be_bytes());
 }
 
 #[derive(Clone)]
@@ -459,10 +529,14 @@ fn call_embedded_verifier(
     proof: &[u8],
     instances: &[Fr],
 ) -> Result<Vec<u8>, ()> {
+    call_embedded_verifier_raw(verifier_solidity, encode_calldata(None, proof, instances))
+}
+
+fn call_embedded_verifier_raw(verifier_solidity: &str, calldata: Vec<u8>) -> Result<Vec<u8>, ()> {
     let mut evm = Evm::default();
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         let verifier_address = evm.create(compile_solidity(verifier_solidity));
-        evm.call(verifier_address, encode_calldata(None, proof, instances)).1
+        evm.call(verifier_address, calldata).1
     }))
     .map_err(|_| ())
 }
@@ -499,6 +573,25 @@ fn assert_solidity_rejects(output: Result<Vec<u8>, ()>, context: &str) {
     if let Ok(bytes) = output {
         assert_ne!(bytes, expected_true, "{context}");
     }
+}
+
+fn mutate_first_large_hex_literal(solidity: &str) -> String {
+    let bytes = solidity.as_bytes();
+    for start in 0..bytes.len().saturating_sub(2) {
+        if bytes[start] == b'0' && bytes[start + 1] == b'x' {
+            let mut end = start + 2;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end - (start + 2) >= 64 {
+                let mut mutated = solidity.to_owned().into_bytes();
+                let last = end - 1;
+                mutated[last] = if mutated[last] == b'0' { b'1' } else { b'0' };
+                return String::from_utf8(mutated).unwrap();
+            }
+        }
+    }
+    panic!("no 64-byte hex literal found to mutate");
 }
 
 #[allow(dead_code)]
