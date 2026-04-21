@@ -15,6 +15,7 @@ itertools = "0.11.0"
 revm = { version = "=3.5.0", default-features = false, optional = true }
 
 [dev-dependencies]
+proptest = "1.6.0"
 rand = "0.8.5"
 revm = { version = "=3.5.0", default-features = false }
 halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }

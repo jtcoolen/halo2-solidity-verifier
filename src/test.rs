@@ -9,6 +9,10 @@ use crate::{
     FN_SIG_VERIFY_PROOF, FN_SIG_VERIFY_PROOF_WITH_VK_ADDRESS,
 };
 use halo2_proofs::halo2curves::bn256::{Bn256, Fr};
+use proptest::{
+    prelude::any,
+    test_runner::{Config as ProptestConfig, TestRunner},
+};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha3::Digest;
 use std::{fs::File, io::Write};
@@ -67,6 +71,23 @@ fn render_separately_gwc19_huge() {
 #[test]
 fn render_separately_gwc19_maingate() {
     run_render_separately::<halo2::maingate::MainGateWithRange<Bn256>>(Gwc19)
+}
+
+#[test]
+#[ignore = "expensive property test; run in release mode"]
+fn pbt_solidity_verifies_standard_plonk_proofs() {
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 8,
+        ..ProptestConfig::default()
+    });
+    let strategy = (any::<u64>(), 10u32..14, any::<bool>());
+
+    runner
+        .run(&strategy, |(seed, k, separate)| {
+            run_property_standard_plonk_case(k, separate, seed);
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn run_render<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
@@ -135,6 +156,189 @@ fn run_render_separately<C: halo2::TestCircuit<Fr>>(scheme: BatchOpenScheme) {
 
 fn std_rng() -> impl RngCore + Clone {
     StdRng::seed_from_u64(0)
+}
+
+#[derive(Clone)]
+struct PropertyStandardPlonkConfig {
+    selectors: [halo2_proofs::plonk::Column<halo2_proofs::plonk::Fixed>; 5],
+    wires: [halo2_proofs::plonk::Column<halo2_proofs::plonk::Advice>; 3],
+    pi: halo2_proofs::plonk::Column<halo2_proofs::plonk::Instance>,
+}
+
+impl PropertyStandardPlonkConfig {
+    fn configure(
+        meta: &mut halo2_proofs::plonk::ConstraintSystem<Fr>,
+    ) -> PropertyStandardPlonkConfig {
+        use halo2_proofs::poly::Rotation;
+
+        let [w_l, w_r, w_o] = [(); 3].map(|_| meta.advice_column());
+        let [q_l, q_r, q_o, q_m, q_c] = [(); 5].map(|_| meta.fixed_column());
+        let pi = meta.instance_column();
+        for column in [w_l, w_r, w_o] {
+            meta.enable_equality(column);
+        }
+        meta.create_gate(
+            "q_l·w_l + q_r·w_r + q_o·w_o + q_m·w_l·w_r + q_c + pi = 0",
+            |meta| {
+                let [w_l, w_r, w_o] =
+                    [w_l, w_r, w_o].map(|column| meta.query_advice(column, Rotation::cur()));
+                let [q_l, q_r, q_o, q_m, q_c] = [q_l, q_r, q_o, q_m, q_c]
+                    .map(|column| meta.query_fixed(column, Rotation::cur()));
+                let pi = meta.query_instance(pi, Rotation::cur());
+                Some(
+                    q_l * w_l.clone()
+                        + q_r * w_r.clone()
+                        + q_o * w_o
+                        + q_m * w_l * w_r
+                        + q_c
+                        + pi,
+                )
+            },
+        );
+        Self {
+            selectors: [q_l, q_r, q_o, q_m, q_c],
+            wires: [w_l, w_r, w_o],
+            pi,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PropertyStandardPlonk<F>(Vec<F>);
+
+impl<F: halo2_proofs::halo2curves::ff::PrimeField> PropertyStandardPlonk<F> {
+    fn rand<R: RngCore>(num_instances: usize, mut rng: R) -> Self {
+        Self((0..num_instances).map(|_| F::random(&mut rng)).collect())
+    }
+
+    fn instances(&self) -> Vec<F> {
+        self.0.clone()
+    }
+}
+
+impl halo2_proofs::plonk::Circuit<Fr> for PropertyStandardPlonk<Fr> {
+    type Config = PropertyStandardPlonkConfig;
+    type FloorPlanner = halo2_proofs::circuit::SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        use halo2_proofs::arithmetic::Field;
+        Self(vec![Fr::ZERO; self.0.len()])
+    }
+
+    fn configure(meta: &mut halo2_proofs::plonk::ConstraintSystem<Fr>) -> Self::Config {
+        meta.set_minimum_degree(5);
+        PropertyStandardPlonkConfig::configure(meta)
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl halo2_proofs::circuit::Layouter<Fr>,
+    ) -> Result<(), halo2_proofs::plonk::Error> {
+        use halo2_proofs::arithmetic::Field;
+        use halo2_proofs::circuit::Value;
+
+        let [q_l, q_r, q_o, q_m, q_c] = config.selectors;
+        let [w_l, w_r, w_o] = config.wires;
+        let _pi = config.pi;
+
+        layouter.assign_region(
+            || "standard plonk witness",
+            |mut region| {
+                for (offset, instance) in self.0.iter().enumerate() {
+                    region.assign_advice(|| "", w_l, offset, || Value::known(*instance))?;
+                    region.assign_fixed(|| "", q_l, offset, || Value::known(-Fr::ONE))?;
+                }
+
+                let offset = self.0.len();
+                let a = region.assign_advice(|| "", w_l, offset, || Value::known(Fr::ONE))?;
+                a.copy_advice(|| "", &mut region, w_r, offset)?;
+                a.copy_advice(|| "", &mut region, w_o, offset)?;
+
+                let offset = offset + 1;
+                region.assign_advice(|| "", w_l, offset, || Value::known(-Fr::from(5)))?;
+                for (column, idx) in [q_l, q_r, q_o, q_m, q_c].iter().zip(1..) {
+                    region.assign_fixed(|| "", *column, offset, || Value::known(Fr::from(idx)))?;
+                }
+                Ok(())
+            },
+        )
+    }
+}
+
+fn run_property_standard_plonk_case(k: u32, separate: bool, seed: u64) {
+    use crate::transcript::Keccak256Transcript;
+    use halo2_proofs::{
+        plonk::{create_proof, keygen_pk, keygen_vk, verify_proof},
+        poly::kzg::{
+            commitment::ParamsKZG,
+            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            strategy::SingleStrategy,
+        },
+        transcript::TranscriptWriterBuffer,
+    };
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let circuit = PropertyStandardPlonk::rand(k as usize, &mut rng);
+    let instances = circuit.instances();
+
+    let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+    let vk = keygen_vk(&params, &circuit).unwrap();
+    let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
+
+    let proof = {
+        let mut transcript = Keccak256Transcript::new(Vec::new());
+        create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
+            &params,
+            &pk,
+            &[circuit.clone()],
+            &[&[&instances]],
+            &mut rng,
+            &mut transcript,
+        )
+        .unwrap();
+        transcript.finalize()
+    };
+
+    let result = {
+        let mut transcript = Keccak256Transcript::new(proof.as_slice());
+        verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
+            &params,
+            pk.get_vk(),
+            SingleStrategy::new(&params),
+            &[&[&instances]],
+            &mut transcript,
+        )
+    };
+    assert!(
+        result.is_ok(),
+        "native verification failed for seed={seed} k={k} separate={separate}"
+    );
+
+    let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
+    let mut evm = Evm::default();
+    let expected_true = [vec![0; 31], vec![1]].concat();
+
+    let output = if separate {
+        let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
+        let verifier_address = evm.create(compile_solidity(&verifier_solidity));
+        let vk_address = evm.create(compile_solidity(&vk_solidity));
+        evm.call(
+            verifier_address,
+            encode_calldata(Some(vk_address.into()), &proof, &instances),
+        )
+        .1
+    } else {
+        let verifier_solidity = generator.render().unwrap();
+        let verifier_address = evm.create(compile_solidity(&verifier_solidity));
+        evm.call(verifier_address, encode_calldata(None, &proof, &instances))
+            .1
+    };
+
+    assert_eq!(
+        output, expected_true,
+        "seed={seed} k={k} separate={separate}"
+    );
 }
 
 #[allow(dead_code)]
