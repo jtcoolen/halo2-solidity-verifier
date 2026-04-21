@@ -79,10 +79,10 @@ where
                 "Invalid elliptic curve point".to_string(),
             )
         })?;
-        [coords.x(), coords.y()].map(|coordinate| {
+        for coordinate in [coords.x(), coords.y()] {
             self.buf
                 .extend(coordinate.to_repr().as_ref().iter().rev().cloned());
-        });
+        }
         Ok(())
     }
 

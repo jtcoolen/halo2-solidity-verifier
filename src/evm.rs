@@ -60,7 +60,8 @@ pub(crate) mod test {
         str,
     };
 
-    /// Compile solidity with `--via-ir` flag, then return creation bytecode.
+    /// Compile solidity with `--via-ir`, targeting Paris bytecode for compatibility with the
+    /// embedded `revm` runner, then return creation bytecode.
     ///
     /// # Panics
     /// Panics if executable `solc` can not be found, or compilation fails.
@@ -71,6 +72,9 @@ pub(crate) mod test {
             .stderr(Stdio::piped())
             .arg("--bin")
             .arg("--optimize")
+            .arg("--via-ir")
+            .arg("--evm-version")
+            .arg("paris")
             .arg("-")
             .spawn()
         {

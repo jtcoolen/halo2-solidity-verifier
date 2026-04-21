@@ -128,7 +128,9 @@ mod application {
             let [w_l, w_r, w_o] = [(); 3].map(|_| meta.advice_column());
             let [q_l, q_r, q_o, q_m, q_c] = [(); 5].map(|_| meta.fixed_column());
             let pi = meta.instance_column();
-            [w_l, w_r, w_o].map(|column| meta.enable_equality(column));
+            for column in [w_l, w_r, w_o] {
+                meta.enable_equality(column);
+            }
             meta.create_gate(
                 "q_l·w_l + q_r·w_r + q_o·w_o + q_m·w_l·w_r + q_c + pi = 0",
                 |meta| {
