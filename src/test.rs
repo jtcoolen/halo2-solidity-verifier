@@ -134,28 +134,44 @@ fn pbt_solidity_rejects_wrong_verifying_keys() {
 fn malformed_embedded_calldata_variants_are_rejected() {
     let fixture = create_property_standard_plonk_fixture(10, 0);
     let valid = encode_calldata(None, &fixture.proof, &fixture.instances);
+    let valid_true = call_embedded_verifier_raw(&fixture.verifier_solidity, valid.clone());
+    assert_solidity_accepts(valid_true, "valid embedded calldata");
 
     let mut wrong_selector = valid.clone();
     wrong_selector[0] ^= 0x01;
 
-    let truncated_by_word = valid[..valid.len() - 32].to_vec();
+    let empty_proof = encode_calldata(None, &[], &fixture.instances);
 
-    let mut zero_proof_len = valid.clone();
-    overwrite_u256_word(&mut zero_proof_len, 4 + 0x40, 0);
+    let truncated_proof = valid[..valid.len() - 1].to_vec();
 
-    let mut bad_instances_offset = valid.clone();
-    overwrite_u256_word(&mut bad_instances_offset, 4 + 0x20, 0x40);
+    let mut extra_trailing_bytes = valid.clone();
+    extra_trailing_bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+    let proof_len = fixture.proof.len();
+    let instances_len_word_start = 4 + 0x40 + 0x20 + proof_len;
+    let mut wrong_instance_array_length = valid.clone();
+    overwrite_u256_word(
+        &mut wrong_instance_array_length,
+        instances_len_word_start,
+        fixture.instances.len() as u64 + 1,
+    );
 
     for (name, calldata) in [
-        ("empty calldata", Vec::new()),
+        ("empty proof", empty_proof),
+        ("truncated proof", truncated_proof),
         ("wrong selector", wrong_selector),
-        ("truncated by word", truncated_by_word),
-        ("zero proof len", zero_proof_len),
-        ("bad instances offset", bad_instances_offset),
+        ("wrong instance array length", wrong_instance_array_length),
     ] {
         let output = call_embedded_verifier_raw(&fixture.verifier_solidity, calldata);
         assert_solidity_rejects(output, name);
     }
+
+    let trailing_output =
+        call_embedded_verifier_raw(&fixture.verifier_solidity, extra_trailing_bytes);
+    assert_solidity_accepts(
+        trailing_output,
+        "extra trailing bytes are currently tolerated by the verifier",
+    );
 }
 
 #[test]
