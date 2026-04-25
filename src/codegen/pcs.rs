@@ -1,10 +1,12 @@
 use crate::codegen::util::{ConstraintSystemMeta, Data, EcPoint, Word};
 use itertools::{chain, izip};
 
-mod bdfg21;
 mod gwc19;
 
 /// KZG batch open schemes in `halo2`.
+///
+/// The BDFG21 (SHPLONK) variant has been removed during the BLS12-381 /
+/// EIP-2537 port -- only GWC19 is supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOpenScheme {
     /// Batch open scheme in [Plonk] paper.
@@ -12,11 +14,6 @@ pub enum BatchOpenScheme {
     ///
     /// [Plonk]: https://eprint.iacr.org/2019/953.pdf
     Gwc19,
-    /// Batch open scheme in [BDFG21] paper.
-    /// Corresponding to `halo2_proofs::poly::kzg::multiopen::ProverSHPLONK`
-    ///
-    /// [BDFG21]: https://eprint.iacr.org/2020/081.pdf
-    Bdfg21,
 }
 
 impl BatchOpenScheme {
@@ -26,7 +23,6 @@ impl BatchOpenScheme {
         data: &Data,
     ) -> usize {
         match self {
-            Self::Bdfg21 => bdfg21::static_working_memory_size(meta, data),
             Self::Gwc19 => gwc19::static_working_memory_size(meta, data),
         }
     }
@@ -37,17 +33,14 @@ impl BatchOpenScheme {
         data: &Data,
     ) -> Vec<Vec<String>> {
         match self {
-            Self::Bdfg21 => bdfg21::computations(meta, data),
             Self::Gwc19 => gwc19::computations(meta, data),
         }
     }
 
     /// Number of G1 commitments that appear *after* the evaluation block
-    /// in the proof byte-stream. For BDFG21 this is the (W, W') pair (= 2);
-    /// for GWC19 there is one W per rotation set.
+    /// in the proof byte-stream. For GWC19 there is one W per rotation set.
     pub(crate) fn num_trailing_g1_points(&self, meta: &ConstraintSystemMeta) -> usize {
         match self {
-            Self::Bdfg21 => 2,
             Self::Gwc19 => meta.num_rotations,
         }
     }

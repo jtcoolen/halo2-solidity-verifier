@@ -15,7 +15,7 @@ use halo2_proofs::{
     poly::{kzg::commitment::ParamsKZG, Rotation},
 };
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Bdfg21, CallOutcome, Evm,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, CallOutcome, Evm,
     Keccak256Transcript, SolidityGenerator,
 };
 use rand::{rngs::StdRng, SeedableRng};
@@ -34,7 +34,7 @@ fn main() {
 
             let vk = keygen_vk(&params, &circuit).unwrap();
             let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
-            let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
+            let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
             let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 
             let mut evm = Evm::default();
@@ -83,7 +83,7 @@ fn create_proof_checked(
 ) -> Vec<u8> {
     use halo2_proofs::{
         poly::kzg::{
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            multiopen::{ProverGWC, VerifierGWC},
             strategy::SingleStrategy,
         },
         transcript::TranscriptWriterBuffer,
@@ -91,7 +91,7 @@ fn create_proof_checked(
     let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
-        create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
+        create_proof::<_, ProverGWC<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
@@ -105,7 +105,7 @@ fn create_proof_checked(
     let verifier_params = params.verifier_params();
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
-        verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
+        verify_proof::<_, VerifierGWC<_>, _, _, SingleStrategy<_>>(
             &verifier_params,
             pk.get_vk(),
             SingleStrategy::new(&verifier_params),

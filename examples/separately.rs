@@ -2,7 +2,7 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Bdfg21, Evm,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
     Keccak256Transcript, SolidityGenerator,
 };
 
@@ -21,7 +21,7 @@ fn main() {
 
         let vk = keygen_vk(&params[&k], &circuit).unwrap();
         let pk = keygen_pk(&params[&k], vk, &circuit).unwrap();
-        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), Bdfg21, num_instances);
+        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), Gwc19, num_instances);
         let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
         // Each (k, circuit) yields a distinct authorized VK, and the verifier
         // pins that VK by codehash, so we save one Halo2Verifier per k too.
@@ -100,7 +100,7 @@ fn create_proof_checked(
 ) -> Vec<u8> {
     use halo2_proofs::{
         poly::kzg::{
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            multiopen::{ProverGWC, VerifierGWC},
             strategy::SingleStrategy,
         },
         transcript::TranscriptWriterBuffer,
@@ -117,7 +117,7 @@ fn create_proof_checked(
     let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
-        create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
+        create_proof::<_, ProverGWC<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
@@ -132,7 +132,7 @@ fn create_proof_checked(
     let verifier_params = params.verifier_params();
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
-        verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
+        verify_proof::<_, VerifierGWC<_>, _, _, SingleStrategy<_>>(
             &verifier_params,
             pk.get_vk(),
             SingleStrategy::new(&verifier_params),

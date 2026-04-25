@@ -6,7 +6,7 @@ use halo2_proofs::{
     transcript::{Transcript, TranscriptRead},
 };
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Bdfg21, Evm,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
     Keccak256Transcript, SolidityGenerator,
 };
 use itertools::chain;
@@ -25,7 +25,7 @@ fn main() {
 
     let vk = keygen_vk(&params, &circuit).unwrap();
     let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
-    let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
+    let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
     let (verifier_solidity, vk_solidity) = generator.render_trace_separately().unwrap();
 
     let proof = create_proof_checked(&params, &pk, circuit, &instances, &mut rng);
@@ -381,7 +381,7 @@ fn compute_rust_pairing_points(
 ) -> Option<([U256; 4], [U256; 4])> {
     use halo2_backend::poly::{
         commitment::{Verifier, MSM},
-        kzg::{msm::DualMSM, multiopen::VerifierSHPLONK, strategy::GuardKZG},
+        kzg::{msm::DualMSM, multiopen::VerifierGWC, strategy::GuardKZG},
         Guard, VerificationStrategy,
     };
     use halo2_middleware::ff::Field;
@@ -458,7 +458,7 @@ fn compute_rust_pairing_points(
     let dual_msm = {
         let mut transcript = Keccak256Transcript::new(proof);
         let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
-        verify_proof::<_, VerifierSHPLONK<_>, _, _, CapturingStrategy<_>>(
+        verify_proof::<_, VerifierGWC<_>, _, _, CapturingStrategy<_>>(
             &verifier_params,
             vk,
             strategy,
@@ -494,7 +494,7 @@ fn create_proof_checked(
 ) -> Vec<u8> {
     use halo2_proofs::{
         poly::kzg::{
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            multiopen::{ProverGWC, VerifierGWC},
             strategy::SingleStrategy,
         },
         transcript::TranscriptWriterBuffer,
@@ -504,7 +504,7 @@ fn create_proof_checked(
     let verifier_params = params.verifier_params();
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
-        create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
+        create_proof::<_, ProverGWC<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
@@ -518,7 +518,7 @@ fn create_proof_checked(
 
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
-        verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
+        verify_proof::<_, VerifierGWC<_>, _, _, SingleStrategy<_>>(
             &verifier_params,
             pk.get_vk(),
             SingleStrategy::new(&verifier_params),

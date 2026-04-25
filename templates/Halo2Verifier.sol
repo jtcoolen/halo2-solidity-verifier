@@ -62,15 +62,8 @@ contract Halo2Verifier {
     uint256 internal constant GAMMA_MPTR = {{ theta_mptr + 2 }};
     uint256 internal constant     Y_MPTR = {{ theta_mptr + 3 }};
     uint256 internal constant     X_MPTR = {{ theta_mptr + 4 }};
-    {%- match scheme %}
-    {%- when Bdfg21 %}
-    uint256 internal constant  ZETA_MPTR = {{ theta_mptr + 5 }};
-    uint256 internal constant    NU_MPTR = {{ theta_mptr + 6 }};
-    uint256 internal constant    MU_MPTR = {{ theta_mptr + 7 }};
-    {%- when Gwc19 %}
     uint256 internal constant    NU_MPTR = {{ theta_mptr + 5 }};
     uint256 internal constant    MU_MPTR = {{ theta_mptr + 6 }};
-    {%- endmatch %}
 
     // EC accumulators each occupy a full G1 point (4 words).
     uint256 internal constant       ACC_LHS_MPTR = {{ theta_mptr + 8 }};
@@ -223,7 +216,7 @@ contract Halo2Verifier {
 
             // Same as ec_add_acc but uses the scratch slot at 0x80..0x100
             // as the second operand and writes to 0x80 (parallel
-            // accumulator used by Bdfg21).
+            // accumulator).
             function ec_add_tmp(success) -> ret {
                 ret := and(success, staticcall(gas(), 0x0b, 0x80, 0x100, 0x80, 0x80))
             }
@@ -337,17 +330,6 @@ contract Halo2Verifier {
                 }
 
                 // Read batch opening proof and squeeze its challenges
-                {%- match scheme %}
-                {%- when Bdfg21 %}
-                challenge_mptr, hash_mptr := squeeze_challenge(challenge_mptr, hash_mptr, r)       // zeta
-                challenge_mptr := squeeze_challenge_cont(challenge_mptr, r)                        // nu
-
-                success, proof_cptr, hash_mptr := read_g1_point(success, proof_cptr, hash_mptr)    // W
-
-                challenge_mptr, hash_mptr := squeeze_challenge(challenge_mptr, hash_mptr, r)       // mu
-
-                success, proof_cptr, hash_mptr := read_g1_point(success, proof_cptr, hash_mptr)    // W'
-                {%- when Gwc19 %}
                 challenge_mptr, hash_mptr := squeeze_challenge(challenge_mptr, hash_mptr, r)       // nu
 
                 for { let proof_cptr_end := add(proof_cptr, {{ (4 * 32 * num_rotations)|hex() }}) }
@@ -357,7 +339,6 @@ contract Halo2Verifier {
                 }
 
                 challenge_mptr, hash_mptr := squeeze_challenge(challenge_mptr, hash_mptr, r)       // mu
-                {%- endmatch %}
 
                 {%~ match self.embedded_vk %}
                 {%- when Some with (embedded_vk) %}
@@ -659,15 +640,8 @@ contract Halo2Verifier {
             trace_u256(9,  mload(GAMMA_MPTR))
             trace_u256(10, mload(Y_MPTR))
             trace_u256(11, mload(X_MPTR))
-            {%- match scheme %}
-            {%- when Bdfg21 %}
-            trace_u256(12, mload(ZETA_MPTR))
             trace_u256(13, mload(NU_MPTR))
             trace_u256(14, mload(MU_MPTR))
-            {%- when Gwc19 %}
-            trace_u256(13, mload(NU_MPTR))
-            trace_u256(14, mload(MU_MPTR))
-            {%- endmatch %}
             trace_u256(15, mload(X_N_MPTR))
             trace_u256(16, mload(X_N_MINUS_1_INV_MPTR))
             trace_u256(17, mload(L_LAST_MPTR))

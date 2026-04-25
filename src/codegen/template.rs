@@ -1,5 +1,5 @@
 use crate::codegen::{
-    pcs::BatchOpenScheme::{self, Bdfg21, Gwc19},
+    pcs::BatchOpenScheme::{self, Gwc19},
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -46,6 +46,7 @@ impl Halo2VerifyingKey {
 #[derive(Template)]
 #[template(path = "Halo2Verifier.sol")]
 pub(crate) struct Halo2Verifier {
+    #[allow(dead_code)]
     pub(crate) scheme: BatchOpenScheme,
     pub(crate) trace: bool,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,

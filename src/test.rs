@@ -1,7 +1,7 @@
 use crate::{
     codegen::{
         AccumulatorEncoding,
-        BatchOpenScheme::{self, Bdfg21, Gwc19},
+        BatchOpenScheme::{self, Gwc19},
         SolidityGenerator,
     },
     encode_calldata,
@@ -25,13 +25,13 @@ fn function_signature() {
     );
 }
 
-/// Codegen-only smoke test: generate Solidity for both BDFG21 and GWC19 with
+/// Codegen-only smoke test: generate Solidity for the GWC19 scheme with
 /// each render mode (embedded VK and separately). Doesn't execute the EVM
 /// because the bundled `revm` doesn't ship the EIP-2537 precompiles, but it
-/// does flush the codegen pipeline through both PCS emitters and asserts
+/// does flush the codegen pipeline through the PCS emitter and asserts
 /// the resulting strings reference the BLS-specific helpers.
 #[test]
-fn render_smoke_bls_bdfg21_and_gwc19_codegen() {
+fn render_smoke_bls_gwc19_codegen() {
     use halo2_proofs::{
         halo2curves::bls12381::Bls12381, plonk::keygen_vk, poly::kzg::commitment::ParamsKZG,
     };
@@ -44,25 +44,23 @@ fn render_smoke_bls_bdfg21_and_gwc19_codegen() {
     let params = ParamsKZG::<Bls12381>::setup(8, &mut rng);
     let vk = keygen_vk(&params, &circuit).unwrap();
 
-    for scheme in [Bdfg21, Gwc19] {
-        let gen = SolidityGenerator::new(&params, &vk, scheme, 1);
-        let inline_sol = gen.render().expect("inline render");
-        assert!(inline_sol.contains("ec_pairing"), "inline must use BLS pairing helper");
-        // BLS-specific Yul markers we should always emit from both PCS
-        // emitters (precompile addresses 0x0b/0x0c/0x0f).
-        assert!(
-            inline_sol.contains("0x0b") && inline_sol.contains("0x0c") && inline_sol.contains("0x0f"),
-            "inline must reference EIP-2537 precompile addresses 0x0b/0x0c/0x0f"
-        );
+    let gen = SolidityGenerator::new(&params, &vk, Gwc19, 1);
+    let inline_sol = gen.render().expect("inline render");
+    assert!(inline_sol.contains("ec_pairing"), "inline must use BLS pairing helper");
+    // BLS-specific Yul markers we should always emit from the PCS
+    // emitter (precompile addresses 0x0b/0x0c/0x0f).
+    assert!(
+        inline_sol.contains("0x0b") && inline_sol.contains("0x0c") && inline_sol.contains("0x0f"),
+        "inline must reference EIP-2537 precompile addresses 0x0b/0x0c/0x0f"
+    );
 
-        let gen = SolidityGenerator::new(&params, &vk, scheme, 1);
-        let (verifier_sol, vk_sol) = gen.render_separately().expect("separate render");
-        assert!(
-            verifier_sol.contains("PAIRING_LHS_MPTR"),
-            "separate verifier must reference PAIRING_LHS_MPTR"
-        );
-        assert!(!vk_sol.is_empty());
-    }
+    let gen = SolidityGenerator::new(&params, &vk, Gwc19, 1);
+    let (verifier_sol, vk_sol) = gen.render_separately().expect("separate render");
+    assert!(
+        verifier_sol.contains("PAIRING_LHS_MPTR"),
+        "separate verifier must reference PAIRING_LHS_MPTR"
+    );
+    assert!(!vk_sol.is_empty());
 }
 
 // All `render_*` tests below produce a Solidity verifier and call it inside
@@ -158,19 +156,6 @@ fn prague_evm_runs_eip2537_g1add_to_identity() {
 
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
-fn render_bdfg21_huge() {
-    run_render::<halo2::huge::HugeCircuit<Bls12381>>(Bdfg21)
-}
-
-#[cfg(feature = "_maingate_v3")]
-#[test]
-#[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
-fn render_bdfg21_maingate() {
-    run_render::<halo2::maingate::MainGateWithRange<Bls12381>>(Bdfg21)
-}
-
-#[test]
-#[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_gwc19_huge() {
     run_render::<halo2::huge::HugeCircuit<Bls12381>>(Gwc19)
 }
@@ -180,19 +165,6 @@ fn render_gwc19_huge() {
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_gwc19_maingate() {
     run_render::<halo2::maingate::MainGateWithRange<Bls12381>>(Gwc19)
-}
-
-#[test]
-#[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
-fn render_separately_bdfg21_huge() {
-    run_render_separately::<halo2::huge::HugeCircuit<Bls12381>>(Bdfg21)
-}
-
-#[cfg(feature = "_maingate_v3")]
-#[test]
-#[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
-fn render_separately_bdfg21_maingate() {
-    run_render_separately::<halo2::maingate::MainGateWithRange<Bls12381>>(Bdfg21)
 }
 
 #[test]
@@ -541,7 +513,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof},
         poly::kzg::{
             commitment::ParamsKZG,
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            multiopen::{ProverGWC, VerifierGWC},
             strategy::SingleStrategy,
         },
         transcript::TranscriptWriterBuffer,
@@ -561,7 +533,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     let verifier_params = params.verifier_params();
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
-        create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
+        create_proof::<_, ProverGWC<_>, _, _, _, _>(
             &params,
             &pk,
             &[circuit.clone()],
@@ -575,7 +547,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
 
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
-        verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
+        verify_proof::<_, VerifierGWC<_>, _, _, SingleStrategy<_>>(
             &verifier_params,
             pk.get_vk(),
             SingleStrategy::new(&verifier_params),
@@ -588,7 +560,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
         "native verification failed for seed={seed} k={k}"
     );
 
-    let generator = SolidityGenerator::new(&params, &vk, Bdfg21, instances.len());
+    let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
     let embedded_verifier_solidity = generator.render().unwrap();
     let (separate_verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 
@@ -831,7 +803,7 @@ mod halo2 {
     use crate::{
         codegen::AccumulatorEncoding,
         transcript::Keccak256Transcript,
-        BatchOpenScheme::{self, Bdfg21, Gwc19},
+        BatchOpenScheme::{self, Gwc19},
     };
     use halo2_proofs::{
         arithmetic::CurveAffine,
@@ -844,7 +816,7 @@ mod halo2 {
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, VerifyingKey},
         poly::kzg::{
             commitment::ParamsKZG,
-            multiopen::{ProverGWC, ProverSHPLONK, VerifierGWC, VerifierSHPLONK},
+            multiopen::{ProverGWC, VerifierGWC},
             strategy::SingleStrategy,
         },
         transcript::TranscriptWriterBuffer,
@@ -875,9 +847,6 @@ mod halo2 {
         Vec<u8>,
     ) {
         match scheme {
-            Bdfg21 => {
-                create_testdata_inner!(ProverSHPLONK<_>, VerifierSHPLONK<_>, k, acc_encoding, rng)
-            }
             Gwc19 => create_testdata_inner!(ProverGWC<_>, VerifierGWC<_>, k, acc_encoding, rng),
         }
     }

@@ -1,6 +1,6 @@
 use crate::codegen::{
     template::Halo2VerifyingKey,
-    BatchOpenScheme::{self, Bdfg21, Gwc19},
+    BatchOpenScheme::{self, Gwc19},
 };
 // halo2curves 0.7 exposes bls12-381 as `bls12381` (no underscore); we
 // alias it as `bls12_381` so the rest of the codegen reads naturally.
@@ -182,7 +182,6 @@ impl ConstraintSystemMeta {
 
     pub(crate) fn batch_open_proof_len(&self, scheme: BatchOpenScheme) -> usize {
         (match scheme {
-            Bdfg21 => 2,
             Gwc19 => self.num_rotations,
         }) * 0x80
     }
