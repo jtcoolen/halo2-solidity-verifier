@@ -563,6 +563,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
     let embedded_verifier_solidity = generator.render().unwrap();
     let (separate_verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
+    let proof = generator.proof_to_bls_padded(&proof);
 
     PropertyStandardPlonkFixture {
         proof,

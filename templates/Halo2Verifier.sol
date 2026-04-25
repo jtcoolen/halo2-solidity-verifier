@@ -272,7 +272,7 @@ contract Halo2Verifier {
                 {%- match self.embedded_vk %}
                 {%- when Some with (embedded_vk) %}
                 {%- for (name, chunk) in embedded_vk.constants[..2] %}
-                mstore({{ vk_mptr + 32 * loop.index0 }}, {{ chunk|hex_padded(64) }}) // {{ name }}
+                mstore({{ vk_mptr + loop.index0 }}, {{ chunk|hex_padded(64) }}) // {{ name }}
                 {%- endfor %}
                 {%- when None %}
                 extcodecopy(vk, VK_MPTR, 0x00, 0x40)
@@ -343,21 +343,21 @@ contract Halo2Verifier {
                 {%~ match self.embedded_vk %}
                 {%- when Some with (embedded_vk) %}
                 {%- for (name, chunk) in embedded_vk.constants %}
-                mstore({{ vk_mptr + 32 * loop.index0 }}, {{ chunk|hex_padded(64) }}) // {{ name }}
+                mstore({{ vk_mptr + loop.index0 }}, {{ chunk|hex_padded(64) }}) // {{ name }}
                 {%- endfor %}
                 {%- for (x_hi, x_lo, y_hi, y_lo) in embedded_vk.fixed_comms %}
-                {%- let offset_b = 32 * embedded_vk.constants.len() %}
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 }}, {{ x_hi|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 32 }}, {{ x_lo|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 64 }}, {{ y_hi|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 96 }}, {{ y_lo|hex_padded(64) }})
+                {%- let offset = embedded_vk.constants.len() %}
+                mstore({{ vk_mptr + offset + 4 * loop.index0 }}, {{ x_hi|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 1 }}, {{ x_lo|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 2 }}, {{ y_hi|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 3 }}, {{ y_lo|hex_padded(64) }})
                 {%- endfor %}
                 {%- for (x_hi, x_lo, y_hi, y_lo) in embedded_vk.permutation_comms %}
-                {%- let offset_b = 32 * embedded_vk.constants.len() + 128 * embedded_vk.fixed_comms.len() %}
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 }}, {{ x_hi|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 32 }}, {{ x_lo|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 64 }}, {{ y_hi|hex_padded(64) }})
-                mstore({{ vk_mptr + offset_b + 128 * loop.index0 + 96 }}, {{ y_lo|hex_padded(64) }})
+                {%- let offset = embedded_vk.constants.len() + 4 * embedded_vk.fixed_comms.len() %}
+                mstore({{ vk_mptr + offset + 4 * loop.index0 }}, {{ x_hi|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 1 }}, {{ x_lo|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 2 }}, {{ y_hi|hex_padded(64) }})
+                mstore({{ vk_mptr + offset + 4 * loop.index0 + 3 }}, {{ y_lo|hex_padded(64) }})
                 {%- endfor %}
                 {%- when None %}
                 extcodecopy(vk, VK_MPTR, 0x00, {{ vk_len|hex() }})
