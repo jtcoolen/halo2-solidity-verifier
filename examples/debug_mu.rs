@@ -1,12 +1,4 @@
-//! Compare halo2 GWC's `u` challenge against Solidity's `mu` for seed=0 k=11.
-//!
-//! Walks the proof transcript using halo2's GWC API:
-//!   v = squeeze
-//!   read N W points (N = num_rotations)
-//!   u = squeeze
-//!
-//! Then compares `u` to what the Solidity verifier emits as `mu` via
-//! its trace logs.
+//! Dump Solidity's GWC `nu`/`mu` trace values for seed=0 k=11.
 //!
 //! Run with:
 //!   cargo run --example debug_mu --features evm --release
@@ -18,7 +10,6 @@ use halo2_proofs::{
     },
     plonk::*,
     poly::{kzg::commitment::ParamsKZG, Rotation},
-    transcript::{Transcript, TranscriptRead},
 };
 use halo2_solidity_verifier::{
     compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, CallOutcome, Evm,
@@ -28,7 +19,6 @@ use rand::{rngs::StdRng, SeedableRng};
 
 const K: u32 = 11;
 const SEED: u64 = 0;
-const NUM_ROTATIONS: usize = 2;
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -75,61 +65,6 @@ fn main() {
         }
     }
 
-    // Walk transcript ourselves with the GWC schedule.
-    let cs = vk.cs();
-    let num_advices_pub: Vec<usize> = cs
-        .advice_column_phase()
-        .iter()
-        .fold(vec![0; cs.num_phases() as usize], |mut acc, p| {
-            acc[*p as usize] += 1;
-            acc
-        });
-    let num_challenges: Vec<usize> = cs.challenge_phase().iter().fold(
-        vec![0; cs.num_phases() as usize],
-        |mut acc, p| {
-            acc[*p as usize] += 1;
-            acc
-        },
-    );
-    let num_evals = cs.advice_queries().len()
-        + cs.fixed_queries().len()
-        + 1 // random
-        + cs.permutation().get_columns().len()
-        + 3 * cs.permutation().get_columns().len() // perm z evals (oversimplified for std plonk: 3*num_perm_zs)
-        ;
-
-    let mut transcript = Keccak256Transcript::<G1Affine, _>::new(proof.as_slice());
-    transcript.common_scalar(vk.transcript_repr()).unwrap();
-    for instance in &instances {
-        transcript.common_scalar(*instance).unwrap();
-    }
-
-    for (n_adv, n_ch) in num_advices_pub.iter().zip(num_challenges.iter()) {
-        for _ in 0..*n_adv {
-            let _ = transcript.read_point().unwrap();
-        }
-        for _ in 0..*n_ch {
-            let _ = transcript.squeeze_challenge_scalar::<()>();
-        }
-    }
-
-    // Permutation Z's commitments
-    // Standard plonk: num_perm_zs = 1
-    let _: G1Affine = transcript.read_point().unwrap();
-    // Quotient commitments: num_quotients = ?
-    // For our circuit it is computed in halo2 as ceil(degree*n/n).
-    // We don't know exactly; we instead just read 4 quotient commitments since
-    // that's what we observed in the proof.
-    for _ in 0..4 {
-        let _: G1Affine = transcript.read_point().unwrap();
-    }
-
-    // Hmm: this is brittle. Let me instead use the halo2 codegen meta walk
-    // by re-reading the generator's view: grab the proof_len and num_evals from
-    // the codegen (we don't have direct access, but we can use the calldata
-    // size to verify).
-
-    // Try a simpler approach: use the same TraceMeta as compare_trace.
     println!("solidity nu = 0x{}", sol_nu.unwrap());
     println!("solidity mu = 0x{}", sol_mu.unwrap());
 }

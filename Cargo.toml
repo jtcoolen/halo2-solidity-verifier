@@ -23,16 +23,16 @@ itertools = "0.11.0"
 # For feature = "evm"
 #
 # revm 19+ ships a Prague handler with the EIP-2537 BLS12-381 precompiles
-# (G1ADD = 0x0b, G1MSM = 0x0c, G2ADD = 0x0d, G2MSM = 0x0e, PAIRING = 0x0f),
-# which is what the BLS-flavored Solidity verifier exercises. Earlier revm
-# versions don't know about these precompiles and treat them as empty
-# accounts, so the verifier reverts with "stack too deep" symptoms.
-revm = { version = "19", default-features = false, optional = true }
+# (G1ADD = 0x0b, G1MSM = 0x0c, G2ADD = 0x0d, G2MSM = 0x0e, PAIRING = 0x0f).
+# Because default features are disabled, enable `blst` explicitly; otherwise
+# Prague does not register those BLS precompiles and staticcalls hit empty
+# accounts instead of doing curve arithmetic.
+revm = { version = "19", default-features = false, features = ["std", "blst"], optional = true }
 
 [dev-dependencies]
 proptest = "1.6.0"
 rand = "0.8.5"
-revm = { version = "19", default-features = false }
+revm = { version = "19", default-features = false, features = ["std", "blst"] }
 # halo2_maingate is upstream maingate from halo2wrong, pinned to v0.3-shaped
 # halo2_proofs. It does not compile against halo2 v0.4 (which we now use), so
 # the maingate-backed render tests in src/test.rs are commented out for the
