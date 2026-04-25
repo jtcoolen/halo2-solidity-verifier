@@ -15,20 +15,53 @@ than reviewing its shape -- there are open ends.
 
 ## Current state
 
-| Layer                                  | State                                     |
-|----------------------------------------|-------------------------------------------|
-| `templates/Halo2Verifier.sol`          | Rewritten for BLS12-381 / EIP-2537        |
-| `templates/Halo2VerifyingKey.sol`      | Rewritten for 4-word G1 / EIP-2537 layout |
-| `src/codegen/template.rs`              | `G1Words = (U256;4)`; VK length doubled   |
-| `src/codegen/util.rs`                  | New BLS helpers + Data stride 4 words     |
-| `src/codegen.rs`                       | Emits BLS-shape constants (see caveats)   |
-| `src/transcript.rs`                    | **Unchanged** -- still BN254-shape        |
-| `src/codegen/pcs/{bdfg21,gwc19}.rs`    | **Unchanged** -- emits BN254-flavoured Yul|
-| `src/test.rs` heavy tests              | `#[ignore]`'d                             |
-| Generated artifacts under `generated/` | Stale (BN254 outputs from `main`)         |
+| Layer                                  | State                                                   |
+|----------------------------------------|---------------------------------------------------------|
+| `templates/Halo2Verifier.sol`          | Rewritten for BLS12-381 / EIP-2537                      |
+| `templates/Halo2VerifyingKey.sol`      | Rewritten for 4-word G1 / EIP-2537 layout               |
+| `src/codegen/template.rs`              | `G1Words = (U256;4)`; VK length doubled                 |
+| `src/codegen/util.rs`                  | EcPoint{base: Ptr} 4-word stride; Value signed offsets  |
+| `src/codegen/pcs/{bdfg21,gwc19}.rs`    | Rewritten as EIP-2537 Yul emitters (commit 947a877)     |
+| `src/codegen.rs`                       | Emits BLS-shape constants + `proof_to_bls_padded`        |
+| `src/evm.rs`                           | revm 19, Prague spec, EIP-2537 precompiles (commit f028b99) |
+| `src/codegen.rs::encode_calldata_bls_padded` | New crate-root export (commit c041bcb)             |
+| `src/transcript.rs`                    | **Unchanged** -- still BN254-shape                      |
+| `src/test.rs` heavy tests              | `#[ignore]`'d (need BLS prover)                         |
+| `vendor/halo2/` (uncommitted)          | v0.4 trimmed to 4 sub-crates + 4 surgical patches       |
+| Cargo.toml `halo2_proofs` dep          | Still v0.3 (pre-vendor switch)                          |
+| Generated artifacts under `generated/` | Stale (BN254 outputs from `main`)                       |
 
-Everything in the **Unchanged** rows still needs work; see "What's missing"
-below.
+Stages landed:
+
+* **Stage A** (commit f028b99): revm 3.5 -> 19, Prague spec, EIP-2537
+  precompiles wired in, plus a hand-assembled `prague_evm_runs_eip2537_g1add_to_identity`
+  smoke test that calls `0x0b` with `2 * G1` and asserts non-zero output.
+* **Stage B** (commit c041bcb): `SolidityGenerator::proof_to_bls_padded()`
+  walks the proof byte-stream using `ConstraintSystemMeta` and the
+  scheme's `num_trailing_g1_points`, expanding each G1 from 64 -> 128
+  bytes to match what the BLS Solidity verifier reads. New crate-root
+  export `encode_calldata_bls_padded()`. `examples/separately.rs` now
+  deploys both contracts on the Prague EVM and reports outcome
+  categorically (currently: revert at pairing with ~100k gas, which
+  confirms the precompiles execute).
+
+Stage C (in progress, not yet wired into Cargo.toml):
+
+* `vendor/halo2/` carries a trimmed copy of upstream halo2 v0.4.0 with
+  4 surgical patches (see `vendor/halo2/PATCHES.md`):
+  1. `VerifyingKey::cs()` `pub(crate)` -> `pub`
+  2. `VerifyingKey::permutation()` accessor (new)
+  3. `permutation::VerifyingKey` + `commitments()` accessor (made `pub`)
+  4. `ParamsKZG::{g, g2, s_g2}` accessors (new)
+* The vendored workspace compiles cleanly under `cargo check
+  --workspace` from `vendor/halo2/`.
+* The project root `Cargo.toml` still pins halo2_proofs to v0.3 git tag
+  so Stages A and B remain green; flipping to the vendored path requires
+  porting every v0.3 -> v0.4 API call site (`Any::Advice` tuple variant,
+  `ConstraintSystemBack`, `Repr<32>` vs `[u8; 32]`, `compile_circuit`,
+  etc.) in `src/codegen.rs`, `src/transcript.rs`, `src/test.rs`, and
+  `examples/separately.rs`. That is a multi-day effort and is intentionally
+  not bundled in the same commit.
 
 ## What works
 
@@ -98,25 +131,40 @@ above are closed we should regenerate it.
 
 ## What's still to do
 
-1. **Find / write a halo2 KZG-BLS backend.** Most likely path: upgrade to
-   `halo2_proofs v0.4` (PSE main) which uses `halo2curves 0.7` with
-   `bls12381`. Confirm that `ParamsKZG<E>` works with `bls12_381::Bls12`
-   (since `ParamsKZG` is generic over `E: Engine`, and `bls12_381::Bls12`
-   does implement `Engine`). The crate API split between `halo2_middleware`
-   / `halo2_backend` / `halo2_frontend` will require touch-ups across
-   `src/test.rs` and `examples/`.
-2. **Rewrite `src/codegen/pcs/{bdfg21,gwc19}.rs`.** The PCS opening checks
-   need to call `BLS12_G1ADD` / `BLS12_G1MSM` / `BLS12_PAIRING_CHECK`
-   instead of doing Fp arithmetic inline. `EcPoint` must grow `(x_hi, x_lo,
-   y_hi, y_lo)` fields and the Yul emitters must reflect that.
+1. **Wire the vendored halo2 v0.4 in.** `vendor/halo2/` is the prepared
+   landing pad with 4 surgical patches applied (see
+   `vendor/halo2/PATCHES.md`). To activate it:
+   * Switch root `Cargo.toml` from
+     `halo2_proofs = { git = "...", tag = "v0.3.0" }` to
+     `halo2_proofs = { path = "vendor/halo2/halo2_proofs" }`.
+   * Find a v0.4-compatible replacement for the `halo2_maingate` dev-dep
+     (current pin v2024_01_31 is v0.3-shaped). Either bump to a newer
+     maingate tag, or replace the `MainGate` test circuit with a custom
+     one that doesn't depend on maingate.
+   * Update every v0.3 -> v0.4 API call site:
+     - `Any::Advice` is no longer a tuple variant -- destructuring patterns
+       in `src/codegen.rs::ConstraintSystemMeta::new` need to be rewritten.
+     - `ConstraintSystem` -> `ConstraintSystemBack` for downstream codegen
+       reads.
+     - `Repr<32>` vs `[u8; 32]` differences in `src/transcript.rs`.
+     - `compile_circuit` is required between v0.4 frontend and backend.
+     - `ProverSHPLONK` / `VerifierSHPLONK` / `ParamsKZG` API tweaks.
+2. **Switch SolidityGenerator types from BN254 to BLS12-381.** Once v0.4
+   compiles, the only remaining cryptographic gap is replacing
+   `&ParamsKZG<bn256::Bn256>` / `&VerifyingKey<bn256::G1Affine>` with
+   `&ParamsKZG<bls12_381::Bls12381>` / `&VerifyingKey<bls12_381::G1Affine>`
+   throughout `src/codegen.rs` and the prover side in `examples/separately.rs`.
+   The codegen helpers `g1_to_u256s` and `g2_to_u256s` already speak the
+   correct EIP-2537 layout for real BLS points.
 3. **Update `src/transcript.rs`.** `Keccak256Transcript` should read 96
    bytes per G1 commitment (48 + 48 BE) and append them to the running hash.
    Scalar (Fr) reads stay at 32 bytes.
 4. **Refresh `generated/`.** Regenerate the canonical Solidity outputs once
-   (1)-(3) are done, and add a deterministic-render snapshot test.
+   the BLS prover swap is done, and add a deterministic-render snapshot test.
 5. **Reactivate `#[ignore]` tests.** As each layer is ported the
-   corresponding render / pbt tests should be re-enabled. The
-   `function_signature` smoke test is the minimum hurdle; `render_*`
+   corresponding render / pbt tests should be re-enabled. `function_signature`,
+   `render_smoke_bls_bdfg21_and_gwc19_codegen`, and
+   `prague_evm_runs_eip2537_g1add_to_identity` already pass; `render_*`
    require a working BLS prover; `pbt_*` require `cargo test --release`.
 
 ## Useful pointers
@@ -130,9 +178,13 @@ above are closed we should regenerate it.
 ## Quick health check
 
 ```
-cargo check --lib              # Should build clean
-cargo check --tests --examples # Should build clean (warnings ok)
-cargo test --lib function_signature
+cargo check --lib                              # Should build clean
+cargo check --tests --examples --features evm  # Should build clean (warnings ok)
+cargo test --lib                                # 3 pass, 17 ignored
+cargo run --example separately --features evm   # Deploys + calls verifier per k
+
+# Verify the vendored halo2 v0.4 still compiles on its own:
+( cd vendor/halo2 && cargo check --workspace )
 ```
 
 If any of those fail, something has regressed in the scaffolding layer; fix
