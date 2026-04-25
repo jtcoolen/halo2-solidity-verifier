@@ -189,6 +189,15 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             };
 
             chain![
+                // Pre-multiply ACC by mu BEFORE building this set's TMP.
+                // Doing it after would corrupt the TMP G1 point because
+                // `ec_mul_acc` writes the scalar at 0x80, the same word
+                // where the TMP point's x_hi lives.
+                (!is_last_set)
+                    .then_some(["success := ec_mul_acc(success, mu)"])
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_string),
                 // Seed accumulator with the last commitment of the set.
                 set.comms()
                     .last()
@@ -207,7 +216,23 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     let ec_add = ec_add.clone();
                     let ec_mul = ec_mul.clone();
                     move |(loc, comms)| {
-                        if comms.len() < 3 {
+                        let ptr = comms.first().unwrap().ptr();
+                        // The `ptr_end = ptr - 4 * comms.len()` calculation
+                        // can go negative when the calldata range starts
+                        // close to offset 0 (e.g. advice commitments at
+                        // 0x64 with BLS's 0x80 stride). The EVM's `lt` is
+                        // unsigned, so a negative ptr_end (rendered as
+                        // `sub(0, X)` = 2^256 - X) makes the loop body
+                        // never execute. Detect that case at codegen time
+                        // and inline instead.
+                        let ptr_end_underflow = if let crate::codegen::util::Value::Integer(p) =
+                            ptr.value()
+                        {
+                            p - (4 * comms.len() as isize) * 0x20 < 0
+                        } else {
+                            false
+                        };
+                        if comms.len() < 3 || ptr_end_underflow {
                             comms
                                 .iter()
                                 .flat_map(|comm| {
@@ -220,7 +245,6 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                                 })
                                 .collect_vec()
                         } else {
-                            let ptr = comms.first().unwrap().ptr();
                             let ptr_end = ptr - 4 * comms.len();
                             let opcode = match loc {
                                 Location::Calldata => "calldataload",
@@ -268,11 +292,12 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 },
                 (!is_last_set)
                     .then_some([
-                        // After folding a set into TMP (0x80..0x100), scale
-                        // ACC by mu and add TMP into it. ec_add_acc reads
-                        // the operand from 0x80..0x100, which is exactly
-                        // where TMP sits, so no extra copy is needed.
-                        "success := ec_mul_acc(success, mu)",
+                        // ACC was already multiplied by mu at the top of
+                        // this iteration; just fold TMP (= inner_msm of
+                        // this set, sitting at 0x80..0x100) into ACC.
+                        // ec_add_acc reads the operand from 0x80..0x100,
+                        // which is exactly where TMP lives, so no extra
+                        // copy is needed.
                         "success := ec_add_acc(success)",
                     ])
                     .into_iter()

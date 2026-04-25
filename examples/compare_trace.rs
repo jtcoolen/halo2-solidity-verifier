@@ -9,7 +9,7 @@ use halo2_solidity_verifier::{
     compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
     Keccak256Transcript, SolidityGenerator,
 };
-use itertools::chain;
+use itertools::{chain, Itertools};
 use ruint::aliases::U256;
 use std::{collections::BTreeMap, io};
 
@@ -136,7 +136,6 @@ const TRACE_NAMES: &[&str] = &[
     "gamma",
     "y",
     "x",
-    "zeta",
     "nu",
     "mu",
     "x_n",
@@ -191,11 +190,16 @@ fn compute_rust_trace(
         let _ = transcript.read_scalar()?;
     }
 
-    let zeta = *transcript.squeeze_challenge_scalar::<()>();
+    // GWC PCS transcript schedule:
+    //   nu = squeeze
+    //   read N W points  (N = num_rotations)
+    //   mu = squeeze
     let nu = *transcript.squeeze_challenge_scalar::<()>();
-    let _ = transcript.read_point()?;
+    for _ in 0..meta.num_rotations {
+        let _ = transcript.read_point()?;
+    }
     let mu = *transcript.squeeze_challenge_scalar::<()>();
-    let _ = transcript.read_point()?;
+    let zeta = Fr::ZERO; // unused for GWC; keep var so later code compiles
 
     let theta = challenges[0];
     let beta = challenges[1];
@@ -231,7 +235,7 @@ fn compute_rust_trace(
         ("gamma", word_hex(gamma)),
         ("y", word_hex(y)),
         ("x", word_hex(x)),
-        ("zeta", word_hex(zeta)),
+        // ("zeta", word_hex(zeta)),  // GWC has no zeta; suppress.
         ("nu", word_hex(nu)),
         ("mu", word_hex(mu)),
         ("x_n", word_hex(x_n)),
@@ -249,6 +253,7 @@ struct TraceMeta {
     num_challenges: Vec<usize>,
     num_evals: usize,
     rotation_last: i32,
+    num_rotations: usize,
 }
 
 impl TraceMeta {
@@ -297,11 +302,33 @@ impl TraceMeta {
         ]
         .collect();
 
+        let num_rotations = {
+            chain![
+                advice_queries.iter().map(|q| q.1),
+                fixed_queries.iter().map(|q| q.1),
+                (num_permutation_zs > 0).then_some([
+                    halo2_proofs::poly::Rotation::cur(),
+                    halo2_proofs::poly::Rotation::next(),
+                ]).into_iter().flatten(),
+                (num_permutation_zs > 1).then_some(halo2_proofs::poly::Rotation(
+                    -(cs.blinding_factors_pub() as i32 + 1),
+                )),
+                (num_lookup_zs > 0).then_some([
+                    halo2_proofs::poly::Rotation::prev(),
+                    halo2_proofs::poly::Rotation::cur(),
+                    halo2_proofs::poly::Rotation::next(),
+                ]).into_iter().flatten(),
+            ]
+            .unique()
+            .count()
+        };
+
         Self {
             num_advices,
             num_challenges: num_user_challenges,
             num_evals,
             rotation_last: -(cs.blinding_factors_pub() as i32 + 1),
+            num_rotations,
         }
     }
 }
@@ -328,7 +355,7 @@ fn trace_name(trace_id: u64) -> Option<&'static str> {
         9 => Some("gamma"),
         10 => Some("y"),
         11 => Some("x"),
-        12 => Some("zeta"),
+        // 12 => Some("zeta"),
         13 => Some("nu"),
         14 => Some("mu"),
         15 => Some("x_n"),
