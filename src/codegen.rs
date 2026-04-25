@@ -195,6 +195,63 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output))
     }
 
+    /// Re-encode a halo2 BN254 proof byte-stream into the EIP-2537 padded
+    /// layout the BLS Solidity verifier expects.
+    ///
+    /// The halo2 proof layout (BN254 shape, what `create_proof` writes) is:
+    /// ```text
+    /// [G1 commitments: sum(num_advices) * 64 bytes]
+    /// [Fr evaluations: num_evals * 32 bytes]
+    /// [G1 W, W' (Bdfg21)  /  G1 ws (Gwc19): batch_open_proof_len * 64 bytes]
+    /// ```
+    /// In BLS shape every G1 chunk doubles to 128 bytes (16 zero bytes +
+    /// 32-byte BN254 coord + 16 zero bytes + 32-byte BN254 coord, twice for
+    /// x and y). Fr evaluations stay at 32 bytes since the BN254 and
+    /// BLS12-381 scalar fields are both 256 bits wide.
+    ///
+    /// This method does NOT do any cryptographic conversion -- the curve
+    /// points still live in BN254-land numerically and the pairing will
+    /// ultimately fail. Its only job is to make the calldata length and
+    /// per-G1 stride match what the BLS Solidity verifier reads. End-to-end
+    /// success requires regenerating the proof against a real BLS-KZG
+    /// prover backend (see PORTING_NOTES.md).
+    pub fn proof_to_bls_padded(&self, bn254_proof: &[u8]) -> Vec<u8> {
+        let early_g1_count: usize = self.meta.num_advices().iter().sum();
+        let trailing_g1_count = self.scheme.num_trailing_g1_points(&self.meta);
+        let evals_bytes = self.meta.num_evals * 0x20;
+
+        let expected = early_g1_count * 0x40 + evals_bytes + trailing_g1_count * 0x40;
+        assert_eq!(
+            bn254_proof.len(),
+            expected,
+            "proof byte length {} does not match expected BN254 layout {} (advice G1 = {}, \
+             evals = {} bytes, trailing G1 = {})",
+            bn254_proof.len(),
+            expected,
+            early_g1_count,
+            evals_bytes,
+            trailing_g1_count,
+        );
+
+        let mut out = Vec::with_capacity(early_g1_count * 0x80 + evals_bytes + trailing_g1_count * 0x80);
+        let mut cursor = 0usize;
+        // Section A: early G1 commitments.
+        for _ in 0..early_g1_count {
+            extend_with_padded_g1(&mut out, &bn254_proof[cursor..cursor + 0x40]);
+            cursor += 0x40;
+        }
+        // Section B: Fr evaluations (unchanged).
+        out.extend_from_slice(&bn254_proof[cursor..cursor + evals_bytes]);
+        cursor += evals_bytes;
+        // Section C: trailing G1 (W / W' for Bdfg21, ws for Gwc19).
+        for _ in 0..trailing_g1_count {
+            extend_with_padded_g1(&mut out, &bn254_proof[cursor..cursor + 0x40]);
+            cursor += 0x40;
+        }
+        debug_assert_eq!(cursor, bn254_proof.len());
+        out
+    }
+
     fn generate_vk(&self) -> Halo2VerifyingKey {
         let mut constants: Vec<(&'static str, U256)> = Vec::new();
         {
@@ -392,4 +449,46 @@ impl<'a> SolidityGenerator<'a> {
 
 fn fr_to_bn254_u256(fr: &bn256::Fr) -> U256 {
     fr_to_u256(fr)
+}
+
+/// Append the EIP-2537 padded encoding of one BN254-shape G1 point (64 bytes
+/// raw: 32-byte x followed by 32-byte y) to `out`. The output is 128 bytes:
+/// `(16 zero | 16 zero | 32 x_be | 16 zero | 16 zero | 32 y_be)`. Any
+/// "y-coord-doesn't-fit-in-381-bits" failure is deferred to the EIP-2537
+/// precompile.
+fn extend_with_padded_g1(out: &mut Vec<u8>, raw_g1_bn254: &[u8]) {
+    debug_assert_eq!(raw_g1_bn254.len(), 0x40);
+    let mut chunk = [0u8; 0x80];
+    // x: 16 zeros, then... wait, BN254 fits in 32 bytes so we need 32 zero
+    // bytes total of padding (top 16 of word 0 + all of nothing in word 0
+    // since BN254 is 254 bits => fits in lower 32 bytes of EIP-2537's
+    // 64-byte slot). EIP-2537 layout per coord: 16 zero bytes + 48-byte
+    // value. BN254 (254 bits) fits in 32 bytes => prepend 16 more zero
+    // bytes to land at 48 bytes => prepend another 16 zeros for the
+    // top-of-word zero-pad, total 32 zeros + 32 BN254 bytes per coord.
+    // Slot 0..32: top 16 zeros of x (16) + first 16 of value (zero pad) = all zeros
+    // Slot 32..64: 32-byte BN254 x BE
+    chunk[0..32].fill(0);
+    chunk[32..64].copy_from_slice(&raw_g1_bn254[0..32]);
+    chunk[64..96].fill(0);
+    chunk[96..128].copy_from_slice(&raw_g1_bn254[32..64]);
+    out.extend_from_slice(&chunk);
+}
+
+/// `encode_calldata` variant that takes a BN254-shape proof and re-encodes
+/// the embedded G1 commitments into the EIP-2537 padded layout that the
+/// BLS Solidity verifier reads.
+///
+/// The resulting calldata length matches what the verifier's CPTR constants
+/// expect (128 bytes per G1, 32 bytes per Fr eval), so the dispatch will
+/// not revert with malformed-length errors. The pairing check still fails
+/// because the embedded points are BN254 numerically; that's fixed by
+/// Stage C (real BLS-KZG prover backend).
+pub fn encode_calldata_bls_padded(
+    generator: &SolidityGenerator<'_>,
+    bn254_proof: &[u8],
+    instances: &[bn256::Fr],
+) -> Vec<u8> {
+    let bls_proof = generator.proof_to_bls_padded(bn254_proof);
+    crate::evm::encode_calldata(&bls_proof, instances)
 }

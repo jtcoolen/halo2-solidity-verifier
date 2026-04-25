@@ -2,7 +2,8 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, BatchOpenScheme::Bdfg21, Keccak256Transcript, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Bdfg21, Evm,
+    Keccak256Transcript, SolidityGenerator,
 };
 
 const K_RANGE: Range<u32> = 10..17;
@@ -11,6 +12,8 @@ fn main() {
     let mut rng = seeded_std_rng();
 
     let params = setup(K_RANGE, &mut rng);
+
+    let mut evm = Evm::default();
 
     for k in K_RANGE {
         let num_instances = k as usize;
@@ -25,12 +28,6 @@ fn main() {
         save_solidity(format!("Halo2Verifier-{k}.sol"), &verifier_solidity);
         save_solidity(format!("Halo2VerifyingKey-{k}.sol"), &vk_solidity);
 
-        // Compile both contracts via solc/--via-ir to make sure the BLS
-        // emitter produced syntactically/semantically valid Yul. We don't
-        // run the contracts here -- the bundled `revm` (v3.5.0) predates
-        // EIP-2537 and a BN254-trained prover would emit 32-byte coords
-        // that won't satisfy the BLS verifier. End-to-end execution is
-        // gated on a halo2 v0.4 + BLS-KZG prover (see PORTING_NOTES.md).
         let vk_creation_code = compile_solidity(&vk_solidity);
         let verifier_creation_code = compile_solidity(&verifier_solidity);
         println!(
@@ -39,13 +36,42 @@ fn main() {
             verifier_creation_code.len()
         );
 
-        // Still exercise the prover side so we keep prover-fidelity covered
-        // -- this proves the keygen/proof path keeps working and the
-        // generated Solidity is the only piece that diverges.
-        let _proof = {
+        // Deploy both contracts on the Prague-spec EVM and call the
+        // verifier with the BN254 proof re-shaped into EIP-2537 padded
+        // layout. The verifier's calldata-length checks pass and the
+        // BLS precompiles execute, but the pairing returns 0 because
+        // the points live on BN254, not BLS12-381 (Stage C will swap
+        // the prover to a real BLS-KZG backend). We therefore expect
+        // the verifier to revert; we surface that as `success=false`
+        // here instead of asserting the proof verifies.
+        let vk_address = evm.create(vk_creation_code);
+        let verifier_address =
+            evm.create_with_address_arg(verifier_creation_code, vk_address);
+        let calldata = {
             let instances = circuit.instances();
-            create_proof_checked(&params[&k], &pk, circuit, &instances, &mut rng)
+            let proof = create_proof_checked(&params[&k], &pk, circuit, &instances, &mut rng);
+            encode_calldata_bls_padded(&generator, &proof, &instances)
         };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evm.call(verifier_address, calldata.clone())
+        }));
+        match outcome {
+            Ok((gas_used, output)) if output == [vec![0; 31], vec![1]].concat() => {
+                println!("  -> verifier accepted (gas = {gas_used})");
+            }
+            Ok((gas_used, output)) => {
+                println!(
+                    "  -> verifier ran but returned {} bytes ({gas_used} gas) -- expected post-Stage-C",
+                    output.len()
+                );
+            }
+            Err(_) => {
+                println!(
+                    "  -> verifier reverted on BN254-shape proof -- expected pre-Stage-C; calldata = {} B",
+                    calldata.len()
+                );
+            }
+        }
     }
 }
 

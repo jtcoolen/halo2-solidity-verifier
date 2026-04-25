@@ -41,6 +41,16 @@ impl BatchOpenScheme {
             Self::Gwc19 => gwc19::computations(meta, data),
         }
     }
+
+    /// Number of G1 commitments that appear *after* the evaluation block
+    /// in the proof byte-stream. For BDFG21 this is the (W, W') pair (= 2);
+    /// for GWC19 there is one W per rotation set.
+    pub(crate) fn num_trailing_g1_points(&self, meta: &ConstraintSystemMeta) -> usize {
+        match self {
+            Self::Bdfg21 => 2,
+            Self::Gwc19 => meta.num_rotations,
+        }
+    }
 }
 
 #[derive(Debug)]
