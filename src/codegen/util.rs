@@ -2,12 +2,9 @@ use crate::codegen::{
     template::Halo2VerifyingKey,
     BatchOpenScheme::{self, Bdfg21, Gwc19},
 };
-// IMPORTANT: bn256 must come from halo2_proofs (which transitively uses
-// halo2curves 0.6) so the types unify with the rest of the codebase. We pull
-// the bls12_381 module separately from halo2curves 0.7+, where it's exposed
-// as `bls12381` (note: no underscore in 0.7).
-use halo2_proofs::halo2curves::{bn256, ff::PrimeField, CurveAffine};
-use halo2curves::bls12381 as bls12_381;
+// halo2curves 0.7 exposes bls12-381 as `bls12381` (no underscore); we
+// alias it as `bls12_381` so the rest of the codegen reads naturally.
+use halo2_proofs::halo2curves::{bls12381 as bls12_381, ff::PrimeField, CurveAffine};
 // halo2 v0.4 split moves the cs walkers into halo2_backend / halo2_middleware:
 //   * ConstraintSystemBack carries the compiled-down constraint system that
 //     the verifying key embeds.
@@ -715,16 +712,11 @@ pub(crate) fn group_backward_adjacent_ec_points<'a>(
 // MSBs. A G2 point occupies 256 bytes = 8 words; the c0/c1 ordering matches
 // EIP-2537 (X.c0, X.c1, Y.c0, Y.c1).
 //
-// We provide two flavours of helper:
-//   * `g1_to_u256s` / `g2_to_u256s` -- take *real* BLS12-381 curve points
-//     (from halo2curves 0.7) and emit the proper EIP-2537 layout. These will
-//     be used once a halo2 KZG-BLS prover backend is wired in.
-//   * `bls_g1_pad_from_bn254_bytes` / `bls_g2_pad_from_bn254_bytes` -- take
-//     a halo2_proofs v0.3 BN254 point and zero-extend its 32-byte coordinates
-//     to 48 bytes before splitting. The resulting bytes are NOT valid BLS
-//     curve points (different field, different curve equation); they exist
-//     only so the BN254-flavoured codegen pipeline can keep producing
-//     calldata-shape-correct Solidity verifiers.
+// `g1_to_u256s` / `g2_to_u256s` take real BLS12-381 curve points (from
+// halo2curves 0.7) and emit the EIP-2537 layout the Solidity verifier
+// reads. The `bls_*_pad_from_bn254_bytes` helpers from earlier in the
+// migration (which fabricated BLS-shape bytes from BN254 coordinates) are
+// gone now that the prover side runs natively on BLS12-381.
 // ----------------------------------------------------------------------------
 
 /// Convert a 48-byte big-endian Fp limb into the EIP-2537 (hi, lo) split.
@@ -740,28 +732,16 @@ fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
     )
 }
 
-fn bn254_fq_to_be48(fe: &bn256::Fq) -> [u8; 48] {
-    // BN254 Fq is 254 bits (32 bytes LE). To re-shape into the BLS12-381
-    // 48-byte slot we left-pad with 16 zero bytes after big-endianifying.
-    let le = fe.to_repr();
-    let mut be32 = [0u8; 32];
-    be32.copy_from_slice(le.as_ref());
-    be32.reverse();
-    let mut be48 = [0u8; 48];
-    be48[16..].copy_from_slice(&be32);
-    be48
-}
-
 /// Encode a BLS12-381 G1 point in EIP-2537 padded form (4 u256 words).
+///
+/// `Fq::to_repr()` always returns *little-endian* bytes (the halo2derive
+/// macro hard-codes `Endian::LE.to_bytes` regardless of the field-level
+/// `endian =` setting), so we reverse to BE before the (hi, lo) split.
 pub(crate) fn g1_to_u256s(ec_point: impl Borrow<bls12_381::G1Affine>) -> [U256; 4] {
     let coords = ec_point.borrow().coordinates().unwrap();
-    let x_repr = coords.x().to_repr();
-    let y_repr = coords.y().to_repr();
-    let mut x_be = [0u8; 48];
-    x_be.copy_from_slice(x_repr.as_ref());
+    let mut x_be: [u8; 48] = coords.x().to_repr().into();
     x_be.reverse();
-    let mut y_be = [0u8; 48];
-    y_be.copy_from_slice(y_repr.as_ref());
+    let mut y_be: [u8; 48] = coords.y().to_repr().into();
     y_be.reverse();
     let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
     let (y_hi, y_lo) = fp48_be_to_hi_lo(&y_be);
@@ -769,86 +749,20 @@ pub(crate) fn g1_to_u256s(ec_point: impl Borrow<bls12_381::G1Affine>) -> [U256; 
 }
 
 /// Encode a BLS12-381 G2 point in EIP-2537 padded form (8 u256 words).
+///
+/// halo2curves' `Fq2::to_bytes()` emits 96 bytes in `(c0_to_bytes ||
+/// c1_to_bytes)`. The base `Fq::to_bytes()` honours the field-level
+/// `endian = "big"` setting, so each 48-byte half here is *big-endian*
+/// already and feeds straight into the splitter (no reversal needed).
 pub(crate) fn g2_to_u256s(ec_point: impl Borrow<bls12_381::G2Affine>) -> [U256; 8] {
     let coords = ec_point.borrow().coordinates().unwrap();
-    // halo2curves 0.7 hides Fq2.c0 / Fq2.c1 behind a private field; use the
-    // public `to_bytes()` helper which emits 96 LE bytes = (c0_le || c1_le).
     let x_bytes: [u8; 96] = coords.x().to_bytes();
     let y_bytes: [u8; 96] = coords.y().to_bytes();
-    let to_be = |le: &[u8]| {
-        let mut be = [0u8; 48];
-        be.copy_from_slice(le);
-        be.reverse();
-        be
-    };
-    let xc0 = to_be(&x_bytes[..48]);
-    let xc1 = to_be(&x_bytes[48..]);
-    let yc0 = to_be(&y_bytes[..48]);
-    let yc1 = to_be(&y_bytes[48..]);
-    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&xc0);
-    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&xc1);
-    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&yc0);
-    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&yc1);
+    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&x_bytes[..48]);
+    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&x_bytes[48..]);
+    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&y_bytes[..48]);
+    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&y_bytes[48..]);
     [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
-}
-
-/// Shape-only conversion: takes a BN254 G1 point, zero-extends its 32-byte
-/// coordinates to 48 bytes, and returns the EIP-2537 4-word layout. NOT a
-/// valid BLS curve point.
-pub(crate) fn bls_g1_pad_from_bn254_bytes(
-    ec_point: impl Borrow<bn256::G1Affine>,
-) -> [U256; 4] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    let x_be = bn254_fq_to_be48(coords.x());
-    let y_be = bn254_fq_to_be48(coords.y());
-    let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
-    let (y_hi, y_lo) = fp48_be_to_hi_lo(&y_be);
-    [x_hi, x_lo, y_hi, y_lo]
-}
-
-/// Shape-only conversion: takes a BN254 G2 point and produces the EIP-2537
-/// 8-word layout. See `bls_g1_pad_from_bn254_bytes` for caveats.
-///
-/// halo2curves 0.7 hides `Fq2.c0` / `Fq2.c1` behind private fields. The
-/// `to_bytes()` helper added by `impl_tower2!` emits 64 bytes in
-/// `(c0_le | c1_le)` order, so we slice that and re-shape per-coord.
-pub(crate) fn bls_g2_pad_from_bn254_bytes(
-    ec_point: impl Borrow<bn256::G2Affine>,
-) -> [U256; 8] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    let x_bytes: [u8; 64] = coords.x().to_bytes();
-    let y_bytes: [u8; 64] = coords.y().to_bytes();
-    let to_be48 = |le_32: &[u8]| {
-        let mut be32 = [0u8; 32];
-        be32.copy_from_slice(le_32);
-        be32.reverse();
-        let mut be48 = [0u8; 48];
-        be48[16..].copy_from_slice(&be32);
-        be48
-    };
-    let xc0 = to_be48(&x_bytes[..32]);
-    let xc1 = to_be48(&x_bytes[32..]);
-    let yc0 = to_be48(&y_bytes[..32]);
-    let yc1 = to_be48(&y_bytes[32..]);
-    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&xc0);
-    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&xc1);
-    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&yc0);
-    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&yc1);
-    [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
-}
-
-/// Legacy BN254 G1 helper kept for callers that still want the 2-word layout.
-pub(crate) fn bn256_g1_to_u256s(ec_point: impl Borrow<bn256::G1Affine>) -> [U256; 2] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    [coords.x(), coords.y()].map(fq_to_u256)
-}
-
-pub(crate) fn fq_to_u256(fe: impl Borrow<bn256::Fq>) -> U256 {
-    fe_to_u256(fe)
-}
-
-pub(crate) fn fr_to_u256(fe: impl Borrow<bn256::Fr>) -> U256 {
-    fe_to_u256(fe)
 }
 
 pub(crate) fn fe_to_u256<F>(fe: impl Borrow<F>) -> U256

@@ -26,7 +26,8 @@ where
     E::G1Affine: CurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
     E::G1: CurveExt<AffineExt = E::G1Affine>,
 {
-    pub(crate) msm_accumulator: DualMSM<E>,
+    /// MSM accumulator that the strategy folds into the pairing check.
+    pub msm_accumulator: DualMSM<E>,
 }
 
 /// Define accumulator type as `DualMSM`

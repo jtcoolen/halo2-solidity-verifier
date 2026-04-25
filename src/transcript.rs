@@ -83,9 +83,28 @@ where
                 "Invalid elliptic curve point".to_string(),
             )
         })?;
+        // The Solidity verifier reads each G1 point as the EIP-2537 padded
+        // 128-byte layout (`(x_hi | x_lo | y_hi | y_lo)`, 64 bytes per
+        // coordinate, 16 zero bytes + 48 BLS Fp big-endian bytes per coord)
+        // and hashes those bytes verbatim into the Fiat-Shamir transcript.
+        // To make the prover's hash agree with the verifier's, we write
+        // the same 64-byte-per-coord padded form here.
+        //
+        // halo2derive's `to_repr()` always returns little-endian bytes
+        // regardless of the field's `endian =` setting, so we flip to
+        // big-endian and then left-pad with 16 zero bytes so each coord
+        // lands in the low bytes of an EIP-2537 64-byte slot.
         for coordinate in [coords.x(), coords.y()] {
-            self.buf
-                .extend(coordinate.to_repr().as_ref().iter().rev().cloned());
+            let repr = coordinate.to_repr();
+            let bytes_be: Vec<u8> = repr.as_ref().iter().rev().copied().collect();
+            assert!(
+                bytes_be.len() <= 64,
+                "common_point: coordinate repr ({} bytes) doesn't fit in EIP-2537 64-byte slot",
+                bytes_be.len(),
+            );
+            let pad = 64 - bytes_be.len();
+            self.buf.extend(std::iter::repeat(0u8).take(pad));
+            self.buf.extend(bytes_be);
         }
         Ok(())
     }
@@ -107,6 +126,10 @@ where
         let mut reprs = [<C::Base as PrimeField>::Repr::default(); 2];
         for repr in &mut reprs {
             self.stream.read_exact(repr.as_mut())?;
+            // The proof stream stores each coord big-endian (matches the
+            // EIP-2537 wire format). `Fq::to_repr()` is always little-
+            // endian, so reverse the bytes before handing them to
+            // `from_repr`.
             repr.as_mut().reverse();
         }
         let [x, y] = reprs.map(|repr| Option::from(C::Base::from_repr(repr)));
@@ -157,6 +180,9 @@ where
     fn write_point(&mut self, ec_point: C) -> io::Result<()> {
         self.common_point(ec_point)?;
         let coords = ec_point.coordinates().unwrap();
+        // Write each coord as big-endian bytes (matches the EIP-2537 wire
+        // format). `Fq::to_repr()` is little-endian regardless of the
+        // field's `endian =` setting, so we reverse here before writing.
         for coord in [coords.x(), coords.y()] {
             let mut repr = coord.to_repr();
             repr.as_mut().reverse();

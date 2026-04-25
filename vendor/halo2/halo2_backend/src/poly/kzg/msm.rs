@@ -143,8 +143,10 @@ where
     E::G1Affine: CurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
     E::G1: CurveExt<AffineExt = E::G1Affine>,
 {
-    pub(crate) left: MSMKZG<E>,
-    pub(crate) right: MSMKZG<E>,
+    /// Left-hand side MSM accumulator.
+    pub left: MSMKZG<E>,
+    /// Right-hand side MSM accumulator.
+    pub right: MSMKZG<E>,
 }
 
 impl<E: MultiMillerLoop> DualMSM<E>

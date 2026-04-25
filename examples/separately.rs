@@ -37,13 +37,12 @@ fn main() {
         );
 
         // Deploy both contracts on the Prague-spec EVM and call the
-        // verifier with the BN254 proof re-shaped into EIP-2537 padded
-        // layout. The verifier's calldata-length checks pass and the
-        // BLS precompiles execute, but the pairing returns 0 because
-        // the points live on BN254, not BLS12-381 (Stage C will swap
-        // the prover to a real BLS-KZG backend). We therefore expect
-        // the verifier to revert; we surface that as `success=false`
-        // here instead of asserting the proof verifies.
+        // verifier with a native BLS12-381 proof re-encoded into the
+        // EIP-2537 padded layout. The prover side (halo2 v0.4 KZG over
+        // bls12381::Bls12381) emits real BLS curve points, and the
+        // Solidity verifier feeds those straight to the 0x0b/0x0c/0x0f
+        // precompiles -- the pairing should now return 1 for valid
+        // proofs.
         let vk_address = evm.create(vk_creation_code);
         let verifier_address =
             evm.create_with_address_arg(verifier_creation_code, vk_address);
@@ -67,7 +66,7 @@ fn main() {
             }
             Err(_) => {
                 println!(
-                    "  -> verifier reverted on BN254-shape proof -- expected pre-Stage-C; calldata = {} B",
+                    "  -> verifier reverted; calldata = {} B",
                     calldata.len()
                 );
             }
@@ -85,15 +84,15 @@ fn save_solidity(name: impl AsRef<str>, solidity: &str) {
         .unwrap();
 }
 
-fn setup(k_range: Range<u32>, mut rng: impl RngCore) -> HashMap<u32, ParamsKZG<Bn256>> {
+fn setup(k_range: Range<u32>, mut rng: impl RngCore) -> HashMap<u32, ParamsKZG<Bls12381>> {
     k_range
         .clone()
-        .zip(k_range.map(|k| ParamsKZG::<Bn256>::setup(k, &mut rng)))
+        .zip(k_range.map(|k| ParamsKZG::<Bls12381>::setup(k, &mut rng)))
         .collect()
 }
 
 fn create_proof_checked(
-    params: &ParamsKZG<Bn256>,
+    params: &ParamsKZG<Bls12381>,
     pk: &ProvingKey<G1Affine>,
     circuit: impl Circuit<Fr>,
     instances: &[Fr],
@@ -253,7 +252,7 @@ mod prelude {
     pub use halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner, Value},
         halo2curves::{
-            bn256::{Bn256, Fr, G1Affine},
+            bls12381::{Bls12381, Fr, G1Affine},
             ff::PrimeField,
         },
         plonk::*,

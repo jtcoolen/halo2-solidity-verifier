@@ -2,15 +2,15 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata, BatchOpenScheme::Bdfg21, Evm, Keccak256Transcript,
-    SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Bdfg21, Evm,
+    Keccak256Transcript, SolidityGenerator,
 };
 
 fn main() {
     let k = 10;
     let mut rng = seeded_std_rng();
 
-    let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+    let params = ParamsKZG::<Bls12381>::setup(k, &mut rng);
     let circuit = StandardPlonk::rand(k as usize, &mut rng);
     let instances = circuit.instances();
 
@@ -30,7 +30,10 @@ fn main() {
 
     println!("call traced verifier");
     let (gas_cost, output, logs) =
-        evm.call_with_logs(verifier_address, encode_calldata(&proof, &instances));
+        evm.call_with_logs(
+            verifier_address,
+            encode_calldata_bls_padded(&generator, &proof, &instances),
+        );
     assert_eq!(output, [vec![0; 31], vec![1]].concat());
 
     println!("Trace gas cost: {gas_cost}");
@@ -101,7 +104,7 @@ fn decode_word(data: &[u8], idx: usize) -> String {
 }
 
 fn create_proof_checked(
-    params: &ParamsKZG<Bn256>,
+    params: &ParamsKZG<Bls12381>,
     pk: &ProvingKey<G1Affine>,
     circuit: impl Circuit<Fr>,
     instances: &[Fr],
@@ -253,7 +256,7 @@ mod prelude {
     pub use halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner, Value},
         halo2curves::{
-            bn256::{Bn256, Fr, G1Affine},
+            bls12381::{Bls12381, Fr, G1Affine},
             ff::{Field, PrimeField},
         },
         plonk::{

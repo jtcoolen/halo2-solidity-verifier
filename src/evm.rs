@@ -1,12 +1,20 @@
-use crate::codegen::util::{fr_to_u256, to_u256_be_bytes};
-use halo2_proofs::halo2curves::bn256;
+use crate::codegen::util::{fe_to_u256, to_u256_be_bytes};
+use halo2_proofs::halo2curves::ff::PrimeField;
 use itertools::chain;
 
 /// Function signature of `verifyProof(bytes,uint256[])`.
 pub const FN_SIG_VERIFY_PROOF: [u8; 4] = [0x1e, 0x8e, 0x1e, 0x13];
 
 /// Encode proof into calldata to invoke `Halo2Verifier.verifyProof`.
-pub fn encode_calldata(proof: &[u8], instances: &[bn256::Fr]) -> Vec<u8> {
+///
+/// Generic over the instance scalar so the same helper handles both BN254
+/// and BLS12-381 instances (both fields have a 32-byte `Repr`, which is
+/// what the Solidity verifier reads from calldata).
+pub fn encode_calldata<F>(proof: &[u8], instances: &[F]) -> Vec<u8>
+where
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
+{
     let offset = 0x40;
     let num_instances = instances.len();
     chain![
@@ -16,7 +24,7 @@ pub fn encode_calldata(proof: &[u8], instances: &[bn256::Fr]) -> Vec<u8> {
         to_u256_be_bytes(proof.len()),                               // length of proof
         proof.iter().cloned(),                                       // proof
         to_u256_be_bytes(num_instances),                             // length of instances
-        instances.iter().map(fr_to_u256).flat_map(to_u256_be_bytes), // instances
+        instances.iter().map(fe_to_u256::<F>).flat_map(to_u256_be_bytes), // instances
     ]
     .collect()
 }
@@ -85,6 +93,38 @@ pub(crate) mod test {
     fn find_binary(stdout: &str) -> Option<Vec<u8>> {
         let start = stdout.find("Binary:")? + 8;
         Some(hex::decode(&stdout[start..stdout.len() - 1]).unwrap())
+    }
+
+    /// Result of a non-panicking EVM call. Mirrors revm's
+    /// `ExecutionResult` shape but flattens to what test/example code
+    /// usually wants: gas, optional output bytes, optional revert
+    /// payload, and any emitted logs.
+    #[derive(Debug)]
+    pub enum CallOutcome {
+        /// The call returned normally.
+        Success {
+            /// Gas consumed by the call.
+            gas_used: u64,
+            /// Return-data bytes copied from the EVM.
+            output: Vec<u8>,
+            /// Logs emitted during the call.
+            logs: Vec<Log>,
+        },
+        /// The call hit a `revert` opcode.
+        Revert {
+            /// Gas consumed before the revert.
+            gas_used: u64,
+            /// Revert payload bytes (often empty for solc-generated
+            /// `revert(0, 0)` paths).
+            output: Vec<u8>,
+        },
+        /// The call halted (out-of-gas, invalid opcode, etc.).
+        Halt {
+            /// Gas consumed before the halt.
+            gas_used: u64,
+            /// Debug string identifying the halt reason.
+            reason: String,
+        },
     }
 
     /// In-process EVM runner pinned to `SpecId::PRAGUE` so that the
@@ -162,6 +202,47 @@ pub(crate) mod test {
             match output {
                 Output::Call(output) => (gas_used, output.into()),
                 _ => unreachable!("expected call output, got {output:?}"),
+            }
+        }
+
+        /// Apply call transaction without panicking on revert/halt.
+        /// Useful for fuzzing or trace-driven debugging where we want to
+        /// observe failures rather than abort the run.
+        pub fn try_call(&mut self, address: Address, calldata: Vec<u8>) -> CallOutcome {
+            let db = std::mem::take(&mut self.db);
+            let mut evm = RevmEvm::builder()
+                .with_db(db)
+                .with_spec_id(SpecId::PRAGUE)
+                .modify_tx_env(|tx| {
+                    tx.gas_limit = u64::MAX;
+                    tx.transact_to = TxKind::Call(address);
+                    tx.data = calldata.into();
+                })
+                .build();
+            let result = evm.transact_commit().unwrap();
+            self.db = std::mem::take(&mut evm.context.evm.db);
+            match result {
+                ExecutionResult::Success {
+                    gas_used,
+                    output,
+                    logs,
+                    ..
+                } => CallOutcome::Success {
+                    gas_used,
+                    output: match output {
+                        Output::Call(o) => o.into(),
+                        _ => unreachable!(),
+                    },
+                    logs,
+                },
+                ExecutionResult::Revert { gas_used, output } => CallOutcome::Revert {
+                    gas_used,
+                    output: output.into(),
+                },
+                ExecutionResult::Halt { reason, gas_used } => CallOutcome::Halt {
+                    gas_used,
+                    reason: format!("{reason:?}"),
+                },
             }
         }
 

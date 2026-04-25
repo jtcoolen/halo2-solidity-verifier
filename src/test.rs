@@ -8,7 +8,7 @@ use crate::{
     evm::test::{compile_solidity, Evm},
     FN_SIG_VERIFY_PROOF,
 };
-use halo2_proofs::halo2curves::bn256::{Bn256, Fr};
+use halo2_proofs::halo2curves::bls12381::{Bls12381, Fr};
 use proptest::{
     prelude::any,
     test_runner::{Config as ProptestConfig, TestRunner},
@@ -33,15 +33,15 @@ fn function_signature() {
 #[test]
 fn render_smoke_bls_bdfg21_and_gwc19_codegen() {
     use halo2_proofs::{
-        halo2curves::bn256::Bn256, plonk::keygen_vk, poly::kzg::commitment::ParamsKZG,
+        halo2curves::bls12381::Bls12381, plonk::keygen_vk, poly::kzg::commitment::ParamsKZG,
     };
     use rand::{rngs::StdRng, SeedableRng};
 
     use crate::{test::halo2::TestCircuit, SolidityGenerator};
 
     let mut rng = StdRng::seed_from_u64(0xcafebabe);
-    let circuit = halo2::huge::HugeCircuit::<Bn256>::new(None, &mut rng);
-    let params = ParamsKZG::<Bn256>::setup(8, &mut rng);
+    let circuit = halo2::huge::HugeCircuit::<Bls12381>::new(None, &mut rng);
+    let params = ParamsKZG::<Bls12381>::setup(8, &mut rng);
     let vk = keygen_vk(&params, &circuit).unwrap();
 
     for scheme in [Bdfg21, Gwc19] {
@@ -159,53 +159,53 @@ fn prague_evm_runs_eip2537_g1add_to_identity() {
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_bdfg21_huge() {
-    run_render::<halo2::huge::HugeCircuit<Bn256>>(Bdfg21)
+    run_render::<halo2::huge::HugeCircuit<Bls12381>>(Bdfg21)
 }
 
 #[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_bdfg21_maingate() {
-    run_render::<halo2::maingate::MainGateWithRange<Bn256>>(Bdfg21)
+    run_render::<halo2::maingate::MainGateWithRange<Bls12381>>(Bdfg21)
 }
 
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_gwc19_huge() {
-    run_render::<halo2::huge::HugeCircuit<Bn256>>(Gwc19)
+    run_render::<halo2::huge::HugeCircuit<Bls12381>>(Gwc19)
 }
 
 #[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_gwc19_maingate() {
-    run_render::<halo2::maingate::MainGateWithRange<Bn256>>(Gwc19)
+    run_render::<halo2::maingate::MainGateWithRange<Bls12381>>(Gwc19)
 }
 
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_bdfg21_huge() {
-    run_render_separately::<halo2::huge::HugeCircuit<Bn256>>(Bdfg21)
+    run_render_separately::<halo2::huge::HugeCircuit<Bls12381>>(Bdfg21)
 }
 
 #[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_bdfg21_maingate() {
-    run_render_separately::<halo2::maingate::MainGateWithRange<Bn256>>(Bdfg21)
+    run_render_separately::<halo2::maingate::MainGateWithRange<Bls12381>>(Bdfg21)
 }
 
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_gwc19_huge() {
-    run_render_separately::<halo2::huge::HugeCircuit<Bn256>>(Gwc19)
+    run_render_separately::<halo2::huge::HugeCircuit<Bls12381>>(Gwc19)
 }
 
 #[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_gwc19_maingate() {
-    run_render_separately::<halo2::maingate::MainGateWithRange<Bn256>>(Gwc19)
+    run_render_separately::<halo2::maingate::MainGateWithRange<Bls12381>>(Gwc19)
 }
 
 #[test]
@@ -551,7 +551,7 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     let circuit = PropertyStandardPlonk::rand(k as usize, &mut rng);
     let instances = circuit.instances();
 
-    let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+    let params = ParamsKZG::<Bls12381>::setup(k, &mut rng);
     let vk = keygen_vk(&params, &circuit).unwrap();
     let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
 
@@ -836,7 +836,7 @@ mod halo2 {
     use halo2_proofs::{
         arithmetic::CurveAffine,
         halo2curves::{
-            bn256,
+            bls12381 as bls12_381,
             ff::{Field, PrimeField},
             group::{prime::PrimeCurveAffine, Curve, Group},
             pairing::{MillerLoopResult, MultiMillerLoop},
@@ -863,15 +863,15 @@ mod halo2 {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn create_testdata<C: TestCircuit<bn256::Fr>>(
+    pub fn create_testdata<C: TestCircuit<bls12_381::Fr>>(
         k: u32,
         scheme: BatchOpenScheme,
         acc_encoding: Option<AccumulatorEncoding>,
         mut rng: impl RngCore + Clone,
     ) -> (
-        ParamsKZG<bn256::Bn256>,
-        VerifyingKey<bn256::G1Affine>,
-        Vec<bn256::Fr>,
+        ParamsKZG<bls12_381::Bls12381>,
+        VerifyingKey<bls12_381::G1Affine>,
+        Vec<bls12_381::Fr>,
         Vec<u8>,
     ) {
         match scheme {
@@ -887,11 +887,11 @@ mod halo2 {
             let circuit = C::new($acc_encoding, $rng.clone());
             let instances = circuit.instances();
 
-            let params = ParamsKZG::<bn256::Bn256>::setup($k, &mut $rng);
+            let params = ParamsKZG::<bls12_381::Bls12381>::setup($k, &mut $rng);
             let vk = keygen_vk(&params, &circuit).unwrap();
             let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
 
-            let instances_owned: Vec<Vec<Vec<bn256::Fr>>> = vec![vec![instances.clone()]];
+            let instances_owned: Vec<Vec<Vec<bls12_381::Fr>>> = vec![vec![instances.clone()]];
             let verifier_params = params.verifier_params();
             let proof = {
                 let mut transcript = Keccak256Transcript::new(Vec::new());
