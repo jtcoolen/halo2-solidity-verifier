@@ -37,12 +37,14 @@ impl<C, S> Keccak256Transcript<C, S> {
 pub struct ChallengeEvm<C>(C::Scalar)
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>;
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>;
 
 impl<C> EncodedChallenge<C> for ChallengeEvm<C>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
 {
     type Input = [u8; 0x20];
 
@@ -58,7 +60,9 @@ where
 impl<C, S> Transcript<C, ChallengeEvm<C>> for Keccak256Transcript<C, S>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
+    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
 {
     fn squeeze_challenge(&mut self) -> ChallengeEvm<C> {
         let buf_len = self.buf.len();
@@ -95,7 +99,9 @@ where
 impl<C, R: Read> TranscriptRead<C, ChallengeEvm<C>> for Keccak256Transcript<C, R>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
+    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
 {
     fn read_point(&mut self) -> io::Result<C> {
         let mut reprs = [<C::Base as PrimeField>::Repr::default(); 2];
@@ -118,10 +124,11 @@ where
     }
 
     fn read_scalar(&mut self) -> io::Result<C::Scalar> {
-        let mut data = [0; 0x20];
-        self.stream.read_exact(data.as_mut())?;
+        let mut data = [0u8; 0x20];
+        self.stream.read_exact(&mut data)?;
         data.reverse();
-        let scalar = C::Scalar::from_repr_vartime(data)
+        let repr = <C::Scalar as PrimeField>::Repr::from(data);
+        let scalar = Option::from(C::Scalar::from_repr_vartime(repr))
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid scalar".to_string()))?;
         Transcript::<C, ChallengeEvm<C>>::common_scalar(self, scalar)?;
         Ok(scalar)
@@ -131,7 +138,9 @@ where
 impl<C, R: Read> TranscriptReadBuffer<R, C, ChallengeEvm<C>> for Keccak256Transcript<C, R>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
+    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
 {
     fn init(reader: R) -> Self {
         Keccak256Transcript::new(reader)
@@ -141,7 +150,9 @@ where
 impl<C, W: Write> TranscriptWrite<C, ChallengeEvm<C>> for Keccak256Transcript<C, W>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
+    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
 {
     fn write_point(&mut self, ec_point: C) -> io::Result<()> {
         self.common_point(ec_point)?;
@@ -165,7 +176,9 @@ where
 impl<C, W: Write> TranscriptWriterBuffer<W, C, ChallengeEvm<C>> for Keccak256Transcript<C, W>
 where
     C: CurveAffine,
-    C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+    C::Scalar: PrimeField,
+    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
+    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
 {
     fn init(writer: W) -> Self {
         Keccak256Transcript::new(writer)
@@ -178,15 +191,23 @@ where
 
 fn u256_to_fe<F>(value: U256) -> F
 where
-    F: PrimeField<Repr = [u8; 0x20]>,
+    F: PrimeField,
+    F::Repr: AsRef<[u8]> + From<[u8; 0x20]>,
 {
     let value = value % modulus::<F>();
-    F::from_repr(value.to_le_bytes::<0x20>()).unwrap()
+    let repr = F::Repr::from(value.to_le_bytes::<0x20>());
+    F::from_repr(repr).unwrap()
 }
 
 fn modulus<F>() -> U256
 where
-    F: PrimeField<Repr = [u8; 0x20]>,
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
 {
-    U256::from_le_bytes((-F::ONE).to_repr()) + U256::from(1)
+    let neg_one_repr = (-F::ONE).to_repr();
+    let bytes = neg_one_repr.as_ref();
+    debug_assert_eq!(bytes.len(), 32);
+    let mut le = [0u8; 32];
+    le.copy_from_slice(bytes);
+    U256::from_le_bytes(le) + U256::from(1)
 }

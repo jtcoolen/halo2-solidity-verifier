@@ -8,7 +8,12 @@ use crate::codegen::{
 // as `bls12381` (note: no underscore in 0.7).
 use halo2_proofs::halo2curves::{bn256, ff::PrimeField, CurveAffine};
 use halo2curves::bls12381 as bls12_381;
-use halo2_proofs::plonk::{Any, Column, ConstraintSystem};
+// halo2 v0.4 split moves the cs walkers into halo2_backend / halo2_middleware:
+//   * ConstraintSystemBack carries the compiled-down constraint system that
+//     the verifying key embeds.
+//   * ColumnMid is the (column_type, index) pair returned by every cs query.
+use halo2_backend::plonk::circuit::ConstraintSystemBack;
+use halo2_middleware::circuit::{Any, ColumnMid};
 use itertools::{chain, izip, Itertools};
 use ruint::{aliases::U256, UintTryFrom};
 use std::{
@@ -21,7 +26,7 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct ConstraintSystemMeta {
     pub(crate) num_fixeds: usize,
-    pub(crate) permutation_columns: Vec<Column<Any>>,
+    pub(crate) permutation_columns: Vec<ColumnMid>,
     pub(crate) permutation_chunk_len: usize,
     pub(crate) num_lookup_permuteds: usize,
     pub(crate) num_permutation_zs: usize,
@@ -39,32 +44,30 @@ pub(crate) struct ConstraintSystemMeta {
 }
 
 impl ConstraintSystemMeta {
-    pub(crate) fn new(cs: &ConstraintSystem<impl PrimeField>) -> Self {
+    pub(crate) fn new<F: PrimeField>(cs: &ConstraintSystemBack<F>) -> Self {
         let num_fixeds = cs.num_fixed_columns();
-        let permutation_columns = cs.permutation().get_columns();
-        let permutation_chunk_len = cs.degree() - 2;
+        let permutation_columns: Vec<ColumnMid> = cs.permutation().columns.clone();
+        let permutation_chunk_len = cs.degree_pub() - 2;
         let num_lookup_permuteds = 2 * cs.lookups().len();
-        let num_permutation_zs = cs
-            .permutation()
-            .get_columns()
-            .chunks(cs.degree() - 2)
+        let num_permutation_zs = permutation_columns
+            .chunks(cs.degree_pub() - 2)
             .count();
         let num_lookup_zs = cs.lookups().len();
-        let num_quotients = cs.degree() - 1;
+        let num_quotients = cs.degree_pub() - 1;
         let advice_queries = cs
             .advice_queries()
             .iter()
-            .map(|(column, rotation)| (column.index(), rotation.0))
+            .map(|(column, rotation)| (column.index, rotation.0))
             .collect_vec();
         let fixed_queries = cs
             .fixed_queries()
             .iter()
-            .map(|(column, rotation)| (column.index(), rotation.0))
+            .map(|(column, rotation)| (column.index, rotation.0))
             .collect_vec();
         let num_evals = advice_queries.len()
             + fixed_queries.len()
             + 1
-            + cs.permutation().get_columns().len()
+            + permutation_columns.len()
             + (3 * num_permutation_zs - 1)
             + 5 * cs.lookups().len();
         let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
@@ -92,9 +95,9 @@ impl ConstraintSystemMeta {
                 .collect::<Vec<_>>();
             (nums, index)
         };
-        let (num_user_advices, advice_indices) = remapping(cs.advice_column_phase());
-        let (num_user_challenges, challenge_indices) = remapping(cs.challenge_phase());
-        let rotation_last = -(cs.blinding_factors() as i32 + 1);
+        let (num_user_advices, advice_indices) = remapping(cs.advice_column_phase().to_vec());
+        let (num_user_challenges, challenge_indices) = remapping(cs.challenge_phase().to_vec());
+        let rotation_last = -(cs.blinding_factors_pub() as i32 + 1);
         let num_rotations = chain![
             advice_queries.iter().map(|query| query.1),
             fixed_queries.iter().map(|query| query.1),
@@ -197,7 +200,7 @@ pub(crate) struct Data {
     pub(crate) w_cptr: Ptr,
 
     pub(crate) fixed_comms: Vec<EcPoint>,
-    pub(crate) permutation_comms: HashMap<Column<Any>, EcPoint>,
+    pub(crate) permutation_comms: HashMap<ColumnMid, EcPoint>,
     pub(crate) advice_comms: Vec<EcPoint>,
     pub(crate) lookup_permuted_comms: Vec<(EcPoint, EcPoint)>,
     pub(crate) permutation_z_comms: Vec<EcPoint>,
@@ -210,7 +213,7 @@ pub(crate) struct Data {
     pub(crate) advice_evals: HashMap<(usize, i32), Word>,
     pub(crate) fixed_evals: HashMap<(usize, i32), Word>,
     pub(crate) random_eval: Word,
-    pub(crate) permutation_evals: HashMap<Column<Any>, Word>,
+    pub(crate) permutation_evals: HashMap<ColumnMid, Word>,
     pub(crate) permutation_z_evals: Vec<(Word, Word, Word)>,
     pub(crate) lookup_evals: Vec<(Word, Word, Word, Word, Word)>,
 
@@ -805,15 +808,28 @@ pub(crate) fn bls_g1_pad_from_bn254_bytes(
 
 /// Shape-only conversion: takes a BN254 G2 point and produces the EIP-2537
 /// 8-word layout. See `bls_g1_pad_from_bn254_bytes` for caveats.
+///
+/// halo2curves 0.7 hides `Fq2.c0` / `Fq2.c1` behind private fields. The
+/// `to_bytes()` helper added by `impl_tower2!` emits 64 bytes in
+/// `(c0_le | c1_le)` order, so we slice that and re-shape per-coord.
 pub(crate) fn bls_g2_pad_from_bn254_bytes(
     ec_point: impl Borrow<bn256::G2Affine>,
 ) -> [U256; 8] {
     let coords = ec_point.borrow().coordinates().unwrap();
-    // halo2curves 0.6 bn256::Fq2 has c0/c1; EIP-2537 expects c0 first.
-    let xc0 = bn254_fq_to_be48(&coords.x().c0);
-    let xc1 = bn254_fq_to_be48(&coords.x().c1);
-    let yc0 = bn254_fq_to_be48(&coords.y().c0);
-    let yc1 = bn254_fq_to_be48(&coords.y().c1);
+    let x_bytes: [u8; 64] = coords.x().to_bytes();
+    let y_bytes: [u8; 64] = coords.y().to_bytes();
+    let to_be48 = |le_32: &[u8]| {
+        let mut be32 = [0u8; 32];
+        be32.copy_from_slice(le_32);
+        be32.reverse();
+        let mut be48 = [0u8; 48];
+        be48[16..].copy_from_slice(&be32);
+        be48
+    };
+    let xc0 = to_be48(&x_bytes[..32]);
+    let xc1 = to_be48(&x_bytes[32..]);
+    let yc0 = to_be48(&y_bytes[..32]);
+    let yc1 = to_be48(&y_bytes[32..]);
     let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&xc0);
     let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&xc1);
     let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&yc0);
@@ -837,9 +853,15 @@ pub(crate) fn fr_to_u256(fe: impl Borrow<bn256::Fr>) -> U256 {
 
 pub(crate) fn fe_to_u256<F>(fe: impl Borrow<F>) -> U256
 where
-    F: PrimeField<Repr = [u8; 0x20]>,
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
 {
-    U256::from_le_bytes(fe.borrow().to_repr())
+    let repr = fe.borrow().to_repr();
+    let bytes = repr.as_ref();
+    debug_assert_eq!(bytes.len(), 32, "fe_to_u256 expects 32-byte repr");
+    let mut le = [0u8; 32];
+    le.copy_from_slice(bytes);
+    U256::from_le_bytes(le)
 }
 
 pub(crate) fn to_u256_be_bytes<T>(value: T) -> [u8; 32]

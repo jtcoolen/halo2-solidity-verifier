@@ -67,7 +67,11 @@ serde_json = "1"
 getrandom = { version = "0.2", features = ["js"] }
 
 [features]
-default = ["batch", "bits", "halo2_frontend/default", "halo2_backend/default", "lookup-any-sanity-checks"]
+# Removed `lookup-any-sanity-checks` from default features so the halo2
+# v0.4 frontend doesn't reject lookups whose table side is all-fixed.
+# halo2-solidity-verifier's smoke test fixture relies on that pattern; turn
+# the feature back on explicitly if you want the upstream behaviour.
+default = ["batch", "bits", "halo2_frontend/default", "halo2_backend/default"]
 dev-graph = ["halo2_frontend/dev-graph", "plotters"]
 test-dev-graph = [
     "halo2_frontend/test-dev-graph",

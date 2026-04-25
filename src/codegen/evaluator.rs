@@ -1,20 +1,24 @@
 #![allow(clippy::useless_format)]
 
 use crate::codegen::util::{code_block, fe_to_u256, ConstraintSystemMeta, Data};
-use halo2_proofs::{
-    halo2curves::ff::PrimeField,
-    plonk::{
-        Advice, AdviceQuery, Any, Challenge, ConstraintSystem, Expression, Fixed, FixedQuery, Gate,
-        InstanceQuery,
-    },
+use halo2_proofs::halo2curves::ff::PrimeField;
+// halo2 v0.4 split moved the compiled-down constraint system, gate, and
+// expression types into halo2_backend / halo2_middleware. We walk the
+// backend cs (`ConstraintSystemBack`) and its `ExpressionBack<F>` directly,
+// instead of the v0.3 frontend `ConstraintSystem<F>` + `Expression<F>`. The
+// only field we read is `gate.poly`.
+use halo2_backend::plonk::circuit::{
+    ConstraintSystemBack, ExpressionBack, GateBack, QueryBack, VarBack,
 };
+use halo2_middleware::circuit::{Any, ChallengeMid};
+use halo2_middleware::expression::Expression as MidExpression;
 use itertools::{chain, izip, Itertools};
 use ruint::aliases::U256;
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, iter};
 
 #[derive(Debug)]
 pub(crate) struct Evaluator<'a, F: PrimeField> {
-    cs: &'a ConstraintSystem<F>,
+    cs: &'a ConstraintSystemBack<F>,
     meta: &'a ConstraintSystemMeta,
     data: &'a Data,
     var_counter: RefCell<usize>,
@@ -23,10 +27,11 @@ pub(crate) struct Evaluator<'a, F: PrimeField> {
 
 impl<'a, F> Evaluator<'a, F>
 where
-    F: PrimeField<Repr = [u8; 0x20]>,
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
 {
     pub(crate) fn new(
-        cs: &'a ConstraintSystem<F>,
+        cs: &'a ConstraintSystemBack<F>,
         meta: &'a ConstraintSystemMeta,
         data: &'a Data,
     ) -> Self {
@@ -43,8 +48,10 @@ where
         self.cs
             .gates()
             .iter()
-            .flat_map(Gate::polynomials)
-            .map(|expression| self.evaluate_and_reset(expression))
+            // halo2 v0.4 backend gates carry a single `poly: ExpressionBack<F>`
+            // (the v0.3 frontend's `gate.polynomials() -> &[Expression<F>]`
+            // collapses into one expression after compilation).
+            .map(|gate| self.evaluate_and_reset(&gate.poly))
             .collect()
     }
 
@@ -87,7 +94,7 @@ where
                     ],
                     columns.iter().flat_map(|column| {
                         let perm_eval = &data.permutation_evals[column];
-                        let eval = self.eval(*column.column_type(), column.index(), 0);
+                        let eval = self.eval(column.column_type, column.index, 0);
                         let item = format!("mulmod(beta, {perm_eval}, r)");
                         [format!(
                             "lhs := mulmod(lhs, addmod(addmod({eval}, {item}, r), gamma, r), r)"
@@ -96,7 +103,7 @@ where
                     (chunk_idx == 0)
                         .then(|| "mstore(0x00, mulmod(beta, mload(X_MPTR), r))".to_string()),
                     columns.iter().enumerate().flat_map(|(idx, column)| {
-                        let eval = self.eval(*column.column_type(), column.index(), 0);
+                        let eval = self.eval(column.column_type, column.index, 0);
                         let item = format!("addmod(addmod({eval}, mload(0x00), r), gamma, r)");
                         chain![
                             [format!("rhs := mulmod(rhs, {item}, r)")],
@@ -127,7 +134,7 @@ where
             .iter()
             .map(|lookup| {
                 let [(input_lines, inputs), (table_lines, tables)] =
-                    [lookup.input_expressions(), lookup.table_expressions()].map(|expressions| {
+                    [&lookup.input_expressions, &lookup.table_expressions].map(|expressions| {
                         let (lines, inputs) = expressions
                             .iter()
                             .map(|expression| self.evaluate(expression))
@@ -219,9 +226,9 @@ where
             .collect_vec()
     }
 
-    fn eval(&self, column_type: impl Into<Any>, column_index: usize, rotation: i32) -> String {
-        match column_type.into() {
-            Any::Advice(_) => self.data.advice_evals[&(column_index, rotation)].to_string(),
+    fn eval(&self, column_type: Any, column_index: usize, rotation: i32) -> String {
+        match column_type {
+            Any::Advice => self.data.advice_evals[&(column_index, rotation)].to_string(),
             Any::Fixed => self.data.fixed_evals[&(column_index, rotation)].to_string(),
             Any::Instance => self.data.instance_eval.to_string(),
         }
@@ -232,13 +239,13 @@ where
         *self.var_cache.borrow_mut() = Default::default();
     }
 
-    fn evaluate_and_reset(&self, expression: &Expression<F>) -> (Vec<String>, String) {
+    fn evaluate_and_reset(&self, expression: &ExpressionBack<F>) -> (Vec<String>, String) {
         let result = self.evaluate(expression);
         self.reset();
         result
     }
 
-    fn evaluate(&self, expression: &Expression<F>) -> (Vec<String>, String) {
+    fn evaluate(&self, expression: &ExpressionBack<F>) -> (Vec<String>, String) {
         evaluate(
             expression,
             &|constant| {
@@ -246,22 +253,22 @@ where
                 self.init_var(constant, None)
             },
             &|query| {
-                self.init_var(
-                    self.eval(Fixed, query.column_index(), query.rotation().0),
-                    Some(fixed_eval_var(query)),
-                )
+                // QueryBack covers fixed/advice/instance via column_type.
+                let column_type = query.column_type;
+                let column_index = query.column_index;
+                let rotation = query.rotation.0;
+                let eval = self.eval(column_type, column_index, rotation);
+                let var_name = match column_type {
+                    Any::Fixed => column_eval_var("f", column_index, rotation),
+                    Any::Advice => column_eval_var("a", column_index, rotation),
+                    Any::Instance => "i_eval".to_string(),
+                };
+                self.init_var(eval, Some(var_name))
             },
-            &|query| {
+            &|challenge: ChallengeMid| {
                 self.init_var(
-                    self.eval(Advice::default(), query.column_index(), query.rotation().0),
-                    Some(advice_eval_var(query)),
-                )
-            },
-            &|_| self.init_var(self.data.instance_eval, Some("i_eval".to_string())),
-            &|challenge| {
-                self.init_var(
-                    self.data.challenges[challenge.index()],
-                    Some(format!("c_{}", challenge.index())),
+                    self.data.challenges[challenge.index],
+                    Some(format!("c_{}", challenge.index)),
                 )
             },
             &|(mut acc, var)| {
@@ -280,12 +287,6 @@ where
                 lhs_acc.extend(rhs_acc);
                 lhs_acc.extend(lines);
                 (lhs_acc, var)
-            },
-            &|(mut acc, var), scalar| {
-                let scalar = u256_string(scalar);
-                let (lines, var) = self.init_var(format!("mulmod({var}, {scalar}, r)"), None);
-                acc.extend(lines);
-                (acc, var)
             },
         )
     }
@@ -318,14 +319,6 @@ fn u256_string(value: U256) -> String {
     }
 }
 
-fn fixed_eval_var(fixed_query: FixedQuery) -> String {
-    column_eval_var("f", fixed_query.column_index(), fixed_query.rotation().0)
-}
-
-fn advice_eval_var(advice_query: AdviceQuery) -> String {
-    column_eval_var("a", advice_query.column_index(), advice_query.rotation().0)
-}
-
 fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> String {
     match rotation.cmp(&0) {
         Ordering::Less => format!("{prefix}_{column_index}_prev_{}", rotation.abs()),
@@ -334,37 +327,33 @@ fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> 
     }
 }
 
+/// Walks a halo2 v0.4 backend `ExpressionBack<F>` tree, dispatching to the
+/// callbacks. The backend Expression has fewer variants than v0.3's
+/// frontend Expression: there is no Selector (compiled away), no Scaled
+/// (folded into Product), and Advice/Fixed/Instance are unified under
+/// `Var(VarBack::Query(QueryBack))`. Challenges live in the same Var
+/// arm via `VarBack::Challenge(ChallengeMid)`.
 #[allow(clippy::too_many_arguments)]
 fn evaluate<F, T>(
-    expression: &Expression<F>,
+    expression: &ExpressionBack<F>,
     constant: &impl Fn(U256) -> T,
-    fixed: &impl Fn(FixedQuery) -> T,
-    advice: &impl Fn(AdviceQuery) -> T,
-    instance: &impl Fn(InstanceQuery) -> T,
-    challenge: &impl Fn(Challenge) -> T,
+    query: &impl Fn(QueryBack) -> T,
+    challenge: &impl Fn(ChallengeMid) -> T,
     negated: &impl Fn(T) -> T,
     sum: &impl Fn(T, T) -> T,
     product: &impl Fn(T, T) -> T,
-    scaled: &impl Fn(T, U256) -> T,
 ) -> T
 where
-    F: PrimeField<Repr = [u8; 0x20]>,
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
 {
-    let evaluate = |expr| {
-        evaluate(
-            expr, constant, fixed, advice, instance, challenge, negated, sum, product, scaled,
-        )
-    };
+    let recurse = |expr| evaluate(expr, constant, query, challenge, negated, sum, product);
     match expression {
-        Expression::Constant(scalar) => constant(fe_to_u256(*scalar)),
-        Expression::Selector(_) => unreachable!(),
-        Expression::Fixed(query) => fixed(*query),
-        Expression::Advice(query) => advice(*query),
-        Expression::Instance(query) => instance(*query),
-        Expression::Challenge(value) => challenge(*value),
-        Expression::Negated(value) => negated(evaluate(value)),
-        Expression::Sum(lhs, rhs) => sum(evaluate(lhs), evaluate(rhs)),
-        Expression::Product(lhs, rhs) => product(evaluate(lhs), evaluate(rhs)),
-        Expression::Scaled(value, scalar) => scaled(evaluate(value), fe_to_u256(*scalar)),
+        MidExpression::Constant(scalar) => constant(fe_to_u256(*scalar)),
+        MidExpression::Var(VarBack::Query(q)) => query(*q),
+        MidExpression::Var(VarBack::Challenge(c)) => challenge(*c),
+        MidExpression::Negated(value) => negated(recurse(value)),
+        MidExpression::Sum(lhs, rhs) => sum(recurse(lhs), recurse(rhs)),
+        MidExpression::Product(lhs, rhs) => product(recurse(lhs), recurse(rhs)),
     }
 }

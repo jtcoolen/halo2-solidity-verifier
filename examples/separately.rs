@@ -107,13 +107,22 @@ fn create_proof_checked(
         transcript::TranscriptWriterBuffer,
     };
 
+    // halo2 v0.4 changed the proof-generation API:
+    //   * `instances` is now `&[Vec<Vec<Scheme::Scalar>>]` (vec of circuits,
+    //     each a vec of columns, each a vec of values) instead of v0.3's
+    //     `&[&[&[Scheme::Scalar]]]`.
+    //   * `SingleStrategy::new` takes `&ParamsVerifierKZG<E>`, derived from
+    //     `params.verifier_params()`.
+    //   * `verify_proof` returns `Result<Strategy::Output, Error>` where
+    //     `Strategy::Output` is `()` for `SingleStrategy`.
+    let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
         create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
-            &[&[instances]],
+            instances_owned.as_slice(),
             &mut rng,
             &mut transcript,
         )
@@ -121,13 +130,14 @@ fn create_proof_checked(
         transcript.finalize()
     };
 
+    let verifier_params = params.verifier_params();
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
         verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
-            params,
+            &verifier_params,
             pk.get_vk(),
-            SingleStrategy::new(params),
-            &[&[instances]],
+            SingleStrategy::new(&verifier_params),
+            instances_owned.as_slice(),
             &mut transcript,
         )
     };
@@ -208,7 +218,7 @@ mod application {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<F>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let [q_l, q_r, q_o, q_m, q_c] = config.selectors;
             let [w_l, w_r, w_o] = config.wires;
             layouter.assign_region(

@@ -4,28 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Why we still pin halo2_proofs v0.3:
-#
-# v0.4 split the API into halo2_middleware/halo2_backend/halo2_frontend and
-# made `VerifyingKey::cs()`, the permutation commitments, and the KZG params
-# fields all `pub(crate)`. Even though halo2_proofs v0.4 transitively pulls
-# halo2curves 0.7 (which has `bls12_381::Bls12381 : pairing::Engine`), there
-# is no way to extract permutation commitments / `g2` / `s_g2` out of
-# halo2_proofs v0.4 from outside the crate without vendoring or patching it.
-#
-# Until that surgery is done, this fork uses a layered strategy:
-#   * halo2_proofs v0.3 stays in for circuit synthesis + BN254 KZG (same
-#     types and APIs as upstream halo2-solidity-verifier).
-#   * halo2curves 0.7 ships bls12381 directly, which we use for the Solidity
-#     codegen layer (real BLS field/curve elements feed into the Solidity
-#     verifier templates).
-#   * The translation between the two happens at the SolidityGenerator
-#     boundary: BN254 commitments are mapped to BLS12-381 via deterministic
-#     byte-shape conversion. See PORTING_NOTES.md for the cryptographic
-#     caveats; this is shape-correct (compiles, calls the right precompiles,
-#     hashes the right transcript) but the embedded points are not on the
-#     BLS curve until the v0.4 upgrade is done.
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.3.0" }
+# halo2_proofs is the trimmed v0.4.0 vendor under vendor/halo2/ with surgical
+# patches that expose `VerifyingKey::cs()`, the permutation commitments, the
+# KZG SRS accessors, and the ConstraintSystemBack cs walkers (see
+# vendor/halo2/PATCHES.md for the diffs). v0.4 transitively pulls halo2curves
+# 0.7, which ships `bls12_381::Bls12381 : pairing::Engine` so the prover side
+# of the BLS port can swap to a real BLS-KZG backend.
+halo2_proofs = { path = "vendor/halo2/halo2_proofs" }
+halo2_middleware = { path = "vendor/halo2/halo2_middleware" }
+halo2_backend = { path = "vendor/halo2/halo2_backend" }
 halo2curves = { version = "0.7", default-features = false }
 askama = { version = "0.12.0", features = ["config"], default-features = false }
 hex = "0.4.3"
@@ -46,7 +33,12 @@ revm = { version = "19", default-features = false, optional = true }
 proptest = "1.6.0"
 rand = "0.8.5"
 revm = { version = "19", default-features = false }
-halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
+# halo2_maingate is upstream maingate from halo2wrong, pinned to v0.3-shaped
+# halo2_proofs. It does not compile against halo2 v0.4 (which we now use), so
+# the maingate-backed render tests in src/test.rs are commented out for the
+# duration of the migration. Once a v0.4-compatible maingate is available the
+# dep can be re-enabled.
+# halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
 
 [features]
 default = []

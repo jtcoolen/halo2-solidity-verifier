@@ -162,6 +162,7 @@ fn render_bdfg21_huge() {
     run_render::<halo2::huge::HugeCircuit<Bn256>>(Bdfg21)
 }
 
+#[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_bdfg21_maingate() {
@@ -174,6 +175,7 @@ fn render_gwc19_huge() {
     run_render::<halo2::huge::HugeCircuit<Bn256>>(Gwc19)
 }
 
+#[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_gwc19_maingate() {
@@ -186,6 +188,7 @@ fn render_separately_bdfg21_huge() {
     run_render_separately::<halo2::huge::HugeCircuit<Bn256>>(Bdfg21)
 }
 
+#[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_bdfg21_maingate() {
@@ -198,6 +201,7 @@ fn render_separately_gwc19_huge() {
     run_render_separately::<halo2::huge::HugeCircuit<Bn256>>(Gwc19)
 }
 
+#[cfg(feature = "_maingate_v3")]
 #[test]
 #[ignore = "needs halo2 KZG-BLS prover backend; see PORTING_NOTES.md"]
 fn render_separately_gwc19_maingate() {
@@ -490,7 +494,7 @@ impl halo2_proofs::plonk::Circuit<Fr> for PropertyStandardPlonk<Fr> {
         &self,
         config: Self::Config,
         mut layouter: impl halo2_proofs::circuit::Layouter<Fr>,
-    ) -> Result<(), halo2_proofs::plonk::Error> {
+    ) -> Result<(), halo2_proofs::plonk::ErrorFront> {
         use halo2_proofs::arithmetic::Field;
         use halo2_proofs::circuit::Value;
 
@@ -551,13 +555,17 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     let vk = keygen_vk(&params, &circuit).unwrap();
     let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
 
+    // halo2 v0.4 wants instances as `&[Vec<Vec<F>>]` (vec per circuit, then
+    // vec per instance column) and SingleStrategy needs `ParamsVerifierKZG`.
+    let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.clone()]];
+    let verifier_params = params.verifier_params();
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
         create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
             &params,
             &pk,
             &[circuit.clone()],
-            &[&[&instances]],
+            instances_owned.as_slice(),
             &mut rng,
             &mut transcript,
         )
@@ -568,10 +576,10 @@ fn create_property_standard_plonk_fixture(k: u32, seed: u64) -> PropertyStandard
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
         verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
-            &params,
+            &verifier_params,
             pk.get_vk(),
-            SingleStrategy::new(&params),
-            &[&[&instances]],
+            SingleStrategy::new(&verifier_params),
+            instances_owned.as_slice(),
             &mut transcript,
         )
     };
@@ -883,13 +891,15 @@ mod halo2 {
             let vk = keygen_vk(&params, &circuit).unwrap();
             let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
 
+            let instances_owned: Vec<Vec<Vec<bn256::Fr>>> = vec![vec![instances.clone()]];
+            let verifier_params = params.verifier_params();
             let proof = {
                 let mut transcript = Keccak256Transcript::new(Vec::new());
                 create_proof::<_, $p, _, _, _, _>(
                     &params,
                     &pk,
                     &[circuit],
-                    &[&[&instances]],
+                    instances_owned.as_slice(),
                     &mut $rng,
                     &mut transcript,
                 )
@@ -900,10 +910,10 @@ mod halo2 {
             let result = {
                 let mut transcript = Keccak256Transcript::new(proof.as_slice());
                 verify_proof::<_, $v, _, _, SingleStrategy<_>>(
-                    &params,
+                    &verifier_params,
                     pk.get_vk(),
-                    SingleStrategy::new(&params),
-                    &[&[&instances]],
+                    SingleStrategy::new(&verifier_params),
+                    instances_owned.as_slice(),
                     &mut transcript,
                 )
             };
@@ -922,8 +932,9 @@ mod halo2 {
     where
         M: MultiMillerLoop,
         M::G1Affine: CurveAffine<ScalarExt = M::Fr>,
-        <M::G1Affine as CurveAffine>::Base: PrimeField<Repr = [u8; 0x20]>,
-        <M::G1Affine as CurveAffine>::ScalarExt: PrimeField<Repr = [u8; 0x20]>,
+        <<M::G1Affine as CurveAffine>::Base as PrimeField>::Repr: AsRef<[u8]>,
+        <<M::G1Affine as CurveAffine>::ScalarExt as PrimeField>::Repr:
+            AsRef<[u8]> + From<[u8; 0x20]>,
     {
         let s = M::Fr::random(&mut rng);
         let g1 = M::G1Affine::generator();
@@ -948,8 +959,8 @@ mod halo2 {
     fn ec_point_to_limbs<C>(ec_point: impl Borrow<C>, num_limb_bits: usize) -> Vec<C::Scalar>
     where
         C: CurveAffine,
-        C::Base: PrimeField<Repr = [u8; 0x20]>,
-        C::Scalar: PrimeField<Repr = [u8; 0x20]>,
+        <C::Base as PrimeField>::Repr: AsRef<[u8]>,
+        <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + From<[u8; 0x20]>,
     {
         let coords = ec_point.borrow().coordinates().unwrap();
         [*coords.x(), *coords.y()]
@@ -960,10 +971,16 @@ mod halo2 {
 
     fn fe_to_limbs<F1, F2>(fe: impl Borrow<F1>, num_limb_bits: usize) -> Vec<F2>
     where
-        F1: PrimeField<Repr = [u8; 0x20]>,
-        F2: PrimeField<Repr = [u8; 0x20]>,
+        F1: PrimeField,
+        F1::Repr: AsRef<[u8]>,
+        F2: PrimeField,
+        F2::Repr: AsRef<[u8]> + From<[u8; 0x20]>,
     {
-        let big = U256::from_le_bytes(fe.borrow().to_repr());
+        let repr = fe.borrow().to_repr();
+        let bytes = repr.as_ref();
+        let mut le = [0u8; 32];
+        le.copy_from_slice(bytes);
+        let big = U256::from_le_bytes(le);
         let mask = &((U256::from(1) << num_limb_bits) - U256::from(1));
         (0usize..)
             .step_by(num_limb_bits)
@@ -974,10 +991,12 @@ mod halo2 {
 
     fn fe_from_u256<F>(u256: impl Borrow<U256>) -> F
     where
-        F: PrimeField<Repr = [u8; 0x20]>,
+        F: PrimeField,
+        F::Repr: From<[u8; 0x20]>,
     {
         let bytes = u256.borrow().to_le_bytes::<32>();
-        F::from_repr_vartime(bytes).unwrap()
+        let repr = F::Repr::from(bytes);
+        F::from_repr_vartime(repr).unwrap()
     }
 
     pub mod huge {
@@ -1009,8 +1028,9 @@ mod halo2 {
         where
             M: MultiMillerLoop,
             M::G1Affine: CurveAffine<ScalarExt = M::Fr>,
-            <M::G1Affine as CurveAffine>::Base: PrimeField<Repr = [u8; 0x20]>,
-            <M::G1Affine as CurveAffine>::ScalarExt: PrimeField<Repr = [u8; 0x20]>,
+            <<M::G1Affine as CurveAffine>::Base as PrimeField>::Repr: AsRef<[u8]>,
+            <<M::G1Affine as CurveAffine>::ScalarExt as PrimeField>::Repr:
+                AsRef<[u8]> + From<[u8; 0x20]>,
         {
             fn min_k() -> u32 {
                 6
@@ -1122,7 +1142,7 @@ mod halo2 {
                 &self,
                 (selectors, complex_selectors, fixeds, advices, instance): Self::Config,
                 mut layouter: impl Layouter<M::Fr>,
-            ) -> Result<(), plonk::Error> {
+            ) -> Result<(), plonk::ErrorFront> {
                 let assigneds = layouter.assign_region(
                     || "",
                     |mut region| {
@@ -1155,6 +1175,12 @@ mod halo2 {
         }
     }
 
+    // The maingate test module is gated off during the halo2 v0.4 migration:
+    // `halo2_maingate` v2024_01_31 only compiles against halo2_proofs v0.3.
+    // Once a v0.4-compatible maingate ships (or we replace MainGate with a
+    // simpler arithmetic chip), re-enable this module and the four
+    // render_*_maingate tests above.
+    #[cfg(feature = "_maingate_v3")]
     pub mod maingate {
         use crate::{
             codegen::AccumulatorEncoding,

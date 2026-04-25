@@ -5,16 +5,20 @@ use halo2_middleware::poly::Rotation;
 use halo2_middleware::{lookup, permutation::ArgumentMid, shuffle};
 
 // TODO: Reuse ColumnMid inside this.
+//
+// Patched in halo2-solidity-verifier-exp: fields promoted to `pub` so the
+// Solidity codegen evaluator can walk `Expression::Var(VarBack::Query(...))`
+// and emit Yul for advice/fixed/instance reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryBack {
     /// Query index
-    pub(crate) index: usize,
+    pub index: usize,
     /// Column index
-    pub(crate) column_index: usize,
+    pub column_index: usize,
     /// The type of the column.
-    pub(crate) column_type: Any,
+    pub column_type: Any,
     /// Rotation of this query
-    pub(crate) rotation: Rotation,
+    pub rotation: Rotation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,11 +55,14 @@ impl Variable for VarBack {
     }
 }
 
-pub(crate) type ExpressionBack<F> = Expression<F, VarBack>;
-pub(crate) type GateBack<F> = Gate<F, VarBack>;
-pub(crate) type LookupArgumentBack<F> = lookup::Argument<F, VarBack>;
-pub(crate) type ShuffleArgumentBack<F> = shuffle::Argument<F, VarBack>;
-pub(crate) type PermutationArgumentBack = ArgumentMid;
+// Patched in halo2-solidity-verifier-exp: promote these aliases to `pub` so
+// downstream callers (Solidity codegen evaluator) can name the return types
+// of the cs accessors below and walk gate expressions.
+pub type ExpressionBack<F> = Expression<F, VarBack>;
+pub type GateBack<F> = Gate<F, VarBack>;
+pub type LookupArgumentBack<F> = lookup::Argument<F, VarBack>;
+pub type ShuffleArgumentBack<F> = shuffle::Argument<F, VarBack>;
+pub type PermutationArgumentBack = ArgumentMid;
 
 /// This is a description of the circuit environment, such as the gate, column and permutation
 /// arrangements.  This type is internal to the backend and will appear in the verifying key.
@@ -98,6 +105,87 @@ pub struct ConstraintSystemBack<F: Field> {
     // larger amount than actually needed. This can be used, for example, to
     // force the permutation argument to involve more columns in the same set.
     pub(crate) minimum_degree: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Public accessor patch (halo2-solidity-verifier-exp)
+//
+// Upstream keeps every field of `ConstraintSystemBack` `pub(crate)` and gives
+// no read accessors, so downstream callers (Solidity codegen) can't walk the
+// constraint system to compute commitment counts, query layouts, or
+// permutation columns. This impl block adds the minimum read-only surface the
+// codegen needs. Nothing about ownership or mutation changes.
+// ---------------------------------------------------------------------------
+impl<F: Field> ConstraintSystemBack<F> {
+    /// Number of fixed columns (was `pub(crate)` field upstream).
+    pub fn num_fixed_columns(&self) -> usize {
+        self.num_fixed_columns
+    }
+
+    /// Number of advice columns.
+    pub fn num_advice_columns(&self) -> usize {
+        self.num_advice_columns
+    }
+
+    /// Number of instance columns.
+    pub fn num_instance_columns(&self) -> usize {
+        self.num_instance_columns
+    }
+
+    /// Number of challenges.
+    pub fn num_challenges(&self) -> usize {
+        self.num_challenges
+    }
+
+    /// Phase byte vector for advice columns (length = `num_advice_columns`).
+    pub fn advice_column_phase(&self) -> &[u8] {
+        &self.advice_column_phase
+    }
+
+    /// Phase byte vector for challenges (length = `num_challenges`).
+    pub fn challenge_phase(&self) -> &[u8] {
+        &self.challenge_phase
+    }
+
+    /// Advice queries: `(column, rotation)` pairs evaluated at proof time.
+    pub fn advice_queries(&self) -> &[(ColumnMid, Rotation)] {
+        &self.advice_queries
+    }
+
+    /// Fixed queries: `(column, rotation)` pairs evaluated at proof time.
+    pub fn fixed_queries(&self) -> &[(ColumnMid, Rotation)] {
+        &self.fixed_queries
+    }
+
+    /// Instance queries: `(column, rotation)` pairs evaluated at proof time.
+    pub fn instance_queries(&self) -> &[(ColumnMid, Rotation)] {
+        &self.instance_queries
+    }
+
+    /// The permutation argument (columns being permutation-checked).
+    pub fn permutation(&self) -> &PermutationArgumentBack {
+        &self.permutation
+    }
+
+    /// The lookup arguments configured on this circuit.
+    pub fn lookups(&self) -> &[LookupArgumentBack<F>] {
+        &self.lookups
+    }
+
+    /// The gate constraints of this circuit.
+    pub fn gates(&self) -> &[GateBack<F>] {
+        &self.gates
+    }
+
+    /// Maximum gate degree of the circuit.
+    pub fn degree_pub(&self) -> usize {
+        self.degree()
+    }
+
+    /// Number of blinding factors required by the prover.
+    pub fn blinding_factors_pub(&self) -> usize {
+        self.blinding_factors()
+    }
 }
 
 impl<F: Field> ConstraintSystemBack<F> {

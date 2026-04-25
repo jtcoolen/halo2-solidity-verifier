@@ -290,7 +290,7 @@ impl<'a> SolidityGenerator<'a> {
             // EIP-2537 padded encodings: G1 = 4 words, G2 = 8 words. The
             // BN254 32-byte coordinates are zero-extended to 48 bytes and
             // then split per EIP-2537. See bls_g1_pad_from_bn254_bytes.
-            let g1_pt = self.params.get_g()[0];
+            let g1_pt = self.params.g()[0];
             let g2_pt = self.params.g2();
             let neg_s_g2_pt = -self.params.s_g2();
             let g1 = bls_g1_pad_from_bn254_bytes(&g1_pt);

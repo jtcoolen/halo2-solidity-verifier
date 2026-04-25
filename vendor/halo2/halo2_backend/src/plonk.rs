@@ -23,7 +23,10 @@ pub(crate) use evaluation::Evaluator;
 
 use std::io;
 
-mod circuit;
+// Patched in halo2-solidity-verifier-exp: module promoted to `pub` so the
+// Solidity codegen can name `ConstraintSystemBack`, `ExpressionBack`,
+// `GateBack`, `VarBack`, `QueryBack`, etc. as concrete types.
+pub mod circuit;
 mod error;
 mod evaluation;
 pub mod keygen;

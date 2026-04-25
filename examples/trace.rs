@@ -115,13 +115,15 @@ fn create_proof_checked(
         transcript::TranscriptWriterBuffer,
     };
 
+    let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
+    let verifier_params = params.verifier_params();
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
         create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
-            &[&[instances]],
+            instances_owned.as_slice(),
             &mut rng,
             &mut transcript,
         )
@@ -132,10 +134,10 @@ fn create_proof_checked(
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
         verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
-            params,
+            &verifier_params,
             pk.get_vk(),
-            SingleStrategy::new(params),
-            &[&[instances]],
+            SingleStrategy::new(&verifier_params),
+            instances_owned.as_slice(),
             &mut transcript,
         )
     };
@@ -216,7 +218,7 @@ mod application {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<F>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let [q_l, q_r, q_o, q_m, q_c] = config.selectors;
             let [w_l, w_r, w_o] = config.wires;
             layouter.assign_region(
@@ -256,7 +258,7 @@ mod prelude {
         },
         plonk::{
             create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-            ConstraintSystem, Error, Fixed, ProvingKey,
+            ConstraintSystem, Error, ErrorFront, Fixed, ProvingKey,
         },
         poly::{kzg::commitment::ParamsKZG, Rotation},
     };

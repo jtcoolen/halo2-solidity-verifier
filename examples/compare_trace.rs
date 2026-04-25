@@ -179,29 +179,32 @@ struct TraceMeta {
 }
 
 impl TraceMeta {
-    fn new(cs: &ConstraintSystem<Fr>) -> Self {
+    // halo2 v0.4 splits the constraint system across the frontend
+    // (`ConstraintSystem<F>`) and the backend (`ConstraintSystemBack<F>`).
+    // VerifyingKey now exposes the backend variant via `vk.cs()`, so the
+    // trace metadata helpers walk that type. The accessors used to be
+    // private on upstream halo2_backend; the vendored copy under
+    // `vendor/halo2/` adds the public read-only getters we need.
+    fn new(cs: &ConstraintSystemBack<Fr>) -> Self {
         let advice_queries = cs.advice_queries();
         let fixed_queries = cs.fixed_queries();
         let num_lookup_permuteds = 2 * cs.lookups().len();
-        let num_permutation_zs = cs
-            .permutation()
-            .get_columns()
-            .chunks(cs.degree() - 2)
-            .count();
+        let permutation_cols = &cs.permutation().columns;
+        let num_permutation_zs = permutation_cols.chunks(cs.degree_pub() - 2).count();
         let num_lookup_zs = cs.lookups().len();
-        let num_quotients = cs.degree() - 1;
+        let num_quotients = cs.degree_pub() - 1;
         let num_evals = advice_queries.len()
             + fixed_queries.len()
             + 1
-            + cs.permutation().get_columns().len()
+            + permutation_cols.len()
             + (3 * num_permutation_zs - 1)
             + 5 * cs.lookups().len();
         let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
-        let remap_counts = |phase: Vec<u8>| {
+        let remap_counts = |phase: &[u8]| {
             phase
-                .into_iter()
-                .fold(vec![0; num_phase], |mut counts, phase| {
-                    counts[phase as usize] += 1;
+                .iter()
+                .fold(vec![0usize; num_phase], |mut counts, phase| {
+                    counts[*phase as usize] += 1;
                     counts
                 })
         };
@@ -225,7 +228,7 @@ impl TraceMeta {
             num_advices,
             num_challenges: num_user_challenges,
             num_evals,
-            rotation_last: -(cs.blinding_factors() as i32 + 1),
+            rotation_last: -(cs.blinding_factors_pub() as i32 + 1),
         }
     }
 }
@@ -300,13 +303,15 @@ fn create_proof_checked(
         transcript::TranscriptWriterBuffer,
     };
 
+    let instances_owned: Vec<Vec<Vec<Fr>>> = vec![vec![instances.to_vec()]];
+    let verifier_params = params.verifier_params();
     let proof = {
         let mut transcript = Keccak256Transcript::new(Vec::new());
         create_proof::<_, ProverSHPLONK<_>, _, _, _, _>(
             params,
             pk,
             &[circuit],
-            &[&[instances]],
+            instances_owned.as_slice(),
             &mut rng,
             &mut transcript,
         )
@@ -317,10 +322,10 @@ fn create_proof_checked(
     let result = {
         let mut transcript = Keccak256Transcript::new(proof.as_slice());
         verify_proof::<_, VerifierSHPLONK<_>, _, _, SingleStrategy<_>>(
-            params,
+            &verifier_params,
             pk.get_vk(),
-            SingleStrategy::new(params),
-            &[&[instances]],
+            SingleStrategy::new(&verifier_params),
+            instances_owned.as_slice(),
             &mut transcript,
         )
     };
@@ -401,7 +406,7 @@ mod application {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<F>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let [q_l, q_r, q_o, q_m, q_c] = config.selectors;
             let [w_l, w_r, w_o] = config.wires;
             layouter.assign_region(
@@ -441,10 +446,11 @@ mod prelude {
         },
         plonk::{
             create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-            ConstraintSystem, Error, Fixed, ProvingKey, VerifyingKey,
+            ConstraintSystem, Error, ErrorFront, Fixed, ProvingKey, VerifyingKey,
         },
         poly::{commitment::Params, kzg::commitment::ParamsKZG, Rotation},
     };
+    pub use halo2_backend::plonk::circuit::ConstraintSystemBack;
     pub use rand::{rngs::StdRng, RngCore, SeedableRng};
 
     pub fn seeded_std_rng() -> StdRng {
