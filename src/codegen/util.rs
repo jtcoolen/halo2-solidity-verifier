@@ -273,10 +273,9 @@ impl Data {
             .take(meta.num_lookup_zs)
             .collect();
         let random_comm = random_comm_start.into();
-        let computed_quotient_comm = EcPoint::new(
-            Ptr::memory("QUOTIENT_X_MPTR"),
-            Ptr::memory("QUOTIENT_Y_MPTR"),
-        );
+        // BLS layout: the computed quotient lives in a contiguous 4-word
+        // block starting at QUOTIENT_MPTR (x_hi, x_lo, y_hi, y_lo).
+        let computed_quotient_comm = EcPoint::new(Ptr::memory("QUOTIENT_MPTR"));
 
         let challenges = meta
             .challenge_indices
@@ -357,22 +356,29 @@ impl Location {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Value {
-    Integer(usize),
-    Identifier(&'static str),
+    /// Byte offset stored as signed so that the BLS code-gen can compute
+    /// `ptr - N` even when `N` exceeds the original offset (the result
+    /// only ever appears as `ptr_end` in `lt(ptr_end, ptr)` style loops
+    /// where any value strictly less than the smallest visited address is
+    /// acceptable).
+    Integer(isize),
+    /// A symbolic Yul identifier `name`, with an optional byte-offset that
+    /// will be rendered as `add(name, 0xNN)` (or just `name` when zero).
+    Identifier(&'static str, isize),
 }
 
 impl Value {
     pub(crate) fn is_integer(&self) -> bool {
         match self {
             Value::Integer(_) => true,
-            Value::Identifier(_) => false,
+            Value::Identifier(..) => false,
         }
     }
 
     pub(crate) fn as_usize(&self) -> usize {
         match self {
-            Value::Integer(int) => *int,
-            Value::Identifier(_) => unreachable!(),
+            Value::Integer(int) => *int as usize,
+            Value::Identifier(..) => unreachable!(),
         }
     }
 }
@@ -385,29 +391,38 @@ impl Default for Value {
 
 impl From<&'static str> for Value {
     fn from(ident: &'static str) -> Self {
-        Value::Identifier(ident)
+        Value::Identifier(ident, 0)
     }
 }
 
 impl From<usize> for Value {
     fn from(int: usize) -> Self {
-        Value::Integer(int)
+        Value::Integer(int as isize)
+    }
+}
+
+fn fmt_hex(off: isize) -> String {
+    let hex = format!("{:x}", off as usize);
+    if hex.len() % 2 == 1 {
+        format!("0x0{hex}")
+    } else {
+        format!("0x{hex}")
     }
 }
 
 impl Display for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Integer(int) => {
-                let hex = format!("{int:x}");
-                if hex.len() % 2 == 1 {
-                    write!(f, "0x0{hex}")
-                } else {
-                    write!(f, "0x{hex}")
-                }
+            Value::Integer(int) if *int >= 0 => write!(f, "{}", fmt_hex(*int)),
+            // Negative literal: render as `sub(0, +int)` to keep the EVM
+            // expression syntactically valid inside Yul.
+            Value::Integer(int) => write!(f, "sub(0, {})", fmt_hex(-*int)),
+            Value::Identifier(ident, 0) => write!(f, "{ident}"),
+            Value::Identifier(ident, off) if *off > 0 => {
+                write!(f, "add({ident}, {})", fmt_hex(*off))
             }
-            Value::Identifier(ident) => {
-                write!(f, "{ident}")
+            Value::Identifier(ident, off) => {
+                write!(f, "sub({ident}, {})", fmt_hex(-*off))
             }
         }
     }
@@ -417,7 +432,12 @@ impl Add<usize> for Value {
     type Output = Value;
 
     fn add(self, rhs: usize) -> Self::Output {
-        (self.as_usize() + rhs * 0x20).into()
+        match self {
+            Value::Integer(int) => Value::Integer(int + (rhs as isize) * 0x20),
+            Value::Identifier(name, off) => {
+                Value::Identifier(name, off + (rhs as isize) * 0x20)
+            }
+        }
     }
 }
 
@@ -425,7 +445,12 @@ impl Sub<usize> for Value {
     type Output = Value;
 
     fn sub(self, rhs: usize) -> Self::Output {
-        (self.as_usize() - rhs * 0x20).into()
+        match self {
+            Value::Integer(int) => Value::Integer(int - (rhs as isize) * 0x20),
+            Value::Identifier(name, off) => {
+                Value::Identifier(name, off - (rhs as isize) * 0x20)
+            }
+        }
     }
 }
 
@@ -517,50 +542,71 @@ impl From<Ptr> for Word {
     }
 }
 
+/// A G1 point in the EIP-2537 padded layout: four EVM words at
+/// `(base + 0, base + 1, base + 2, base + 3)` carrying
+/// `(x_hi, x_lo, y_hi, y_lo)` respectively. Each Fp coordinate is 64 bytes
+/// (16 zero-byte prefix + 48 byte value), and `EcPoint::range` therefore
+/// strides 4 words between consecutive points instead of the BN254-era 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EcPoint {
-    x: Word,
-    y: Word,
+    base: Ptr,
 }
 
 impl EcPoint {
-    pub(crate) fn new(x: impl Into<Word>, y: impl Into<Word>) -> Self {
-        Self {
-            x: x.into(),
-            y: y.into(),
-        }
+    pub(crate) fn new(base: impl Into<Ptr>) -> Self {
+        Self { base: base.into() }
     }
 
-    pub(crate) fn range(ec_point: impl Into<EcPoint>) -> impl Iterator<Item = EcPoint> {
-        // BLS12-381 EIP-2537 G1 = 4 words; the BN254-era stride of 2 is
-        // wrong here. NOTE: `EcPoint` itself still tracks only `x`/`y` as
-        // single words, which makes the in-EVM modular-arithmetic Yul
-        // emitted from `pcs/{bdfg21,gwc19}.rs` semantically incorrect for
-        // BLS12-381 (Fp is 381 bits and won't fit in a single u256). The
-        // BLS port is *layout-correct* but those pcs blocks still need a
-        // dedicated rewrite to call EIP-2537 precompiles instead of doing
-        // Fp arithmetic in EVM. See PORTING_NOTES.md.
-        let ptr = ec_point.into().x.ptr();
-        (0..).map(move |idx| ptr + 4 * idx).map_into()
+    /// Iterate G1 points starting at the given base, advancing by 4 words.
+    pub(crate) fn range(base: impl Into<EcPoint>) -> impl Iterator<Item = EcPoint> {
+        let base = base.into().base;
+        (0..).map(move |idx| EcPoint::new(base + 4 * idx))
     }
 
     pub(crate) fn loc(&self) -> Location {
-        self.x.ptr().loc()
+        self.base.loc()
     }
 
-    pub(crate) fn x(&self) -> Word {
-        self.x
+    /// Pointer to the first word of the point (= the `x_hi` slot).
+    pub(crate) fn ptr(&self) -> Ptr {
+        self.base
     }
 
-    pub(crate) fn y(&self) -> Word {
-        self.y
+    pub(crate) fn x_hi(&self) -> Word {
+        Word::from(self.base)
+    }
+    pub(crate) fn x_lo(&self) -> Word {
+        Word::from(self.base + 1)
+    }
+    pub(crate) fn y_hi(&self) -> Word {
+        Word::from(self.base + 2)
+    }
+    pub(crate) fn y_lo(&self) -> Word {
+        Word::from(self.base + 3)
+    }
+
+    /// Returns the four words (x_hi, x_lo, y_hi, y_lo) in EIP-2537 order.
+    pub(crate) fn words(&self) -> [Word; 4] {
+        [self.x_hi(), self.x_lo(), self.y_hi(), self.y_lo()]
     }
 }
 
 impl From<Ptr> for EcPoint {
     fn from(ptr: Ptr) -> Self {
-        Self::new(ptr, ptr + 1)
+        Self::new(ptr)
     }
+}
+
+/// Emit four `mstore`s copying a 4-word G1 point from `src` (in calldata or
+/// memory) into the contiguous memory range starting at `dst_base`.
+pub(crate) fn copy_g1_point(dst_base: Ptr, src: &EcPoint) -> [String; 4] {
+    let [x_hi, x_lo, y_hi, y_lo] = src.words();
+    [
+        format!("mstore({}, {x_hi})", dst_base),
+        format!("mstore({}, {x_lo})", dst_base + 1),
+        format!("mstore({}, {y_hi})", dst_base + 2),
+        format!("mstore({}, {y_lo})", dst_base + 3),
+    ]
 }
 
 /// Add indention to given lines by `4 * N` spaces.
@@ -634,14 +680,17 @@ pub(crate) fn group_backward_adjacent_words<'a>(
 pub(crate) fn group_backward_adjacent_ec_points<'a>(
     ec_point: impl IntoIterator<Item = &'a EcPoint>,
 ) -> Vec<(Location, Vec<&'a EcPoint>)> {
+    // BLS12-381 EIP-2537 stride is 4 words per G1 point, so two points are
+    // backward-adjacent when their bases differ by exactly 4 (one EcPoint
+    // step).
     ec_point
         .into_iter()
         .fold(Vec::new(), |mut ec_point_groups, ec_point| {
             if let Some(last_group) = ec_point_groups.last_mut() {
                 let last_ec_point = **last_group.1.last().unwrap();
                 if last_group.0 == ec_point.loc()
-                    && last_ec_point.x().ptr().value().is_integer()
-                    && last_ec_point.x().ptr() - 2 == ec_point.x().ptr()
+                    && last_ec_point.ptr().value().is_integer()
+                    && last_ec_point.ptr() - 4 == ec_point.ptr()
                 {
                     last_group.1.push(ec_point)
                 } else {

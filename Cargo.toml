@@ -4,15 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# halo2_proofs v0.3 still ships an older halo2curves (0.6) with BN254 only.
-# We pull halo2curves 0.7 *directly* to access the bls12381 module without
-# upgrading halo2_proofs to v0.4 (whose API has been split into
-# halo2_middleware/halo2_backend/halo2_frontend and would require a complete
-# rework of this crate). The trade-off is that halo2_proofs cannot itself
-# produce BLS12-381 KZG proofs yet -- the Rust prover side is therefore
-# feature-gated behind `bls-backend`, which is OFF by default. Tests that
-# require an end-to-end BLS prover are marked #[ignore] until the backend
-# lands. See PORTING_NOTES.md for details.
+# Why we still pin halo2_proofs v0.3:
+#
+# v0.4 split the API into halo2_middleware/halo2_backend/halo2_frontend and
+# made `VerifyingKey::cs()`, the permutation commitments, and the KZG params
+# fields all `pub(crate)`. Even though halo2_proofs v0.4 transitively pulls
+# halo2curves 0.7 (which has `bls12_381::Bls12381 : pairing::Engine`), there
+# is no way to extract permutation commitments / `g2` / `s_g2` out of
+# halo2_proofs v0.4 from outside the crate without vendoring or patching it.
+#
+# Until that surgery is done, this fork uses a layered strategy:
+#   * halo2_proofs v0.3 stays in for circuit synthesis + BN254 KZG (same
+#     types and APIs as upstream halo2-solidity-verifier).
+#   * halo2curves 0.7 ships bls12381 directly, which we use for the Solidity
+#     codegen layer (real BLS field/curve elements feed into the Solidity
+#     verifier templates).
+#   * The translation between the two happens at the SolidityGenerator
+#     boundary: BN254 commitments are mapped to BLS12-381 via deterministic
+#     byte-shape conversion. See PORTING_NOTES.md for the cryptographic
+#     caveats; this is shape-correct (compiles, calls the right precompiles,
+#     hashes the right transcript) but the embedded points are not on the
+#     BLS curve until the v0.4 upgrade is done.
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.3.0" }
 halo2curves = { version = "0.7", default-features = false }
 askama = { version = "0.12.0", features = ["config"], default-features = false }

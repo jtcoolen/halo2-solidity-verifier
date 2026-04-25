@@ -22,8 +22,9 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
     let max_rot = *superset.last().unwrap();
     let num_coeffs = sets.iter().map(|set| set.rots().len()).sum::<usize>();
 
+    // Each G1 point is a 4-word EIP-2537 quad in calldata.
     let w = EcPoint::from(data.w_cptr);
-    let w_prime = EcPoint::from(data.w_cptr + 2);
+    let w_prime = EcPoint::from(data.w_cptr + 4);
 
     let diff_0 = Word::from(Ptr::memory(0x00));
     let coeffs = sets
@@ -311,24 +312,66 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
     ]
     .collect_vec();
 
+    // -----------------------------------------------------------------
+    // BLS12-381 / EIP-2537 pairing-input emission.
+    //
+    // Each G1 point is 4 words (x_hi, x_lo, y_hi, y_lo). The runtime EVM
+    // helpers in Halo2Verifier.sol expect:
+    //
+    //   ec_add_acc(success):
+    //     reads acc      from 0x00..0x80
+    //     reads operand  from 0x80..0x100
+    //     writes acc     to   0x00..0x80
+    //   ec_mul_acc(success, scalar):
+    //     reads acc      from 0x00..0x80
+    //     puts scalar    at   0x80
+    //     writes acc     to   0x00..0x80
+    //   ec_add_tmp / ec_mul_tmp: same shape shifted by 0x80.
+    //
+    // So when we want to fold a commitment `C` into ACC we mstore the four
+    // words of `C` to 0x80..0x100 and call `ec_add_acc(success)`. For the
+    // TMP-track the operand goes to 0x100..0x180 and we call
+    // `ec_add_tmp(success)`.
+    // -----------------------------------------------------------------
     let pairing_input_computations = chain![
         ["let zeta := mload(ZETA_MPTR)", "let nu := mload(NU_MPTR)"].map(str::to_string),
         izip!(0.., &sets, &diffs).flat_map(|(set_idx, set, set_coeff)| {
             let is_first_set = set_idx == 0;
             let is_last_set = set_idx == sets.len() - 1;
-            let ec_add = &format!("ec_add_{}", if is_first_set { "acc" } else { "tmp" });
-            let ec_mul = &format!("ec_mul_{}", if is_first_set { "acc" } else { "tmp" });
-            let acc_x = Ptr::memory(0x00) + if is_first_set { 0 } else { 4 };
-            let acc_y = acc_x + 1;
+            let track = if is_first_set { "acc" } else { "tmp" };
+            let ec_add = format!("ec_add_{track}");
+            let ec_mul = format!("ec_mul_{track}");
+            // Accumulator base: ACC slot at 0x00 for the first set, TMP slot
+            // at 0x80 for the rest. The matching operand slot is one slot
+            // further along (0x80 / 0x100 respectively).
+            let acc_base = Ptr::memory(0x00) + if is_first_set { 0 } else { 4 };
+            let operand_base = acc_base + 4;
             let comm_groups = group_backward_adjacent_ec_points(set.comms().iter().rev().skip(1));
 
+            // Closure: emit the four mstores moving a commitment word-quad
+            // (in calldata or memory) into the operand slot at `operand_base`.
+            let emit_mstore_words = |comm: &EcPoint| {
+                let words = comm.words();
+                [
+                    format!("mstore({}, {})", operand_base, words[0]),
+                    format!("mstore({}, {})", operand_base + 1, words[1]),
+                    format!("mstore({}, {})", operand_base + 2, words[2]),
+                    format!("mstore({}, {})", operand_base + 3, words[3]),
+                ]
+            };
+
             chain![
+                // Seed the running accumulator with the last commitment of the
+                // set: just write its four words to the accumulator slot.
                 set.comms()
                     .last()
                     .map(|comm| {
+                        let words = comm.words();
                         [
-                            format!("mstore({acc_x}, {})", comm.x()),
-                            format!("mstore({acc_y}, {})", comm.y()),
+                            format!("mstore({}, {})", acc_base, words[0]),
+                            format!("mstore({}, {})", acc_base + 1, words[1]),
+                            format!("mstore({}, {})", acc_base + 2, words[2]),
+                            format!("mstore({}, {})", acc_base + 3, words[3]),
                         ]
                     })
                     .into_iter()
@@ -338,28 +381,45 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                         comms
                             .iter()
                             .flat_map(|comm| {
-                                let (x, y) = (comm.x(), comm.y());
-                                [
-                                    format!("success := {ec_mul}(success, zeta)"),
-                                    format!("success := {ec_add}(success, {x}, {y})"),
+                                chain![
+                                    [format!("success := {ec_mul}(success, zeta)")],
+                                    emit_mstore_words(comm),
+                                    [format!("success := {ec_add}(success)")],
                                 ]
+                                .collect_vec()
                             })
                             .collect_vec()
                     } else {
-                        let ptr = comms.first().unwrap().x().ptr();
-                        let ptr_end = ptr - 2 * comms.len();
-                        let x = Word::from(Ptr::new(loc, "ptr"));
-                        let y = Word::from(Ptr::new(loc, "add(ptr, 0x20)"));
+                        // Stride between commitments is 4 words = 0x80 bytes.
+                        let ptr = comms.first().unwrap().ptr();
+                        let ptr_end = ptr - 4 * comms.len();
+                        let opcode = match loc {
+                            Location::Calldata => "calldataload",
+                            Location::Memory => "mload",
+                        };
                         for_loop(
                             [
                                 format!("let ptr := {ptr}"),
                                 format!("let ptr_end := {ptr_end}"),
                             ],
                             "lt(ptr_end, ptr)",
-                            ["ptr := sub(ptr, 0x40)"],
+                            ["ptr := sub(ptr, 0x80)"],
                             [
                                 format!("success := {ec_mul}(success, zeta)"),
-                                format!("success := {ec_add}(success, {x}, {y})"),
+                                format!("mstore({}, {opcode}(ptr))", operand_base),
+                                format!(
+                                    "mstore({}, {opcode}(add(ptr, 0x20)))",
+                                    operand_base + 1
+                                ),
+                                format!(
+                                    "mstore({}, {opcode}(add(ptr, 0x40)))",
+                                    operand_base + 2
+                                ),
+                                format!(
+                                    "mstore({}, {opcode}(add(ptr, 0x60)))",
+                                    operand_base + 3
+                                ),
+                                format!("success := {ec_add}(success)"),
                             ],
                         )
                     }
@@ -367,11 +427,15 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 (!is_first_set)
                     .then(|| {
                         let scalar = format!("mulmod(nu, {set_coeff}, r)");
+                        // After folding the TMP-track set into a single G1
+                        // (in TMP slot 0x80..0x100), multiply by the
+                        // composite nu*set_coeff and add into ACC.
                         chain![
-                            [
-                                format!("success := ec_mul_tmp(success, {scalar})"),
-                                format!("success := ec_add_acc(success, mload(0x80), mload(0xa0))"),
-                            ],
+                            [format!("success := ec_mul_tmp(success, {scalar})")],
+                            // ec_add_acc reads operand from 0x80..0x100, which
+                            // is exactly where TMP already lives -- no copy
+                            // needed.
+                            [format!("success := ec_add_acc(success)")],
                             (!is_last_set).then(|| format!("nu := mulmod(nu, mload(NU_MPTR), r)"))
                         ]
                     })
@@ -380,23 +444,53 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             ]
             .collect_vec()
         }),
-        [
-            format!("mstore(0x80, mload(G1_X_MPTR))"),
-            format!("mstore(0xa0, mload(G1_Y_MPTR))"),
-            format!("success := ec_mul_tmp(success, mload(G1_SCALAR_MPTR))"),
-            format!("success := ec_add_acc(success, mload(0x80), mload(0xa0))"),
-            format!("mstore(0x80, {})", w.x()),
-            format!("mstore(0xa0, {})", w.y()),
-            format!("success := ec_mul_tmp(success, sub(r, {vanishing_0}))"),
-            format!("success := ec_add_acc(success, mload(0x80), mload(0xa0))"),
-            format!("mstore(0x80, {})", w_prime.x()),
-            format!("mstore(0xa0, {})", w_prime.y()),
-            format!("success := ec_mul_tmp(success, mload(MU_MPTR))"),
-            format!("success := ec_add_acc(success, mload(0x80), mload(0xa0))"),
-            format!("mstore(PAIRING_LHS_X_MPTR, mload(0x00))"),
-            format!("mstore(PAIRING_LHS_Y_MPTR, mload(0x20))"),
-            format!("mstore(PAIRING_RHS_X_MPTR, {})", w_prime.x()),
-            format!("mstore(PAIRING_RHS_Y_MPTR, {})", w_prime.y()),
+        // ----- Final mix-in steps. Each step loads a G1 point into TMP
+        //       (0x80..0x100), multiplies by a scalar, then adds into ACC.
+        chain![
+            // + G1_BASE * G1_SCALAR
+            [
+                format!("mstore(0x80, mload(G1_BASE_MPTR))"),
+                format!("mstore(0xa0, mload(add(G1_BASE_MPTR, 0x20)))"),
+                format!("mstore(0xc0, mload(add(G1_BASE_MPTR, 0x40)))"),
+                format!("mstore(0xe0, mload(add(G1_BASE_MPTR, 0x60)))"),
+                format!("success := ec_mul_tmp(success, mload(G1_SCALAR_MPTR))"),
+                format!("success := ec_add_acc(success)"),
+            ],
+            // + (-vanishing_0) * W
+            {
+                let w_words = w.words();
+                [
+                    format!("mstore(0x80, {})", w_words[0]),
+                    format!("mstore(0xa0, {})", w_words[1]),
+                    format!("mstore(0xc0, {})", w_words[2]),
+                    format!("mstore(0xe0, {})", w_words[3]),
+                    format!("success := ec_mul_tmp(success, sub(r, {vanishing_0}))"),
+                    format!("success := ec_add_acc(success)"),
+                ]
+            },
+            // + mu * W'
+            {
+                let wp_words = w_prime.words();
+                [
+                    format!("mstore(0x80, {})", wp_words[0]),
+                    format!("mstore(0xa0, {})", wp_words[1]),
+                    format!("mstore(0xc0, {})", wp_words[2]),
+                    format!("mstore(0xe0, {})", wp_words[3]),
+                    format!("success := ec_mul_tmp(success, mload(MU_MPTR))"),
+                    format!("success := ec_add_acc(success)"),
+                ]
+            },
+            // Persist ACC as PAIRING_LHS (4 words) and W' as PAIRING_RHS.
+            [
+                format!("mstore(PAIRING_LHS_MPTR, mload(0x00))"),
+                format!("mstore(add(PAIRING_LHS_MPTR, 0x20), mload(0x20))"),
+                format!("mstore(add(PAIRING_LHS_MPTR, 0x40), mload(0x40))"),
+                format!("mstore(add(PAIRING_LHS_MPTR, 0x60), mload(0x60))"),
+                format!("mstore(PAIRING_RHS_MPTR, {})", w_prime.x_hi()),
+                format!("mstore(add(PAIRING_RHS_MPTR, 0x20), {})", w_prime.x_lo()),
+                format!("mstore(add(PAIRING_RHS_MPTR, 0x40), {})", w_prime.y_hi()),
+                format!("mstore(add(PAIRING_RHS_MPTR, 0x60), {})", w_prime.y_lo()),
+            ],
         ],
     ]
     .collect_vec();

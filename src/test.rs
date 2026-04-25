@@ -25,6 +25,46 @@ fn function_signature() {
     );
 }
 
+/// Codegen-only smoke test: generate Solidity for both BDFG21 and GWC19 with
+/// each render mode (embedded VK and separately). Doesn't execute the EVM
+/// because the bundled `revm` doesn't ship the EIP-2537 precompiles, but it
+/// does flush the codegen pipeline through both PCS emitters and asserts
+/// the resulting strings reference the BLS-specific helpers.
+#[test]
+fn render_smoke_bls_bdfg21_and_gwc19_codegen() {
+    use halo2_proofs::{
+        halo2curves::bn256::Bn256, plonk::keygen_vk, poly::kzg::commitment::ParamsKZG,
+    };
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use crate::{test::halo2::TestCircuit, SolidityGenerator};
+
+    let mut rng = StdRng::seed_from_u64(0xcafebabe);
+    let circuit = halo2::huge::HugeCircuit::<Bn256>::new(None, &mut rng);
+    let params = ParamsKZG::<Bn256>::setup(8, &mut rng);
+    let vk = keygen_vk(&params, &circuit).unwrap();
+
+    for scheme in [Bdfg21, Gwc19] {
+        let gen = SolidityGenerator::new(&params, &vk, scheme, 1);
+        let inline_sol = gen.render().expect("inline render");
+        assert!(inline_sol.contains("ec_pairing"), "inline must use BLS pairing helper");
+        // BLS-specific Yul markers we should always emit from both PCS
+        // emitters (precompile addresses 0x0b/0x0c/0x0f).
+        assert!(
+            inline_sol.contains("0x0b") && inline_sol.contains("0x0c") && inline_sol.contains("0x0f"),
+            "inline must reference EIP-2537 precompile addresses 0x0b/0x0c/0x0f"
+        );
+
+        let gen = SolidityGenerator::new(&params, &vk, scheme, 1);
+        let (verifier_sol, vk_sol) = gen.render_separately().expect("separate render");
+        assert!(
+            verifier_sol.contains("PAIRING_LHS_MPTR"),
+            "separate verifier must reference PAIRING_LHS_MPTR"
+        );
+        assert!(!vk_sol.is_empty());
+    }
+}
+
 // All `render_*` tests below produce a Solidity verifier and call it inside
 // an embedded EVM. After the BLS12-381 / EIP-2537 port the Solidity uses
 // precompiles 0x0b/0x0c/0x0f which our embedded EVM doesn't ship, AND the
