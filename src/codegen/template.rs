@@ -6,26 +6,38 @@ use askama::{Error, Template};
 use ruint::aliases::U256;
 use std::fmt;
 
+/// G1 point in EIP-2537 padded encoding: (x_hi, x_lo, y_hi, y_lo).
+pub(crate) type G1Words = (U256, U256, U256, U256);
+
 #[derive(Template)]
 #[template(path = "Halo2VerifyingKey.sol")]
 pub(crate) struct Halo2VerifyingKey {
     pub(crate) constants: Vec<(&'static str, U256)>,
-    pub(crate) fixed_comms: Vec<(U256, U256)>,
-    pub(crate) permutation_comms: Vec<(U256, U256)>,
+    pub(crate) fixed_comms: Vec<G1Words>,
+    pub(crate) permutation_comms: Vec<G1Words>,
 }
 
 impl Halo2VerifyingKey {
     pub(crate) fn len(&self) -> usize {
+        // 32 bytes per scalar constant + 128 bytes per G1 point (EIP-2537 padded).
         (self.constants.len() * 0x20)
-            + (self.fixed_comms.len() + self.permutation_comms.len()) * 0x40
+            + (self.fixed_comms.len() + self.permutation_comms.len()) * 0x80
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
         self.constants
             .iter()
             .map(|(_, value)| *value)
-            .chain(self.fixed_comms.iter().flat_map(|(x, y)| [*x, *y]))
-            .chain(self.permutation_comms.iter().flat_map(|(x, y)| [*x, *y]))
+            .chain(
+                self.fixed_comms
+                    .iter()
+                    .flat_map(|(a, b, c, d)| [*a, *b, *c, *d]),
+            )
+            .chain(
+                self.permutation_comms
+                    .iter()
+                    .flat_map(|(a, b, c, d)| [*a, *b, *c, *d]),
+            )
             .flat_map(|value| value.to_be_bytes::<32>())
             .collect()
     }

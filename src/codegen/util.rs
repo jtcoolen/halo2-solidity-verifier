@@ -2,10 +2,13 @@ use crate::codegen::{
     template::Halo2VerifyingKey,
     BatchOpenScheme::{self, Bdfg21, Gwc19},
 };
-use halo2_proofs::{
-    halo2curves::{bn256, ff::PrimeField, CurveAffine},
-    plonk::{Any, Column, ConstraintSystem},
-};
+// IMPORTANT: bn256 must come from halo2_proofs (which transitively uses
+// halo2curves 0.6) so the types unify with the rest of the codebase. We pull
+// the bls12_381 module separately from halo2curves 0.7+, where it's exposed
+// as `bls12381` (note: no underscore in 0.7).
+use halo2_proofs::halo2curves::{bn256, ff::PrimeField, CurveAffine};
+use halo2curves::bls12381 as bls12_381;
+use halo2_proofs::plonk::{Any, Column, ConstraintSystem};
 use itertools::{chain, izip, Itertools};
 use ruint::{aliases::U256, UintTryFrom};
 use std::{
@@ -170,7 +173,9 @@ impl ConstraintSystemMeta {
     }
 
     pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
-        self.num_advices().iter().sum::<usize>() * 0x40
+        // Each G1 commitment in the proof is 128 bytes (EIP-2537 padded
+        // BLS12-381 G1 = 4 words). Scalar evals stay at 32 bytes.
+        self.num_advices().iter().sum::<usize>() * 0x80
             + self.num_evals * 0x20
             + self.batch_open_proof_len(scheme)
     }
@@ -179,7 +184,7 @@ impl ConstraintSystemMeta {
         (match scheme {
             Bdfg21 => 2,
             Gwc19 => self.num_rotations,
-        }) * 0x40
+        }) * 0x80
     }
 }
 
@@ -220,19 +225,21 @@ impl Data {
         vk_mptr: Ptr,
         proof_cptr: Ptr,
     ) -> Self {
+        // BLS12-381 G1 commitments occupy 4 words (EIP-2537 padded), so the
+        // stride between consecutive points is 4 instead of the BN254-era 2.
         let fixed_comm_mptr = vk_mptr + vk.constants.len();
-        let permutation_comm_mptr = fixed_comm_mptr + 2 * vk.fixed_comms.len();
-        let challenge_mptr = permutation_comm_mptr + 2 * vk.permutation_comms.len();
+        let permutation_comm_mptr = fixed_comm_mptr + 4 * vk.fixed_comms.len();
+        let challenge_mptr = permutation_comm_mptr + 4 * vk.permutation_comms.len();
         let theta_mptr = challenge_mptr + meta.challenge_indices.len();
 
         let advice_comm_start = proof_cptr;
-        let lookup_permuted_comm_start = advice_comm_start + 2 * meta.advice_indices.len();
-        let permutation_z_comm_start = lookup_permuted_comm_start + 2 * meta.num_lookup_permuteds;
-        let lookup_z_comm_start = permutation_z_comm_start + 2 * meta.num_permutation_zs;
-        let random_comm_start = lookup_z_comm_start + 2 * meta.num_lookup_zs;
-        let quotient_comm_start = random_comm_start + 2;
+        let lookup_permuted_comm_start = advice_comm_start + 4 * meta.advice_indices.len();
+        let permutation_z_comm_start = lookup_permuted_comm_start + 4 * meta.num_lookup_permuteds;
+        let lookup_z_comm_start = permutation_z_comm_start + 4 * meta.num_permutation_zs;
+        let random_comm_start = lookup_z_comm_start + 4 * meta.num_lookup_zs;
+        let quotient_comm_start = random_comm_start + 4;
 
-        let eval_cptr = quotient_comm_start + 2 * meta.num_quotients;
+        let eval_cptr = quotient_comm_start + 4 * meta.num_quotients;
         let advice_eval_cptr = eval_cptr;
         let fixed_eval_cptr = advice_eval_cptr + meta.advice_queries.len();
         let random_eval_cptr = fixed_eval_cptr + meta.fixed_queries.len();
@@ -252,7 +259,7 @@ impl Data {
         let advice_comms = meta
             .advice_indices
             .iter()
-            .map(|idx| advice_comm_start + 2 * idx)
+            .map(|idx| advice_comm_start + 4 * idx)
             .map_into()
             .collect();
         let lookup_permuted_comms = EcPoint::range(lookup_permuted_comm_start)
@@ -525,8 +532,16 @@ impl EcPoint {
     }
 
     pub(crate) fn range(ec_point: impl Into<EcPoint>) -> impl Iterator<Item = EcPoint> {
+        // BLS12-381 EIP-2537 G1 = 4 words; the BN254-era stride of 2 is
+        // wrong here. NOTE: `EcPoint` itself still tracks only `x`/`y` as
+        // single words, which makes the in-EVM modular-arithmetic Yul
+        // emitted from `pcs/{bdfg21,gwc19}.rs` semantically incorrect for
+        // BLS12-381 (Fp is 381 bits and won't fit in a single u256). The
+        // BLS port is *layout-correct* but those pcs blocks still need a
+        // dedicated rewrite to call EIP-2537 precompiles instead of doing
+        // Fp arithmetic in EVM. See PORTING_NOTES.md.
         let ptr = ec_point.into().x.ptr();
-        (0..).map(move |idx| ptr + 2 * idx).map_into()
+        (0..).map(move |idx| ptr + 4 * idx).map_into()
     }
 
     pub(crate) fn loc(&self) -> Location {
@@ -639,21 +654,128 @@ pub(crate) fn group_backward_adjacent_ec_points<'a>(
         })
 }
 
-pub(crate) fn g1_to_u256s(ec_point: impl Borrow<bn256::G1Affine>) -> [U256; 2] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    [coords.x(), coords.y()].map(fq_to_u256)
+// ----------------------------------------------------------------------------
+// BLS12-381 EIP-2537 encoding helpers.
+//
+// EIP-2537 encodes each Fp coordinate as 64 bytes: 16 leading zero bytes
+// followed by 48 bytes of value (big-endian). A G1 point therefore occupies
+// 128 bytes = 4 u256 words: (x_hi, x_lo, y_hi, y_lo) where hi has 16 zero
+// MSBs. A G2 point occupies 256 bytes = 8 words; the c0/c1 ordering matches
+// EIP-2537 (X.c0, X.c1, Y.c0, Y.c1).
+//
+// We provide two flavours of helper:
+//   * `g1_to_u256s` / `g2_to_u256s` -- take *real* BLS12-381 curve points
+//     (from halo2curves 0.7) and emit the proper EIP-2537 layout. These will
+//     be used once a halo2 KZG-BLS prover backend is wired in.
+//   * `bls_g1_pad_from_bn254_bytes` / `bls_g2_pad_from_bn254_bytes` -- take
+//     a halo2_proofs v0.3 BN254 point and zero-extend its 32-byte coordinates
+//     to 48 bytes before splitting. The resulting bytes are NOT valid BLS
+//     curve points (different field, different curve equation); they exist
+//     only so the BN254-flavoured codegen pipeline can keep producing
+//     calldata-shape-correct Solidity verifiers.
+// ----------------------------------------------------------------------------
+
+/// Convert a 48-byte big-endian Fp limb into the EIP-2537 (hi, lo) split.
+fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
+    debug_assert_eq!(be.len(), 48);
+    let mut hi_bytes = [0u8; 32];
+    hi_bytes[16..].copy_from_slice(&be[..16]);
+    let mut lo_bytes = [0u8; 32];
+    lo_bytes.copy_from_slice(&be[16..]);
+    (
+        U256::from_be_bytes(hi_bytes),
+        U256::from_be_bytes(lo_bytes),
+    )
 }
 
-pub(crate) fn g2_to_u256s(ec_point: impl Borrow<bn256::G2Affine>) -> [U256; 4] {
+fn bn254_fq_to_be48(fe: &bn256::Fq) -> [u8; 48] {
+    // BN254 Fq is 254 bits (32 bytes LE). To re-shape into the BLS12-381
+    // 48-byte slot we left-pad with 16 zero bytes after big-endianifying.
+    let le = fe.to_repr();
+    let mut be32 = [0u8; 32];
+    be32.copy_from_slice(le.as_ref());
+    be32.reverse();
+    let mut be48 = [0u8; 48];
+    be48[16..].copy_from_slice(&be32);
+    be48
+}
+
+/// Encode a BLS12-381 G1 point in EIP-2537 padded form (4 u256 words).
+pub(crate) fn g1_to_u256s(ec_point: impl Borrow<bls12_381::G1Affine>) -> [U256; 4] {
     let coords = ec_point.borrow().coordinates().unwrap();
-    let x = coords.x().to_repr();
-    let y = coords.y().to_repr();
-    [
-        U256::try_from_le_slice(&x.as_ref()[0x20..]).unwrap(),
-        U256::try_from_le_slice(&x.as_ref()[..0x20]).unwrap(),
-        U256::try_from_le_slice(&y.as_ref()[0x20..]).unwrap(),
-        U256::try_from_le_slice(&y.as_ref()[..0x20]).unwrap(),
-    ]
+    let x_repr = coords.x().to_repr();
+    let y_repr = coords.y().to_repr();
+    let mut x_be = [0u8; 48];
+    x_be.copy_from_slice(x_repr.as_ref());
+    x_be.reverse();
+    let mut y_be = [0u8; 48];
+    y_be.copy_from_slice(y_repr.as_ref());
+    y_be.reverse();
+    let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
+    let (y_hi, y_lo) = fp48_be_to_hi_lo(&y_be);
+    [x_hi, x_lo, y_hi, y_lo]
+}
+
+/// Encode a BLS12-381 G2 point in EIP-2537 padded form (8 u256 words).
+pub(crate) fn g2_to_u256s(ec_point: impl Borrow<bls12_381::G2Affine>) -> [U256; 8] {
+    let coords = ec_point.borrow().coordinates().unwrap();
+    // halo2curves 0.7 hides Fq2.c0 / Fq2.c1 behind a private field; use the
+    // public `to_bytes()` helper which emits 96 LE bytes = (c0_le || c1_le).
+    let x_bytes: [u8; 96] = coords.x().to_bytes();
+    let y_bytes: [u8; 96] = coords.y().to_bytes();
+    let to_be = |le: &[u8]| {
+        let mut be = [0u8; 48];
+        be.copy_from_slice(le);
+        be.reverse();
+        be
+    };
+    let xc0 = to_be(&x_bytes[..48]);
+    let xc1 = to_be(&x_bytes[48..]);
+    let yc0 = to_be(&y_bytes[..48]);
+    let yc1 = to_be(&y_bytes[48..]);
+    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&xc0);
+    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&xc1);
+    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&yc0);
+    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&yc1);
+    [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
+}
+
+/// Shape-only conversion: takes a BN254 G1 point, zero-extends its 32-byte
+/// coordinates to 48 bytes, and returns the EIP-2537 4-word layout. NOT a
+/// valid BLS curve point.
+pub(crate) fn bls_g1_pad_from_bn254_bytes(
+    ec_point: impl Borrow<bn256::G1Affine>,
+) -> [U256; 4] {
+    let coords = ec_point.borrow().coordinates().unwrap();
+    let x_be = bn254_fq_to_be48(coords.x());
+    let y_be = bn254_fq_to_be48(coords.y());
+    let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
+    let (y_hi, y_lo) = fp48_be_to_hi_lo(&y_be);
+    [x_hi, x_lo, y_hi, y_lo]
+}
+
+/// Shape-only conversion: takes a BN254 G2 point and produces the EIP-2537
+/// 8-word layout. See `bls_g1_pad_from_bn254_bytes` for caveats.
+pub(crate) fn bls_g2_pad_from_bn254_bytes(
+    ec_point: impl Borrow<bn256::G2Affine>,
+) -> [U256; 8] {
+    let coords = ec_point.borrow().coordinates().unwrap();
+    // halo2curves 0.6 bn256::Fq2 has c0/c1; EIP-2537 expects c0 first.
+    let xc0 = bn254_fq_to_be48(&coords.x().c0);
+    let xc1 = bn254_fq_to_be48(&coords.x().c1);
+    let yc0 = bn254_fq_to_be48(&coords.y().c0);
+    let yc1 = bn254_fq_to_be48(&coords.y().c1);
+    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&xc0);
+    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&xc1);
+    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&yc0);
+    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&yc1);
+    [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
+}
+
+/// Legacy BN254 G1 helper kept for callers that still want the 2-word layout.
+pub(crate) fn bn256_g1_to_u256s(ec_point: impl Borrow<bn256::G1Affine>) -> [U256; 2] {
+    let coords = ec_point.borrow().coordinates().unwrap();
+    [coords.x(), coords.y()].map(fq_to_u256)
 }
 
 pub(crate) fn fq_to_u256(fe: impl Borrow<bn256::Fq>) -> U256 {

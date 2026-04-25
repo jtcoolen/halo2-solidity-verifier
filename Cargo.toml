@@ -4,7 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# halo2_proofs v0.3 still ships an older halo2curves (0.6) with BN254 only.
+# We pull halo2curves 0.7 *directly* to access the bls12381 module without
+# upgrading halo2_proofs to v0.4 (whose API has been split into
+# halo2_middleware/halo2_backend/halo2_frontend and would require a complete
+# rework of this crate). The trade-off is that halo2_proofs cannot itself
+# produce BLS12-381 KZG proofs yet -- the Rust prover side is therefore
+# feature-gated behind `bls-backend`, which is OFF by default. Tests that
+# require an end-to-end BLS prover are marked #[ignore] until the backend
+# lands. See PORTING_NOTES.md for details.
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.3.0" }
+halo2curves = { version = "0.7", default-features = false }
 askama = { version = "0.12.0", features = ["config"], default-features = false }
 hex = "0.4.3"
 ruint = "1"
