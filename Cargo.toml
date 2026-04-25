@@ -34,12 +34,18 @@ sha3 = "0.10"
 itertools = "0.11.0"
 
 # For feature = "evm"
-revm = { version = "=3.5.0", default-features = false, optional = true }
+#
+# revm 19+ ships a Prague handler with the EIP-2537 BLS12-381 precompiles
+# (G1ADD = 0x0b, G1MSM = 0x0c, G2ADD = 0x0d, G2MSM = 0x0e, PAIRING = 0x0f),
+# which is what the BLS-flavored Solidity verifier exercises. Earlier revm
+# versions don't know about these precompiles and treat them as empty
+# accounts, so the verifier reverts with "stack too deep" symptoms.
+revm = { version = "19", default-features = false, optional = true }
 
 [dev-dependencies]
 proptest = "1.6.0"
 rand = "0.8.5"
-revm = { version = "=3.5.0", default-features = false }
+revm = { version = "19", default-features = false }
 halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
 
 [features]

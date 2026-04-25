@@ -40,16 +40,16 @@ fn main() {
 
 fn print_trace_logs(logs: &[revm::primitives::Log]) {
     for log in logs {
-        let topics = &log.topics;
+        let topics = log.data.topics();
         let trace_id = decode_trace_id(topics[0]);
         if is_point_trace(trace_id) {
             let name = trace_name(trace_id);
-            let x = decode_word(log.data.as_ref(), 0);
-            let y = decode_word(log.data.as_ref(), 1);
+            let x = decode_word(log.data.data.as_ref(), 0);
+            let y = decode_word(log.data.data.as_ref(), 1);
             println!("{name}: ({x}, {y})");
         } else {
             let name = trace_name(trace_id);
-            let value = decode_word(log.data.as_ref(), 0);
+            let value = decode_word(log.data.data.as_ref(), 0);
             println!("{name}: {value}");
         }
     }

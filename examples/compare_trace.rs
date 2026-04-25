@@ -77,12 +77,12 @@ const TRACE_NAMES: &[&str] = &[
 fn decode_solidity_trace(logs: &[revm::primitives::Log]) -> BTreeMap<&'static str, String> {
     let mut values = BTreeMap::new();
     for log in logs {
-        let trace_id = decode_trace_id(log.topics[0]);
+        let trace_id = decode_trace_id(log.data.topics()[0]);
         if let Some(name) = trace_name(trace_id) {
             if is_point_trace(trace_id) {
                 continue;
             }
-            values.insert(name, decode_word(log.data.as_ref(), 0));
+            values.insert(name, decode_word(log.data.data.as_ref(), 0));
         }
     }
     values

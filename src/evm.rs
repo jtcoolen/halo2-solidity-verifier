@@ -25,8 +25,9 @@ pub fn encode_calldata(proof: &[u8], instances: &[bn256::Fr]) -> Vec<u8> {
 pub(crate) mod test {
     pub use revm;
     use revm::{
-        primitives::{Address, CreateScheme, ExecutionResult, Log, Output, TransactTo, TxEnv},
-        InMemoryDB, EVM,
+        db::InMemoryDB,
+        primitives::{Address, ExecutionResult, Log, Output, SpecId, TxKind},
+        Evm as RevmEvm,
     };
     use ruint::aliases::U256;
     use std::{
@@ -36,8 +37,9 @@ pub(crate) mod test {
         str,
     };
 
-    /// Compile solidity with `--via-ir`, targeting Paris bytecode for compatibility with the
-    /// embedded `revm` runner, then return creation bytecode.
+    /// Compile solidity with `--via-ir`, targeting Cancun bytecode (the
+    /// embedded revm runner is set up for the Prague hard fork which
+    /// supersedes Cancun + adds EIP-2537), then return creation bytecode.
     ///
     /// # Panics
     /// Panics if executable `solc` can not be found, or compilation fails.
@@ -50,7 +52,7 @@ pub(crate) mod test {
             .arg("--optimize")
             .arg("--via-ir")
             .arg("--evm-version")
-            .arg("paris")
+            .arg("cancun")
             .arg("-")
             .spawn()
         {
@@ -85,28 +87,25 @@ pub(crate) mod test {
         Some(hex::decode(&stdout[start..stdout.len() - 1]).unwrap())
     }
 
-    /// Evm runner.
+    /// In-process EVM runner pinned to `SpecId::PRAGUE` so that the
+    /// EIP-2537 BLS12-381 precompiles (`0x0b`/`0x0c`/`0x0d`/`0x0e`/`0x0f`)
+    /// are routed to revm's bundled implementations. The runner keeps an
+    /// `InMemoryDB` across calls so tests can deploy once and call many
+    /// times.
     pub struct Evm {
-        evm: EVM<InMemoryDB>,
+        db: InMemoryDB,
     }
 
     impl Debug for Evm {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            let mut debug_struct = f.debug_struct("Evm");
-            debug_struct
-                .field("env", &self.evm.env)
-                .field("db", &self.evm.db.as_ref().unwrap())
-                .finish()
+            f.debug_struct("Evm").finish_non_exhaustive()
         }
     }
 
     impl Default for Evm {
         fn default() -> Self {
             Self {
-                evm: EVM {
-                    env: Default::default(),
-                    db: Some(Default::default()),
-                },
+                db: InMemoryDB::default(),
             }
         }
     }
@@ -117,12 +116,12 @@ pub(crate) mod test {
         /// # Panics
         /// Panics if given address doesn't have bytecode.
         pub fn code_size(&mut self, address: Address) -> usize {
-            self.evm.db.as_ref().unwrap().accounts[&address]
+            self.db.accounts[&address]
                 .info
                 .code
                 .as_ref()
-                .unwrap()
-                .len()
+                .map(|c| c.len())
+                .unwrap_or(0)
         }
 
         /// Apply create transaction with given `bytecode` as creation bytecode.
@@ -131,15 +130,10 @@ pub(crate) mod test {
         /// # Panics
         /// Panics if execution reverts or halts unexpectedly.
         pub fn create(&mut self, bytecode: Vec<u8>) -> Address {
-            let (_, output, _) = self.transact_success_or_panic(TxEnv {
-                gas_limit: u64::MAX,
-                transact_to: TransactTo::Create(CreateScheme::Create),
-                data: bytecode.into(),
-                ..Default::default()
-            });
+            let (_, output, _) = self.run_tx(TxKind::Create, bytecode);
             match output {
                 Output::Create(_, Some(address)) => address,
-                _ => unreachable!(),
+                _ => unreachable!("expected create output, got {output:?}"),
             }
         }
 
@@ -164,15 +158,10 @@ pub(crate) mod test {
         /// # Panics
         /// Panics if execution reverts or halts unexpectedly.
         pub fn call(&mut self, address: Address, calldata: Vec<u8>) -> (u64, Vec<u8>) {
-            let (gas_used, output, _) = self.transact_success_or_panic(TxEnv {
-                gas_limit: u64::MAX,
-                transact_to: TransactTo::Call(address),
-                data: calldata.into(),
-                ..Default::default()
-            });
+            let (gas_used, output, _) = self.run_tx(TxKind::Call(address), calldata);
             match output {
                 Output::Call(output) => (gas_used, output.into()),
-                _ => unreachable!(),
+                _ => unreachable!("expected call output, got {output:?}"),
             }
         }
 
@@ -182,22 +171,34 @@ pub(crate) mod test {
             address: Address,
             calldata: Vec<u8>,
         ) -> (u64, Vec<u8>, Vec<Log>) {
-            let (gas_used, output, logs) = self.transact_success_or_panic(TxEnv {
-                gas_limit: u64::MAX,
-                transact_to: TransactTo::Call(address),
-                data: calldata.into(),
-                ..Default::default()
-            });
+            let (gas_used, output, logs) = self.run_tx(TxKind::Call(address), calldata);
             match output {
                 Output::Call(output) => (gas_used, output.into(), logs),
-                _ => unreachable!(),
+                _ => unreachable!("expected call output, got {output:?}"),
             }
         }
 
-        fn transact_success_or_panic(&mut self, tx: TxEnv) -> (u64, Output, Vec<Log>) {
-            self.evm.env.tx = tx;
-            let result = self.evm.transact_commit().unwrap();
-            self.evm.env.tx = Default::default();
+        /// Build a Prague-spec EVM around the in-memory db, run the
+        /// configured transaction, commit, then unwrap the success result.
+        fn run_tx(&mut self, transact_to: TxKind, data: Vec<u8>) -> (u64, Output, Vec<Log>) {
+            // Take the db out so we can hand it to the builder, then put it
+            // back after the call.
+            let db = std::mem::take(&mut self.db);
+            let mut evm = RevmEvm::builder()
+                .with_db(db)
+                .with_spec_id(SpecId::PRAGUE)
+                .modify_tx_env(|tx| {
+                    tx.gas_limit = u64::MAX;
+                    tx.transact_to = transact_to;
+                    tx.data = data.into();
+                })
+                .build();
+            let result = evm.transact_commit().unwrap();
+            // Recover the database for the next call. revm 19 stores the
+            // db deep inside `evm.context.evm.db`; the simplest way to get
+            // it back without moving fields out of `EvmContext` (which
+            // holds non-Copy state) is to swap with a dummy default.
+            self.db = std::mem::take(&mut evm.context.evm.db);
             match result {
                 ExecutionResult::Success {
                     gas_used,
@@ -209,7 +210,7 @@ pub(crate) mod test {
                         println!("--- logs from {} ---", logs[0].address);
                         for (log_idx, log) in logs.iter().enumerate() {
                             println!("log#{log_idx}");
-                            for (topic_idx, topic) in log.topics.iter().enumerate() {
+                            for (topic_idx, topic) in log.data.topics().iter().enumerate() {
                                 println!("  topic{topic_idx}: {topic:?}");
                             }
                         }
@@ -218,7 +219,7 @@ pub(crate) mod test {
                     (gas_used, output, logs)
                 }
                 ExecutionResult::Revert { gas_used, output } => {
-                    panic!("Transaction reverts with gas_used {gas_used} and output {output:#x}")
+                    panic!("Transaction reverts with gas_used {gas_used} and output 0x{output:x}")
                 }
                 ExecutionResult::Halt { reason, gas_used } => panic!(
                     "Transaction halts unexpectedly with gas_used {gas_used} and reason {reason:?}"
