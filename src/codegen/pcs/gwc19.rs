@@ -74,6 +74,8 @@ pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
     let mut out: Vec<Query> = Vec::new();
 
     // Per-proof queries (we only support num_proofs = 1 in the codegen).
+    // Order matches `verify_algebraic_constraints` in
+    // `midfall/proofs/src/plonk/verifier.rs`.
 
     // 1. Advice commitments at advice_query rotations.
     for q in &meta.advice_queries {
@@ -82,6 +84,21 @@ pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
             .advice_evals
             .get(q)
             .expect("advice eval present for every advice query");
+        out.push(Query::new(comm, q.1, eval));
+    }
+
+    // 1b. Committed-instance queries (col_idx < num_committed_instances).
+    //    All committed-instance commitments point at the G1 identity in
+    //    memory.
+    for q in &meta.instance_queries {
+        if q.0 >= meta.num_committed_instances {
+            continue;
+        }
+        let comm = data.committed_instance_comms[q.0];
+        let eval = *data
+            .committed_instance_evals
+            .get(q)
+            .expect("committed instance eval present for every committed instance query");
         out.push(Query::new(comm, q.1, eval));
     }
 

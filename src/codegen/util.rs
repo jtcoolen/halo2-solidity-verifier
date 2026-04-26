@@ -69,6 +69,7 @@ pub(crate) struct ConstraintSystemMeta {
     pub(crate) num_quotients: usize,
     pub(crate) advice_queries: Vec<(usize, i32)>,
     pub(crate) fixed_queries: Vec<(usize, i32)>,
+    pub(crate) instance_queries: Vec<(usize, i32)>,
     pub(crate) num_simple_selectors: usize,
     /// Set of fixed-column indices that are *simple selectors* (i.e.
     /// multiplicative selectors that the prover sets to 0 or 1 only).
@@ -139,6 +140,11 @@ impl ConstraintSystemMeta {
             .iter()
             .map(|(column, rotation)| (column.index(), rotation.0))
             .collect_vec();
+        let instance_queries = cs
+            .instance_queries()
+            .iter()
+            .map(|(column, rotation)| (column.index(), rotation.0))
+            .collect_vec();
 
         let num_simple_selectors = cs.num_simple_selectors();
         let simple_selector_cols: BTreeSet<usize> = (0..num_fixeds)
@@ -205,6 +211,10 @@ impl ConstraintSystemMeta {
         let num_rotations = chain![
             advice_queries.iter().map(|q| q.1),
             fixed_queries.iter().map(|q| q.1),
+            instance_queries
+                .iter()
+                .filter(|(col, _)| *col < nb_committed_instances)
+                .map(|q| q.1),
             (num_permutation_zs > 0).then_some([0, 1]).into_iter().flatten(),
             (num_permutation_zs > 1).then_some(rotation_last),
             (num_lookups > 0).then_some([0, 1]).into_iter().flatten(),
@@ -224,6 +234,7 @@ impl ConstraintSystemMeta {
             num_quotients,
             advice_queries,
             fixed_queries,
+            instance_queries,
             num_simple_selectors,
             simple_selector_cols,
             num_committed_instances: nb_committed_instances,
@@ -390,6 +401,11 @@ pub(crate) struct Data {
     pub(crate) fixed_comms: Vec<EcPoint>,
     pub(crate) permutation_comms: HashMap<Column<Any>, EcPoint>,
     pub(crate) advice_comms: Vec<EcPoint>,
+    /// Per committed-instance column: the EcPoint of the committed
+    /// instance commitment. Currently always points to `G1_IDENTITY_MPTR`
+    /// because the zk_stdlib `verify` path passes
+    /// `committed_pi = G1Affine::identity()`.
+    pub(crate) committed_instance_comms: Vec<EcPoint>,
     pub(crate) permutation_z_comms: Vec<EcPoint>,
     pub(crate) lookup_m_comms: Vec<EcPoint>,
     pub(crate) lookup_helper_comms: Vec<Vec<EcPoint>>,
@@ -399,6 +415,10 @@ pub(crate) struct Data {
     pub(crate) challenges: Vec<Word>,
 
     pub(crate) instance_eval: Word,
+    /// Per-(committed-instance-column, rotation): the calldata word for
+    /// that committed instance evaluation. Empty when
+    /// `num_committed_instances == 0`.
+    pub(crate) committed_instance_evals: HashMap<(usize, i32), Word>,
     pub(crate) advice_evals: HashMap<(usize, i32), Word>,
     pub(crate) fixed_evals: HashMap<(usize, i32), Word>,
     pub(crate) permutation_evals: HashMap<Column<Any>, Word>,
@@ -500,6 +520,14 @@ impl Data {
         let _ = trashcan_words; // included in template arithmetic
 
         let fixed_comms = EcPoint::range(fixed_comm_mptr).take(meta.num_fixeds).collect();
+        // Committed instance commitments: all point at the same memory
+        // slot (G1_IDENTITY_MPTR) since the zk_stdlib `verify` path
+        // passes `committed_pi = G1::identity()`. The memory at that
+        // slot is never written and EVM memory is zero-initialised, so
+        // the four `mload` reads produce the identity encoding.
+        let committed_instance_comms: Vec<EcPoint> = (0..meta.num_committed_instances)
+            .map(|_| EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR")))
+            .collect();
         let permutation_comms = izip!(
             meta.permutation_columns.iter().cloned(),
             EcPoint::range(permutation_comm_mptr)
@@ -542,10 +570,20 @@ impl Data {
             .collect_vec();
         let instance_eval = Ptr::memory("INSTANCE_EVAL_MPTR").into();
 
-        // For Steps 1-3 we just place evals contiguously at eval_cptr,
-        // skipping the committed-instance reads (we don't yet support
-        // committed instances on the codegen side). The exact mapping
-        // is finalised in Step 6.
+        // The first `num_committed_instances`-many evals in calldata
+        // are the committed-instance evals (one per (col, rot) pair in
+        // `instance_queries` whose col_idx < nb_committed_instances). We
+        // store the calldata word for each so that the PCS query list
+        // can reference them; the actual eval value for a committed
+        // instance is 0 (since committed_pi = G1::identity in midnight)
+        // but the *MSM position* matters for x1-power scaling.
+        let committed_instance_evals: HashMap<(usize, i32), Word> = meta
+            .instance_queries
+            .iter()
+            .filter(|(col, _)| *col < meta.num_committed_instances)
+            .zip(Word::range(eval_cptr))
+            .map(|(q, w)| (*q, w))
+            .collect();
         let mut eval_walk = eval_cptr + meta.num_committed_instances;
         let advice_evals = izip!(
             meta.advice_queries.iter().cloned(),
@@ -632,6 +670,7 @@ impl Data {
             fixed_comms,
             permutation_comms,
             advice_comms,
+            committed_instance_comms,
             permutation_z_comms,
             lookup_m_comms,
             lookup_helper_comms,
@@ -640,6 +679,7 @@ impl Data {
             computed_quotient_comm,
             challenges,
             instance_eval,
+            committed_instance_evals,
             advice_evals,
             fixed_evals,
             permutation_evals,

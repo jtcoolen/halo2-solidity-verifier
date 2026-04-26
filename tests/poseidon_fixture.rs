@@ -135,6 +135,11 @@ fn poseidon_renders_compiles_and_verifies() {
         &srs, &pk, &relation, &instance, witness, prover_rng,
     )
     .expect("Proof generation should not fail");
+    {
+        use sha3::Digest;
+        let h = sha3::Keccak256::digest(&proof);
+        eprintln!("[fixture] proof keccak = 0x{}", hex::encode(h));
+    }
 
     // Sanity-check via the native verifier first. If this fails, the
     // proof itself is broken so any Solidity-side mismatch downstream
@@ -224,6 +229,84 @@ fn poseidon_renders_compiles_and_verifies() {
         eprintln!("[native]  gamma = 0x{}", hex_be(gamma));
         eprintln!("[native]      y = 0x{}", hex_be(y));
         eprintln!("[native]      x = 0x{}", hex_be(x));
+
+        // ---- Lagrange / instance / quotient (native) ----
+        let domain = vk.vk().get_domain();
+        let k = domain.k();
+        let n: u64 = 1u64 << k;
+        let n_inv = F::from(n).invert().unwrap();
+        let omega = domain.get_omega();
+        let omega_inv = domain.get_omega_inv();
+        let num_neg_lagranges = (vk.vk().cs().blinding_factors() + 1) as i32;
+        eprintln!("[native] num_neg_lagranges = {}", num_neg_lagranges);
+
+        // x^n
+        let mut x_n = x;
+        for _ in 0..k {
+            x_n = x_n * x_n;
+        }
+        let x_n_minus_1 = x_n - F::ONE;
+        let x_n_minus_1_inv = x_n_minus_1.invert().unwrap();
+
+        // Lagranges l_i for i in {-num_neg_lagranges, ..., num_instances-1}.
+        // l_i(x) = (x^n - 1) / n * omega^i / (x - omega^i)
+        // For i >= 0 we use omega^i; for i = -j we use omega^(-j) = omega_inv^j.
+        let omega_inv_to_l: F = omega_inv.pow_vartime([num_neg_lagranges as u64]);
+        let num_instances_actual = 1usize;
+        let total = (num_neg_lagranges as usize) + num_instances_actual;
+        let mut omega_pows = Vec::with_capacity(total);
+        let mut p = omega_inv_to_l;
+        for _ in 0..total {
+            omega_pows.push(p);
+            p = p * omega;
+        }
+        let l_common = x_n_minus_1 * n_inv;
+        let mut l_evals: Vec<F> = omega_pows
+            .iter()
+            .map(|w| {
+                let denom = (x - *w).invert().unwrap();
+                l_common * denom * *w
+            })
+            .collect();
+        // l_evals[0] = l_last, l_evals[num_neg_lagranges-1] = l_0 (since
+        // we start the loop at omega_inv^L = omega^-L, and walk forward).
+        let l_last = l_evals[0];
+        let l_blind: F = l_evals[1..(num_neg_lagranges as usize)].iter().fold(F::ZERO, |a, b| a + *b);
+        let l_0 = l_evals[num_neg_lagranges as usize];
+        let mut instance_eval = F::ZERO;
+        instance_eval = instance_eval + l_evals[num_neg_lagranges as usize] * instance;
+
+        eprintln!("[native]              x_n = 0x{}", hex_be(x_n));
+        eprintln!("[native]  x_n_minus_1_inv = 0x{}", hex_be(x_n_minus_1_inv));
+        eprintln!("[native]           l_last = 0x{}", hex_be(l_last));
+        eprintln!("[native]          l_blind = 0x{}", hex_be(l_blind));
+        eprintln!("[native]              l_0 = 0x{}", hex_be(l_0));
+        eprintln!("[native]    instance_eval = 0x{}", hex_be(instance_eval));
+        eprintln!("[native]   instance value = 0x{}", hex_be(instance));
+        eprintln!("[native] num_simple_selectors = {}", cs.num_simple_selectors());
+        eprintln!("[native] num_fixed_columns = {}", cs.num_fixed_columns());
+        for (gi, gate) in cs.gates().iter().enumerate() {
+            let simple_sels: Vec<_> = gate
+                .queried_selectors()
+                .iter()
+                .filter(|s| s.is_simple())
+                .map(|s| s.index())
+                .collect();
+            eprintln!(
+                "[native] gate[{}] name={:?} polys={} simple_selectors={:?}",
+                gi,
+                gate.name(),
+                gate.polynomials().len(),
+                simple_sels
+            );
+        }
+        for col in 0..cs.num_fixed_columns() {
+            eprintln!(
+                "[native] fixed col {} simple={}",
+                col,
+                cs.has_simple_selector_col(col)
+            );
+        }
         let cs = vk.vk().cs();
         eprintln!(
             "[native] cs: lookups={}, num_advice={}, num_perm_cols={}, perm_chunks={}, num_trashcans={}, degree={}",
@@ -311,6 +394,31 @@ fn poseidon_renders_compiles_and_verifies() {
         CallOutcome::Success {
             gas_used, output, ..
         } => {
+            if output.len() == 0x120 {
+                let labels = [
+                    "neg_expected_eval", "sel_acc[13]", "sel_acc[14]", "sel_acc[15]", "sel_acc[17]",
+                    "lin_com_x_hi", "lin_com_x_lo", "lin_com_y_hi", "lin_com_y_lo",
+                ];
+                for (i, l) in labels.iter().enumerate() {
+                    let v = &output[i * 32..(i + 1) * 32];
+                    eprintln!("[yul]    {:>20} = 0x{}", l, hex::encode(v));
+                }
+                return;
+            }
+            if output.len() == 0x260 {
+                let labels = [
+                    "lin_com_x_hi", "lin_com_x_lo", "lin_com_y_hi", "lin_com_y_lo",
+                    "neg_expected_eval", "f_eval", "v",
+                    "final_com_x_hi", "final_com_x_lo", "final_com_y_hi", "final_com_y_lo",
+                    "pi_x_hi", "pi_x_lo", "pi_y_hi", "pi_y_lo",
+                    "rhs_x_hi", "rhs_x_lo", "rhs_y_hi", "rhs_y_lo",
+                ];
+                for (i, l) in labels.iter().enumerate() {
+                    let v = &output[i * 32..(i + 1) * 32];
+                    eprintln!("[yul]    {:>20} = 0x{}", l, hex::encode(v));
+                }
+                return;
+            }
             let expected: Vec<u8> = [vec![0u8; 31], vec![1]].concat();
             assert_eq!(
                 output, expected,

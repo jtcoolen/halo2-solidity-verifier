@@ -113,6 +113,13 @@ contract Halo2Verifier {
     // block of the proof; we keep it as a memory slot for symmetry.
     uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ theta_mptr + 200 }};
 
+    // Reserved 4-word slot for the G1 identity (point at infinity) in
+    // EIP-2537 padded form. EVM memory is zero-initialised, and we
+    // never write to this region, so the four `mload`s below produce
+    // 0,0,0,0 which is exactly the identity encoding the EIP-2537
+    // ec_add / ec_mul precompiles accept.
+    uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 208 }};
+
     // ----------------------------------------------------------------------
     // Per-category bases for decompressed G1 commitments. The proof emits
     // G1 commitments in zcash-compressed form (48 bytes each); this region
@@ -1080,7 +1087,20 @@ contract Halo2Verifier {
                 mstore(add(PAIRING_RHS_MPTR, 0x60), mload(0x160))
             }
 
-            success := ec_pairing(success, PAIRING_LHS_MPTR, PAIRING_RHS_MPTR)
+            // The Yul `ec_pairing` helper checks
+            //   e(arg0, G2_BASE) * e(arg1, NEG_S_G2_BASE) == 1
+            // i.e.  e(arg0, [1]_2) = e(arg1, [s]_2).
+            //
+            // The KZG pairing identity is
+            //   e(final_com - v*G + x3*pi, [1]_2) = e(pi, [s]_2),
+            // so arg0 must be (final_com - v*G + x3*pi) and arg1 must be
+            // pi. The PAIRING_*_MPTR slots store
+            //   PAIRING_LHS_MPTR := pi
+            //   PAIRING_RHS_MPTR := final_com - v*G + x3*pi
+            // -- the historical "LHS"/"RHS" naming follows the dual MSM
+            // accumulator (left = pi, right = combined) and *not* the
+            // pairing argument order. Pass them swapped to ec_pairing.
+            success := ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)
 
             {%- if self.trace %}
             // In trace builds we always run to the end so the host-side
