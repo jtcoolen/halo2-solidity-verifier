@@ -77,6 +77,36 @@ impl<'a> Evaluator<'a> {
             .collect()
     }
 
+    /// Like [`gate_computations`], but additionally tags each gate
+    /// polynomial with its simple-selector fixed-column index (if any).
+    /// Mirrors `partially_evaluate_identities` in
+    /// `midfall/proofs/src/plonk/mod.rs`: for each gate, the simple
+    /// selector index is `gate.queried_selectors().filter(|s|
+    /// s.is_simple()).next().map(|s| s.index())`. After
+    /// `directly_convert_selectors_to_fixed`, a simple selector's
+    /// `index()` equals the fixed column index of its replacement
+    /// (selector indices were shifted by `nr_fixed_columns`).
+    pub fn gate_computations_tagged(&self) -> Vec<(Vec<String>, String, Option<usize>)> {
+        self.cs
+            .gates()
+            .iter()
+            .flat_map(|gate| {
+                let simple_idx = gate
+                    .queried_selectors()
+                    .iter()
+                    .find(|s| s.is_simple())
+                    .map(|s| s.index());
+                gate.polynomials()
+                    .iter()
+                    .map(|poly| {
+                        let (lines, var) = self.evaluate_and_reset(poly);
+                        (lines, var, simple_idx)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     // ----------------------------------------------------------------
     // Permutation emitter.
     //

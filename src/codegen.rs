@@ -330,25 +330,109 @@ impl<'a> SolidityGenerator<'a> {
         meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
 
         let evaluator = Evaluator::new(self.vk.cs(), &meta, &data);
-        let quotient_eval_numer_computations = chain![
-            evaluator.gate_computations(),
-            evaluator.permutation_computations(),
-            evaluator.lookup_computations(),
-            evaluator.trashcan_computations(),
-        ]
-        .enumerate()
-        .map(|(idx, (mut lines, var))| {
-            let line = if idx == 0 {
-                format!("quotient_eval_numer := {var}")
-            } else {
-                format!(
-                    "quotient_eval_numer := addmod(mulmod(quotient_eval_numer, y, r), {var}, r)"
-                )
+
+        // Build the merged identity list, tagging each item with its
+        // simple-selector fixed column (if any) so we can route gate
+        // contributions to the correct accumulator. Permutation,
+        // lookup, and trash identities are always `None`-bucket.
+        let gate_items = evaluator.gate_computations_tagged();
+        let perm_items = evaluator.permutation_computations();
+        let lookup_items = evaluator.lookup_computations();
+        let trash_items = evaluator.trashcan_computations();
+
+        let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
+        sorted_simple.sort_unstable();
+        let sel_var = |col: usize| format!("sel_acc_{col}");
+
+        let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
+
+        // Step 0: declare and zero-init all accumulators.
+        {
+            let mut init_lines = Vec::new();
+            init_lines.push("let quotient_eval_numer := 0".to_string());
+            for &col in &sorted_simple {
+                init_lines.push(format!("let {} := 0", sel_var(col)));
+            }
+            quotient_eval_numer_computations.push(init_lines);
+        }
+
+        // Helper that emits a self-contained Horner-fold step for one
+        // identity. The eval is computed inside its own `{}` scope
+        // (so per-block `v0..vN` locals don't collide with siblings)
+        // and exported via a small per-step shim. We compute the
+        // eval inside the block, store its value at scratch slot
+        // 0x4400 (which sits between THETA_MPTR area and quotient
+        // limb base), and then perform the Horner update at the
+        // outer scope. Using mstore/mload here is wasteful but lets
+        // us keep the existing `evaluate` contract untouched.
+        // Scratch slot for piping each identity's eval out of its
+        // inner `{}` block back to the outer Horner accumulator. Must
+        // not overlap any other region:
+        //   * 0x4340..~0x4540 — QUOTIENT_LIMB_COMMS (4 limbs * 4 words)
+        //   * 0x5000..0x5080 — simple-selector accumulator dump (used
+        //                       below by the linearization MSM)
+        //   * 0x6000+        — scalar_inv modexp scratch
+        // We park it at 0x5800 which falls in the 0x5080..0x5fff hole.
+        const EVAL_SCRATCH_SLOT: usize = 0x5800;
+        let make_block = |lines: Vec<String>, var: String, sel_idx: Option<usize>| -> Vec<String> {
+            let mut block = Vec::with_capacity(lines.len() + 6);
+            // Inner block: compute the eval and stash it in a scratch slot.
+            block.push("{".to_string());
+            for l in lines {
+                block.push(l);
+            }
+            block.push(format!(
+                "mstore({EVAL_SCRATCH_SLOT:#x}, {var})"
+            ));
+            block.push("}".to_string());
+            // Outer Horner update (re-loads from the scratch slot).
+            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+            for &col in &sorted_simple {
+                block.push(format!(
+                    "{name} := mulmod({name}, y, r)",
+                    name = sel_var(col)
+                ));
+            }
+            let target = match sel_idx {
+                Some(col) => sel_var(col),
+                None => "quotient_eval_numer".to_string(),
             };
-            lines.push(line);
-            lines
-        })
-        .collect();
+            block.push(format!(
+                "{target} := addmod({target}, mload({EVAL_SCRATCH_SLOT:#x}), r)"
+            ));
+            block
+        };
+
+        for (lines, var, sel_idx) in gate_items {
+            quotient_eval_numer_computations.push(make_block(lines, var, sel_idx));
+        }
+        for (lines, var) in perm_items {
+            quotient_eval_numer_computations.push(make_block(lines, var, None));
+        }
+        for (lines, var) in lookup_items {
+            quotient_eval_numer_computations.push(make_block(lines, var, None));
+        }
+        for (lines, var) in trash_items {
+            quotient_eval_numer_computations.push(make_block(lines, var, None));
+        }
+
+        // Tail block: store each simple-selector accumulator at a
+        // dedicated memory slot so the linearization-MSM emitter can
+        // pick them up. We park them at consecutive 32-byte slots
+        // starting at `0x4400` (well above THETA_MPTR/y/x and below
+        // QUOTIENT_LIMB_COMMS_MPTR_BASE = 0x42c0+...).
+        // TODO: wire a proper named MPTR via Data instead of hardcoding.
+        if !sorted_simple.is_empty() {
+            let mut tail = Vec::new();
+            for (i, &col) in sorted_simple.iter().enumerate() {
+                let off = 0x5000 + i * 0x20;
+                tail.push(format!(
+                    "mstore({off:#x}, {})",
+                    sel_var(col)
+                ));
+            }
+            quotient_eval_numer_computations.push(tail);
+        }
 
         let pcs_computations = self.scheme.computations(&meta, &data);
 
@@ -373,6 +457,9 @@ impl<'a> SolidityGenerator<'a> {
             meta.lookup_chunks.iter().sum::<usize>() + meta.num_lookups;
         let total_advices: usize = user_phases.iter().map(|p| p.num_advices).sum();
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
+
+        // Compute fixed_comm_mptr before moving vk into the struct.
+        let fixed_comm_mptr_byte = (vk_mptr + vk.constants.len()).value().as_usize();
 
         Halo2Verifier {
             scheme: self.scheme,
@@ -404,6 +491,8 @@ impl<'a> SolidityGenerator<'a> {
             theta_mptr: data.theta_mptr,
             quotient_eval_numer_computations,
             pcs_computations,
+            simple_selector_cols: sorted_simple.clone(),
+            fixed_comm_mptr: fixed_comm_mptr_byte,
         }
     }
 

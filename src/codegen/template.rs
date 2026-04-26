@@ -140,6 +140,13 @@ pub(crate) struct Halo2Verifier {
     pub(crate) comms_mptr_base: Ptr,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
+    /// Sorted simple-selector fixed-column indices. Each is rendered
+    /// into a Yul snippet that adds `S_i_com * sel_acc_i` to the
+    /// linearization commitment after Q_folded is scaled by (1-x^n).
+    pub(crate) simple_selector_cols: Vec<usize>,
+    /// Memory pointer base for the embedded VK fixed commitments. Used
+    /// to resolve per-column G1 offsets in the simple-selector MSM.
+    pub(crate) fixed_comm_mptr: usize,
 }
 
 impl Halo2VerifyingKey {

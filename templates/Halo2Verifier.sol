@@ -652,6 +652,24 @@ contract Halo2Verifier {
             // byte-reverse before absorbing.
             buf_len := common_word(buf_len, byte_reverse_32(mload(VK_DIGEST_MPTR)))
 
+            // Absorb committed_pi = G1Affine::identity() (48 bytes:
+            // 0xc0 || 47 zero bytes -- BLS12-381 compressed identity
+            // encoding) when the `committed-instances` feature is on
+            // in midnight-proofs. The Hashable<G1>::to_bytes path uses
+            // the curve's GroupEncoding which yields these 48 bytes.
+            // Native verifier absorbs this BEFORE the instance count.
+            {
+                // PREFIX_COMMON (0x01) at buf_len.
+                mstore8(buf_len, 0x01)
+                // 48-byte compressed identity = 0xc0 || 47 * 0x00.
+                // Write 48 bytes of zeros starting at buf_len+1, then
+                // set the very first byte to 0xc0.
+                mstore(add(buf_len, 1), 0)
+                mstore(add(buf_len, 33), 0)
+                mstore8(add(buf_len, 1), 0xc0)
+                buf_len := add(buf_len, 49)
+            }
+
             {
                 let num_instances := mload(NUM_INSTANCES_MPTR)
                 // common(num_instances as Fq scalar in LE-32). The number is
@@ -904,22 +922,32 @@ contract Halo2Verifier {
             // Quotient evaluation. Pure Fr arithmetic.
             // ===============================================================
             {
-                let quotient_eval_numer
                 let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999 // BLS12-381 Fr::DELTA
                 let y := mload(Y_MPTR)
 
                 {%- for code_block in quotient_eval_numer_computations %}
-                {
-                    {%- for line in code_block %}
-                    {{ line }}
-                    {%- endfor %}
-                }
+                {%- for line in code_block %}
+                {{ line }}
+                {%- endfor %}
                 {%- endfor %}
 
                 pop(y)
                 pop(delta)
 
-                let quotient_eval := mulmod(quotient_eval_numer, mload(X_N_MINUS_1_INV_MPTR), r)
+                // The linearization-poly target eval at x is the (negated)
+                // sum of fully-evaluated identities — see
+                // `compute_linearization_commitment` in
+                // midfall/proofs/src/plonk/linearization/verifier.rs:
+                //
+                //   expected_eval -= eval     (for col_idx == None)
+                //
+                // For our setting (num_simple_selectors == 0) every
+                // identity is fully evaluated, so the target eval is
+                // -quotient_eval_numer. The point is paired with a
+                // commitment that already includes the (1 - x^n)
+                // factor (see splitting_pow init below), so we do
+                // NOT divide by (x^n - 1) here.
+                let quotient_eval := sub(r, quotient_eval_numer)
                 mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
             }
 
@@ -968,6 +996,35 @@ contract Halo2Verifier {
                     success := ec_add_acc(success)
                     mptr := sub(mptr, 0x80)
                 }
+                // Scale Q_folded by (1 - x^n). This matches
+                // `splitting_pow := F::ONE - *xn` in
+                // `compute_linearization_commitment`. The full scalar
+                // sequence over the limbs is then
+                //   (1-x^n), (1-x^n)*x^(n-1), (1-x^n)*x^(2(n-1)), ...
+                // i.e. (1-x^n) factored out across the Horner fold.
+                {
+                    let one_minus_x_n := addmod(1, sub(r, mload(X_N_MPTR)), r)
+                    success := ec_mul_acc(success, one_minus_x_n)
+                }
+                {%- if simple_selector_cols.len() > 0 %}
+                // Add Σ S_i_com * sel_acc_i (one MSM term per simple
+                // selector). Mirrors the `Some(col_idx)` branch of
+                // `compute_linearization_commitment`: each gate carrying
+                // a simple selector contributes its (selector-substituted-
+                // to-1) eval to `selector_acc[col]`, and the MSM picks
+                // up `vk.fixed_commitments[col]` with that scalar.
+                {%- for col in simple_selector_cols %}
+                {
+                    let sel_com := {{ (fixed_comm_mptr + col * 0x80)|hex() }}
+                    mstore(0x180, mload(sel_com))
+                    mstore(0x1a0, mload(add(sel_com, 0x20)))
+                    mstore(0x1c0, mload(add(sel_com, 0x40)))
+                    mstore(0x1e0, mload(add(sel_com, 0x60)))
+                    success := ec_mul_tmp(success, mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
+                    success := ec_add_acc(success)
+                }
+                {%- endfor %}
+                {%- endif %}
                 mstore(QUOTIENT_MPTR,            mload(0x100))
                 mstore(add(QUOTIENT_MPTR, 0x20), mload(0x120))
                 mstore(add(QUOTIENT_MPTR, 0x40), mload(0x140))
