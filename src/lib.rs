@@ -11,6 +11,9 @@ mod codegen;
 mod evm;
 mod transcript;
 
+#[cfg(all(test, feature = "evm"))]
+mod test;
+
 pub use codegen::{
     encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, SolidityGenerator,
 };
