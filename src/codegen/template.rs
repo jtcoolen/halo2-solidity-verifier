@@ -1,7 +1,6 @@
-use crate::codegen::{
-    pcs::BatchOpenScheme::{self, Gwc19},
-    util::Ptr,
-};
+#![allow(dead_code)]
+
+use crate::codegen::{pcs::BatchOpenScheme, util::Ptr};
 use askama::{Error, Template};
 use ruint::aliases::U256;
 use std::fmt;
@@ -64,6 +63,8 @@ pub(crate) struct Halo2Verifier {
     pub(crate) num_rotations: usize,
     pub(crate) num_evals: usize,
     pub(crate) num_quotients: usize,
+    pub(crate) num_lookups: usize,
+    pub(crate) num_trashcans: usize,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
 }

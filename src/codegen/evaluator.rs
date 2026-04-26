@@ -1,37 +1,68 @@
 #![allow(clippy::useless_format)]
 
-use crate::codegen::util::{code_block, fe_to_u256, ConstraintSystemMeta, Data};
-use halo2_proofs::halo2curves::ff::PrimeField;
-// halo2 v0.4 split moved the compiled-down constraint system, gate, and
-// expression types into halo2_backend / halo2_middleware. We walk the
-// backend cs (`ConstraintSystemBack`) and its `ExpressionBack<F>` directly,
-// instead of the v0.3 frontend `ConstraintSystem<F>` + `Expression<F>`. The
-// only field we read is `gate.poly`.
-use halo2_backend::plonk::circuit::{
-    ConstraintSystemBack, ExpressionBack, GateBack, QueryBack, VarBack,
-};
-use halo2_middleware::circuit::{Any, ChallengeMid};
-use halo2_middleware::expression::Expression as MidExpression;
-use itertools::{chain, izip, Itertools};
+//! Quotient-numerator emitter.
+//!
+//! This module walks the gates / permutation / lookup / trash-can
+//! arguments stored in a `midnight_proofs::plonk::ConstraintSystem` and
+//! emits the Yul lines that compute their per-row contributions to
+//! `quotient_eval_numer` at the evaluation challenge `x`.
+//!
+//! The previous halo2-proofs v0.4 backend exposed a flat
+//! `ExpressionBack<F>` (Constant / Var / Negated / Sum / Product) that
+//! made expression walking trivial. midnight-proofs preserves the
+//! frontend `Expression<F>` directly:
+//!
+//! ```ignore
+//! enum Expression<F> {
+//!     Constant(F),
+//!     Selector(Selector),                 // removed during keygen
+//!     Fixed(FixedQuery),                  // index, column_index, rotation
+//!     Advice(AdviceQuery),                // index, column_index, rotation, phase
+//!     Instance(InstanceQuery),            // index, column_index, rotation
+//!     Challenge(Challenge),               // index, phase
+//!     Negated(Box<Expression<F>>),
+//!     Sum(Box<Expression<F>>, Box<Expression<F>>),
+//!     Product(Box<Expression<F>>, Box<Expression<F>>),
+//!     Scaled(Box<Expression<F>>, F),
+//! }
+//! ```
+//!
+//! plus a `.evaluate(...)` visitor with 10 callbacks.
+//!
+//! ## Migration status (Steps 1-3, 2026-04-26)
+//!
+//! For Steps 1-3 we only rebind the types and stub out
+//! `permutation_computations` / `lookup_computations` / `trashcan_computations`
+//! to empty slices so the codegen tree compiles. The actual Yul emitters
+//! for permutation, logup, and trash will be re-implemented in Step 4
+//! against the midnight-proofs schema (in particular: logup needs the
+//! per-chunk `f_j` / helper / accumulator structure, and trash needs
+//! the (1 - q)*trash_eval shape from `proofs/src/plonk/trash.rs`).
+//!
+//! `gate_computations` is fully ported because the gate shape (one
+//! `Expression<F>` per polynomial in each gate) carries over directly
+//! from halo2.
+
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap};
+
+use midnight_curves::Fq;
+use midnight_proofs::plonk::{Any, ConstraintSystem, Expression};
 use ruint::aliases::U256;
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, iter};
+
+use crate::codegen::util::{fe_to_u256, ConstraintSystemMeta, Data};
 
 #[derive(Debug)]
-pub(crate) struct Evaluator<'a, F: PrimeField> {
-    cs: &'a ConstraintSystemBack<F>,
+pub(crate) struct Evaluator<'a> {
+    cs: &'a ConstraintSystem<Fq>,
     meta: &'a ConstraintSystemMeta,
     data: &'a Data,
     var_counter: RefCell<usize>,
     var_cache: RefCell<HashMap<String, String>>,
 }
 
-impl<'a, F> Evaluator<'a, F>
-where
-    F: PrimeField,
-    F::Repr: AsRef<[u8]>,
-{
+impl<'a> Evaluator<'a> {
     pub(crate) fn new(
-        cs: &'a ConstraintSystemBack<F>,
+        cs: &'a ConstraintSystem<Fq>,
         meta: &'a ConstraintSystemMeta,
         data: &'a Data,
     ) -> Self {
@@ -48,187 +79,46 @@ where
         self.cs
             .gates()
             .iter()
-            // halo2 v0.4 backend gates carry a single `poly: ExpressionBack<F>`
-            // (the v0.3 frontend's `gate.polynomials() -> &[Expression<F>]`
-            // collapses into one expression after compilation).
-            .map(|gate| self.evaluate_and_reset(&gate.poly))
+            .flat_map(|gate| {
+                gate.polynomials()
+                    .iter()
+                    .map(|poly| self.evaluate_and_reset(poly))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
+    /// Permutation argument expressions emitter.
+    ///
+    /// **TODO (Step 4)**: port the midnight-proofs permutation expression
+    /// emitter from `proofs/src/plonk/permutation.rs::expressions`. The
+    /// per-set boundary / wrap-around terms differ from halo2 (sets +
+    /// per-chunk delta-pow walking + l_last z^2-z), so the previous
+    /// emitter cannot be reused as-is.
     pub fn permutation_computations(&self) -> Vec<(Vec<String>, String)> {
-        let Self { meta, data, .. } = self;
-        let last_chunk_idx = meta.num_permutation_zs - 1;
-        chain![
-            data.permutation_z_evals.first().map(|(z, _, _)| {
-                vec![
-                    format!("let l_0 := mload(L_0_MPTR)"),
-                    format!("let eval := addmod(l_0, sub(r, mulmod(l_0, {z}, r)), r)"),
-                ]
-            }),
-            data.permutation_z_evals.last().map(|(z, _, _)| {
-                let item = "addmod(mulmod(perm_z_last, perm_z_last, r), sub(r, perm_z_last), r)";
-                vec![
-                    format!("let perm_z_last := {z}"),
-                    format!("let eval := mulmod(mload(L_LAST_MPTR), {item}, r)"),
-                ]
-            }),
-            data.permutation_z_evals.iter().tuple_windows().map(
-                |((_, _, z_i_last), (z_j, _, _))| {
-                    let item = format!("addmod({z_j}, sub(r, {z_i_last}), r)");
-                    vec![format!("let eval := mulmod(mload(L_0_MPTR), {item}, r)")]
-                }
-            ),
-            izip!(
-                meta.permutation_columns.chunks(meta.permutation_chunk_len),
-                &data.permutation_z_evals,
-            )
-            .enumerate()
-            .map(|(chunk_idx, (columns, evals))| {
-                let last_column_idx = columns.len() - 1;
-                chain![
-                    [
-                        format!("let gamma := mload(GAMMA_MPTR)"),
-                        format!("let beta := mload(BETA_MPTR)"),
-                        format!("let lhs := {}", evals.1),
-                        format!("let rhs := {}", evals.0),
-                    ],
-                    columns.iter().flat_map(|column| {
-                        let perm_eval = &data.permutation_evals[column];
-                        let eval = self.eval(column.column_type, column.index, 0);
-                        let item = format!("mulmod(beta, {perm_eval}, r)");
-                        [format!(
-                            "lhs := mulmod(lhs, addmod(addmod({eval}, {item}, r), gamma, r), r)"
-                        )]
-                    }),
-                    (chunk_idx == 0)
-                        .then(|| "mstore(0x00, mulmod(beta, mload(X_MPTR), r))".to_string()),
-                    columns.iter().enumerate().flat_map(|(idx, column)| {
-                        let eval = self.eval(column.column_type, column.index, 0);
-                        let item = format!("addmod(addmod({eval}, mload(0x00), r), gamma, r)");
-                        chain![
-                            [format!("rhs := mulmod(rhs, {item}, r)")],
-                            (!(chunk_idx == last_chunk_idx && idx == last_column_idx))
-                                .then(|| "mstore(0x00, mulmod(mload(0x00), delta, r))".to_string()),
-                        ]
-                    }),
-                    {
-                        let item = format!("addmod(mload(L_LAST_MPTR), mload(L_BLIND_MPTR), r)");
-                        let item = format!("sub(r, mulmod(left_sub_right, {item}, r))");
-                        [
-                            format!("let left_sub_right := addmod(lhs, sub(r, rhs), r)"),
-                            format!("let eval := addmod(left_sub_right, {item}, r)"),
-                        ]
-                    }
-                ]
-                .collect_vec()
-            })
-        ]
-        .zip(iter::repeat("eval".to_string()))
-        .collect()
+        let _ = (&self.meta, &self.data); // silence unused warnings
+        Vec::new()
     }
 
+    /// LogUp lookup argument emitter.
+    ///
+    /// **TODO (Step 4)**: implement the helper / accumulator constraints
+    /// from `proofs/src/plonk/logup.rs::Evaluated::expressions`.
     pub fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
-        let input_tables = self
-            .cs
-            .lookups()
-            .iter()
-            .map(|lookup| {
-                let [(input_lines, inputs), (table_lines, tables)] =
-                    [&lookup.input_expressions, &lookup.table_expressions].map(|expressions| {
-                        let (lines, inputs) = expressions
-                            .iter()
-                            .map(|expression| self.evaluate(expression))
-                            .fold((Vec::new(), Vec::new()), |mut acc, result| {
-                                acc.0.extend(result.0);
-                                acc.1.push(result.1);
-                                acc
-                            });
-                        self.reset();
-                        (lines, inputs)
-                    });
-                (input_lines, inputs, table_lines, tables)
-            })
-            .collect_vec();
-        izip!(input_tables, &self.data.lookup_evals)
-            .flat_map(|(input_table, evals)| {
-                let (input_lines, inputs, table_lines, tables) = input_table;
-                let (input_0, rest_inputs) = inputs.split_first().unwrap();
-                let (table_0, rest_tables) = tables.split_first().unwrap();
-                let (z, z_next, p_input, p_input_prev, p_table) = evals;
-                [
-                    vec![
-                        format!("let l_0 := mload(L_0_MPTR)"),
-                        format!("let eval := addmod(l_0, mulmod(l_0, sub(r, {z}), r), r)"),
-                    ],
-                    {
-                        let item = format!("addmod(mulmod({z}, {z}, r), sub(r, {z}), r)");
-                        vec![
-                            format!("let l_last := mload(L_LAST_MPTR)"),
-                            format!("let eval := mulmod(l_last, {item}, r)"),
-                        ]
-                    },
-                    chain![
-                        ["let theta := mload(THETA_MPTR)", "let input"].map(str::to_string),
-                        code_block::<1, false>(chain![
-                            input_lines,
-                            [format!("input := {input_0}")],
-                            rest_inputs.iter().map(|input| format!(
-                                "input := addmod(mulmod(input, theta, r), {input}, r)"
-                            ))
-                        ]),
-                        ["let table"].map(str::to_string),
-                        code_block::<1, false>(chain![
-                            table_lines,
-                            [format!("table := {table_0}")],
-                            rest_tables.iter().map(|table| format!(
-                                "table := addmod(mulmod(table, theta, r), {table}, r)"
-                            ))
-                        ]),
-                        {
-                            let lhs = format!("addmod({p_input}, beta, r)");
-                            let rhs = format!("addmod({p_table}, gamma, r)");
-                            let permuted = format!("mulmod({lhs}, {rhs}, r)");
-                            let input =
-                                "mulmod(addmod(input, beta, r), addmod(table, gamma, r), r)";
-                            [
-                                format!("let beta := mload(BETA_MPTR)"),
-                                format!("let gamma := mload(GAMMA_MPTR)"),
-                                format!("let lhs := mulmod({z_next}, {permuted}, r)"),
-                                format!("let rhs := mulmod({z}, {input}, r)"),
-                            ]
-                        },
-                        {
-                            let l_inactive = "addmod(mload(L_BLIND_MPTR), mload(L_LAST_MPTR), r)";
-                            let l_active = format!("addmod(1, sub(r, {l_inactive}), r)");
-                            [format!(
-                                "let eval := mulmod({l_active}, addmod(lhs, sub(r, rhs), r), r)"
-                            )]
-                        },
-                    ]
-                    .collect_vec(),
-                    {
-                        let l_0 = "mload(L_0_MPTR)";
-                        let item = format!("addmod({p_input}, sub(r, {p_table}), r)");
-                        vec![format!("let eval := mulmod({l_0}, {item}, r)")]
-                    },
-                    {
-                        let l_inactive = "addmod(mload(L_BLIND_MPTR), mload(L_LAST_MPTR), r)";
-                        let l_active = format!("addmod(1, sub(r, {l_inactive}), r)");
-                        let lhs = format!("addmod({p_input}, sub(r, {p_table}), r)");
-                        let rhs = format!("addmod({p_input}, sub(r, {p_input_prev}), r)");
-                        vec![format!(
-                            "let eval := mulmod({l_active}, mulmod({lhs}, {rhs}, r), r)"
-                        )]
-                    },
-                ]
-            })
-            .zip(iter::repeat("eval".to_string()))
-            .collect_vec()
+        Vec::new()
+    }
+
+    /// Trash argument emitter.
+    ///
+    /// **TODO (Step 4)**: implement the trash boundary check from
+    /// `proofs/src/plonk/trash.rs::Evaluated::expressions`.
+    pub fn trashcan_computations(&self) -> Vec<(Vec<String>, String)> {
+        Vec::new()
     }
 
     fn eval(&self, column_type: Any, column_index: usize, rotation: i32) -> String {
         match column_type {
-            Any::Advice => self.data.advice_evals[&(column_index, rotation)].to_string(),
+            Any::Advice(_) => self.data.advice_evals[&(column_index, rotation)].to_string(),
             Any::Fixed => self.data.fixed_evals[&(column_index, rotation)].to_string(),
             Any::Instance => self.data.instance_eval.to_string(),
         }
@@ -239,36 +129,49 @@ where
         *self.var_cache.borrow_mut() = Default::default();
     }
 
-    fn evaluate_and_reset(&self, expression: &ExpressionBack<F>) -> (Vec<String>, String) {
+    fn evaluate_and_reset(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         let result = self.evaluate(expression);
         self.reset();
         result
     }
 
-    fn evaluate(&self, expression: &ExpressionBack<F>) -> (Vec<String>, String) {
-        evaluate(
-            expression,
-            &|constant| {
-                let constant = u256_string(constant);
-                self.init_var(constant, None)
-            },
+    fn evaluate(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
+        // midnight-proofs `Expression<F>` carries the full frontend
+        // variants: Constant / Selector / Fixed / Advice / Instance /
+        // Challenge / Negated / Sum / Product / Scaled. We do not expect
+        // to see `Selector` here because virtual selectors are removed
+        // during `directly_convert_selectors_to_fixed`. We collapse
+        // `Scaled` into a Product against a constant.
+        expression.evaluate(
+            &|scalar| self.init_var(u256_string(fe_to_u256::<Fq>(&scalar)), None),
+            // Selector is removed during compile; if we hit it the VK is
+            // malformed. We panic loud rather than silently emit garbage.
+            &|_| panic!("virtual selectors must be removed before codegen"),
             &|query| {
-                // QueryBack covers fixed/advice/instance via column_type.
-                let column_type = query.column_type;
-                let column_index = query.column_index;
-                let rotation = query.rotation.0;
-                let eval = self.eval(column_type, column_index, rotation);
-                let var_name = match column_type {
-                    Any::Fixed => column_eval_var("f", column_index, rotation),
-                    Any::Advice => column_eval_var("a", column_index, rotation),
-                    Any::Instance => "i_eval".to_string(),
-                };
+                let column_index = query.column_index();
+                let rotation = query.rotation().0;
+                let eval = self.eval(Any::Fixed, column_index, rotation);
+                let var_name = column_eval_var("f", column_index, rotation);
                 self.init_var(eval, Some(var_name))
             },
-            &|challenge: ChallengeMid| {
+            &|query| {
+                let column_index = query.column_index();
+                let rotation = query.rotation().0;
+                let eval = self.eval(Any::advice(), column_index, rotation);
+                let var_name = column_eval_var("a", column_index, rotation);
+                self.init_var(eval, Some(var_name))
+            },
+            &|_query| {
+                // Instance queries always rotate to the current row in
+                // the verifier's view. The codegen pre-computes
+                // `instance_eval` once.
+                let eval = self.eval(Any::Instance, 0, 0);
+                self.init_var(eval, Some("i_eval".to_string()))
+            },
+            &|challenge| {
                 self.init_var(
-                    self.data.challenges[challenge.index],
-                    Some(format!("c_{}", challenge.index)),
+                    self.data.challenges[challenge.index()],
+                    Some(format!("c_{}", challenge.index())),
                 )
             },
             &|(mut acc, var)| {
@@ -277,16 +180,26 @@ where
                 (acc, var)
             },
             &|(mut lhs_acc, lhs_var), (rhs_acc, rhs_var)| {
-                let (lines, var) = self.init_var(format!("addmod({lhs_var}, {rhs_var}, r)"), None);
+                let (lines, var) =
+                    self.init_var(format!("addmod({lhs_var}, {rhs_var}, r)"), None);
                 lhs_acc.extend(rhs_acc);
                 lhs_acc.extend(lines);
                 (lhs_acc, var)
             },
             &|(mut lhs_acc, lhs_var), (rhs_acc, rhs_var)| {
-                let (lines, var) = self.init_var(format!("mulmod({lhs_var}, {rhs_var}, r)"), None);
+                let (lines, var) =
+                    self.init_var(format!("mulmod({lhs_var}, {rhs_var}, r)"), None);
                 lhs_acc.extend(rhs_acc);
                 lhs_acc.extend(lines);
                 (lhs_acc, var)
+            },
+            &|(mut acc, var), scalar| {
+                let scalar_var = self.init_var(u256_string(fe_to_u256::<Fq>(&scalar)), None);
+                acc.extend(scalar_var.0);
+                let (lines, out) =
+                    self.init_var(format!("mulmod({var}, {}, r)", scalar_var.1), None);
+                acc.extend(lines);
+                (acc, out)
             },
         )
     }
@@ -297,9 +210,7 @@ where
             (vec![], self.var_cache.borrow()[&value].clone())
         } else {
             let var = var.unwrap_or_else(|| self.next_var());
-            self.var_cache
-                .borrow_mut()
-                .insert(value.clone(), var.clone());
+            self.var_cache.borrow_mut().insert(value.clone(), var.clone());
             (vec![format!("let {var} := {value}")], var)
         }
     }
@@ -324,36 +235,5 @@ fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> 
         Ordering::Less => format!("{prefix}_{column_index}_prev_{}", rotation.abs()),
         Ordering::Equal => format!("{prefix}_{column_index}"),
         Ordering::Greater => format!("{prefix}_{column_index}_next_{rotation}"),
-    }
-}
-
-/// Walks a halo2 v0.4 backend `ExpressionBack<F>` tree, dispatching to the
-/// callbacks. The backend Expression has fewer variants than v0.3's
-/// frontend Expression: there is no Selector (compiled away), no Scaled
-/// (folded into Product), and Advice/Fixed/Instance are unified under
-/// `Var(VarBack::Query(QueryBack))`. Challenges live in the same Var
-/// arm via `VarBack::Challenge(ChallengeMid)`.
-#[allow(clippy::too_many_arguments)]
-fn evaluate<F, T>(
-    expression: &ExpressionBack<F>,
-    constant: &impl Fn(U256) -> T,
-    query: &impl Fn(QueryBack) -> T,
-    challenge: &impl Fn(ChallengeMid) -> T,
-    negated: &impl Fn(T) -> T,
-    sum: &impl Fn(T, T) -> T,
-    product: &impl Fn(T, T) -> T,
-) -> T
-where
-    F: PrimeField,
-    F::Repr: AsRef<[u8]>,
-{
-    let recurse = |expr| evaluate(expr, constant, query, challenge, negated, sum, product);
-    match expression {
-        MidExpression::Constant(scalar) => constant(fe_to_u256(*scalar)),
-        MidExpression::Var(VarBack::Query(q)) => query(*q),
-        MidExpression::Var(VarBack::Challenge(c)) => challenge(*c),
-        MidExpression::Negated(value) => negated(recurse(value)),
-        MidExpression::Sum(lhs, rhs) => sum(recurse(lhs), recurse(rhs)),
-        MidExpression::Product(lhs, rhs) => product(recurse(lhs), recurse(rhs)),
     }
 }

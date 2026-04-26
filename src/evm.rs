@@ -1,5 +1,5 @@
 use crate::codegen::util::{fe_to_u256, to_u256_be_bytes};
-use halo2_proofs::halo2curves::ff::PrimeField;
+use ff::PrimeField;
 use itertools::chain;
 
 /// Function signature of `verifyProof(bytes,uint256[])`.
@@ -30,6 +30,7 @@ where
 }
 
 #[cfg(any(test, feature = "evm"))]
+#[allow(dead_code)]
 pub(crate) mod test {
     pub use revm;
     use revm::{

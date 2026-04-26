@@ -1,18 +1,20 @@
-use crate::codegen::util::{ConstraintSystemMeta, Data, EcPoint, Word};
-use itertools::{chain, izip};
+#![allow(dead_code)]
+
+use crate::codegen::util::{ConstraintSystemMeta, Data};
 
 mod gwc19;
 
-/// KZG batch open schemes in `halo2`.
+/// PCS schemes supported by the codegen.
 ///
-/// The BDFG21 (SHPLONK) variant has been removed during the BLS12-381 /
-/// EIP-2537 port -- only GWC19 is supported.
+/// **Migration status (Steps 1-3, 2026-04-26)**: only GWC19 is exposed
+/// as a placeholder. The midnight-proofs PCS is `KZGCommitmentScheme`'s
+/// `multi_prepare`/`multi_open` flow (x1, x2, f_com, x3, q_evals, x4,
+/// pi); see `MIGRATION.md` Step 5 for the planned rewrite of this
+/// module. Until then, the GWC19 emitter delegates everything to a
+/// zero-output stub so the codegen tree compiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOpenScheme {
-    /// Batch open scheme in [Plonk] paper.
-    /// Corresponding to `halo2_proofs::poly::kzg::multiopen::ProverGWC`
-    ///
-    /// [Plonk]: https://eprint.iacr.org/2019/953.pdf
+    /// Placeholder for the midnight-proofs multi-prepare KZG flow.
     Gwc19,
 }
 
@@ -38,69 +40,11 @@ impl BatchOpenScheme {
     }
 
     /// Number of G1 commitments that appear *after* the evaluation block
-    /// in the proof byte-stream. For GWC19 there is one W per rotation set.
-    pub(crate) fn num_trailing_g1_points(&self, meta: &ConstraintSystemMeta) -> usize {
+    /// in the proof byte-stream. For midnight-proofs multi-prepare this
+    /// is 2: `f_com` and `pi`.
+    pub(crate) fn num_trailing_g1_points(&self, _meta: &ConstraintSystemMeta) -> usize {
         match self {
-            Self::Gwc19 => meta.num_rotations,
+            Self::Gwc19 => 2,
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct Query {
-    comm: EcPoint,
-    rot: i32,
-    eval: Word,
-}
-
-impl Query {
-    fn new(comm: EcPoint, rot: i32, eval: Word) -> Self {
-        Self { comm, rot, eval }
-    }
-}
-
-pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
-    chain![
-        meta.advice_queries.iter().map(|query| {
-            let comm = data.advice_comms[query.0];
-            let eval = data.advice_evals[query];
-            Query::new(comm, query.1, eval)
-        }),
-        izip!(&data.permutation_z_comms, &data.permutation_z_evals).flat_map(|(&comm, evals)| {
-            [Query::new(comm, 0, evals.0), Query::new(comm, 1, evals.1)]
-        }),
-        izip!(&data.permutation_z_comms, &data.permutation_z_evals)
-            .rev()
-            .skip(1)
-            .map(|(&comm, evals)| Query::new(comm, meta.rotation_last, evals.2)),
-        izip!(
-            &data.lookup_permuted_comms,
-            &data.lookup_z_comms,
-            &data.lookup_evals
-        )
-        .flat_map(|(permuted_comms, &z_comm, evals)| {
-            [
-                Query::new(z_comm, 0, evals.0),
-                Query::new(permuted_comms.0, 0, evals.2),
-                Query::new(permuted_comms.1, 0, evals.4),
-                Query::new(permuted_comms.0, -1, evals.3),
-                Query::new(z_comm, 1, evals.1),
-            ]
-        }),
-        meta.fixed_queries.iter().map(|query| {
-            let comm = data.fixed_comms[query.0];
-            let eval = data.fixed_evals[query];
-            Query::new(comm, query.1, eval)
-        }),
-        meta.permutation_columns.iter().map(|column| {
-            let comm = data.permutation_comms[column];
-            let eval = data.permutation_evals[column];
-            Query::new(comm, 0, eval)
-        }),
-        [
-            Query::new(data.computed_quotient_comm, 0, data.computed_quotient_eval),
-            Query::new(data.random_comm, 0, data.random_eval),
-        ]
-    ]
-    .collect()
 }

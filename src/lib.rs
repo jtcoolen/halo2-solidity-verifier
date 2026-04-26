@@ -1,17 +1,15 @@
-//! Solidity verifier generator for [`halo2`] proof with KZG polynomial commitment scheme on BN254.
+//! Solidity verifier generator for midnight-proofs with KZG polynomial
+//! commitment scheme on BLS12-381 / EIP-2537.
 //!
-//! [`halo2`]: http://github.com/privacy-scaling-explorations/halo2
+//! Migration in progress (Steps 1-3, 2026-04-26): see `MIGRATION.md` for
+//! the full plan and remaining steps.
 
-#![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod codegen;
 mod evm;
 mod transcript;
-
-#[cfg(test)]
-mod test;
 
 pub use codegen::{
     encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, SolidityGenerator,
@@ -27,7 +25,7 @@ pub use evm::test::{compile_solidity, revm, CallOutcome, Evm};
 /// points using the exact same pipeline the Solidity verifier consumes.
 #[doc(hidden)]
 pub fn __test_only_g1_to_u256s(
-    point: &halo2_proofs::halo2curves::bls12381::G1Affine,
+    point: &midnight_curves::G1Affine,
 ) -> [ruint::aliases::U256; 4] {
     crate::codegen::util::g1_to_u256s(point)
 }

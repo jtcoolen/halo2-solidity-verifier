@@ -1,17 +1,17 @@
+// Step 1-3 migration: most of the Yul-emission helpers in this module are
+// only consumed by the codegen tree once Steps 4-9 are completed. We
+// keep them here (rather than gating them with `cfg(test)`) so the
+// post-migration emitter has them available without a re-import dance.
+#![allow(dead_code)]
+
 use crate::codegen::{
     template::Halo2VerifyingKey,
     BatchOpenScheme::{self, Gwc19},
 };
-// halo2curves 0.7 exposes bls12-381 as `bls12381` (no underscore); we
-// alias it as `bls12_381` so the rest of the codegen reads naturally.
-use halo2_proofs::halo2curves::{bls12381 as bls12_381, ff::PrimeField, CurveAffine};
-// halo2 v0.4 split moves the cs walkers into halo2_backend / halo2_middleware:
-//   * ConstraintSystemBack carries the compiled-down constraint system that
-//     the verifying key embeds.
-//   * ColumnMid is the (column_type, index) pair returned by every cs query.
-use halo2_backend::plonk::circuit::ConstraintSystemBack;
-use halo2_middleware::circuit::{Any, ColumnMid};
+use ff::PrimeField;
 use itertools::{chain, izip, Itertools};
+use midnight_curves::{Coordinates, CurveAffine, Fq, G1Affine, G2Affine};
+use midnight_proofs::plonk::{Any, Column, ConstraintSystem};
 use ruint::{aliases::U256, UintTryFrom};
 use std::{
     borrow::Borrow,
@@ -20,17 +20,57 @@ use std::{
     ops::{Add, Sub},
 };
 
-#[derive(Debug)]
+// ----------------------------------------------------------------------------
+// Migration note (Steps 1-3, 2026-04-26): the old `ConstraintSystemMeta` was
+// driven by halo2-proofs v0.4 backend types (`ConstraintSystemBack`,
+// `ColumnMid`, halo2 grand-product lookup). We now walk the
+// `midnight_proofs::plonk::ConstraintSystem<Fq>` directly, which exposes:
+//
+//   * `cs.lookups()` -> `Vec<logup::BatchedArgument<F>>` (with `chunk_by_degree`,
+//     `num_chunks`)
+//   * `cs.trashcans()` -> `Vec<trash::Argument<F>>`
+//   * `cs.permutation()` -> `&permutation::Argument` with `get_columns()`
+//   * `cs.num_simple_selectors()`, `cs.has_simple_selector_col(idx)`
+//
+// The proof byte layout this metadata describes corresponds to
+// `midnight_proofs::plonk::verifier::parse_trace`:
+//   per phase: read advices, squeeze challenges, ...
+//   theta
+//   per proof: read multiplicities (one G1 per lookup)
+//   beta, gamma
+//   per proof: read permutation product commitments
+//   per proof: per lookup, read num_chunks helpers + 1 accumulator
+//   trash_challenge
+//   per proof: read trashcan commitments
+//   y
+//   read quotient limbs
+//   x
+//   read evaluations (committed_instance? + advice + fixed-non-simple +
+//                     perm_common + perm_set + lookup + trash)
+//   PCS (multi_prepare):
+//     x1, x2; read f_com; x3; read q_evals (one per point set);
+//     x4; read pi
+//
+// Steps 4-9 of MIGRATION.md track the remaining work to materialise this
+// schema into a complete Yul emitter. For Steps 1-3 we only need the
+// scalar metadata fields below to be derivable from the new CS so that
+// `cargo check --lib` is green.
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
 pub(crate) struct ConstraintSystemMeta {
     pub(crate) num_fixeds: usize,
-    pub(crate) permutation_columns: Vec<ColumnMid>,
+    pub(crate) permutation_columns: Vec<Column<Any>>,
     pub(crate) permutation_chunk_len: usize,
-    pub(crate) num_lookup_permuteds: usize,
+    pub(crate) num_lookups: usize,
+    pub(crate) lookup_chunks: Vec<usize>,
+    pub(crate) num_trashcans: usize,
     pub(crate) num_permutation_zs: usize,
-    pub(crate) num_lookup_zs: usize,
     pub(crate) num_quotients: usize,
     pub(crate) advice_queries: Vec<(usize, i32)>,
     pub(crate) fixed_queries: Vec<(usize, i32)>,
+    pub(crate) num_simple_selectors: usize,
+    pub(crate) num_committed_instances: usize,
     pub(crate) num_rotations: usize,
     pub(crate) num_evals: usize,
     pub(crate) num_user_advices: Vec<usize>,
@@ -41,85 +81,136 @@ pub(crate) struct ConstraintSystemMeta {
 }
 
 impl ConstraintSystemMeta {
-    pub(crate) fn new<F: PrimeField>(cs: &ConstraintSystemBack<F>) -> Self {
+    /// Derive metadata from a midnight-proofs `ConstraintSystem`.
+    ///
+    /// `nb_committed_instances` is the number of instance columns that the
+    /// verifier *reads* from the proof transcript (vs. computes locally
+    /// via Lagrange interpolation). For the poseidon example this is 0;
+    /// for IVC-style fixtures with committed inputs it would be > 0.
+    pub(crate) fn new(cs: &ConstraintSystem<Fq>, nb_committed_instances: usize) -> Self {
+        let cs_degree = cs.degree();
         let num_fixeds = cs.num_fixed_columns();
-        let permutation_columns: Vec<ColumnMid> = cs.permutation().columns.clone();
-        let permutation_chunk_len = cs.degree_pub() - 2;
-        let num_lookup_permuteds = 2 * cs.lookups().len();
-        let num_permutation_zs = permutation_columns
-            .chunks(cs.degree_pub() - 2)
-            .count();
-        let num_lookup_zs = cs.lookups().len();
-        let num_quotients = cs.degree_pub() - 1;
+        let permutation_columns = cs.permutation().get_columns();
+        let permutation_chunk_len = cs_degree - 2;
+
+        let num_permutation_zs = if permutation_columns.is_empty() {
+            0
+        } else {
+            permutation_columns.len().div_ceil(permutation_chunk_len)
+        };
+
+        // For each batched lookup, midnight-proofs commits to one
+        // multiplicity polynomial, `num_chunks` helper polynomials
+        // (degree-bounded chunking of the parallel-lookups), and one
+        // accumulator polynomial. See `midnight_proofs::plonk::logup`.
+        let lookup_chunks: Vec<usize> = cs
+            .lookups()
+            .iter()
+            .map(|l| l.chunk_by_degree(cs_degree).num_chunks())
+            .collect();
+        let num_lookups = cs.lookups().len();
+
+        let num_trashcans = cs.trashcans().len();
+
+        // The quotient polynomial has degree `(d - 1) * (n - 1)` for a
+        // CS of degree `d`. Without the `single-h-commitment` feature we
+        // commit one limb per `(d - 1)`.
+        let num_quotients = cs_degree.saturating_sub(1);
+
         let advice_queries = cs
             .advice_queries()
             .iter()
-            .map(|(column, rotation)| (column.index, rotation.0))
+            .map(|(column, rotation)| (column.index(), rotation.0))
             .collect_vec();
         let fixed_queries = cs
             .fixed_queries()
             .iter()
-            .map(|(column, rotation)| (column.index, rotation.0))
+            .map(|(column, rotation)| (column.index(), rotation.0))
             .collect_vec();
-        let num_evals = advice_queries.len()
-            + fixed_queries.len()
-            + 1
+
+        let num_simple_selectors = cs.num_simple_selectors();
+
+        // Total number of evaluations the verifier reads from the proof
+        // transcript. See `midnight_proofs::plonk::verifier::verify_algebraic_constraints`.
+        //
+        //   committed_instance reads:
+        //     #{ (col, _) in instance_queries : col.index() < nb_committed_instances }
+        //   advice reads:        advice_queries.len()
+        //   fixed-non-simple:    num_fixed_columns - num_simple_selectors
+        //   perm common:         permutation_columns.len()
+        //   perm sets:           per set, (cur, next) + (last for all but the final set)
+        //                        => 3 * num_permutation_zs - 1 if > 0, else 0
+        //   lookup evals:        per lookup, m + helpers + acc + acc_next
+        //                        => sum(num_chunks) + 3 * num_lookups
+        //   trash evals:         num_trashcans
+        let num_committed_instance_reads = cs
+            .instance_queries()
+            .iter()
+            .filter(|(col, _)| col.index() < nb_committed_instances)
+            .count();
+        let perm_set_evals = if num_permutation_zs == 0 {
+            0
+        } else {
+            3 * num_permutation_zs - 1
+        };
+        let lookup_helper_total: usize = lookup_chunks.iter().sum();
+        let lookup_evals_total = lookup_helper_total + 3 * num_lookups;
+        let num_evals = num_committed_instance_reads
+            + advice_queries.len()
+            + (num_fixeds - num_simple_selectors)
             + permutation_columns.len()
-            + (3 * num_permutation_zs - 1)
-            + 5 * cs.lookups().len();
+            + perm_set_evals
+            + lookup_evals_total
+            + num_trashcans;
+
         let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
-        // Indices of advice and challenge are not same as their position in calldata/memory,
-        // because we support multiple phases, we need to remap them and find their actual indices.
         let remapping = |phase: Vec<u8>| {
-            let nums = phase.iter().fold(vec![0; num_phase], |mut nums, phase| {
-                nums[*phase as usize] += 1;
+            let nums = phase.iter().fold(vec![0usize; num_phase], |mut nums, p| {
+                nums[*p as usize] += 1;
                 nums
             });
-            let offsets = nums
-                .iter()
-                .take(num_phase - 1)
-                .fold(vec![0], |mut offsets, n| {
-                    offsets.push(offsets.last().unwrap() + n);
-                    offsets
-                });
+            let offsets = nums.iter().take(num_phase - 1).fold(vec![0usize], |mut offsets, n| {
+                offsets.push(offsets.last().unwrap() + n);
+                offsets
+            });
             let index = phase
                 .iter()
-                .scan(offsets, |state, phase| {
-                    let index = state[*phase as usize];
-                    state[*phase as usize] += 1;
-                    Some(index)
+                .scan(offsets, |state, p| {
+                    let i = state[*p as usize];
+                    state[*p as usize] += 1;
+                    Some(i)
                 })
                 .collect::<Vec<_>>();
             (nums, index)
         };
-        let (num_user_advices, advice_indices) = remapping(cs.advice_column_phase().to_vec());
-        let (num_user_challenges, challenge_indices) = remapping(cs.challenge_phase().to_vec());
-        let rotation_last = -(cs.blinding_factors_pub() as i32 + 1);
+        let (num_user_advices, advice_indices) = remapping(cs.advice_column_phase());
+        let (num_user_challenges, challenge_indices) = remapping(cs.challenge_phase());
+
+        let rotation_last = -(cs.blinding_factors() as i32 + 1);
         let num_rotations = chain![
-            advice_queries.iter().map(|query| query.1),
-            fixed_queries.iter().map(|query| query.1),
-            (num_permutation_zs > 0)
-                .then_some([0, 1])
-                .into_iter()
-                .flatten(),
+            advice_queries.iter().map(|q| q.1),
+            fixed_queries.iter().map(|q| q.1),
+            (num_permutation_zs > 0).then_some([0, 1]).into_iter().flatten(),
             (num_permutation_zs > 1).then_some(rotation_last),
-            (num_lookup_zs > 0)
-                .then_some([-1, 0, 1])
-                .into_iter()
-                .flatten(),
+            (num_lookups > 0).then_some([0, 1]).into_iter().flatten(),
+            (num_trashcans > 0).then_some(0),
         ]
         .unique()
         .count();
+
         Self {
             num_fixeds,
             permutation_columns,
             permutation_chunk_len,
-            num_lookup_permuteds,
+            num_lookups,
+            lookup_chunks,
+            num_trashcans,
             num_permutation_zs,
-            num_lookup_zs,
             num_quotients,
             advice_queries,
             fixed_queries,
+            num_simple_selectors,
+            num_committed_instances: nb_committed_instances,
             num_evals,
             num_rotations,
             num_user_advices,
@@ -130,64 +221,145 @@ impl ConstraintSystemMeta {
         }
     }
 
+    /// Returns the number of advice / advice-like commitments emitted in
+    /// each phase of the proof byte stream. This matches the
+    /// `for current_phase in vk.cs.phases() { ... }` loop in
+    /// `midnight_proofs::plonk::verifier::parse_trace`, *plus* dedicated
+    /// "phases" for:
+    ///   - lookup multiplicities (one per lookup, after theta)
+    ///   - permutation product commitments (after beta/gamma)
+    ///   - lookup helpers + accumulators (after permutation products)
+    ///   - trashcan commitments (after trash_challenge)
+    ///   - quotient limbs (after y)
+    ///
+    /// We surface the per-phase counts so the Yul template can emit the
+    /// matching `read_g1_compressed` loops.
     pub(crate) fn num_advices(&self) -> Vec<usize> {
-        chain![
-            self.num_user_advices.iter().cloned(),
-            (self.num_lookup_permuteds != 0).then_some(self.num_lookup_permuteds), // lookup permuted
-            [
-                self.num_permutation_zs + self.num_lookup_zs + 1, // permutation and lookup grand products, random
-                self.num_quotients,                               // quotients
-            ],
-        ]
-        .collect()
+        let mut out = self.num_user_advices.clone();
+        // theta is squeezed *between* the user phases and the lookup
+        // multiplicity phase, so the multiplicity phase is its own block.
+        if self.num_lookups != 0 {
+            out.push(self.num_lookups); // multiplicities
+        }
+        // permutation product commitments
+        if self.num_permutation_zs != 0 {
+            out.push(self.num_permutation_zs);
+        }
+        // lookup helpers + accumulators
+        let lookup_h_plus_acc: usize =
+            self.lookup_chunks.iter().sum::<usize>() + self.num_lookups;
+        if lookup_h_plus_acc != 0 {
+            out.push(lookup_h_plus_acc);
+        }
+        // trashcans
+        if self.num_trashcans != 0 {
+            out.push(self.num_trashcans);
+        }
+        // quotient limbs
+        out.push(self.num_quotients);
+        out
     }
 
     pub(crate) fn num_challenges(&self) -> Vec<usize> {
-        let mut num_challenges = self.num_user_challenges.clone();
-        // If there is no lookup used, merge also beta and gamma into the last user phase, to avoid
-        // squeezing challenge from nothing.
-        // Otherwise, merge theta into last user phase since they are originally adjacent.
-        if self.num_lookup_permuteds == 0 {
-            *num_challenges.last_mut().unwrap() += 3; // theta, beta, gamma
-            num_challenges.extend([
-                1, // y
-                1, // x
-            ]);
+        // midnight-proofs squeezes the challenges in this order:
+        //   user-phase challenges (any number per user phase)
+        //   theta
+        //   beta, gamma
+        //   trash_challenge
+        //   y
+        //   x
+        //
+        // To keep the Yul template structure (alternating "read advices /
+        // squeeze challenges"), we splice these into the per-phase
+        // schedule. The exact splicing scheme is finalised in Step 6
+        // (Yul rewrite); this metadata only records the *counts* and
+        // their squeeze ordering.
+        let mut counts = self.num_user_challenges.clone();
+
+        if self.num_lookups != 0 {
+            // Last user phase: append theta (squeezed before reading
+            // multiplicities).
+            *counts.last_mut().unwrap() += 1; // theta
+            counts.push(2); // beta, gamma after multiplicities
+            // After permutation_products + lookup_helpers, before trashcans.
+            if self.num_trashcans != 0 {
+                counts.push(1); // trash_challenge
+            }
+            counts.push(1); // y
+            counts.push(1); // x
         } else {
-            *num_challenges.last_mut().unwrap() += 1; // theta
-            num_challenges.extend([
-                2, // beta, gamma
-                1, // y
-                1, // x
-            ]);
+            // No lookups: theta+beta+gamma collapse to a single squeeze
+            // block (they are still squeezed individually but with no
+            // intervening reads).
+            *counts.last_mut().unwrap() += 3; // theta, beta, gamma
+            if self.num_trashcans != 0 {
+                counts.push(1); // trash_challenge
+            }
+            counts.push(1); // y
+            counts.push(1); // x
         }
-        num_challenges
+
+        counts
     }
 
     pub(crate) fn num_permutations(&self) -> usize {
         self.permutation_columns.len()
     }
 
-    pub(crate) fn num_lookups(&self) -> usize {
-        self.num_lookup_zs
-    }
-
     pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
-        // Each G1 commitment in the proof is 128 bytes (EIP-2537 padded
-        // BLS12-381 G1 = 4 words). Scalar evals stay at 32 bytes.
-        self.num_advices().iter().sum::<usize>() * 0x80
-            + self.num_evals * 0x20
-            + self.batch_open_proof_len(scheme)
+        // Each G1 commitment in the proof is 48 bytes (compressed
+        // BLS12-381). Each Fq evaluation is 32 bytes. For now we still
+        // declare the verifier proof layout in terms of EIP-2537
+        // *uncompressed* points (4 words = 128 bytes per G1) because
+        // the Solidity verifier converts compressed -> uncompressed
+        // internally before doing curve arithmetic; calldata however
+        // carries the *compressed* form to keep proofs small.
+        //
+        // This length is the calldata size (compressed). The Yul
+        // verifier will read 48 bytes per point and decompress in-EVM.
+        let g1_count: usize = self.num_advices().iter().sum::<usize>()
+            + self.batch_open_g1_count(scheme);
+        g1_count * 0x30 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
     }
 
     pub(crate) fn batch_open_proof_len(&self, scheme: BatchOpenScheme) -> usize {
-        (match scheme {
-            Gwc19 => self.num_rotations,
-        }) * 0x80
+        match scheme {
+            // Trailing G1 points are: f_com (1) + pi (1) = 2.
+            // Plus the per-set q_evals (handled separately as scalars).
+            Gwc19 => self.batch_open_g1_count(scheme) * 0x30,
+        }
+    }
+
+    /// G1 commitments emitted *after* the evaluation block in the proof
+    /// stream by `KZGCommitmentScheme::multi_open` (midnight-proofs):
+    ///   `f_com` (the proof of the polynomial-commitment-degree
+    ///   reduction) and `pi` (the final KZG opening). 2 G1 in total.
+    pub(crate) fn batch_open_g1_count(&self, scheme: BatchOpenScheme) -> usize {
+        match scheme {
+            Gwc19 => 2,
+        }
+    }
+
+    /// Extra Fq scalars in the multi-open block: one `q_eval` per
+    /// distinct point set (read at `x_3`).
+    pub(crate) fn batch_open_extra_evals(&self, _scheme: BatchOpenScheme) -> usize {
+        // We don't know the exact number of point sets at codegen time
+        // without reproducing `construct_intermediate_sets`. The Yul
+        // verifier reads them in a loop bounded by "everything between
+        // the last fixed eval and the trailing pi G1" -- mirrors the
+        // approach in `midfall/proofs/solidity-verifier/src/trace_replay.rs`.
+        0
     }
 }
 
-#[derive(Debug)]
+// ----------------------------------------------------------------------------
+// Memory-layout helpers (Data, Ptr, EcPoint, Word, ...). Keep mostly as-is
+// from the halo2 era; the BLS12-381 layout (4 words per G1) does not
+// change. Only the type that keys `permutation_comms` flips from
+// `ColumnMid` to `Column<Any>`.
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
 pub(crate) struct Data {
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
@@ -196,22 +368,24 @@ pub(crate) struct Data {
     pub(crate) w_cptr: Ptr,
 
     pub(crate) fixed_comms: Vec<EcPoint>,
-    pub(crate) permutation_comms: HashMap<ColumnMid, EcPoint>,
+    pub(crate) permutation_comms: HashMap<Column<Any>, EcPoint>,
     pub(crate) advice_comms: Vec<EcPoint>,
-    pub(crate) lookup_permuted_comms: Vec<(EcPoint, EcPoint)>,
     pub(crate) permutation_z_comms: Vec<EcPoint>,
+    pub(crate) lookup_m_comms: Vec<EcPoint>,
+    pub(crate) lookup_helper_comms: Vec<Vec<EcPoint>>,
     pub(crate) lookup_z_comms: Vec<EcPoint>,
-    pub(crate) random_comm: EcPoint,
+    pub(crate) trashcan_comms: Vec<EcPoint>,
 
     pub(crate) challenges: Vec<Word>,
 
     pub(crate) instance_eval: Word,
     pub(crate) advice_evals: HashMap<(usize, i32), Word>,
     pub(crate) fixed_evals: HashMap<(usize, i32), Word>,
-    pub(crate) random_eval: Word,
-    pub(crate) permutation_evals: HashMap<ColumnMid, Word>,
+    pub(crate) permutation_evals: HashMap<Column<Any>, Word>,
     pub(crate) permutation_z_evals: Vec<(Word, Word, Word)>,
-    pub(crate) lookup_evals: Vec<(Word, Word, Word, Word, Word)>,
+    /// Per lookup: `(m, [helpers], z, z_next)` evaluations.
+    pub(crate) lookup_evals: Vec<(Word, Vec<Word>, Word, Word)>,
+    pub(crate) trashcan_evals: Vec<Word>,
 
     pub(crate) computed_quotient_comm: EcPoint,
     pub(crate) computed_quotient_eval: Word,
@@ -231,25 +405,28 @@ impl Data {
         let challenge_mptr = permutation_comm_mptr + 4 * vk.permutation_comms.len();
         let theta_mptr = challenge_mptr + meta.challenge_indices.len();
 
+        // ------------------------------------------------------------
+        // The calldata layout below is *placeholder* and only used to
+        // make the codegen tree compile during Steps 1-3. The real
+        // midnight-proofs layout is finalised in Step 6 of
+        // MIGRATION.md. In particular, lookup helpers/accumulators,
+        // trashcans, and the new PCS commitments are not yet placed
+        // into this map.
+        // ------------------------------------------------------------
         let advice_comm_start = proof_cptr;
-        let lookup_permuted_comm_start = advice_comm_start + 4 * meta.advice_indices.len();
-        let permutation_z_comm_start = lookup_permuted_comm_start + 4 * meta.num_lookup_permuteds;
-        let lookup_z_comm_start = permutation_z_comm_start + 4 * meta.num_permutation_zs;
-        let random_comm_start = lookup_z_comm_start + 4 * meta.num_lookup_zs;
-        let quotient_comm_start = random_comm_start + 4;
+        let lookup_m_comm_start = advice_comm_start + 4 * meta.advice_indices.len();
+        let permutation_z_comm_start = lookup_m_comm_start + 4 * meta.num_lookups;
+        let lookup_helper_total: usize = meta.lookup_chunks.iter().sum();
+        let lookup_helper_comm_start =
+            permutation_z_comm_start + 4 * meta.num_permutation_zs;
+        let lookup_z_comm_start = lookup_helper_comm_start + 4 * lookup_helper_total;
+        let trashcan_comm_start = lookup_z_comm_start + 4 * meta.num_lookups;
+        let quotient_comm_start = trashcan_comm_start + 4 * meta.num_trashcans;
 
         let eval_cptr = quotient_comm_start + 4 * meta.num_quotients;
-        let advice_eval_cptr = eval_cptr;
-        let fixed_eval_cptr = advice_eval_cptr + meta.advice_queries.len();
-        let random_eval_cptr = fixed_eval_cptr + meta.fixed_queries.len();
-        let permutation_eval_cptr = random_eval_cptr + 1;
-        let permutation_z_eval_cptr = permutation_eval_cptr + meta.num_permutations();
-        let lookup_eval_cptr = permutation_z_eval_cptr + 3 * meta.num_permutation_zs - 1;
-        let w_cptr = lookup_eval_cptr + 5 * meta.num_lookups();
+        let w_cptr = eval_cptr + meta.num_evals;
 
-        let fixed_comms = EcPoint::range(fixed_comm_mptr)
-            .take(meta.num_fixeds)
-            .collect();
+        let fixed_comms = EcPoint::range(fixed_comm_mptr).take(meta.num_fixeds).collect();
         let permutation_comms = izip!(
             meta.permutation_columns.iter().cloned(),
             EcPoint::range(permutation_comm_mptr)
@@ -261,19 +438,27 @@ impl Data {
             .map(|idx| advice_comm_start + 4 * idx)
             .map_into()
             .collect();
-        let lookup_permuted_comms = EcPoint::range(lookup_permuted_comm_start)
-            .take(meta.num_lookup_permuteds)
-            .tuples()
+        let lookup_m_comms = EcPoint::range(lookup_m_comm_start)
+            .take(meta.num_lookups)
             .collect();
         let permutation_z_comms = EcPoint::range(permutation_z_comm_start)
             .take(meta.num_permutation_zs)
             .collect();
+
+        // Group helpers per lookup by lookup_chunks[i].
+        let mut lookup_helper_comms: Vec<Vec<EcPoint>> = Vec::with_capacity(meta.num_lookups);
+        let mut helper_cursor = lookup_helper_comm_start;
+        for &chunks in &meta.lookup_chunks {
+            let row: Vec<EcPoint> = EcPoint::range(helper_cursor).take(chunks).collect();
+            helper_cursor = helper_cursor + 4 * chunks;
+            lookup_helper_comms.push(row);
+        }
         let lookup_z_comms = EcPoint::range(lookup_z_comm_start)
-            .take(meta.num_lookup_zs)
+            .take(meta.num_lookups)
             .collect();
-        let random_comm = random_comm_start.into();
-        // BLS layout: the computed quotient lives in a contiguous 4-word
-        // block starting at QUOTIENT_MPTR (x_hi, x_lo, y_hi, y_lo).
+        let trashcan_comms = EcPoint::range(trashcan_comm_start)
+            .take(meta.num_trashcans)
+            .collect();
         let computed_quotient_comm = EcPoint::new(Ptr::memory("QUOTIENT_MPTR"));
 
         let challenges = meta
@@ -283,30 +468,77 @@ impl Data {
             .map_into()
             .collect_vec();
         let instance_eval = Ptr::memory("INSTANCE_EVAL_MPTR").into();
+
+        // For Steps 1-3 we just place evals contiguously at eval_cptr,
+        // skipping the committed-instance reads (we don't yet support
+        // committed instances on the codegen side). The exact mapping
+        // is finalised in Step 6.
+        let mut eval_walk = eval_cptr + meta.num_committed_instances;
         let advice_evals = izip!(
             meta.advice_queries.iter().cloned(),
-            Word::range(advice_eval_cptr)
+            Word::range(eval_walk)
         )
-        .collect();
-        let fixed_evals = izip!(
-            meta.fixed_queries.iter().cloned(),
-            Word::range(fixed_eval_cptr)
-        )
-        .collect();
-        let random_eval = random_eval_cptr.into();
+        .take(meta.advice_queries.len())
+        .collect::<HashMap<_, _>>();
+        eval_walk = eval_walk + meta.advice_queries.len();
+
+        // fixed-non-simple evals
+        let mut fixed_evals: HashMap<(usize, i32), Word> = HashMap::new();
+        let mut fixed_walk = eval_walk;
+        for query in &meta.fixed_queries {
+            // We only emit a slot for non-simple-selector columns; for
+            // simple selectors the evaluator must use Fq::ONE in place.
+            // (See `midnight_proofs::plonk::verifier::verify_algebraic_constraints`
+            // which inserts F::ONE into fixed_evals at simple-selector
+            // indices after reading the rest from the transcript.)
+            // For Steps 1-3 we don't enforce this filter; later steps
+            // will adjust.
+            fixed_evals.insert(*query, fixed_walk.into());
+            fixed_walk = fixed_walk + 1;
+        }
+        eval_walk = fixed_walk;
+
         let permutation_evals = izip!(
             meta.permutation_columns.iter().cloned(),
-            Word::range(permutation_eval_cptr)
+            Word::range(eval_walk)
         )
-        .collect();
-        let permutation_z_evals = Word::range(permutation_z_eval_cptr)
-            .take(3 * meta.num_permutation_zs)
-            .tuples()
+        .collect::<HashMap<_, _>>();
+        eval_walk = eval_walk + meta.permutation_columns.len();
+
+        let perm_set_count = if meta.num_permutation_zs == 0 {
+            0
+        } else {
+            3 * meta.num_permutation_zs - 1
+        };
+        let permutation_z_evals = Word::range(eval_walk)
+            .take(perm_set_count)
+            .collect::<Vec<_>>()
+            .chunks(3)
+            .map(|chunk| match chunk {
+                [a, b, c] => (*a, *b, *c),
+                [a, b] => (*a, *b, *a), // last set has no last_eval
+                _ => unreachable!(),
+            })
             .collect_vec();
-        let lookup_evals = Word::range(lookup_eval_cptr)
-            .take(5 * meta.num_lookup_zs)
-            .tuples()
-            .collect_vec();
+        eval_walk = eval_walk + perm_set_count;
+
+        // lookup evals: per lookup, m + helpers + acc + acc_next
+        let mut lookup_evals: Vec<(Word, Vec<Word>, Word, Word)> =
+            Vec::with_capacity(meta.num_lookups);
+        for &chunks in &meta.lookup_chunks {
+            let m = eval_walk.into();
+            eval_walk = eval_walk + 1;
+            let helpers: Vec<Word> = Word::range(eval_walk).take(chunks).collect();
+            eval_walk = eval_walk + chunks;
+            let z = eval_walk.into();
+            eval_walk = eval_walk + 1;
+            let z_next = eval_walk.into();
+            eval_walk = eval_walk + 1;
+            lookup_evals.push((m, helpers, z, z_next));
+        }
+
+        let trashcan_evals: Vec<Word> = Word::range(eval_walk).take(meta.num_trashcans).collect();
+
         let computed_quotient_eval = Ptr::memory("QUOTIENT_EVAL_MPTR").into();
 
         Self {
@@ -314,25 +546,23 @@ impl Data {
             theta_mptr,
             quotient_comm_cptr: quotient_comm_start,
             w_cptr,
-
             fixed_comms,
             permutation_comms,
             advice_comms,
-            lookup_permuted_comms,
             permutation_z_comms,
+            lookup_m_comms,
+            lookup_helper_comms,
             lookup_z_comms,
-            random_comm,
+            trashcan_comms,
             computed_quotient_comm,
-
             challenges,
-
             instance_eval,
             advice_evals,
             fixed_evals,
             permutation_evals,
             permutation_z_evals,
             lookup_evals,
-            random_eval,
+            trashcan_evals,
             computed_quotient_eval,
         }
     }
@@ -368,10 +598,7 @@ pub(crate) enum Value {
 
 impl Value {
     pub(crate) fn is_integer(&self) -> bool {
-        match self {
-            Value::Integer(_) => true,
-            Value::Identifier(..) => false,
-        }
+        matches!(self, Value::Integer(_))
     }
 
     pub(crate) fn as_usize(&self) -> usize {
@@ -413,8 +640,6 @@ impl Display for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(int) if *int >= 0 => write!(f, "{}", fmt_hex(*int)),
-            // Negative literal: render as `sub(0, +int)` to keep the EVM
-            // expression syntactically valid inside Yul.
             Value::Integer(int) => write!(f, "sub(0, {})", fmt_hex(-*int)),
             Value::Identifier(ident, 0) => write!(f, "{ident}"),
             Value::Identifier(ident, off) if *off > 0 => {
@@ -429,7 +654,6 @@ impl Display for Value {
 
 impl Add<usize> for Value {
     type Output = Value;
-
     fn add(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int + (rhs as isize) * 0x20),
@@ -442,7 +666,6 @@ impl Add<usize> for Value {
 
 impl Sub<usize> for Value {
     type Output = Value;
-
     fn sub(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int - (rhs as isize) * 0x20),
@@ -453,9 +676,6 @@ impl Sub<usize> for Value {
     }
 }
 
-/// `Ptr` points to a EVM word at either calldata or memory.
-///
-/// When adding or subtracting it by 1, its value moves by 32 and points to next/previous EVM word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ptr {
     loc: Location,
@@ -495,7 +715,6 @@ impl Display for Ptr {
 
 impl Add<usize> for Ptr {
     type Output = Ptr;
-
     fn add(mut self, rhs: usize) -> Self::Output {
         self.value = self.value + rhs;
         self
@@ -504,7 +723,6 @@ impl Add<usize> for Ptr {
 
 impl Sub<usize> for Ptr {
     type Output = Ptr;
-
     fn sub(mut self, rhs: usize) -> Self::Output {
         self.value = self.value - rhs;
         self
@@ -541,11 +759,6 @@ impl From<Ptr> for Word {
     }
 }
 
-/// A G1 point in the EIP-2537 padded layout: four EVM words at
-/// `(base + 0, base + 1, base + 2, base + 3)` carrying
-/// `(x_hi, x_lo, y_hi, y_lo)` respectively. Each Fp coordinate is 64 bytes
-/// (16 zero-byte prefix + 48 byte value), and `EcPoint::range` therefore
-/// strides 4 words between consecutive points instead of the BN254-era 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EcPoint {
     base: Ptr,
@@ -556,7 +769,6 @@ impl EcPoint {
         Self { base: base.into() }
     }
 
-    /// Iterate G1 points starting at the given base, advancing by 4 words.
     pub(crate) fn range(base: impl Into<EcPoint>) -> impl Iterator<Item = EcPoint> {
         let base = base.into().base;
         (0..).map(move |idx| EcPoint::new(base + 4 * idx))
@@ -566,7 +778,6 @@ impl EcPoint {
         self.base.loc()
     }
 
-    /// Pointer to the first word of the point (= the `x_hi` slot).
     pub(crate) fn ptr(&self) -> Ptr {
         self.base
     }
@@ -584,7 +795,6 @@ impl EcPoint {
         Word::from(self.base + 3)
     }
 
-    /// Returns the four words (x_hi, x_lo, y_hi, y_lo) in EIP-2537 order.
     pub(crate) fn words(&self) -> [Word; 4] {
         [self.x_hi(), self.x_lo(), self.y_hi(), self.y_lo()]
     }
@@ -596,8 +806,6 @@ impl From<Ptr> for EcPoint {
     }
 }
 
-/// Emit four `mstore`s copying a 4-word G1 point from `src` (in calldata or
-/// memory) into the contiguous memory range starting at `dst_base`.
 pub(crate) fn copy_g1_point(dst_base: Ptr, src: &EcPoint) -> [String; 4] {
     let [x_hi, x_lo, y_hi, y_lo] = src.words();
     [
@@ -608,7 +816,6 @@ pub(crate) fn copy_g1_point(dst_base: Ptr, src: &EcPoint) -> [String; 4] {
     ]
 }
 
-/// Add indention to given lines by `4 * N` spaces.
 pub(crate) fn indent<const N: usize>(
     lines: impl IntoIterator<Item = impl Into<String>>,
 ) -> Vec<String> {
@@ -618,9 +825,6 @@ pub(crate) fn indent<const N: usize>(
         .collect()
 }
 
-/// Create a code block for given lines with indention.
-///
-/// If `PACKED` is true, single line code block will be packed into single line.
 pub(crate) fn code_block<const N: usize, const PACKED: bool>(
     lines: impl IntoIterator<Item = impl Into<String>>,
 ) -> Vec<String> {
@@ -638,7 +842,6 @@ pub(crate) fn code_block<const N: usize, const PACKED: bool>(
     }
 }
 
-/// Create a for loop with proper indention.
 pub(crate) fn for_loop(
     initialization: impl IntoIterator<Item = impl Into<String>>,
     condition: impl Into<String>,
@@ -679,88 +882,87 @@ pub(crate) fn group_backward_adjacent_words<'a>(
 pub(crate) fn group_backward_adjacent_ec_points<'a>(
     ec_point: impl IntoIterator<Item = &'a EcPoint>,
 ) -> Vec<(Location, Vec<&'a EcPoint>)> {
-    // BLS12-381 EIP-2537 stride is 4 words per G1 point, so two points are
-    // backward-adjacent when their bases differ by exactly 4 (one EcPoint
-    // step).
-    ec_point
-        .into_iter()
-        .fold(Vec::new(), |mut ec_point_groups, ec_point| {
-            if let Some(last_group) = ec_point_groups.last_mut() {
-                let last_ec_point = **last_group.1.last().unwrap();
-                if last_group.0 == ec_point.loc()
-                    && last_ec_point.ptr().value().is_integer()
-                    && last_ec_point.ptr() - 4 == ec_point.ptr()
-                {
-                    last_group.1.push(ec_point)
-                } else {
-                    ec_point_groups.push((ec_point.loc(), vec![ec_point]))
-                }
-                ec_point_groups
+    ec_point.into_iter().fold(Vec::new(), |mut ec_point_groups, ec_point| {
+        if let Some(last_group) = ec_point_groups.last_mut() {
+            let last_ec_point = **last_group.1.last().unwrap();
+            if last_group.0 == ec_point.loc()
+                && last_ec_point.ptr().value().is_integer()
+                && last_ec_point.ptr() - 4 == ec_point.ptr()
+            {
+                last_group.1.push(ec_point)
             } else {
-                vec![(ec_point.loc(), vec![ec_point])]
+                ec_point_groups.push((ec_point.loc(), vec![ec_point]))
             }
-        })
+            ec_point_groups
+        } else {
+            vec![(ec_point.loc(), vec![ec_point])]
+        }
+    })
 }
 
 // ----------------------------------------------------------------------------
-// BLS12-381 EIP-2537 encoding helpers.
-//
-// EIP-2537 encodes each Fp coordinate as 64 bytes: 16 leading zero bytes
-// followed by 48 bytes of value (big-endian). A G1 point therefore occupies
-// 128 bytes = 4 u256 words: (x_hi, x_lo, y_hi, y_lo) where hi has 16 zero
-// MSBs. A G2 point occupies 256 bytes = 8 words; the c0/c1 ordering matches
-// EIP-2537 (X.c0, X.c1, Y.c0, Y.c1).
-//
-// `g1_to_u256s` / `g2_to_u256s` take real BLS12-381 curve points (from
-// halo2curves 0.7) and emit the EIP-2537 layout the Solidity verifier
-// reads. The `bls_*_pad_from_bn254_bytes` helpers from earlier in the
-// migration (which fabricated BLS-shape bytes from BN254 coordinates) are
-// gone now that the prover side runs natively on BLS12-381.
+// BLS12-381 EIP-2537 encoding helpers (post-migration: types come from
+// `midnight_curves` instead of `halo2curves::bls12381`). The shape of the
+// encoded U256 array is unchanged.
 // ----------------------------------------------------------------------------
 
-/// Convert a 48-byte big-endian Fp limb into the EIP-2537 (hi, lo) split.
 fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
     debug_assert_eq!(be.len(), 48);
     let mut hi_bytes = [0u8; 32];
     hi_bytes[16..].copy_from_slice(&be[..16]);
     let mut lo_bytes = [0u8; 32];
     lo_bytes.copy_from_slice(&be[16..]);
-    (
-        U256::from_be_bytes(hi_bytes),
-        U256::from_be_bytes(lo_bytes),
-    )
+    (U256::from_be_bytes(hi_bytes), U256::from_be_bytes(lo_bytes))
 }
 
-/// Encode a BLS12-381 G1 point in EIP-2537 padded form (4 u256 words).
+/// Encode a midnight-curves G1 point in EIP-2537 padded form (4 u256 words).
 ///
-/// `Fq::to_repr()` always returns *little-endian* bytes (the halo2derive
-/// macro hard-codes `Endian::LE.to_bytes` regardless of the field-level
-/// `endian =` setting), so we reverse to BE before the (hi, lo) split.
-pub(crate) fn g1_to_u256s(ec_point: impl Borrow<bls12_381::G1Affine>) -> [U256; 4] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    let mut x_be: [u8; 48] = coords.x().to_repr().into();
+/// `Fp::to_repr()` returns *little-endian* 48 bytes (FpRepr). We reverse to
+/// big-endian and split (hi=top 16 bytes padded into u256, lo=bottom 32
+/// bytes).
+pub(crate) fn g1_to_u256s(ec_point: impl Borrow<G1Affine>) -> [U256; 4] {
+    let coords: Coordinates<G1Affine> =
+        Option::from(ec_point.borrow().coordinates()).expect("g1 identity not supported in VK");
+    let mut x_be = [0u8; 48];
+    x_be.copy_from_slice(coords.x().to_repr().as_ref());
     x_be.reverse();
-    let mut y_be: [u8; 48] = coords.y().to_repr().into();
+    let mut y_be = [0u8; 48];
+    y_be.copy_from_slice(coords.y().to_repr().as_ref());
     y_be.reverse();
     let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
     let (y_hi, y_lo) = fp48_be_to_hi_lo(&y_be);
     [x_hi, x_lo, y_hi, y_lo]
 }
 
-/// Encode a BLS12-381 G2 point in EIP-2537 padded form (8 u256 words).
+/// Encode a midnight-curves G2 point in EIP-2537 padded form (8 u256 words).
 ///
-/// halo2curves' `Fq2::to_bytes()` emits 96 bytes in `(c0_to_bytes ||
-/// c1_to_bytes)`. The base `Fq::to_bytes()` honours the field-level
-/// `endian = "big"` setting, so each 48-byte half here is *big-endian*
-/// already and feeds straight into the splitter (no reversal needed).
-pub(crate) fn g2_to_u256s(ec_point: impl Borrow<bls12_381::G2Affine>) -> [U256; 8] {
-    let coords = ec_point.borrow().coordinates().unwrap();
-    let x_bytes: [u8; 96] = coords.x().to_bytes();
-    let y_bytes: [u8; 96] = coords.y().to_bytes();
-    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&x_bytes[..48]);
-    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&x_bytes[48..]);
-    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&y_bytes[..48]);
-    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&y_bytes[48..]);
+/// G2 coordinates are `Fp2` with c0/c1 components, each a 48-byte
+/// little-endian Fp. EIP-2537 expects (c0, c1) for both x and y, packed
+/// in big-endian per coord. The midnight-curves convention matches:
+/// each `Fp` coordinate read via `to_repr()` returns LE bytes.
+pub(crate) fn g2_to_u256s(ec_point: impl Borrow<G2Affine>) -> [U256; 8] {
+    let coords: Coordinates<G2Affine> =
+        Option::from(ec_point.borrow().coordinates()).expect("g2 identity not supported in VK");
+
+    let pack_fp = |fp: midnight_curves::Fp| -> [u8; 48] {
+        let mut be = [0u8; 48];
+        be.copy_from_slice(fp.to_repr().as_ref());
+        be.reverse();
+        be
+    };
+
+    let x = coords.x();
+    let y = coords.y();
+
+    let x0 = pack_fp(x.c0());
+    let x1 = pack_fp(x.c1());
+    let y0 = pack_fp(y.c0());
+    let y1 = pack_fp(y.c1());
+
+    let (x0_hi, x0_lo) = fp48_be_to_hi_lo(&x0);
+    let (x1_hi, x1_lo) = fp48_be_to_hi_lo(&x1);
+    let (y0_hi, y0_lo) = fp48_be_to_hi_lo(&y0);
+    let (y1_hi, y1_lo) = fp48_be_to_hi_lo(&y1);
     [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
 }
 

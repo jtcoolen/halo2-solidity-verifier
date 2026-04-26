@@ -1,239 +1,240 @@
-use halo2_proofs::{
-    halo2curves::{ff::PrimeField, Coordinates, CurveAffine},
-    transcript::{
-        EncodedChallenge, Transcript, TranscriptRead, TranscriptReadBuffer, TranscriptWrite,
-        TranscriptWriterBuffer,
-    },
-};
-use itertools::{chain, Itertools};
-use ruint::aliases::U256;
+//! Keccak256 transcript matching `midnight_proofs::transcript::CircuitTranscript<Keccak256>`
+//! byte-for-byte. The previous BN254-era implementation in this crate
+//! used a different scheme (raw byte concatenation with a `0x01`
+//! continuation marker, mod-r reduction of the 32-byte digest); this
+//! file is a complete rewrite for the midnight-proofs migration.
+//!
+//! Reference Rust implementation:
+//!   * `midfall/proofs/src/transcript/mod.rs::CircuitTranscript`
+//!   * `midfall/proofs/src/transcript/implementors.rs::TranscriptHash for Keccak256`
+//!
+//! Behaviour summary:
+//!
+//!   * `init`: hasher = `Keccak256::new().update("Domain separator for transcript")`.
+//!   * `common(input)`: hasher.update([1u8 PREFIX_COMMON]); hasher.update(input).
+//!     For G1, `input` is the **compressed 48-byte BLS12-381 encoding**
+//!     (`<G1Projective as GroupEncoding>::to_bytes`), not the EIP-2537
+//!     padded 128-byte form the previous transcript used.
+//!     For Fq scalars, `input` is the canonical little-endian 32-byte
+//!     repr (`Fq::to_repr()`).
+//!   * `squeeze`: produces 64 bytes via two domain-separated finalisations
+//!     (`state || PREFIX_CHALLENGE=0 || 0x00` and `... || 0x01`), then
+//!     re-seeds the hasher with `Keccak256::new().update(out64)`.
+//!   * `sample::<Fq>(out64)`: `Fq::from_uniform_bytes(&out64)` =
+//!     `LE(out64[0..32]) + LE(out64[32..64]) * 2^256 (mod r)`.
+//!
+//! The Solidity verifier (`templates/Halo2Verifier.sol`) ports this exactly:
+//! see Step 6 in MIGRATION.md for the planned Yul translation.
+
+use std::io::{self, Cursor, Read, Write};
+
+use ff::{FromUniformBytes, PrimeField};
+use group::GroupEncoding;
+use midnight_curves::{Fq, G1Projective};
 use sha3::{Digest, Keccak256};
-use std::{
-    io::{self, Read, Write},
-    marker::PhantomData,
-    mem,
-};
 
-/// Transcript using Keccak256 as hash function in Fiat-Shamir transformation.
-#[derive(Debug, Default)]
-pub struct Keccak256Transcript<C, S> {
+/// Prefix matching `midnight_proofs::transcript::KECCAK256_PREFIX_CHALLENGE`.
+pub(crate) const KECCAK256_PREFIX_CHALLENGE: u8 = 0;
+/// Prefix matching `midnight_proofs::transcript::KECCAK256_PREFIX_COMMON`.
+pub(crate) const KECCAK256_PREFIX_COMMON: u8 = 1;
+
+/// In-memory Keccak256 transcript matching `CircuitTranscript<Keccak256>`.
+#[derive(Clone, Debug)]
+pub struct Keccak256Transcript<S> {
+    state: Keccak256,
     stream: S,
-    buf: Vec<u8>,
-    _marker: PhantomData<C>,
 }
 
-impl<C, S> Keccak256Transcript<C, S> {
-    /// Return a `Keccak256Transcript` with empty buffer.
+impl<S: Default> Default for Keccak256Transcript<S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
+impl<S> Keccak256Transcript<S> {
+    /// Construct a new transcript wrapping `stream` with the midnight-
+    /// proofs domain separator already absorbed.
     pub fn new(stream: S) -> Self {
-        Self {
-            stream,
-            buf: Vec::new(),
-            _marker: PhantomData,
-        }
+        let mut state = Keccak256::new();
+        state.update(b"Domain separator for transcript");
+        Self { state, stream }
+    }
+
+    /// Absorb a `PREFIX_COMMON || input` block into the running hasher.
+    fn absorb_bytes(&mut self, input: &[u8]) {
+        self.state.update([KECCAK256_PREFIX_COMMON]);
+        self.state.update(input);
+    }
+
+    /// Squeeze 64 bytes via the midnight-proofs two-fork pattern, then
+    /// re-seed `self.state` with the squeezed bytes.
+    fn squeeze_bytes(&mut self) -> [u8; 64] {
+        // Append PREFIX_CHALLENGE inside the per-fork tag the same way
+        // midnight-proofs' impl does (it absorbs PREFIX_CHALLENGE before
+        // the fork tag).
+        self.state.update([KECCAK256_PREFIX_CHALLENGE]);
+
+        let mut h0 = self.state.clone();
+        h0.update([0u8]);
+        let out0 = h0.finalize();
+
+        let mut h1 = self.state.clone();
+        h1.update([1u8]);
+        let out1 = h1.finalize();
+
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&out0);
+        out[32..].copy_from_slice(&out1);
+
+        // Re-seed the state with the squeezed 64 bytes (matches Rust:
+        // `state = Keccak256::new(); state.update(out)` -- importantly,
+        // *no* domain separator is re-applied on reseed).
+        let mut new_state = Keccak256::new();
+        new_state.update(out);
+        self.state = new_state;
+
+        out
+    }
+
+    /// Squeeze a Fq challenge using `from_uniform_bytes` semantics.
+    pub fn squeeze_challenge(&mut self) -> Fq {
+        let bytes = self.squeeze_bytes();
+        // Fq::from_uniform_bytes reduces 64 bytes (interpreted as a
+        // 512-bit little-endian integer) modulo r.
+        Fq::from_uniform_bytes(&bytes)
+    }
+
+    /// Absorb a Fq scalar in its canonical 32-byte LE repr.
+    pub fn common_scalar(&mut self, scalar: &Fq) -> io::Result<()> {
+        let repr = scalar.to_repr();
+        self.absorb_bytes(repr.as_ref());
+        Ok(())
+    }
+
+    /// Absorb a G1 point in its compressed 48-byte BLS12-381 encoding
+    /// (matches `Hashable<Keccak256> for G1Projective`).
+    pub fn common_g1(&mut self, point: &G1Projective) -> io::Result<()> {
+        let repr = <G1Projective as GroupEncoding>::to_bytes(point);
+        self.absorb_bytes(repr.as_ref());
+        Ok(())
     }
 }
 
-#[derive(Debug)]
-pub struct ChallengeEvm<C>(C::Scalar)
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>;
-
-impl<C> EncodedChallenge<C> for ChallengeEvm<C>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-{
-    type Input = [u8; 0x20];
-
-    fn new(challenge_input: &[u8; 0x20]) -> Self {
-        ChallengeEvm(u256_to_fe(U256::from_be_bytes(*challenge_input)))
+impl<R: Read> Keccak256Transcript<R> {
+    /// Read 32 bytes from the stream, absorb them via PREFIX_COMMON, and
+    /// decode the canonical-LE Fq scalar.
+    pub fn read_scalar(&mut self) -> io::Result<Fq> {
+        let mut bytes = [0u8; 32];
+        self.stream.read_exact(&mut bytes)?;
+        self.absorb_bytes(&bytes);
+        let mut repr = <Fq as PrimeField>::Repr::default();
+        repr.as_mut().copy_from_slice(&bytes);
+        Option::from(Fq::from_repr(repr))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Fq scalar"))
     }
 
-    fn get_scalar(&self) -> C::Scalar {
-        self.0
-    }
-}
-
-impl<C, S> Transcript<C, ChallengeEvm<C>> for Keccak256Transcript<C, S>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
-{
-    fn squeeze_challenge(&mut self) -> ChallengeEvm<C> {
-        let buf_len = self.buf.len();
-        let data = chain![
-            mem::take(&mut self.buf),
-            if buf_len == 0x20 { Some(1) } else { None }
-        ]
-        .collect_vec();
-        let hash: [u8; 0x20] = Keccak256::digest(data).into();
-        self.buf = hash.to_vec();
-        ChallengeEvm::new(&hash)
-    }
-
-    fn common_point(&mut self, ec_point: C) -> io::Result<()> {
-        let coords: Coordinates<C> = Option::from(ec_point.coordinates()).ok_or_else(|| {
+    /// Read a 48-byte compressed G1 point from the stream, absorb the
+    /// raw compressed bytes via PREFIX_COMMON, and decompress to
+    /// `G1Projective`.
+    pub fn read_g1(&mut self) -> io::Result<G1Projective> {
+        let mut bytes = <G1Projective as GroupEncoding>::Repr::default();
+        self.stream.read_exact(bytes.as_mut())?;
+        self.absorb_bytes(bytes.as_ref());
+        Option::from(G1Projective::from_bytes(&bytes)).ok_or_else(|| {
             io::Error::new(
-                io::ErrorKind::Other,
-                "Invalid elliptic curve point".to_string(),
+                io::ErrorKind::InvalidData,
+                "invalid compressed BLS12-381 G1 point",
             )
-        })?;
-        // The Solidity verifier reads each G1 point as the EIP-2537 padded
-        // 128-byte layout (`(x_hi | x_lo | y_hi | y_lo)`, 64 bytes per
-        // coordinate, 16 zero bytes + 48 BLS Fp big-endian bytes per coord)
-        // and hashes those bytes verbatim into the Fiat-Shamir transcript.
-        // To make the prover's hash agree with the verifier's, we write
-        // the same 64-byte-per-coord padded form here.
-        //
-        // halo2derive's `to_repr()` always returns little-endian bytes
-        // regardless of the field's `endian =` setting, so we flip to
-        // big-endian and then left-pad with 16 zero bytes so each coord
-        // lands in the low bytes of an EIP-2537 64-byte slot.
-        for coordinate in [coords.x(), coords.y()] {
-            let repr = coordinate.to_repr();
-            let bytes_be: Vec<u8> = repr.as_ref().iter().rev().copied().collect();
-            assert!(
-                bytes_be.len() <= 64,
-                "common_point: coordinate repr ({} bytes) doesn't fit in EIP-2537 64-byte slot",
-                bytes_be.len(),
-            );
-            let pad = 64 - bytes_be.len();
-            self.buf.extend(std::iter::repeat(0u8).take(pad));
-            self.buf.extend(bytes_be);
-        }
-        Ok(())
-    }
-
-    fn common_scalar(&mut self, scalar: C::Scalar) -> io::Result<()> {
-        self.buf.extend(scalar.to_repr().as_ref().iter().rev());
-        Ok(())
+        })
     }
 }
 
-impl<C, R: Read> TranscriptRead<C, ChallengeEvm<C>> for Keccak256Transcript<C, R>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
-{
-    fn read_point(&mut self) -> io::Result<C> {
-        let mut reprs = [<C::Base as PrimeField>::Repr::default(); 2];
-        for repr in &mut reprs {
-            self.stream.read_exact(repr.as_mut())?;
-            // The proof stream stores each coord big-endian (matches the
-            // EIP-2537 wire format). `Fq::to_repr()` is always little-
-            // endian, so reverse the bytes before handing them to
-            // `from_repr`.
-            repr.as_mut().reverse();
-        }
-        let [x, y] = reprs.map(|repr| Option::from(C::Base::from_repr(repr)));
-        let ec_point = x
-            .zip(y)
-            .and_then(|(x, y)| Option::from(C::from_xy(x, y)))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "Invalid elliptic curve point".to_string(),
-                )
-            })?;
-        self.common_point(ec_point)?;
-        Ok(ec_point)
-    }
-
-    fn read_scalar(&mut self) -> io::Result<C::Scalar> {
-        let mut data = [0u8; 0x20];
-        self.stream.read_exact(&mut data)?;
-        data.reverse();
-        let repr = <C::Scalar as PrimeField>::Repr::from(data);
-        let scalar = Option::from(C::Scalar::from_repr_vartime(repr))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid scalar".to_string()))?;
-        Transcript::<C, ChallengeEvm<C>>::common_scalar(self, scalar)?;
-        Ok(scalar)
+impl Keccak256Transcript<Cursor<Vec<u8>>> {
+    /// Initialise a transcript from raw proof bytes for verification.
+    pub fn init_from_bytes(bytes: &[u8]) -> Self {
+        Self::new(Cursor::new(bytes.to_vec()))
     }
 }
 
-impl<C, R: Read> TranscriptReadBuffer<R, C, ChallengeEvm<C>> for Keccak256Transcript<C, R>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
-{
-    fn init(reader: R) -> Self {
-        Keccak256Transcript::new(reader)
-    }
-}
-
-impl<C, W: Write> TranscriptWrite<C, ChallengeEvm<C>> for Keccak256Transcript<C, W>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
-{
-    fn write_point(&mut self, ec_point: C) -> io::Result<()> {
-        self.common_point(ec_point)?;
-        let coords = ec_point.coordinates().unwrap();
-        // Write each coord as big-endian bytes (matches the EIP-2537 wire
-        // format). `Fq::to_repr()` is little-endian regardless of the
-        // field's `endian =` setting, so we reverse here before writing.
-        for coord in [coords.x(), coords.y()] {
-            let mut repr = coord.to_repr();
-            repr.as_mut().reverse();
-            self.stream.write_all(repr.as_ref())?;
-        }
-        Ok(())
+impl<W: Write> Keccak256Transcript<W> {
+    /// Append a Fq scalar to the proof stream and absorb it into the
+    /// transcript.
+    pub fn write_scalar(&mut self, scalar: &Fq) -> io::Result<()> {
+        self.common_scalar(scalar)?;
+        self.stream.write_all(scalar.to_repr().as_ref())
     }
 
-    fn write_scalar(&mut self, scalar: C::Scalar) -> io::Result<()> {
-        Transcript::<C, ChallengeEvm<C>>::common_scalar(self, scalar)?;
-        let mut data = scalar.to_repr();
-        data.as_mut().reverse();
-        self.stream.write_all(data.as_ref())
-    }
-}
-
-impl<C, W: Write> TranscriptWriterBuffer<W, C, ChallengeEvm<C>> for Keccak256Transcript<C, W>
-where
-    C: CurveAffine,
-    C::Scalar: PrimeField,
-    <C::Scalar as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]> + From<[u8; 0x20]>,
-    <C::Base as PrimeField>::Repr: AsRef<[u8]> + AsMut<[u8]>,
-{
-    fn init(writer: W) -> Self {
-        Keccak256Transcript::new(writer)
+    /// Append a G1 point (compressed) to the proof stream and absorb
+    /// the compressed bytes into the transcript.
+    pub fn write_g1(&mut self, point: &G1Projective) -> io::Result<()> {
+        self.common_g1(point)?;
+        let repr = <G1Projective as GroupEncoding>::to_bytes(point);
+        self.stream.write_all(repr.as_ref())
     }
 
-    fn finalize(self) -> W {
+    /// Consume the transcript and return the underlying writer.
+    pub fn finalize(self) -> W {
         self.stream
     }
 }
 
-fn u256_to_fe<F>(value: U256) -> F
-where
-    F: PrimeField,
-    F::Repr: AsRef<[u8]> + From<[u8; 0x20]>,
-{
-    let value = value % modulus::<F>();
-    let repr = F::Repr::from(value.to_le_bytes::<0x20>());
-    F::from_repr(repr).unwrap()
-}
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
 
-fn modulus<F>() -> U256
-where
-    F: PrimeField,
-    F::Repr: AsRef<[u8]>,
-{
-    let neg_one_repr = (-F::ONE).to_repr();
-    let bytes = neg_one_repr.as_ref();
-    debug_assert_eq!(bytes.len(), 32);
-    let mut le = [0u8; 32];
-    le.copy_from_slice(bytes);
-    U256::from_le_bytes(le) + U256::from(1)
+    use midnight_proofs::transcript::{CircuitTranscript, Transcript};
+    use sha3::Keccak256;
+
+    use super::*;
+
+    /// Round-trip equivalence test against `midnight_proofs::transcript::CircuitTranscript<Keccak256>`.
+    /// Squeeze a challenge from an empty transcript on both sides; the
+    /// 64-byte intermediate hash and the resulting Fq sample must agree.
+    #[test]
+    fn empty_squeeze_matches_midnight_proofs() {
+        let mut ours = Keccak256Transcript::new(Cursor::new(Vec::<u8>::new()));
+        let theirs = {
+            let mut t: CircuitTranscript<Keccak256> = CircuitTranscript::init();
+            // Squeeze an Fq directly; no absorbs.
+            let c: Fq = t.squeeze_challenge();
+            c
+        };
+        let our_c = ours.squeeze_challenge();
+        assert_eq!(our_c, theirs, "empty squeeze diverges");
+    }
+
+    #[test]
+    fn common_scalar_then_squeeze_matches() {
+        let s = Fq::from(0x1234567890abcdefu64);
+        let mut ours = Keccak256Transcript::new(Cursor::new(Vec::<u8>::new()));
+        ours.common_scalar(&s).unwrap();
+        let our_c = ours.squeeze_challenge();
+
+        let theirs = {
+            let mut t: CircuitTranscript<Keccak256> = CircuitTranscript::init();
+            t.common(&s).unwrap();
+            let c: Fq = t.squeeze_challenge();
+            c
+        };
+
+        assert_eq!(our_c, theirs);
+    }
+
+    #[test]
+    fn common_g1_then_squeeze_matches() {
+        use group::Group;
+        let p = G1Projective::generator() * Fq::from(7u64);
+        let mut ours = Keccak256Transcript::new(Cursor::new(Vec::<u8>::new()));
+        ours.common_g1(&p).unwrap();
+        let our_c = ours.squeeze_challenge();
+
+        let theirs = {
+            let mut t: CircuitTranscript<Keccak256> = CircuitTranscript::init();
+            t.common(&p).unwrap();
+            let c: Fq = t.squeeze_challenge();
+            c
+        };
+
+        assert_eq!(our_c, theirs);
+    }
 }

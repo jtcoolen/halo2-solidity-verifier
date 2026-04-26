@@ -4,16 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# halo2_proofs is the trimmed v0.4.0 vendor under vendor/halo2/ with surgical
-# patches that expose `VerifyingKey::cs()`, the permutation commitments, the
-# KZG SRS accessors, and the ConstraintSystemBack cs walkers (see
-# vendor/halo2/PATCHES.md for the diffs). v0.4 transitively pulls halo2curves
-# 0.7, which ships `bls12_381::Bls12381 : pairing::Engine` so the prover side
-# of the BLS port can swap to a real BLS-KZG backend.
-halo2_proofs = { path = "vendor/halo2/halo2_proofs" }
-halo2_middleware = { path = "vendor/halo2/halo2_middleware" }
-halo2_backend = { path = "vendor/halo2/halo2_backend" }
-halo2curves = { version = "0.7", default-features = false }
+# Migration target: depend on midnight-proofs (the midfall fork of halo2 v0.4)
+# directly via a path dep. midnight-proofs ships logup, the trash argument,
+# the midnight KZG multi-prepare PCS, and a Keccak256 transcript with a
+# domain-separator + 64-byte squeeze. midnight-curves carries BLS12-381
+# natively (Fq scalar = midnight_curves::Fq, G1 = midnight_curves::G1Affine,
+# pairing engine = midnight_curves::Bls12).
+#
+# The vendored halo2 v0.4 tree under vendor/halo2/ is now obsolete and is
+# kept on disk only for the transcript / codegen tests that have not yet
+# been ported (see MIGRATION.md). It is no longer in the build graph.
+midnight-proofs = { path = "../midfall/proofs", default-features = false, features = ["keccak-transcript", "committed-instances"] }
+midnight-curves = { version = "0.2.0" }
+ff = "0.13"
+group = "0.13"
 askama = { version = "0.12.0", features = ["config"], default-features = false }
 hex = "0.4.3"
 ruint = "1"

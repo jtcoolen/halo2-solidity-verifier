@@ -3,18 +3,24 @@ use crate::codegen::{
     template::{Halo2Verifier, Halo2VerifyingKey},
     util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
 };
-// halo2 v0.4 transitively pulls halo2curves 0.7, which ships native
-// BLS12-381 support including `bls12381::Bls12381 : pairing::Engine`. We
-// take the BLS12-381 prover types directly so the proofs and VK embed real
-// BLS curve points and the EIP-2537 pairing precompile actually accepts
-// them. Fr is 32 bytes (same as BN254 Fr); Fq is 48 bytes per coordinate
-// (split per EIP-2537 into 16-byte hi + 32-byte lo halves).
-use halo2_proofs::{
-    halo2curves::{bls12381 as bls12_381, ff::Field},
-    plonk::VerifyingKey,
-    poly::{commitment::ParamsProver, kzg::commitment::ParamsKZG, Rotation},
-};
+// midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
+// = midnight_curves::Fq (BLS12-381 scalar) and CS = KZGCommitmentScheme<Bls12>.
+// All embedded commitments are now `G1Projective`; we convert them to
+// affine before EIP-2537 packing. ParamsKZG carries the SRS in the same
+// form as halo2 v0.4 (bare G1/G2 fields), but the public accessors only
+// expose `g_lagrange()`, `g2()`, `s_g2()`. The G1 generator is read from
+// `G1Affine::generator()` directly.
+use ff::Field;
+use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
+use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, G2Affine};
+use midnight_proofs::{
+    plonk::VerifyingKey,
+    poly::{
+        kzg::{params::ParamsKZG, KZGCommitmentScheme},
+        Rotation,
+    },
+};
 use ruint::aliases::U256;
 use sha3::{Digest, Keccak256};
 use std::fmt::{self, Debug};
@@ -26,40 +32,31 @@ pub(crate) mod util;
 
 pub use pcs::BatchOpenScheme;
 
-/// Solidity verifier generator for halo2 proofs with KZG polynomial commitment
-/// scheme. Emits Solidity that uses the BLS12-381 EIP-2537 precompiles.
+/// Solidity verifier generator for midnight-proofs (logup + trash + KZG
+/// multi-prepare PCS) on BLS12-381 EIP-2537.
 ///
-/// As of Stage C-final, this takes a `ParamsKZG<bls12381::Bls12381>` and
-/// `VerifyingKey<bls12381::G1Affine>` directly. The embedded G1/G2 commitments
-/// are real BLS12-381 curve points laid out in the EIP-2537 padded format
-/// (4 u256 words per G1, 8 per G2). The Solidity verifier therefore feeds
-/// well-formed inputs to the 0x0b/0x0c/0x0f precompiles and the pairing
-/// check returns 1 for valid proofs.
+/// **Migration status (Steps 1-3, 2026-04-26)**: this struct now binds to
+/// `midnight_proofs::plonk::VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>`
+/// and `ParamsKZG<Bls12>` instead of halo2-proofs v0.4 + halo2curves
+/// `bls12381::Bls12381`. The generated Yul still reflects the old halo2
+/// schema (no logup helpers / trashcans / multi-prepare PCS); Steps 4-9
+/// of MIGRATION.md track the Yul rewrite.
 #[derive(Debug)]
 pub struct SolidityGenerator<'a> {
-    params: &'a ParamsKZG<bls12_381::Bls12381>,
-    vk: &'a VerifyingKey<bls12_381::G1Affine>,
+    params: &'a ParamsKZG<Bls12>,
+    vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
     scheme: BatchOpenScheme,
     num_instances: usize,
+    /// Number of instance columns whose values are *committed* in the
+    /// proof transcript rather than read directly from `instances` and
+    /// Lagrange-interpolated by the verifier. Defaults to 0 for the
+    /// poseidon example.
+    num_committed_instances: usize,
     acc_encoding: Option<AccumulatorEncoding>,
     meta: ConstraintSystemMeta,
 }
 
 /// KZG accumulator encoding information.
-/// Limbs of each field element are assumed to be least significant limb first.
-///
-/// Given instances and `AccumulatorEncoding`, the accumulator is reconstructed
-/// the same way as the BN254 version, except both `acc_lhs` and `acc_rhs` are
-/// `bls12_381::G1Affine` and the base field is the 381-bit `bls12_381::Fq`.
-/// Each base-field element decomposes into `num_limbs` little-endian limbs of
-/// `num_limb_bits` bits, so for a typical `num_limbs = 4`, `num_limb_bits = 96`
-/// you need `4 * 4 * 4 = 64` instance slots (4 coordinates x 4 limbs each, but
-/// then x4 because each limb is itself padded into a u256 from the instance
-/// scalar field). The Solidity verifier reconstructs the (hi, lo) split
-/// expected by EIP-2537.
-///
-/// In the end of `verifyProof`, the accumulator is used to do batched pairing
-/// with the pairing input of the incoming proof.
 #[derive(Clone, Copy, Debug)]
 pub struct AccumulatorEncoding {
     /// Offset of accumulator limbs in instances.
@@ -84,8 +81,8 @@ impl AccumulatorEncoding {
 impl<'a> SolidityGenerator<'a> {
     /// Return a new `SolidityGenerator`.
     pub fn new(
-        params: &'a ParamsKZG<bls12_381::Bls12381>,
-        vk: &'a VerifyingKey<bls12_381::G1Affine>,
+        params: &'a ParamsKZG<Bls12>,
+        vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
         scheme: BatchOpenScheme,
         num_instances: usize,
     ) -> Self {
@@ -102,19 +99,34 @@ impl<'a> SolidityGenerator<'a> {
             "Rotated query to instance column is not yet implemented"
         );
 
+        let num_committed_instances = 0;
+        let meta = ConstraintSystemMeta::new(vk.cs(), num_committed_instances);
+
         Self {
             params,
             vk,
             scheme,
             num_instances,
+            num_committed_instances,
             acc_encoding: None,
-            meta: ConstraintSystemMeta::new(vk.cs()),
+            meta,
         }
     }
 
     /// Set `AccumulatorEncoding`.
     pub fn set_acc_encoding(mut self, acc_encoding: Option<AccumulatorEncoding>) -> Self {
         self.acc_encoding = acc_encoding;
+        self
+    }
+
+    /// Number of instance columns committed to in the transcript (vs read
+    /// from `instances` and Lagrange-interpolated locally). Surfacing the
+    /// value here so that downstream callers (drivers, debugging
+    /// examples) can configure committed-instance proofs without having
+    /// to plumb through a constructor argument.
+    pub fn set_num_committed_instances(mut self, n: usize) -> Self {
+        self.num_committed_instances = n;
+        self.meta = ConstraintSystemMeta::new(self.vk.cs(), n);
         self
     }
 }
@@ -188,79 +200,25 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output))
     }
 
-    /// Re-encode a native BLS12-381 halo2 proof byte-stream into the
-    /// EIP-2537 padded layout the Solidity verifier expects.
-    ///
-    /// What halo2's `create_proof` writes (per `Keccak256Transcript`):
-    /// ```text
-    /// [G1 commitments:    sum(num_advices) * 96 bytes]   // 48-byte BE x | 48-byte BE y
-    /// [Fr evaluations:    num_evals        * 32 bytes]
-    /// [G1 W,W' / ws:      trailing_g1_count* 96 bytes]
-    /// ```
-    /// EIP-2537 G1 layout is 128 bytes per point: each 48-byte coordinate
-    /// is preceded by 16 zero bytes (so each coord lives in the low 48
-    /// bytes of a 64-byte slot). We therefore prepend 16 zero bytes before
-    /// each 48-byte half. Fr evaluations stay at 32 bytes (BLS12-381 Fr
-    /// fits in a u256 word).
-    pub fn proof_to_bls_padded(&self, bls_proof: &[u8]) -> Vec<u8> {
-        let early_g1_count: usize = self.meta.num_advices().iter().sum();
-        let trailing_g1_count = self.scheme.num_trailing_g1_points(&self.meta);
-        let evals_bytes = self.meta.num_evals * 0x20;
-
-        // Native BLS proof has 96 bytes per G1 (48 + 48 BE).
-        let bls_g1_raw = 0x60usize;
-        // EIP-2537-padded G1 stride is 128 bytes (4 u256 words).
-        let bls_g1_padded = 0x80usize;
-        let expected = early_g1_count * bls_g1_raw + evals_bytes + trailing_g1_count * bls_g1_raw;
-        assert_eq!(
-            bls_proof.len(),
-            expected,
-            "proof byte length {} does not match expected BLS layout {} (advice G1 = {}, \
-             evals = {} bytes, trailing G1 = {})",
-            bls_proof.len(),
-            expected,
-            early_g1_count,
-            evals_bytes,
-            trailing_g1_count,
-        );
-
-        let mut out = Vec::with_capacity(
-            early_g1_count * bls_g1_padded + evals_bytes + trailing_g1_count * bls_g1_padded,
-        );
-        let mut cursor = 0usize;
-        for _ in 0..early_g1_count {
-            extend_with_padded_g1(&mut out, &bls_proof[cursor..cursor + bls_g1_raw]);
-            cursor += bls_g1_raw;
-        }
-        out.extend_from_slice(&bls_proof[cursor..cursor + evals_bytes]);
-        cursor += evals_bytes;
-        for _ in 0..trailing_g1_count {
-            extend_with_padded_g1(&mut out, &bls_proof[cursor..cursor + bls_g1_raw]);
-            cursor += bls_g1_raw;
-        }
-        debug_assert_eq!(cursor, bls_proof.len());
-        out
-    }
-
     fn generate_vk(&self) -> Halo2VerifyingKey {
         let mut constants: Vec<(&'static str, U256)> = Vec::new();
         {
             let domain = self.vk.get_domain();
-            // BLS12-381 Fr is 32 bytes wide (256 bits) so the same
+            // BLS12-381 scalar Fq is 32 bytes wide (256 bits) so the same
             // little-endian-to-u256 conversion that worked for BN254 Fr
             // also works here: the verifier reads each scalar from
             // calldata into a single 32-byte word.
-            let vk_digest = fe_to_u256::<bls12_381::Fr>(&self.vk.transcript_repr());
+            let vk_digest = fe_to_u256::<Fq>(&self.vk.transcript_repr());
             let num_instances = U256::from(self.num_instances);
             let k = U256::from(domain.k());
-            let n_inv = fe_to_u256::<bls12_381::Fr>(
-                &bls12_381::Fr::from(1 << domain.k()).invert().unwrap(),
+            let n_inv = fe_to_u256::<Fq>(
+                &Fq::from(1u64 << domain.k()).invert().unwrap(),
             );
-            let omega = fe_to_u256::<bls12_381::Fr>(&domain.get_omega());
-            let omega_inv = fe_to_u256::<bls12_381::Fr>(&domain.get_omega_inv());
+            let omega = fe_to_u256::<Fq>(&domain.get_omega());
+            let omega_inv = fe_to_u256::<Fq>(&domain.get_omega_inv());
             let omega_inv_to_l = {
                 let l = self.meta.rotation_last.unsigned_abs() as u64;
-                fe_to_u256::<bls12_381::Fr>(&domain.get_omega_inv().pow_vartime([l]))
+                fe_to_u256::<Fq>(&domain.get_omega_inv().pow_vartime([l]))
             };
             let has_accumulator = U256::from(self.acc_encoding.is_some() as usize);
             let acc_offset = self
@@ -275,14 +233,13 @@ impl<'a> SolidityGenerator<'a> {
                 .acc_encoding
                 .map(|acc_encoding| U256::from(acc_encoding.num_limb_bits))
                 .unwrap_or_default();
-            // EIP-2537 padded encodings: G1 = 4 words (16-byte zero-pad |
-            // 16-byte hi | 32-byte lo, repeated for x and y), G2 = 8 words
-            // (same shape applied to each Fq2 coefficient of x and y).
-            // `g1_to_u256s` / `g2_to_u256s` walk halo2curves' BLS12-381
-            // affine points into that layout directly.
-            let g1_pt = self.params.g()[0];
-            let g2_pt = self.params.g2();
-            let neg_s_g2_pt = -self.params.s_g2();
+            // EIP-2537 padded encodings come from `g1_to_u256s` / `g2_to_u256s`
+            // (4 / 8 u256 words respectively). We cannot read `params.g[0]`
+            // directly (the field is crate-private in midnight-proofs), so
+            // we use the canonical BLS12-381 generator.
+            let g1_pt: G1Affine = G1Affine::generator();
+            let g2_pt: G2Affine = self.params.g2().to_affine();
+            let neg_s_g2_pt: G2Affine = (-self.params.s_g2()).to_affine();
             let g1 = g1_to_u256s(&g1_pt);
             let g2 = g2_to_u256s(&g2_pt);
             let neg_s_g2 = g2_to_u256s(&neg_s_g2_pt);
@@ -328,11 +285,16 @@ impl<'a> SolidityGenerator<'a> {
             ]);
         }
 
+        // Convert each commitment from G1Projective to G1Affine before
+        // EIP-2537 packing.
+        let to_affine = |g: &G1Projective| -> G1Affine { g.to_affine() };
         let fixed_comms = chain![self.vk.fixed_commitments()]
+            .map(to_affine)
             .map(g1_to_u256s)
             .map(|[a, b, c, d]| (a, b, c, d))
             .collect();
         let permutation_comms = chain![self.vk.permutation().commitments()]
+            .map(to_affine)
             .map(g1_to_u256s)
             .map(|[a, b, c, d]| (a, b, c, d))
             .collect();
@@ -359,7 +321,8 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_eval_numer_computations = chain![
             evaluator.gate_computations(),
             evaluator.permutation_computations(),
-            evaluator.lookup_computations()
+            evaluator.lookup_computations(),
+            evaluator.trashcan_computations(),
         ]
         .enumerate()
         .map(|(idx, (mut lines, var))| {
@@ -390,6 +353,8 @@ impl<'a> SolidityGenerator<'a> {
             num_rotations: self.meta.num_rotations,
             num_evals: self.meta.num_evals,
             num_quotients: self.meta.num_quotients,
+            num_lookups: self.meta.num_lookups,
+            num_trashcans: self.meta.num_trashcans,
             proof_cptr,
             quotient_comm_cptr: data.quotient_comm_cptr,
             proof_len: self.meta.proof_len(self.scheme),
@@ -426,39 +391,19 @@ impl<'a> SolidityGenerator<'a> {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Native BLS12-381 -> EIP-2537 padded encoding helpers.
-//
-// halo2's `Keccak256Transcript::write_point` writes each G1 point as
-// `(x_be || y_be)` with each coordinate in raw BLS12-381 Fp big-endian
-// form (48 bytes per coord, 96 bytes per point). The EIP-2537 precompile
-// inputs want the same coordinates but each coord prefixed with 16 zero
-// bytes so it lands in the low 48 bytes of a 64-byte slot. We rebuild the
-// proof bytestream with that padding so the Solidity verifier can DMA
-// straight into the pairing precompile.
-// ----------------------------------------------------------------------------
-
-/// Append one BLS12-381 G1 point in EIP-2537 padded form (128 bytes) to
-/// `out`. Input is 96 bytes raw `(x_be || y_be)`. Output is
-/// `(16 zero | 48 x_be | 16 zero | 48 y_be)`.
-fn extend_with_padded_g1(out: &mut Vec<u8>, raw_g1: &[u8]) {
-    debug_assert_eq!(raw_g1.len(), 0x60);
-    let mut chunk = [0u8; 0x80];
-    // First 64-byte slot: 16 zero | 48-byte x_be.
-    chunk[16..64].copy_from_slice(&raw_g1[0..48]);
-    // Second 64-byte slot: 16 zero | 48-byte y_be.
-    chunk[80..128].copy_from_slice(&raw_g1[48..96]);
-    out.extend_from_slice(&chunk);
-}
-
-/// `encode_calldata` variant that takes a native BLS12-381 proof and
-/// re-encodes the embedded G1 commitments into the EIP-2537 padded layout
-/// the Solidity verifier reads.
+/// Encode a midnight-proofs proof + instances into Halo2Verifier calldata.
+///
+/// In the midnight-proofs schema each G1 commitment in the proof byte
+/// stream is the **48-byte compressed** BLS12-381 form. The Solidity
+/// verifier decompresses internally and feeds EIP-2537 the padded
+/// uncompressed form, so the calldata stays a flat byte concatenation
+/// of `(compressed-G1 | scalars | compressed-G1 | scalars | ...)` with
+/// the exact layout `parse_trace` consumes. This helper just wraps
+/// `encode_calldata` so callers don't have to import `evm`.
 pub fn encode_calldata_bls_padded(
-    generator: &SolidityGenerator<'_>,
-    bls_proof: &[u8],
-    instances: &[bls12_381::Fr],
+    _generator: &SolidityGenerator<'_>,
+    proof: &[u8],
+    instances: &[Fq],
 ) -> Vec<u8> {
-    let padded = generator.proof_to_bls_padded(bls_proof);
-    crate::evm::encode_calldata(&padded, instances)
+    crate::evm::encode_calldata(proof, instances)
 }
