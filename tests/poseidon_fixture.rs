@@ -130,8 +130,9 @@ fn poseidon_renders_compiles_and_verifies() {
     let witness: [F; 3] = core::array::from_fn(|_| F::random(&mut rng));
     let instance = <PoseidonChip<F> as HashCPU<F, F>>::hash(&witness);
 
+    let prover_rng = ChaCha8Rng::seed_from_u64(0xdebd);
     let proof = midnight_zk_stdlib::prove::<PoseidonExample, Keccak256>(
-        &srs, &pk, &relation, &instance, witness, OsRng,
+        &srs, &pk, &relation, &instance, witness, prover_rng,
     )
     .expect("Proof generation should not fail");
 
@@ -146,6 +147,106 @@ fn poseidon_renders_compiles_and_verifies() {
         &proof,
     )
     .expect("native verify should accept the proof");
+
+    // Parse the proof natively to recover the challenge stream so we
+    // can byte-diff against the Yul-side probe. We can't access the
+    // private VerifierTrace fields, so re-walk the transcript schedule
+    // by hand: VK digest and instance values get absorbed first, then
+    // we read the user-phase advice columns, squeeze theta, etc.
+    {
+        use ff::PrimeField;
+        use midnight_proofs::transcript::{CircuitTranscript, Hashable, Transcript};
+        type Hasher = sha3::Keccak256;
+        // Bls12 G1 affine point (post-decompression, blst-side).
+        type G1 = midnight_curves::G1Projective;
+        let mut t = <CircuitTranscript<Hasher> as Transcript>::init_from_bytes(&proof);
+        // VK digest.
+        midnight_proofs::plonk::VerifyingKey::<F, midnight_proofs::poly::kzg::KZGCommitmentScheme<midnight_curves::Bls12>>::hash_into(vk.vk(), &mut t).unwrap();
+        // Single instance, single column, single value.
+        <F as Hashable<Hasher>>::to_input(&instance);
+        <CircuitTranscript<Hasher> as Transcript>::common::<F>(&mut t, &F::from_u128(1u128)).unwrap();
+        <CircuitTranscript<Hasher> as Transcript>::common::<F>(&mut t, &instance).unwrap();
+        // User advice phases. ZkStdLib's poseidon example ends up with
+        // some number of advice columns; we read until theta squeezes.
+        // For brevity, read advices for every advice column the ZkStdLib
+        // CS exposes via vk.cs.advice_column_phase, then squeeze theta.
+        let cs = vk.vk().cs();
+        let advice_column_phase = cs.advice_column_phase();
+        let challenge_phase = cs.challenge_phase();
+        let phases: Vec<u8> = (0..=*advice_column_phase.iter().max().unwrap_or(&0)).collect();
+        let mut challenges: Vec<F> = vec![F::ZERO; cs.num_challenges()];
+        for current_phase in phases {
+            for (phase, _col) in advice_column_phase.iter().enumerate() {
+                if advice_column_phase[phase] == current_phase {
+                    let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+                }
+            }
+            for (phase, ch) in challenge_phase.iter().zip(challenges.iter_mut()) {
+                if *phase == current_phase {
+                    *ch = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge::<F>(&mut t);
+                }
+            }
+        }
+        let theta: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        // Read multiplicities (one G1 per lookup; for poseidon there's none).
+        for _ in 0..cs.lookups().len() {
+            let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+        }
+        let beta: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        let gamma: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        // Permutation Z products (one G1 per chunk).
+        let perm_chunks = vk.vk().cs().permutation().columns.chunks(vk.vk().cs().degree() - 2).count();
+        for _ in 0..perm_chunks {
+            let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+        }
+        // For each lookup: nb_chunks helper commitments + 1 accumulator.
+        // For poseidon's BatchedArgument with 1 input expression, nb_chunks=1.
+        for _ in 0..cs.lookups().len() {
+            // 1 helper + 1 accumulator (assume nb_chunks=1).
+            for _ in 0..1 {
+                let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+            }
+            let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+        }
+        let _trash_chal: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        for _ in 0..cs.trashcans().len() {
+            let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+        }
+        let y: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        // num_quotients = degree - 1 = 4 for poseidon
+        let num_quotients = cs.degree() - 1;
+        for _ in 0..num_quotients {
+            let _: G1 = <CircuitTranscript<Hasher> as Transcript>::read::<G1>(&mut t).unwrap();
+        }
+        let x: F = <CircuitTranscript<Hasher> as Transcript>::squeeze_challenge(&mut t);
+        eprintln!("[native]  theta = 0x{}", hex_be(theta));
+        eprintln!("[native]   beta = 0x{}", hex_be(beta));
+        eprintln!("[native]  gamma = 0x{}", hex_be(gamma));
+        eprintln!("[native]      y = 0x{}", hex_be(y));
+        eprintln!("[native]      x = 0x{}", hex_be(x));
+        let cs = vk.vk().cs();
+        eprintln!(
+            "[native] cs: lookups={}, num_advice={}, num_perm_cols={}, perm_chunks={}, num_trashcans={}, degree={}",
+            cs.lookups().len(),
+            cs.num_advice_columns(),
+            cs.permutation().columns.len(),
+            perm_chunks,
+            cs.trashcans().len(),
+            cs.degree(),
+        );
+        eprintln!(
+            "[native] num_eval_columns: advice_q={}, fixed_q={}, instance_q={}, perm_z={}",
+            cs.advice_queries().len(),
+            cs.fixed_queries().len(),
+            cs.instance_queries().len(),
+            perm_chunks
+        );
+        fn hex_be<F: ff::PrimeField>(f: F) -> String {
+            let mut bytes = f.to_repr().as_ref().to_vec();
+            bytes.reverse();
+            hex::encode(bytes)
+        }
+    }
 
     // Render Halo2Verifier.sol + Halo2VerifyingKey.sol against the
     // same VK. ZkStdLib creates two instance columns (one committed,

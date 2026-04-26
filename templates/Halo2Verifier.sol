@@ -13,7 +13,7 @@ pragma solidity ^0.8.0;
 //     decompresses to EIP-2537 padded form via modexp(x, (p+1)/4, p).
 //   * Transcript is a streaming Keccak256 with domain separator
 //     "Domain separator for transcript" + PREFIX_COMMON (0x01) before
-//     each absorbed value + PREFIX_CHALLENGE (0x02) before each squeeze.
+//     each absorbed value + PREFIX_CHALLENGE (0x00) before each squeeze.
 //     Squeeze is a two-fork: clone state || 0x00 then clone state ||
 //     0x01, finalize each, concat to 64 bytes, reseed.
 //   * Fq sampling: from_uniform_bytes(64) = a0 + a1 * 2^256 (mod r),
@@ -203,11 +203,20 @@ contract Halo2Verifier {
             }
 
             // Inverse of a Fr scalar via modexp(x, r-2, r). Uses memory
-            // [0x2000..0x20e0] as scratch; placed well above the
-            // streaming transcript buffer (peak < ~6KB for the supported
-            // circuit sizes).
+            // [0x6000..0x60e0] as scratch — chosen to live ABOVE every
+            // labeled MPTR in this verifier so callers don't have to
+            // worry about clobbering theta/beta/gamma (originally placed
+            // at 0x2000, which collided with `THETA_MPTR = 0x2040`,
+            // `BETA_MPTR = 0x2060`, `GAMMA_MPTR = 0x2080` and silently
+            // overwrote the squeezed challenges with the modexp input
+            // bytes — a ~960k-gas pairing rejection that took a few
+            // hours to track down). The full memory map ends at the
+            // last QUOTIENT_LIMB_COMMS_MPTR_BASE slot (well below
+            // 0x5000 even for 32-quotient-limb circuits), so 0x6000 is
+            // a safe permanent home; if a future codegen change moves
+            // any MPTR past 0x6000, bump this constant in lock-step.
             function scalar_inv(x) -> inv {
-                let p := 0x2000
+                let p := 0x6000
                 mstore(p,            0x20)        // base len
                 mstore(add(p, 0x20), 0x20)        // exp len
                 mstore(add(p, 0x40), 0x20)        // mod len
@@ -466,8 +475,16 @@ contract Halo2Verifier {
             // PREFIX_CHALLENGE + two-fork keccak + reseed. Returns the new
             // buffer length (= 64) and stores the squeezed Fq at `mptr`.
             function squeeze_to(buf_len, mptr) -> ret {
-                // Append PREFIX_CHALLENGE (0x02) at buf_len.
-                mstore8(buf_len, 0x02)
+                // Append PREFIX_CHALLENGE (0x00) at buf_len. midnight-proofs
+                // (`midfall/proofs/src/transcript/mod.rs:15`) defines
+                // `KECCAK256_PREFIX_CHALLENGE: u8 = 0`. Earlier verifier
+                // generations targeting the upstream halo2 BN254 transcript
+                // hard-coded `0x02` here, which silently rerouted the
+                // challenge stream onto a different domain and produced
+                // garbage scalars; we keep the byte writable so the next
+                // line can overlay the per-fork tag (0x00 / 0x01) without
+                // moving the cursor.
+                mstore8(buf_len, 0x00)
                 // Append 0x00; first fork.
                 mstore8(add(buf_len, 1), 0x00)
                 let h0 := keccak256(0x00, add(buf_len, 2))
@@ -629,7 +646,11 @@ contract Halo2Verifier {
             // Transcript: domain sep + VK digest + instances + proof.
             // ===============================================================
             let buf_len := transcript_init()
-            buf_len := common_word(buf_len, mload(VK_DIGEST_MPTR))
+            // VK_DIGEST_MPTR holds the digest as a BE 32-byte word (the
+            // VK contract stores it via `mstore`, which is BE). Native
+            // midnight-proofs hashes `Fq::to_repr()` (LE bytes), so we
+            // byte-reverse before absorbing.
+            buf_len := common_word(buf_len, byte_reverse_32(mload(VK_DIGEST_MPTR)))
 
             {
                 let num_instances := mload(NUM_INSTANCES_MPTR)
@@ -918,22 +939,7 @@ contract Halo2Verifier {
                 // The native verifier folds the quotient limbs with the
                 // *splitting factor* `x^(n-1)`, not `x^n` — see
                 // `compute_linearization_commitment` in
-                // midfall/proofs/src/plonk/linearization/verifier.rs:
-                //
-                //   let mut splitting_pow = F::ONE - *xn;
-                //   for _ in 0..quotient_limb_commitments.len() {
-                //       identities_scalars.push(splitting_pow);
-                //       splitting_pow *= splitting_factor;   // x^(n-1)
-                //   }
-                //
-                // We compute `x^(n-1)` here from the iterated squaring of
-                // `x` (mirroring the Lagrange block above): at iteration
-                // `i` we maintain
-                //   x_pow_2i        = x^(2^i)
-                //   x_pow_2i_minus1 = x^(2^i - 1)
-                // and update both per Knuth-style "all-ones" recurrence.
-                // After `k` iterations `x_pow_2i_minus1 = x^(2^k - 1) =
-                // x^(n-1)`.
+                // midfall/proofs/src/plonk/linearization/verifier.rs.
                 let x := mload(X_MPTR)
                 let k := mload(K_MPTR)
                 let x_pow_2i := x
