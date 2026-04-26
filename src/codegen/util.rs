@@ -15,7 +15,7 @@ use midnight_proofs::plonk::{Any, Column, ConstraintSystem};
 use ruint::{aliases::U256, UintTryFrom};
 use std::{
     borrow::Borrow,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::{self, Display, Formatter},
     ops::{Add, Sub},
 };
@@ -70,6 +70,13 @@ pub(crate) struct ConstraintSystemMeta {
     pub(crate) advice_queries: Vec<(usize, i32)>,
     pub(crate) fixed_queries: Vec<(usize, i32)>,
     pub(crate) num_simple_selectors: usize,
+    /// Set of fixed-column indices that are *simple selectors* (i.e.
+    /// multiplicative selectors that the prover sets to 0 or 1 only).
+    /// These columns have no eval slot in the proof transcript: the
+    /// verifier substitutes `F::ONE` at their fixed_query index after
+    /// reading the rest. Step 6 (Yul rewrite) keeps the same convention;
+    /// the codegen evaluator emits `0x1` directly for these queries.
+    pub(crate) simple_selector_cols: BTreeSet<usize>,
     pub(crate) num_committed_instances: usize,
     pub(crate) num_rotations: usize,
     pub(crate) num_evals: usize,
@@ -129,6 +136,9 @@ impl ConstraintSystemMeta {
             .collect_vec();
 
         let num_simple_selectors = cs.num_simple_selectors();
+        let simple_selector_cols: BTreeSet<usize> = (0..num_fixeds)
+            .filter(|&idx| cs.has_simple_selector_col(idx))
+            .collect();
 
         // Total number of evaluations the verifier reads from the proof
         // transcript. See `midnight_proofs::plonk::verifier::verify_algebraic_constraints`.
@@ -210,6 +220,7 @@ impl ConstraintSystemMeta {
             advice_queries,
             fixed_queries,
             num_simple_selectors,
+            simple_selector_cols,
             num_committed_instances: nb_committed_instances,
             num_evals,
             num_rotations,
@@ -382,7 +393,10 @@ pub(crate) struct Data {
     pub(crate) advice_evals: HashMap<(usize, i32), Word>,
     pub(crate) fixed_evals: HashMap<(usize, i32), Word>,
     pub(crate) permutation_evals: HashMap<Column<Any>, Word>,
-    pub(crate) permutation_z_evals: Vec<(Word, Word, Word)>,
+    /// Per permutation set: `(z_cur, z_next, z_last)`. `z_last` is
+    /// `None` for the last set (it has no `last_eval` in the proof; see
+    /// `midnight_proofs::plonk::permutation::verifier::Committed::evaluate`).
+    pub(crate) permutation_z_evals: Vec<(Word, Word, Option<Word>)>,
     /// Per lookup: `(m, [helpers], z, z_next)` evaluations.
     pub(crate) lookup_evals: Vec<(Word, Vec<Word>, Word, Word)>,
     pub(crate) trashcan_evals: Vec<Word>,
@@ -482,17 +496,19 @@ impl Data {
         .collect::<HashMap<_, _>>();
         eval_walk = eval_walk + meta.advice_queries.len();
 
-        // fixed-non-simple evals
+        // fixed-non-simple evals. The proof byte stream contains
+        //   `num_fixed_columns - num_simple_selectors`
+        // evals; the verifier inserts `F::ONE` for simple-selector
+        // columns. We mirror that by skipping those columns entirely
+        // here (they are absent from `fixed_evals`); the evaluator emits
+        // a literal `0x1` whenever it sees a fixed-query for a column
+        // in `meta.simple_selector_cols`.
         let mut fixed_evals: HashMap<(usize, i32), Word> = HashMap::new();
         let mut fixed_walk = eval_walk;
         for query in &meta.fixed_queries {
-            // We only emit a slot for non-simple-selector columns; for
-            // simple selectors the evaluator must use Fq::ONE in place.
-            // (See `midnight_proofs::plonk::verifier::verify_algebraic_constraints`
-            // which inserts F::ONE into fixed_evals at simple-selector
-            // indices after reading the rest from the transcript.)
-            // For Steps 1-3 we don't enforce this filter; later steps
-            // will adjust.
+            if meta.simple_selector_cols.contains(&query.0) {
+                continue;
+            }
             fixed_evals.insert(*query, fixed_walk.into());
             fixed_walk = fixed_walk + 1;
         }
@@ -510,16 +526,24 @@ impl Data {
         } else {
             3 * meta.num_permutation_zs - 1
         };
-        let permutation_z_evals = Word::range(eval_walk)
-            .take(perm_set_count)
-            .collect::<Vec<_>>()
-            .chunks(3)
-            .map(|chunk| match chunk {
-                [a, b, c] => (*a, *b, *c),
-                [a, b] => (*a, *b, *a), // last set has no last_eval
-                _ => unreachable!(),
-            })
-            .collect_vec();
+        // Layout: [z_0_cur, z_0_next, z_0_last,
+        //          z_1_cur, z_1_next, z_1_last,
+        //          ...,
+        //          z_{n-1}_cur, z_{n-1}_next]   (no last_eval for the last set)
+        let perm_words: Vec<Word> = Word::range(eval_walk).take(perm_set_count).collect();
+        let mut permutation_z_evals: Vec<(Word, Word, Option<Word>)> =
+            Vec::with_capacity(meta.num_permutation_zs);
+        let mut walk = perm_words.into_iter();
+        for set_idx in 0..meta.num_permutation_zs {
+            let cur = walk.next().expect("permutation z cur");
+            let next = walk.next().expect("permutation z next");
+            let last = if set_idx + 1 == meta.num_permutation_zs {
+                None
+            } else {
+                Some(walk.next().expect("permutation z last"))
+            };
+            permutation_z_evals.push((cur, next, last));
+        }
         eval_walk = eval_walk + perm_set_count;
 
         // lookup evals: per lookup, m + helpers + acc + acc_next
