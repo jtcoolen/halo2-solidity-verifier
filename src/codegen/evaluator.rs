@@ -659,7 +659,7 @@ impl<'a> Evaluator<'a> {
                         .to_string()
                 }
             }
-            Any::Instance => self.data.instance_eval.to_string(),
+            Any::Instance => self.instance_eval_at(col_idx, rotation),
         }
     }
 
@@ -714,9 +714,14 @@ impl<'a> Evaluator<'a> {
                 let var_name = column_eval_var("a", column_index, rotation);
                 self.init_var(eval.to_string(), Some(var_name))
             },
-            &|_query| {
-                let eval = self.data.instance_eval.to_string();
-                self.init_var(eval, Some("i_eval".to_string()))
+            &|query| {
+                let column_index = query.column_index();
+                let rotation = query.rotation().0;
+                let eval = self.instance_eval_at(column_index, rotation);
+                self.init_var(
+                    eval,
+                    Some(column_eval_var("i", column_index, rotation)),
+                )
             },
             &|challenge| {
                 self.init_var(
@@ -752,6 +757,21 @@ impl<'a> Evaluator<'a> {
                 (acc, out)
             },
         )
+    }
+
+    fn instance_eval_at(&self, column_index: usize, rotation: i32) -> String {
+        if column_index < self.meta.num_committed_instances {
+            self.data
+                .committed_instance_evals
+                .get(&(column_index, rotation))
+                .expect("committed instance eval present")
+                .to_string()
+        } else {
+            // The current public API supports one non-committed instance
+            // column, whose Lagrange-combined evaluation is computed by
+            // the template prologue and stored at INSTANCE_EVAL_MPTR.
+            self.data.instance_eval.to_string()
+        }
     }
 
     fn init_var(&self, value: impl ToString, var: Option<String>) -> (Vec<String>, String) {

@@ -335,26 +335,24 @@ impl ConstraintSystemMeta {
     }
 
     pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
-        // Each G1 commitment in the proof is 48 bytes (compressed
-        // BLS12-381). Each Fq evaluation is 32 bytes. For now we still
-        // declare the verifier proof layout in terms of EIP-2537
-        // *uncompressed* points (4 words = 128 bytes per G1) because
-        // the Solidity verifier converts compressed -> uncompressed
-        // internally before doing curve arithmetic; calldata however
-        // carries the *compressed* form to keep proofs small.
-        //
-        // This length is the calldata size (compressed). The Yul
-        // verifier will read 48 bytes per point and decompress in-EVM.
+        // Each G1 commitment in the proof is 128 bytes (uncompressed,
+        // EIP-2537 padded form: 4 words = x_hi, x_lo, y_hi, y_lo). Each
+        // Fq evaluation is 32 bytes. The off-chain prover's compressed
+        // 48-byte zcash-encoding is decompressed by the test-side
+        // `repack_proof_uncompressed` helper before being passed to
+        // `verifyProof`. The Yul verifier reconstructs the compressed
+        // 48-byte form on the fly inside `common_uncompressed_g1` for
+        // transcript hashing only.
         let g1_count: usize = self.num_advices().iter().sum::<usize>()
             + self.batch_open_g1_count(scheme);
-        g1_count * 0x30 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
+        g1_count * 0x80 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
     }
 
     pub(crate) fn batch_open_proof_len(&self, scheme: BatchOpenScheme) -> usize {
         match scheme {
             // Trailing G1 points are: f_com (1) + pi (1) = 2.
             // Plus the per-set q_evals (handled separately as scalars).
-            Gwc19 => self.batch_open_g1_count(scheme) * 0x30,
+            Gwc19 => self.batch_open_g1_count(scheme) * 0x80,
         }
     }
 
@@ -472,23 +470,25 @@ impl Data {
         // ------------------------------------------------------------
         let lookup_helper_total: usize = meta.lookup_chunks.iter().sum();
 
-        // -- calldata cursor (compressed, 0x30 byte stride per G1) --
-        // We can't use Ptr's word-aligned `+ usize` arithmetic for 0x30
-        // strides, so we walk a raw byte cursor and reconstruct Ptrs
-        // at the end.
+        // -- calldata cursor (uncompressed, 0x80 byte stride per G1) --
+        // Each G1 commitment in calldata is 128 bytes (4 words = x_hi,
+        // x_lo, y_hi, y_lo in EIP-2537 padded form). The test-side
+        // `repack_proof_uncompressed` helper decompresses the
+        // midnight-proofs prover's 48-byte zcash form before passing
+        // the proof to `verifyProof`.
         let proof_cptr_bytes = match proof_cptr.value() {
             Value::Integer(b) => b as usize,
             _ => unreachable!("proof_cptr must be a literal byte offset"),
         };
         let mut cd_byte = proof_cptr_bytes;
-        cd_byte += 0x30 * meta.advice_indices.len();
-        cd_byte += 0x30 * meta.num_lookups;
-        cd_byte += 0x30 * meta.num_permutation_zs;
-        cd_byte += 0x30 * lookup_helper_total;
-        cd_byte += 0x30 * meta.num_lookups;
-        cd_byte += 0x30 * meta.num_trashcans;
+        cd_byte += 0x80 * meta.advice_indices.len();
+        cd_byte += 0x80 * meta.num_lookups;
+        cd_byte += 0x80 * meta.num_permutation_zs;
+        cd_byte += 0x80 * lookup_helper_total;
+        cd_byte += 0x80 * meta.num_lookups;
+        cd_byte += 0x80 * meta.num_trashcans;
         let quotient_limb_cd = cd_byte;
-        cd_byte += 0x30 * meta.num_quotients;
+        cd_byte += 0x80 * meta.num_quotients;
         let eval_cd = cd_byte;
 
         let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
@@ -874,7 +874,15 @@ impl Word {
 
 impl Display for Word {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}({})", self.0.loc.opcode(), self.0.value)
+        // For Calldata-located Words (proof evals), the bytes in calldata
+        // are stored LE (midnight-proofs `Fq::to_repr` convention), so
+        // reading via `calldataload` (which interprets bytes as BE) gives
+        // the byte-reversed integer. Wrap in `byte_reverse_32(...)` so
+        // the consumer always sees the correct field-element value.
+        match self.0.loc {
+            Location::Calldata => write!(f, "byte_reverse_32(calldataload({}))", self.0.value),
+            Location::Memory => write!(f, "mload({})", self.0.value),
+        }
     }
 }
 

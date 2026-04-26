@@ -465,14 +465,15 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             ));
 
             // Initialise q_com[s] = first commitment in the set.
-            // Initialise q_eval_set[s] = first commitment's eval at the
-            // first rotation (which is x1^0 = 1, so no scaling needed).
-            let first = &commitments_in_set[0];
-            let first_pt = &first.comm;
+            let first_pt = &commitments_in_set[0].comm;
             // Copy first commitment to (0x00..0x80) scratch.
             for (off, w) in first_pt.words().iter().enumerate() {
                 lines.push(format!("mstore({:#x}, {})", off * 0x20, w));
             }
+
+            // Initialise q_eval_set[s] = first commitment's eval at the
+            // first rotation (which is x1^0 = 1, so no scaling needed).
+            let first = &commitments_in_set[0];
             // q_eval_set[s] = sum_k x1^0 * c0.evals[k] over rotations k.
             // We compute the eval contribution as the "inner product"
             // with rotations[k] inside the set, but actually the
@@ -502,19 +503,15 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             //   Q_EVAL_SET_MPTR + 0x20 * (set_offset + k)
             // where set_offset is the cumulative |sets[<s]| sum.
 
-            // Push initial first-commitment evals into the set slot.
-            // For each rotation k in the set, the slot value is
-            // first.evals[k] (since x1^0 = 1).
+            // Keep q_eval_set[s][k] in stack locals while accumulating,
+            // then store once. This avoids an mload/mstore round-trip
+            // for every commitment after the first.
             let set_eval_offset_words: usize = sets.point_sets[..set_idx]
                 .iter()
                 .map(|s| s.len())
                 .sum::<usize>();
             for (k, ev) in first.evals.iter().enumerate() {
-                lines.push(format!(
-                    "mstore(add(Q_EVAL_SET_MPTR, {:#x}), {})",
-                    (set_eval_offset_words + k) * 0x20,
-                    ev
-                ));
+                lines.push(format!("let q_eval_set_{k} := {ev}"));
             }
 
             // For each subsequent commitment in the set, scale by
@@ -536,12 +533,8 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
 
                 // q_eval_set[s][k] += x1_pow * c.evals[k]
                 for (k, ev) in c.evals.iter().enumerate() {
-                    let slot = format!(
-                        "add(Q_EVAL_SET_MPTR, {:#x})",
-                        (set_eval_offset_words + k) * 0x20
-                    );
                     lines.push(format!(
-                        "mstore({slot}, addmod(mload({slot}), mulmod({ev}, {x1_pow}, r), r))"
+                        "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
                     ));
                 }
             }
@@ -552,6 +545,12 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     "mstore({}, mload({:#x}))",
                     add_offset(&q_com_base, off * 0x20),
                     off * 0x20
+                ));
+            }
+            for k in 0..first.evals.len() {
+                lines.push(format!(
+                    "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
+                    (set_eval_offset_words + k) * 0x20
                 ));
             }
 
@@ -591,7 +590,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             let m = points.len();
             // proof_eval is the s-th q_eval scalar in calldata.
             let proof_eval = format!(
-                "calldataload(add(Q_EVAL_CPTR, {:#x}))",
+                "byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x})))",
                 set_idx * 0x20
             );
             // Reference to q_eval_set[set_idx][k]:
@@ -728,8 +727,8 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 off * 0x20
             ));
         }
-        // v = q_evals[0] (calldata)
-        lines.push("let v := calldataload(Q_EVAL_CPTR)".to_string());
+        // v = q_evals[0] (calldata, midnight-proofs Fr::to_repr() is LE -> byte-reverse)
+        lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
         lines.push("let x4_pow := 1".to_string());
 
         for s in 1..n_sets {
@@ -755,7 +754,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             );
             // v += x4_pow * q_evals[s]
             lines.push(format!(
-                "v := addmod(v, mulmod(calldataload(add(Q_EVAL_CPTR, {:#x})), x4_pow, r), r)",
+                "v := addmod(v, mulmod(byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x}))), x4_pow, r), r)",
                 s * 0x20
             ));
         }
@@ -966,5 +965,3 @@ mod tests {
         assert_eq!(result.point_sets[0].len(), 2);
     }
 }
-
-

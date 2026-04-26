@@ -8,9 +8,14 @@ pragma solidity ^0.8.0;
 //   * BLS12-381 base field Fp is 381 bits and does not fit in a uint256.
 //     Each Fp coord is encoded EIP-2537 padded (16 zero bytes + 48 bytes).
 //     A G1 point is 128 bytes (4 words); a G2 point is 256 bytes (8).
-//   * Calldata carries G1 commitments in their 48-byte compressed form
-//     (zcash convention: top 3 flag bits + 381-bit x). The verifier
-//     decompresses to EIP-2537 padded form via modexp(x, (p+1)/4, p).
+//   * Calldata carries G1 commitments in uncompressed EIP-2537 padded
+//     form (4 words = 128 bytes per point: x_hi, x_lo, y_hi, y_lo). The
+//     proof bytes produced by midnight-proofs prover are repacked off
+//     chain (compressed -> uncompressed) before being passed to
+//     `verifyProof`. The verifier still hashes the *compressed* 48-byte
+//     encoding into the transcript (to match the native verifier); the
+//     compressed bytes are reconstructed on the fly inside
+//     `common_uncompressed_g1` from the four uncompressed words.
 //   * Transcript is a streaming Keccak256 with domain separator
 //     "Domain separator for transcript" + PREFIX_COMMON (0x01) before
 //     each absorbed value + PREFIX_CHALLENGE (0x00) before each squeeze.
@@ -20,9 +25,9 @@ pragma solidity ^0.8.0;
 //     where a0 = LE int of bytes[0..32], a1 = LE int of bytes[32..64].
 //   * Scalar inversion uses modexp(scalar, r-2, r).
 //   * Precompiles:
-//       0x05 modexp (used for G1 sqrt and Fr inversion)
+//       0x05 modexp (used for Fr inversion)
 //       0x0b BLS12_G1ADD
-//       0x0c BLS12_G1MSM (single-pair mode)
+//       0x0c BLS12_G1MSM
 //       0x0f BLS12_PAIRING_CHECK
 contract Halo2Verifier {
     {%- match self.expected_vk_codehash %}
@@ -144,15 +149,13 @@ contract Halo2Verifier {
     uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups + 4 * num_trashcans }};
 
     // ----------------------------------------------------------------------
-    // BLS12-381 base-field arithmetic constants used by `decompress_g1`
-    // and `scalar_inv`. p is 381 bits so it spans 48 BE bytes (top 16
-    // bytes go in word 0, bottom 32 bytes go in word 1 — both stored
-    // left-aligned so an mstore lands them at the right offset).
+    // BLS12-381 base-field constants used by `common_uncompressed_g1` to
+    // compute the sign(y) bit of the on-the-fly compressed encoding.
+    // p is 381 bits so it spans 48 BE bytes (top 32 bytes in BLS_P_TOP32,
+    // bottom 16 bytes left-aligned in BLS_P_BOT16_LEFT).
     // ----------------------------------------------------------------------
     uint256 internal constant BLS_P_TOP32        = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624;
     uint256 internal constant BLS_P_BOT16_LEFT   = 0x1eabfffeb153ffffb9feffffffffaaab00000000000000000000000000000000;
-    uint256 internal constant BLS_SQRT_EXP_TOP32      = 0x0680447a8e5ff9a692c6e9ed90d2eb35d91dd2e13ce144afd9cc34a83dac3d89;
-    uint256 internal constant BLS_SQRT_EXP_BOT16_LEFT = 0x07aaffffac54ffffee7fbfffffffeaab00000000000000000000000000000000;
 
     // Fr modulus and Montgomery constant 2^256 mod r used by from_uniform_bytes.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
@@ -198,15 +201,10 @@ contract Halo2Verifier {
             // scalars read from calldata that need to be interpreted as
             // big-endian integers (or vice versa).
             function byte_reverse_32(x) -> r {
-                r := or(shl(8,  and(x, 0x00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff)),
-                        shr(8,  and(x, 0xff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00)))
-                r := or(shl(16, and(r, 0x0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff)),
-                        shr(16, and(r, 0xffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000)))
-                r := or(shl(32, and(r, 0x00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff)),
-                        shr(32, and(r, 0xffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000)))
-                r := or(shl(64, and(r, 0x0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff)),
-                        shr(64, and(r, 0xffffffffffffffff0000000000000000ffffffffffffffff0000000000000000)))
-                r := or(shl(128, and(r, 0xffffffffffffffffffffffffffffffff)), shr(128, r))
+                r := 0
+                for { let i := 0 } lt(i, 32) { i := add(i, 1) } {
+                    r := or(r, shl(mul(i, 8), byte(i, x)))
+                }
             }
 
             // Inverse of a Fr scalar via modexp(x, r-2, r). Uses memory
@@ -234,140 +232,87 @@ contract Halo2Verifier {
                 inv := mload(p)
             }
 
-            // Decompress a 48-byte compressed BLS12-381 G1 point (zcash
-            // convention) into a 4-word EIP-2537 padded form at `dst`.
-            // Returns updated success flag.
+            // ---------- Streaming Keccak256 transcript helpers ----------
+            //
+            // The transcript buffer lives at memory[0x00..buf_len). On
+            // verifier entry we seed it with the 30-byte domain separator;
+            // every common(input) prepends a single PREFIX_COMMON byte and
+            // then writes the input bytes. squeeze_*(buf_len) computes the
+            // 64-byte two-fork keccak output, reseeds the buffer, and
+            // samples a Fq element via from_uniform_bytes.
+
+            function transcript_init() -> buf_len {
+                // Write the 31-byte domain separator. The literal is
+                // stored left-aligned in DOMAIN_SEPARATOR; the trailing
+                // byte (zero) is overwritten by the first PREFIX_COMMON
+                // absorb.
+                mstore(0x00, DOMAIN_SEPARATOR)
+                buf_len := 31
+            }
+
+            // Append PREFIX_COMMON || word[0..32] at the current end of the
+            // transcript buffer.
+            function common_word(buf_len, word) -> ret {
+                mstore8(buf_len, 0x01)
+                mstore(add(buf_len, 1), word)
+                ret := add(buf_len, 33)
+            }
+
+            // Read an uncompressed BLS12-381 G1 point from calldata
+            // (4 words = 128 bytes; EIP-2537 padded form: x_hi, x_lo,
+            // y_hi, y_lo) and absorb its compressed 48-byte zcash
+            // encoding into the transcript buffer at `buf_len`.
             //
             // Compressed encoding (48 bytes):
             //   byte 0 high 3 bits = (compression=1, infinity, sign)
             //   x = 381 bits big-endian, top 3 bits cleared
             //
-            // Decompression:
-            //   if infinity: dst <- (0,0,0,0)
-            //   else:
-            //     y_sq = x^3 + 4                  // potentially > p, ok
-            //     y = y_sq^((p+1)/4) mod p         // modexp reduces y_sq
-            //     if sign != lex(y): y = p - y
+            // The compression bit is always set. The infinity bit is
+            // set iff the point is the identity (all 4 words = 0). The
+            // sign bit is `lex(y) > lex(p - y)`, computed with a
+            // 384-bit limb subtraction (no precompiles, no modexp).
             //
-            // Memory budget: scratch from 0x2200..0x2400 placed well
-            // above the streaming transcript buffer. Staticcall outputs
-            // are written back into the input region to save memory.
-            // `src` is a CALLDATA pointer (`proof_cptr`) into the
-            // 48-byte compressed G1 region; the function reads via
-            // `calldataload` rather than `mload`.
-            function decompress_g1(success, src, dst) -> ret {
-                let head := calldataload(src)             // 32 bytes [0..32]
-                let tail := calldataload(add(src, 0x20))  // 32 bytes [32..64], we use [32..48]
-                let flag_byte := byte(0, head)
-                let comp_flag := and(shr(7, flag_byte), 1)
-                let inf_flag  := and(shr(6, flag_byte), 1)
-                let sign_flag := and(shr(5, flag_byte), 1)
-                ret := and(success, comp_flag)
+            // The point's uncompressed form remains in calldata; the
+            // call site is responsible for `calldatacopy`-ing it into
+            // memory afterwards if it needs the on-curve coordinates.
+            function common_uncompressed_g1(buf_len, cptr) -> ret {
+                let x_hi_word := calldataload(cptr)
+                let x_lo_word := calldataload(add(cptr, 0x20))
+                let y_hi_word := calldataload(add(cptr, 0x40))
+                let y_lo_word := calldataload(add(cptr, 0x60))
 
-                switch inf_flag
-                case 1 {
-                    mstore(dst,            0)
-                    mstore(add(dst, 0x20), 0)
-                    mstore(add(dst, 0x40), 0)
-                    mstore(add(dst, 0x60), 0)
+                // x_hi/x_lo are EIP-2537 padded: top 16 bytes of each
+                // word are zero, payload sits in the bottom 16 bytes
+                // for x_hi and the full 32 bytes for x_lo.
+                let x_hi_payload := and(x_hi_word, 0xffffffffffffffffffffffffffffffff)
+                let x_lo_payload := x_lo_word
+                let y_hi_payload := and(y_hi_word, 0xffffffffffffffffffffffffffffffff)
+                let y_lo_payload := y_lo_word
+
+                let is_identity := iszero(or(or(or(x_hi_payload, x_lo_payload), y_hi_payload), y_lo_payload))
+
+                // Default flag = 0x80 (compression bit). For identity
+                // we OR in the infinity bit (0x40), giving 0xc0 and
+                // zero out the x bytes.
+                let flag := 0x80
+                if is_identity {
+                    flag := 0xc0
+                    x_hi_payload := 0
+                    x_lo_payload := 0
                 }
-                default {
-                    // x_hi = top 16 bytes (with top 3 flag bits cleared).
-                    let x_hi := shr(128, head)
-                    x_hi := and(x_hi, 0x1fffffffffffffffffffffffffffffff)
-                    let head_bot16 := and(head, 0xffffffffffffffffffffffffffffffff)
-                    let tail_top16 := shr(128, tail)
-                    let x_lo := or(shl(128, head_bot16), tail_top16)
 
-                    // -------- modexp(x, 3, p) -> x^3 mod p --------
-                    //
-                    // Layout at p..p+0xe0:
-                    //   p+0x00..0x20: B_size = 48
-                    //   p+0x20..0x40: E_size = 1
-                    //   p+0x40..0x60: M_size = 48
-                    //   p+0x60..0x90: B = x (48 BE bytes; top 16 = x_hi, bot 32 = x_lo)
-                    //   p+0x90..0x91: E = 0x03
-                    //   p+0x91..0xc1: M = p (48 BE bytes; top 32 = BLS_P_TOP32, bot 16 = BLS_P_BOT16_LEFT)
-                    let p := 0x2200
-                    mstore(p,            0x30)
-                    mstore(add(p, 0x20), 0x01)
-                    mstore(add(p, 0x40), 0x30)
-                    // B = x as 48 BE bytes:
-                    mstore(add(p, 0x60), shl(128, x_hi))   // bytes 0..16 = x_hi
-                    mstore(add(p, 0x70), x_lo)             // bytes 16..48 = x_lo
-                    // E = 0x03 (one byte).
-                    mstore8(add(p, 0x90), 0x03)
-                    // M = p (48 BE bytes).
-                    mstore(add(p, 0x91), BLS_P_TOP32)
-                    mstore(add(p, 0xb1), BLS_P_BOT16_LEFT)
-                    // Total input: 0x60 + 0x30 + 0x01 + 0x30 = 0xc1
-                    if iszero(staticcall(gas(), 0x05, p, 0xc1, add(p, 0xd0), 0x30)) { revert(0, 0) }
-
-                    // Read x^3 (48 bytes) back as (xc_top32, xc_bot16_left).
-                    let xc_top32 := mload(add(p, 0xd0))
-                    let xc_bot16_left := mload(add(p, 0xf0))
-
-                    // y_sq = x^3 + 4. Add to bottom 16 bytes (left-aligned).
-                    let xc_bot16_int := shr(128, xc_bot16_left)
-                    let y_sq_bot_int := add(xc_bot16_int, 4)
-                    let y_sq_top32 := xc_top32
-                    // Propagate carry if y_sq_bot_int overflowed 128 bits.
-                    if iszero(lt(y_sq_bot_int, 0x100000000000000000000000000000000)) {
-                        y_sq_bot_int := sub(y_sq_bot_int, 0x100000000000000000000000000000000)
-                        y_sq_top32 := add(y_sq_top32, 1)
-                    }
-                    let y_sq_bot_left := shl(128, y_sq_bot_int)
-
-                    // -------- modexp(y_sq, (p+1)/4, p) -> y --------
-                    //
-                    // Layout at q..q+0x101:
-                    //   q+0x00..0x20: B_size = 48
-                    //   q+0x20..0x40: E_size = 48
-                    //   q+0x40..0x60: M_size = 48
-                    //   q+0x60..0x90: B = y_sq
-                    //   q+0x90..0xc0: E = (p+1)/4
-                    //   q+0xc0..0xf0: M = p
-                    let q := 0x2300
-                    mstore(q,            0x30)
-                    mstore(add(q, 0x20), 0x30)
-                    mstore(add(q, 0x40), 0x30)
-                    mstore(add(q, 0x60), y_sq_top32)
-                    mstore(add(q, 0x80), y_sq_bot_left)
-                    mstore(add(q, 0x90), BLS_SQRT_EXP_TOP32)
-                    mstore(add(q, 0xb0), BLS_SQRT_EXP_BOT16_LEFT)
-                    mstore(add(q, 0xc0), BLS_P_TOP32)
-                    mstore(add(q, 0xe0), BLS_P_BOT16_LEFT)
-                    if iszero(staticcall(gas(), 0x05, q, 0xf0, add(q, 0x100), 0x30)) { revert(0, 0) }
-                    let y_top32 := mload(add(q, 0x100))
-                    let y_bot16_left := mload(add(q, 0x120))
-
+                if iszero(is_identity) {
                     // ---- Determine sign by comparing y vs p - y ----
-                    // p - y: subtract y from p (381-bit subtraction). y < p so
-                    // this never underflows.
-                    let y_top_int  := y_top32
-                    let y_bot_int  := shr(128, y_bot16_left)
-                    let p_top_int  := BLS_P_TOP32
-                    let p_bot_int  := shr(128, BLS_P_BOT16_LEFT)
-
-                    // Compute (p_lo, p_hi) - (y_lo, y_hi) where the value is
-                    //   hi * 2^256 + lo
-                    // and the "halves" carry the BE byte split:
-                    //   y_hi_int (32 bytes int)  + (y_bot_int << 128) is the
-                    // total 384-bit y. Same for p.
-                    // For the comparison we want py = p - y; sign = (y > py).
-
-                    // 384-bit subtraction. Encode as (hi, mid, lo) bytes via:
-                    //   p_total = (p_top_int << 128) | p_bot_int   // doesn't fit in 256
-                    // Easier: do direct 16-byte limb sub.
-                    //   Limb0 = bytes [0..16]   = byte 0..16 (BE)  = top 128 bits
-                    //   Limb1 = bytes [16..32]
-                    //   Limb2 = bytes [32..48]
+                    // p - y: subtract y from p (381-bit subtraction).
+                    // y < p so this never underflows.
+                    let p_top_int := BLS_P_TOP32
+                    let p_bot_int := shr(128, BLS_P_BOT16_LEFT)
                     let p_l0 := shr(128, p_top_int)
                     let p_l1 := and(p_top_int, 0xffffffffffffffffffffffffffffffff)
                     let p_l2 := p_bot_int
-                    let y_l0 := shr(128, y_top_int)
-                    let y_l1 := and(y_top_int, 0xffffffffffffffffffffffffffffffff)
-                    let y_l2 := y_bot_int
+                    let y_l0 := y_hi_payload
+                    let y_l1 := shr(128, y_lo_payload)
+                    let y_l2 := and(y_lo_payload, 0xffffffffffffffffffffffffffffffff)
 
                     let borrow := 0
                     let py_l2  := 0
@@ -412,70 +357,30 @@ contract Halo2Verifier {
                         default {}
                     }
 
-                    let need_negate := xor(lex_y_larger, sign_flag)
-                    if need_negate {
-                        y_top_int := or(shl(128, py_l0), py_l1)
-                        y_bot_int := py_l2
+                    if lex_y_larger {
+                        flag := or(flag, 0x20)
                     }
-                    let y_bot_left := shl(128, y_bot_int)
-
-                    // Encode (x, y) in EIP-2537 padded form at `dst`.
-                    // x_hi word: 16 zero + x_hi (already in lower 128 bits) = x_hi
-                    // x_lo word: x_lo (already 32 bytes)
-                    mstore(dst,            x_hi)
-                    mstore(add(dst, 0x20), x_lo)
-                    // y_hi word: 16 zero + y_top16. y_top_int = y_top32 BE; the
-                    // top 16 bytes of y are in the high half of y_top_int, but
-                    // we want them in the low half of the y_hi word (with 16
-                    // zero pad above). So y_hi_word = shr(128, y_top_int).
-                    mstore(add(dst, 0x40), shr(128, y_top_int))
-                    // y_lo word: bottom 32 bytes of y = (y_top_int low 16 bytes) || y_bot16
-                    let y_top_bot16 := and(y_top_int, 0xffffffffffffffffffffffffffffffff)
-                    mstore(add(dst, 0x60), or(shl(128, y_top_bot16), shr(128, y_bot_left)))
                 }
-            }
 
-            // ---------- Streaming Keccak256 transcript helpers ----------
-            //
-            // The transcript buffer lives at memory[0x00..buf_len). On
-            // verifier entry we seed it with the 30-byte domain separator;
-            // every common(input) prepends a single PREFIX_COMMON byte and
-            // then writes the input bytes. squeeze_*(buf_len) computes the
-            // 64-byte two-fork keccak output, reseeds the buffer, and
-            // samples a Fq element via from_uniform_bytes.
-
-            function transcript_init() -> buf_len {
-                // Write the 31-byte domain separator. The literal is
-                // stored left-aligned in DOMAIN_SEPARATOR; the trailing
-                // byte (zero) is overwritten by the first PREFIX_COMMON
-                // absorb.
-                mstore(0x00, DOMAIN_SEPARATOR)
-                buf_len := 31
-            }
-
-            // Append PREFIX_COMMON || word[0..32] at the current end of the
-            // transcript buffer.
-            function common_word(buf_len, word) -> ret {
+                // Build the 48 compressed bytes:
+                //   byte 0: flag | (x_hi top byte)
+                //   byte 1..16: rest of x_hi
+                //   byte 16..48: x_lo
+                // x_hi_payload occupies the low 128 bits (16 bytes) of
+                // x_hi_word. The top 3 bits of the 381-bit x are zero
+                // by construction (since x < p < 2^381 < 2^384), so
+                // OR-ing the flag byte into the top byte is safe.
+                //
+                // Compressed-as-32-bytes top word:
+                //   shl(128, x_hi_payload | (flag << 120))
+                // i.e. the 16 payload bytes left-shifted by 128 bits
+                // and the flag in the very top byte (byte 0 of the
+                // memory word).
                 mstore8(buf_len, 0x01)
-                mstore(add(buf_len, 1), word)
-                ret := add(buf_len, 33)
-            }
-
-            // Append PREFIX_COMMON || compressed_g1[0..48]. The 48-byte
-            // compressed encoding is read directly from calldata at cptr.
-            function common_compressed_g1(buf_len, cptr) -> ret {
-                mstore8(buf_len, 0x01)
-                let head := calldataload(cptr)
-                let tail := calldataload(add(cptr, 0x20))
-                // Place 48 bytes starting at buf_len+1.
-                mstore(add(buf_len, 1), head)
-                // The next mstore overlaps; we write only top 16 bytes of tail
-                // by aligning at offset +1+32 = +33 with the upper 16 bytes
-                // of `tail` (which are exactly the 16 bytes we want).
-                // mstore writes 32 bytes; we'll then overwrite bytes 49..81
-                // with the next absorb, but that's fine since the call site
-                // only relies on bytes 0..49.
-                mstore(add(buf_len, 33), tail)
+                let comp_top := or(shl(128, x_hi_payload), shl(248, flag))
+                mstore(add(buf_len, 1), comp_top)
+                // Bytes 16..48 of the compressed encoding = x_lo.
+                mstore(add(buf_len, 17), x_lo_payload)
                 ret := add(buf_len, 49)
             }
 
@@ -600,8 +505,8 @@ contract Halo2Verifier {
 
             {%- if self.trace %}
             function trace_u256(id, value) {
-                mstore(0x00, value)
-                log1(0x00, 0x20, id)
+                mstore(0x5e00, value)
+                log1(0x5e00, 0x20, id)
             }
             function trace_point(id, mptr) {
                 log1(mptr, 0x80, id)
@@ -710,13 +615,13 @@ contract Halo2Verifier {
 
             {%- for phase in user_phases %}
             // ---- User phase {{ loop.index }} ----
-            for { let end := add(proof_cptr, {{ (phase.num_advices * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (phase.num_advices * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, advice_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(advice_walk, proof_cptr, 0x80)
                 advice_walk := add(advice_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
             {%- for j in 0..phase.num_challenges %}
             buf_len := squeeze_to(buf_len, add(CHALLENGE_MPTR, {{ ((phase.challenge_offset + j) * 32)|hex() }}))
@@ -729,13 +634,13 @@ contract Halo2Verifier {
             {%- if num_lookups != 0 %}
             // ---- multiplicities (one G1 per lookup) ----
             let lookup_m_walk := LOOKUP_M_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_lookups * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (num_lookups * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, lookup_m_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(lookup_m_walk, proof_cptr, 0x80)
                 lookup_m_walk := add(lookup_m_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
             {%- endif %}
 
@@ -746,13 +651,13 @@ contract Halo2Verifier {
             {%- if num_permutation_zs != 0 %}
             // ---- permutation Z products ----
             let perm_z_walk := PERM_Z_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_permutation_zs * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (num_permutation_zs * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, perm_z_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(perm_z_walk, proof_cptr, 0x80)
                 perm_z_walk := add(perm_z_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
             {%- endif %}
 
@@ -762,18 +667,18 @@ contract Halo2Verifier {
             let lookup_z_walk := LOOKUP_Z_COMMS_MPTR_BASE
             {%- for chunks in lookup_chunks %}
             // lookup {{ loop.index0 }}: {{ chunks }} helper(s) + 1 acc
-            for { let end := add(proof_cptr, {{ (chunks * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (chunks * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, lookup_helper_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(lookup_helper_walk, proof_cptr, 0x80)
                 lookup_helper_walk := add(lookup_helper_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
-            buf_len := common_compressed_g1(buf_len, proof_cptr)
-            success := decompress_g1(success, proof_cptr, lookup_z_walk)
+            buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+            calldatacopy(lookup_z_walk, proof_cptr, 0x80)
             lookup_z_walk := add(lookup_z_walk, 0x80)
-            proof_cptr := add(proof_cptr, 0x30)
+            proof_cptr := add(proof_cptr, 0x80)
             {%- endfor %}
             {%- endif %}
 
@@ -782,13 +687,13 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)
             // ---- trashcans ----
             let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_trashcans * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (num_trashcans * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, trashcan_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(trashcan_walk, proof_cptr, 0x80)
                 trashcan_walk := add(trashcan_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
             {%- endif %}
 
@@ -796,17 +701,19 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, Y_MPTR)
 
             // ---- quotient limbs ----
-            // Each compressed limb is decompressed inline and stored at
+            // Each uncompressed limb is calldatacopied directly to
             // QUOTIENT_LIMB_COMMS_MPTR_BASE; the Horner fold below reads
-            // them back from memory.
+            // them back from memory. The compressed form is reconstructed
+            // on the fly inside common_uncompressed_g1 for transcript
+            // hashing only.
             let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_quotients * 48)|hex() }}) }
+            for { let end := add(proof_cptr, {{ (num_quotients * 128)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                buf_len := common_compressed_g1(buf_len, proof_cptr)
-                success := decompress_g1(success, proof_cptr, quotient_walk)
+                buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+                calldatacopy(quotient_walk, proof_cptr, 0x80)
                 quotient_walk := add(quotient_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x30)
+                proof_cptr := add(proof_cptr, 0x80)
             }
 
             // ---- x ----
@@ -827,10 +734,10 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, X1_MPTR)
             buf_len := squeeze_to(buf_len, X2_MPTR)
 
-            // ---- f_com (1 compressed G1) ----
-            buf_len := common_compressed_g1(buf_len, proof_cptr)
-            success := decompress_g1(success, proof_cptr, F_COM_MPTR)
-            proof_cptr := add(proof_cptr, 0x30)
+            // ---- f_com (1 uncompressed G1) ----
+            buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+            calldatacopy(F_COM_MPTR, proof_cptr, 0x80)
+            proof_cptr := add(proof_cptr, 0x80)
 
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
@@ -850,10 +757,10 @@ contract Halo2Verifier {
             // ---- x4 ----
             buf_len := squeeze_to(buf_len, X4_MPTR)
 
-            // ---- pi (1 compressed G1) ----
-            buf_len := common_compressed_g1(buf_len, proof_cptr)
-            success := decompress_g1(success, proof_cptr, PI_MPTR)
-            proof_cptr := add(proof_cptr, 0x30)
+            // ---- pi (1 uncompressed G1) ----
+            buf_len := common_uncompressed_g1(buf_len, proof_cptr)
+            calldatacopy(PI_MPTR, proof_cptr, 0x80)
+            proof_cptr := add(proof_cptr, 0x80)
 
             if iszero(success) { revert(0, 0) }
 
@@ -937,6 +844,7 @@ contract Halo2Verifier {
                 {{ line }}
                 {%- endfor %}
                 {%- endfor %}
+
 
                 pop(y)
                 pop(delta)
@@ -1135,6 +1043,9 @@ contract Halo2Verifier {
             trace_point(24, QUOTIENT_MPTR)
             trace_point(25, F_COM_MPTR)
             trace_point(26, PI_MPTR)
+            trace_u256(31, mload(F_EVAL_MPTR))
+            trace_u256(32, mload(V_MPTR))
+            trace_point(33, FINAL_COM_MPTR)
             trace_point(27, PAIRING_LHS_MPTR)
             trace_point(28, PAIRING_RHS_MPTR)
             if mload(HAS_ACCUMULATOR_MPTR) {
