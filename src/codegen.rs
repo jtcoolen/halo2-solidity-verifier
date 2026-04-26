@@ -87,9 +87,13 @@ impl<'a> SolidityGenerator<'a> {
         num_instances: usize,
     ) -> Self {
         assert_ne!(vk.cs().num_advice_columns(), 0);
+        // midnight-proofs ZkStdLib always allocates two instance columns
+        // (one committed, one non-committed), so the v0.4 `<= 1`
+        // tightness no longer applies. We accept up to 2 here and let
+        // `set_num_committed_instances` handle the split.
         assert!(
-            vk.cs().num_instance_columns() <= 1,
-            "Multiple instance columns is not yet implemented"
+            vk.cs().num_instance_columns() <= 2,
+            "More than two instance columns is not yet implemented"
         );
         assert!(
             !vk.cs()

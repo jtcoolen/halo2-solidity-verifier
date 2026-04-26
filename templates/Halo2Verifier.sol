@@ -159,7 +159,7 @@ contract Halo2Verifier {
         }
         {%- else %}
         {%- endmatch %}
-        assembly {
+        assembly ("memory-safe") {
             // ===============================================================
             // Helpers: byte-order, modexp, decompress, transcript
             // ===============================================================

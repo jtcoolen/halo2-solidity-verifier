@@ -91,7 +91,7 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
         midfall/proofs/solidity-verifier/tests/.
 ```
 
-## What landed in Steps 1-7
+## What landed in Steps 1-7 + Step 8 scaffolding
 
 ### Steps 1-3
 
@@ -314,11 +314,80 @@ The `cargo test --lib` suite now stands at 7/7 green:
   * 2 IntermediateSets bucketing tests
   * 2 VK layout / render tests
 
-## Pending work (Steps 8-9)
+### Step 8 scaffolding (2026-04-26, in-progress)
+
+* `Cargo.toml` — added `midnight-circuits` and `midnight-zk-stdlib`
+  as dev-deps (path = `../midfall/circuits` and
+  `../midfall/zk_stdlib`, both with `features = ["testing"]`),
+  plus `rand_chacha = "0.3.1"`. Added `[patch.crates-io]` and
+  `[patch."https://github.com/midnightntwrk/midnight-zk"]` redirects
+  for `midnight-proofs` / `midnight-curves` / `midnight-circuits`,
+  and a `[patch."https://github.com/eryxcoop/blake2b_halo2"]`
+  redirect to `../midfall/vendor/blake2b_halo2`. Without these
+  patches `Hashable<G1Projective>` etc. become ambiguous because
+  `keccak_sha3` (a transitive dep of `midnight-zk-stdlib`) pulls in
+  its own copy of `midnight-proofs`. Also enabled the
+  `circuit-params` feature on the main `midnight-proofs` dep so the
+  `Circuit` trait surface matches what `MidnightCircuit<R>` expects.
+* `src/codegen.rs::SolidityGenerator::new` — relaxed the
+  `num_instance_columns() <= 1` assertion to `<= 2`. ZkStdLib
+  always allocates two instance columns (one committed, one
+  non-committed), so the v0.4 tightness no longer applies.
+  Callers select the split via `set_num_committed_instances`.
+* `src/codegen/pcs/gwc19.rs` — fixed two emitter bugs surfaced by
+  the first end-to-end render:
+    * Block 4 / Block 5 now bind `let Q_EVAL_CPTR :=
+      mload(Q_EVAL_CPTR_MPTR)` at the top so the in-block
+      `calldataload(add(Q_EVAL_CPTR, ...))` references resolve.
+    * `scalar_inv(x, r)` calls collapsed to `scalar_inv(x)` to
+      match the template's helper signature (the helper bakes the
+      modulus internally).
+* `templates/Halo2Verifier.sol` — wrapped the top-level body in
+  `assembly ("memory-safe") { ... }` to silence the legacy
+  stack-too-deep error path; with `--via-ir` solc 0.8.30 now
+  compiles the full ~117 kB output cleanly.
+* `tests/poseidon_fixture.rs` — new integration test (gated behind
+  `feature = "evm"` and currently `#[ignore]`d, see below) that:
+    1. Configures `SRS_DIR` to point at
+       `../midfall/zk_stdlib/examples/assets/bls_filecoin_2p6`.
+    2. Builds the same `PoseidonExample` `Relation` the midfall
+       fixture was generated from (`std_lib.poseidon` over a
+       3-element witness, hash exposed as the single public
+       input).
+    3. Calls `setup_vk` / `setup_pk` / `prove::<_, Keccak256>` to
+       produce a fresh `(vk, proof, instance)` triple at `k = 6`.
+    4. Sanity-checks via the native Rust verifier
+       (`midnight_zk_stdlib::verify::<_, Keccak256>`).
+    5. Constructs a `SolidityGenerator` against the same VK with
+       `set_num_committed_instances(1)` to acknowledge the
+       committed-instance column.
+    6. Calls `render_separately()` -> `compile_solidity` -> deploys
+       both contracts on Prague-spec revm (with EIP-2537 BLS12-381
+       precompiles routed through `blst`).
+    7. Encodes calldata via `encode_calldata_bls_padded` and
+       calls the verifier; on `CallOutcome::Revert` it dumps the
+       full rendered Yul + proof + instance under
+       `target/poseidon-fixture-dump/` for post-mortem.
+
+  **Status**: render + compile + deploy all succeed; the verifier
+  reverts mid-execution with empty payload at gas ~123 k against
+  the real proof. The remaining work is to chase the trace
+  divergence between the rendered Yul and the reference
+  verifier_trace.bin / rust_trace.json. Likely culprits:
+    * G1 decompression sign-correction logic (limb-wise compare).
+    * Per-phase advice / challenge offset computation against the
+      committed-instance column counts.
+    * Quotient limb folding / x_n_minus computation.
+    * PCS Lagrange interpolation block.
+
+  Once the trace divergence is identified, remove the `#[ignore]`
+  attribute and the test should assert end-to-end soundness.
+
+## Pending work (Step 8 follow-up + Step 9)
 
 | Step | Files | Notes |
 |------|-------|-------|
-| 8 | `examples/`, drivers | `verify_poseidon` example consuming the fixture; verify the rendered Yul compiles under solc and the precompile addresses (0x05/0x0b/0x0c/0x0f) execute on Prague-spec revm. |
+| 8 (cont.) | `templates/Halo2Verifier.sol`, `src/codegen/**` | chase the rendered-Yul revert against the midfall poseidon fixture's `verifier_trace.bin` and `rust_trace.json`. Once both traces agree element-by-element, drop the `#[ignore]` on `tests/poseidon_fixture.rs` and assert the verifier returns 1. Optionally port `examples/separately.rs`, `examples/trace.rs`, and `examples/compare_trace.rs` to the midnight-proofs API (currently they reference v0.4 types and don't compile). |
 | 9 | `tests/` | PBTs + soundness flips. Mirror the existing approach in `midfall/proofs/solidity-verifier/tests/`. |
 
 ## How to validate the current state
@@ -327,7 +396,7 @@ The `cargo test --lib` suite now stands at 7/7 green:
 $ cargo check --lib
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.08s
 
-$ cargo test --lib
+$ cargo test --lib --features evm
 running 7 tests
 test codegen::pcs::gwc19::tests::intermediate_sets_dedups_commitments ... ok
 test codegen::pcs::gwc19::tests::intermediate_sets_partitions_by_rotation_set ... ok
@@ -337,6 +406,15 @@ test transcript::tests::common_g1_then_squeeze_matches ... ok
 test transcript::tests::common_scalar_then_squeeze_matches ... ok
 test transcript::tests::empty_squeeze_matches_midnight_proofs ... ok
 test result: ok. 7 passed; 0 failed; ...
+
+$ cargo test --features evm --test poseidon_fixture
+running 1 test
+test poseidon_renders_compiles_and_verifies ... ignored
+test result: ok. 0 passed; 0 failed; 1 ignored; ...
+
+$ cargo test --features evm --test poseidon_fixture -- --ignored --nocapture
+# (currently fails with "verifier reverted with gas_used = ~123410";
+#  see Step 8 follow-up notes for the in-flight debugging plan)
 ```
 
 `examples/`, `src/test.rs`, and the rendered Yul are *not yet* fully

@@ -566,6 +566,8 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("let x2 := mload(X2_MPTR)".to_string());
         lines.push("let x3 := mload(X3_MPTR)".to_string());
         lines.push("let f_eval := 0".to_string());
+        // Resolve the calldata pointer to the q_evals block once.
+        lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
         for set_idx in (0..n_sets).rev() {
             let points = &sets.point_sets[set_idx];
@@ -600,9 +602,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 lines.push(format!(
                     "let dx0 := addmod(x3, sub(r, {pt}), r)"
                 ));
-                lines.push(format!(
-                    "let dx0_inv := scalar_inv(dx0, r)"
-                ));
+                lines.push("let dx0_inv := scalar_inv(dx0)".to_string());
                 lines.push(format!(
                     "let eval := mulmod(addmod({proof_eval}, sub(r, {ev}), r), dx0_inv, r)"
                 ));
@@ -635,7 +635,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             for j in 1..m {
                 lines.push(format!("den := mulmod(den, dx_{j}, r)"));
             }
-            lines.push("let den_inv := scalar_inv(den, r)".to_string());
+            lines.push("let den_inv := scalar_inv(den)".to_string());
 
             // For each j: lagrange_basis_inv_j = inv(prod_{k!=j} (p_j - p_k))
             for j in 0..m {
@@ -656,7 +656,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                         "lbasis_{j} := mulmod(lbasis_{j}, addmod({pj}, sub(r, {pk}), r), r)"
                     ));
                 }
-                lines.push(format!("let lbasis_inv_{j} := scalar_inv(lbasis_{j}, r)"));
+                lines.push(format!("let lbasis_inv_{j} := scalar_inv(lbasis_{j})"));
             }
 
             // r_eval = sum_j evals[j] * den * inv(dx_j) * lbasis_inv_j
@@ -672,9 +672,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     "mload(add(Q_EVAL_SET_MPTR, {:#x}))",
                     (set_eval_offset_words + j) * 0x20
                 );
-                lines.push(format!(
-                    "let dx_inv_{j} := scalar_inv(dx_{j}, r)"
-                ));
+                lines.push(format!("let dx_inv_{j} := scalar_inv(dx_{j})"));
                 lines.push(format!(
                     "let term_{j} := mulmod(mulmod({ev_j}, dx_inv_{j}, r), lbasis_inv_{j}, r)"
                 ));
@@ -702,6 +700,8 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         let mut lines: Vec<String> = Vec::new();
         lines.push("// build final_com and v (KZG single-opening proof)".to_string());
         lines.push("let x4 := mload(X4_MPTR)".to_string());
+        // Resolve the calldata pointer to the q_evals block once.
+        lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
         // Seed acc with q_com[0] (x4^0 = 1).
         for off in 0..4 {
