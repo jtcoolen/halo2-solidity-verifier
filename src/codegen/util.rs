@@ -412,6 +412,14 @@ pub(crate) struct Data {
 
     pub(crate) computed_quotient_comm: EcPoint,
     pub(crate) computed_quotient_eval: Word,
+
+    /// Word offset (in the verifier's static memory map) of the start of
+    /// the per-category decompressed-commitment region. See the
+    /// `KNOWN BUG` block in `Data::new` for the layout convention.
+    pub(crate) comms_mptr_base: Ptr,
+    /// Calldata pointer to the first compressed quotient G1 in the proof
+    /// stream. Used by the quotient-fold loop in the template.
+    pub(crate) quotient_limb_cptr: Ptr,
 }
 
 impl Data {
@@ -429,44 +437,67 @@ impl Data {
         let theta_mptr = challenge_mptr + meta.challenge_indices.len();
 
         // ------------------------------------------------------------
-        // KNOWN BUG (Step 8 follow-up, 2026-04-26):
+        // Step 8 layout (2026-04-26):
         //
-        // The cursor advances below use a 4-word stride (`+ 4 *
-        // count` = 128 bytes per G1), which assumes commitments are
-        // stored in EIP-2537 *padded* form. The actual proof emits
-        // commitments in zcash-compressed form (48 bytes per G1).
-        // Because of this mismatch:
-        //   * the EcPoints below point at the wrong calldata regions
-        //     (when the verifier dereferences them via four
-        //     `calldataload(...)` calls in `EcPoint::words()`, it
-        //     reads garbage / zero-pad past `calldatasize()`);
-        //   * the derived `eval_cptr` lands ~2.7x past the actual
-        //     eval block.
+        // The proof stream emits BLS12-381 G1 commitments in zcash
+        // *compressed* form (48 bytes per G1). The PCS / quotient-fold
+        // emitters consume points as 4 contiguous words (EIP-2537
+        // *padded*, 128 bytes per G1) via `EcPoint::words()`. The
+        // template therefore decompresses every G1 inline during proof
+        // reading and stores the padded form at a fixed memory MPTR.
         //
-        // Fix path (see `MIGRATION.md` Step 8 follow-up):
-        //   1. allocate per-category memory MPTRs in the template,
-        //   2. decompress every G1 inline during proof reading,
-        //   3. point each EcPoint at its memory MPTR (so
-        //      `c.comm.words()` emits `mload(...)` instead of
-        //      `calldataload(...)`),
-        //   4. recompute `eval_cptr` from the correct 0x30 stride.
-        //
-        // The `proof_len` calculation above is ALREADY correct (it
-        // uses 0x30); only the in-memory addressing inherited from
-        // the BN254-era code is broken.
+        // The seven per-category memory bases below match the constants
+        // emitted in `templates/Halo2Verifier.sol`. Each base anchors a
+        // contiguous run of 4-word slots (one per G1).
         // ------------------------------------------------------------
-        let advice_comm_start = proof_cptr;
-        let lookup_m_comm_start = advice_comm_start + 4 * meta.advice_indices.len();
-        let permutation_z_comm_start = lookup_m_comm_start + 4 * meta.num_lookups;
         let lookup_helper_total: usize = meta.lookup_chunks.iter().sum();
-        let lookup_helper_comm_start =
-            permutation_z_comm_start + 4 * meta.num_permutation_zs;
-        let lookup_z_comm_start = lookup_helper_comm_start + 4 * lookup_helper_total;
-        let trashcan_comm_start = lookup_z_comm_start + 4 * meta.num_lookups;
-        let quotient_comm_start = trashcan_comm_start + 4 * meta.num_trashcans;
 
-        let eval_cptr = quotient_comm_start + 4 * meta.num_quotients;
+        // -- calldata cursor (compressed, 0x30 byte stride per G1) --
+        // We can't use Ptr's word-aligned `+ usize` arithmetic for 0x30
+        // strides, so we walk a raw byte cursor and reconstruct Ptrs
+        // at the end.
+        let proof_cptr_bytes = match proof_cptr.value() {
+            Value::Integer(b) => b as usize,
+            _ => unreachable!("proof_cptr must be a literal byte offset"),
+        };
+        let mut cd_byte = proof_cptr_bytes;
+        cd_byte += 0x30 * meta.advice_indices.len();
+        cd_byte += 0x30 * meta.num_lookups;
+        cd_byte += 0x30 * meta.num_permutation_zs;
+        cd_byte += 0x30 * lookup_helper_total;
+        cd_byte += 0x30 * meta.num_lookups;
+        cd_byte += 0x30 * meta.num_trashcans;
+        let quotient_limb_cd = cd_byte;
+        cd_byte += 0x30 * meta.num_quotients;
+        let eval_cd = cd_byte;
+
+        let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
+        let eval_cptr = Ptr::calldata(eval_cd);
         let w_cptr = eval_cptr + meta.num_evals;
+
+        // -- memory bases for decompressed commitments (4 words each) --
+        // The template emits a named Solidity constant for each base so
+        // the hand-written proof-reading loops can use friendly
+        // identifiers like `ADVICE_COMMS_MPTR_BASE`. The PCS code
+        // generated below operates on absolute integer offsets so it
+        // matches the constant values exactly.
+        let theta_words: usize = match theta_mptr.value() {
+            Value::Integer(b) => (b as usize) / 0x20,
+            _ => unreachable!("theta_mptr is always an integer offset"),
+        };
+        let comms_mptr_base = Ptr::memory((theta_words + 220) * 0x20);
+        let advice_words = 4 * meta.advice_indices.len();
+        let lookup_m_words = 4 * meta.num_lookups;
+        let perm_z_words = 4 * meta.num_permutation_zs;
+        let lookup_helper_words = 4 * lookup_helper_total;
+        let lookup_z_words = 4 * meta.num_lookups;
+        let trashcan_words = 4 * meta.num_trashcans;
+        let lookup_m_comm_mem_base = comms_mptr_base + advice_words;
+        let perm_z_comm_mem_base = lookup_m_comm_mem_base + lookup_m_words;
+        let lookup_helper_comm_mem_base = perm_z_comm_mem_base + perm_z_words;
+        let lookup_z_comm_mem_base = lookup_helper_comm_mem_base + lookup_helper_words;
+        let trashcan_comm_mem_base = lookup_z_comm_mem_base + lookup_z_words;
+        let _ = trashcan_words; // included in template arithmetic
 
         let fixed_comms = EcPoint::range(fixed_comm_mptr).take(meta.num_fixeds).collect();
         let permutation_comms = izip!(
@@ -477,28 +508,28 @@ impl Data {
         let advice_comms = meta
             .advice_indices
             .iter()
-            .map(|idx| advice_comm_start + 4 * idx)
+            .map(|idx| comms_mptr_base + 4 * idx)
             .map_into()
             .collect();
-        let lookup_m_comms = EcPoint::range(lookup_m_comm_start)
+        let lookup_m_comms = EcPoint::range(lookup_m_comm_mem_base)
             .take(meta.num_lookups)
             .collect();
-        let permutation_z_comms = EcPoint::range(permutation_z_comm_start)
+        let permutation_z_comms = EcPoint::range(perm_z_comm_mem_base)
             .take(meta.num_permutation_zs)
             .collect();
 
         // Group helpers per lookup by lookup_chunks[i].
         let mut lookup_helper_comms: Vec<Vec<EcPoint>> = Vec::with_capacity(meta.num_lookups);
-        let mut helper_cursor = lookup_helper_comm_start;
+        let mut helper_cursor = lookup_helper_comm_mem_base;
         for &chunks in &meta.lookup_chunks {
             let row: Vec<EcPoint> = EcPoint::range(helper_cursor).take(chunks).collect();
             helper_cursor = helper_cursor + 4 * chunks;
             lookup_helper_comms.push(row);
         }
-        let lookup_z_comms = EcPoint::range(lookup_z_comm_start)
+        let lookup_z_comms = EcPoint::range(lookup_z_comm_mem_base)
             .take(meta.num_lookups)
             .collect();
-        let trashcan_comms = EcPoint::range(trashcan_comm_start)
+        let trashcan_comms = EcPoint::range(trashcan_comm_mem_base)
             .take(meta.num_trashcans)
             .collect();
         let computed_quotient_comm = EcPoint::new(Ptr::memory("QUOTIENT_MPTR"));
@@ -616,6 +647,8 @@ impl Data {
             lookup_evals,
             trashcan_evals,
             computed_quotient_eval,
+            comms_mptr_base,
+            quotient_limb_cptr: Ptr::calldata(quotient_limb_cd),
         }
     }
 }

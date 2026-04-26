@@ -35,8 +35,8 @@ contract Halo2Verifier {
 
     uint256 internal constant    PROOF_LEN_CPTR = {{ proof_cptr - 1 }};
     uint256 internal constant        PROOF_CPTR = {{ proof_cptr }};
-    uint256 internal constant NUM_INSTANCE_CPTR = {{ proof_cptr + (proof_len / 32) }};
-    uint256 internal constant     INSTANCE_CPTR = {{ proof_cptr + (proof_len / 32) + 1 }};
+    uint256 internal constant NUM_INSTANCE_CPTR = {{ num_instance_cptr|hex_padded(2) }};
+    uint256 internal constant     INSTANCE_CPTR = {{ instance_cptr|hex_padded(2) }};
 
     uint256 internal constant FIRST_QUOTIENT_X_CPTR = {{ quotient_comm_cptr }};
     uint256 internal constant  LAST_QUOTIENT_X_CPTR = {{ quotient_comm_cptr + 4 * (num_quotients - 1) }};
@@ -114,6 +114,29 @@ contract Halo2Verifier {
     uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ theta_mptr + 200 }};
 
     // ----------------------------------------------------------------------
+    // Per-category bases for decompressed G1 commitments. The proof emits
+    // G1 commitments in zcash-compressed form (48 bytes each); this region
+    // holds the decompressed EIP-2537 padded form (4 words = 128 bytes
+    // each) used by the PCS / quotient-fold sections.
+    //
+    // Cumulative offsets (in words from `comms_mptr_base`):
+    //   ADVICE_COMMS_MPTR_BASE          + 0
+    //   LOOKUP_M_COMMS_MPTR_BASE        + 4*total_advices
+    //   PERM_Z_COMMS_MPTR_BASE          + 4*total_advices + 4*num_lookups
+    //   LOOKUP_HELPER_COMMS_MPTR_BASE   + ... + 4*num_permutation_zs
+    //   LOOKUP_Z_COMMS_MPTR_BASE        + ... + 4*lookup_helper_chunks_total
+    //   TRASHCAN_COMMS_MPTR_BASE        + ... + 4*num_lookups
+    //   QUOTIENT_LIMB_COMMS_MPTR_BASE   + ... + 4*num_trashcans
+    // ----------------------------------------------------------------------
+    uint256 internal constant         ADVICE_COMMS_MPTR_BASE = {{ comms_mptr_base }};
+    uint256 internal constant       LOOKUP_M_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices }};
+    uint256 internal constant         PERM_Z_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups }};
+    uint256 internal constant  LOOKUP_HELPER_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs }};
+    uint256 internal constant       LOOKUP_Z_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total }};
+    uint256 internal constant     TRASHCAN_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups }};
+    uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups + 4 * num_trashcans }};
+
+    // ----------------------------------------------------------------------
     // BLS12-381 base-field arithmetic constants used by `decompress_g1`
     // and `scalar_inv`. p is 381 bits so it spans 48 BE bytes (top 16
     // bytes go in word 0, bottom 32 bytes go in word 1 — both stored
@@ -122,7 +145,7 @@ contract Halo2Verifier {
     uint256 internal constant BLS_P_TOP32        = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624;
     uint256 internal constant BLS_P_BOT16_LEFT   = 0x1eabfffeb153ffffb9feffffffffaaab00000000000000000000000000000000;
     uint256 internal constant BLS_SQRT_EXP_TOP32      = 0x0680447a8e5ff9a692c6e9ed90d2eb35d91dd2e13ce144afd9cc34a83dac3d89;
-    uint256 internal constant BLS_SQRT_EXP_BOT16_LEFT = 0x07aaffffac54ffffee7fbfffffffffeab00000000000000000000000000000000;
+    uint256 internal constant BLS_SQRT_EXP_BOT16_LEFT = 0x07aaffffac54ffffee7fbfffffffeaab00000000000000000000000000000000;
 
     // Fr modulus and Montgomery constant 2^256 mod r used by from_uniform_bytes.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
@@ -213,9 +236,12 @@ contract Halo2Verifier {
             // Memory budget: scratch from 0x2200..0x2400 placed well
             // above the streaming transcript buffer. Staticcall outputs
             // are written back into the input region to save memory.
+            // `src` is a CALLDATA pointer (`proof_cptr`) into the
+            // 48-byte compressed G1 region; the function reads via
+            // `calldataload` rather than `mload`.
             function decompress_g1(success, src, dst) -> ret {
-                let head := mload(src)             // 32 bytes [0..32]
-                let tail := mload(add(src, 0x20))  // 32 bytes [32..64], we use [32..48]
+                let head := calldataload(src)             // 32 bytes [0..32]
+                let tail := calldataload(add(src, 0x20))  // 32 bytes [32..64], we use [32..48]
                 let flag_byte := byte(0, head)
                 let comp_flag := and(shr(7, flag_byte), 1)
                 let inf_flag  := and(shr(6, flag_byte), 1)
@@ -260,6 +286,7 @@ contract Halo2Verifier {
                     mstore(add(p, 0xb1), BLS_P_BOT16_LEFT)
                     // Total input: 0x60 + 0x30 + 0x01 + 0x30 = 0xc1
                     if iszero(staticcall(gas(), 0x05, p, 0xc1, add(p, 0xd0), 0x30)) { revert(0, 0) }
+
                     // Read x^3 (48 bytes) back as (xc_top32, xc_bot16_left).
                     let xc_top32 := mload(add(p, 0xd0))
                     let xc_bot16_left := mload(add(p, 0xf0))
@@ -626,13 +653,14 @@ contract Halo2Verifier {
 
             // ===============================================================
             // Per-user-phase reads + challenge squeezes.
+            //
+            // Each compressed G1 absorbed into the transcript is also
+            // decompressed inline and stored at the corresponding
+            // per-category MPTR (4-word EIP-2537 padded form). The PCS
+            // / quotient-fold blocks below dereference those MPTRs.
             // ===============================================================
             let proof_cptr := PROOF_CPTR
-            let advice_dst := add(VK_MPTR, {{ vk_len / 32 }}) // unused; advices are not buffered
-            // We never hold all advice commitments in memory simultaneously
-            // because the streaming transcript only needs them as raw
-            // compressed bytes; the verifier consumes them into the
-            // pcs_computations later via the proof_cptr range.
+            let advice_walk := ADVICE_COMMS_MPTR_BASE
 
             {%- for phase in user_phases %}
             // ---- User phase {{ loop.index }} ----
@@ -640,6 +668,8 @@ contract Halo2Verifier {
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, advice_walk)
+                advice_walk := add(advice_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
             {%- for j in 0..phase.num_challenges %}
@@ -652,10 +682,13 @@ contract Halo2Verifier {
 
             {%- if num_lookups != 0 %}
             // ---- multiplicities (one G1 per lookup) ----
+            let lookup_m_walk := LOOKUP_M_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_lookups * 48)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, lookup_m_walk)
+                lookup_m_walk := add(lookup_m_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
             {%- endif %}
@@ -666,32 +699,49 @@ contract Halo2Verifier {
 
             {%- if num_permutation_zs != 0 %}
             // ---- permutation Z products ----
+            let perm_z_walk := PERM_Z_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_permutation_zs * 48)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, perm_z_walk)
+                perm_z_walk := add(perm_z_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
             {%- endif %}
 
             {%- if lookup_h_plus_acc != 0 %}
-            // ---- lookup helpers + accumulators ----
-            for { let end := add(proof_cptr, {{ (lookup_h_plus_acc * 48)|hex() }}) }
+            // ---- lookup helpers + accumulators (per-lookup) ----
+            let lookup_helper_walk := LOOKUP_HELPER_COMMS_MPTR_BASE
+            let lookup_z_walk := LOOKUP_Z_COMMS_MPTR_BASE
+            {%- for chunks in lookup_chunks %}
+            // lookup {{ loop.index0 }}: {{ chunks }} helper(s) + 1 acc
+            for { let end := add(proof_cptr, {{ (chunks * 48)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, lookup_helper_walk)
+                lookup_helper_walk := add(lookup_helper_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
+            buf_len := common_compressed_g1(buf_len, proof_cptr)
+            success := decompress_g1(success, proof_cptr, lookup_z_walk)
+            lookup_z_walk := add(lookup_z_walk, 0x80)
+            proof_cptr := add(proof_cptr, 0x30)
+            {%- endfor %}
             {%- endif %}
 
             {%- if num_trashcans != 0 %}
             // ---- trash_challenge ----
             buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)
             // ---- trashcans ----
+            let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_trashcans * 48)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, trashcan_walk)
+                trashcan_walk := add(trashcan_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
             {%- endif %}
@@ -700,14 +750,16 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, Y_MPTR)
 
             // ---- quotient limbs ----
-            // The verifier records the quotient G1 calldata range
-            // [FIRST_QUOTIENT_X_CPTR..LAST_QUOTIENT_X_CPTR+0x80) for the
-            // Horner fold below. The proof_cptr advance here is for the
-            // transcript hash (we still need to absorb the compressed bytes).
+            // Each compressed limb is decompressed inline and stored at
+            // QUOTIENT_LIMB_COMMS_MPTR_BASE; the Horner fold below reads
+            // them back from memory.
+            let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_quotients * 48)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_compressed_g1(buf_len, proof_cptr)
+                success := decompress_g1(success, proof_cptr, quotient_walk)
+                quotient_walk := add(quotient_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x30)
             }
 
@@ -852,26 +904,32 @@ contract Halo2Verifier {
 
             // ===============================================================
             // Fold the quotient commitment via Horner with x_n as scalar.
+            // The decompressed quotient limbs live at
+            // QUOTIENT_LIMB_COMMS_MPTR_BASE (4 words per limb); fold
+            // from the last limb back to the first.
             // ===============================================================
             {
-                mstore(0x100, calldataload(LAST_QUOTIENT_X_CPTR))
-                mstore(0x120, calldataload(add(LAST_QUOTIENT_X_CPTR, 0x20)))
-                mstore(0x140, calldataload(add(LAST_QUOTIENT_X_CPTR, 0x40)))
-                mstore(0x160, calldataload(add(LAST_QUOTIENT_X_CPTR, 0x60)))
+                let last_limb := add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {{ (0x80 * (num_quotients - 1))|hex() }})
+                mstore(0x100, mload(last_limb))
+                mstore(0x120, mload(add(last_limb, 0x20)))
+                mstore(0x140, mload(add(last_limb, 0x40)))
+                mstore(0x160, mload(add(last_limb, 0x60)))
+
                 let x_n := mload(X_N_MPTR)
+
                 for {
-                        let cptr := sub(LAST_QUOTIENT_X_CPTR, 0x80)
-                        let cptr_end := sub(FIRST_QUOTIENT_X_CPTR, 0x80)
+                        let mptr := sub(last_limb, 0x80)
+                        let mptr_end := sub(QUOTIENT_LIMB_COMMS_MPTR_BASE, 0x80)
                     }
-                    lt(cptr_end, cptr)
+                    lt(mptr_end, mptr)
                     {} {
                     success := ec_mul_acc(success, x_n)
-                    mstore(0x180, calldataload(cptr))
-                    mstore(0x1a0, calldataload(add(cptr, 0x20)))
-                    mstore(0x1c0, calldataload(add(cptr, 0x40)))
-                    mstore(0x1e0, calldataload(add(cptr, 0x60)))
+                    mstore(0x180, mload(mptr))
+                    mstore(0x1a0, mload(add(mptr, 0x20)))
+                    mstore(0x1c0, mload(add(mptr, 0x40)))
+                    mstore(0x1e0, mload(add(mptr, 0x60)))
                     success := ec_add_acc(success)
-                    cptr := sub(cptr, 0x80)
+                    mptr := sub(mptr, 0x80)
                 }
                 mstore(QUOTIENT_MPTR,            mload(0x100))
                 mstore(add(QUOTIENT_MPTR, 0x20), mload(0x120))

@@ -371,6 +371,8 @@ impl<'a> SolidityGenerator<'a> {
         let num_user_challenges: usize = meta.num_user_challenges.iter().sum();
         let lookup_h_plus_acc: usize =
             meta.lookup_chunks.iter().sum::<usize>() + meta.num_lookups;
+        let total_advices: usize = user_phases.iter().map(|p| p.num_advices).sum();
+        let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
 
         Halo2Verifier {
             scheme: self.scheme,
@@ -389,7 +391,13 @@ impl<'a> SolidityGenerator<'a> {
             num_quotients: meta.num_quotients,
             num_evals: meta.num_evals,
             num_point_sets: meta.num_point_sets,
+            total_advices,
+            lookup_helper_chunks_total,
+            lookup_chunks: meta.lookup_chunks.clone(),
+            comms_mptr_base: data.comms_mptr_base,
             proof_cptr,
+            num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
+            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + 0x20,
             quotient_comm_cptr: data.quotient_comm_cptr,
             proof_len: meta.proof_len(self.scheme),
             challenge_mptr: data.challenge_mptr,
@@ -414,9 +422,16 @@ impl<'a> SolidityGenerator<'a> {
         // bytes (64 words) suffices for the poseidon fixture and small
         // circuits; larger circuits will scale this up.
         let transcript_words: usize = {
-            // Worst case: domain sep + all advices + all evals absorbed
-            // before any squeeze. In practice the squeeze cadence shrinks
-            // this, but the bound is safe.
+            // The streaming Keccak256 buffer at memory `[0..buf_len)`
+            // grows monotonically between two challenge squeezes and is
+            // reset to 64 bytes after each squeeze, so the actual peak
+            // is the longest distance between consecutive squeezes —
+            // dominated by the evaluation block (`num_evals` scalars)
+            // since none of the user phases interleave more than a
+            // dozen G1 reads. We bound it by the absorption cost of
+            // *all* G1s (49 bytes each) and *all* scalars (33 bytes
+            // each) plus a 64-byte cushion for the post-squeeze seed.
+            // This is conservative but always safe.
             let total_g1: usize = self.meta.num_user_advices.iter().sum::<usize>()
                 + self.meta.num_lookups
                 + self.meta.num_permutation_zs
@@ -429,14 +444,26 @@ impl<'a> SolidityGenerator<'a> {
                 + self.meta.num_trashcans
                 + self.meta.num_quotients
                 + 2; // f_com + pi
-            let total_scalar = self.meta.num_evals + self.meta.num_point_sets;
-            let bytes = 32 + total_g1 * 49 + total_scalar * 33 + 64;
+            // `num_point_sets` is computed only AFTER this function
+            // returns (it depends on the codegen-side
+            // `construct_intermediate_sets` simulation which itself
+            // needs `vk_mptr`), so we approximate it with a generous
+            // upper bound — `num_evals` is always at least as large as
+            // the number of opening sets, and adding 32 extra slots of
+            // headroom guarantees the buffer stays clear of `VK_MPTR`
+            // even for circuits with unusual rotation patterns.
+            let total_scalar = self.meta.num_evals + self.meta.num_point_sets + 32;
+            let bytes = 64 + total_g1 * 49 + total_scalar * 33 + 64;
             bytes.div_ceil(0x20)
         };
 
         itertools::max([
-            // Transcript buffer (streaming Keccak256)
-            transcript_words.saturating_sub(vk.len() / 0x20),
+            // Transcript buffer (streaming Keccak256). The buffer must
+            // fit *below* `VK_MPTR` because every `mload(VK_MPTR + ...)`
+            // assumes the VK contract bytes copied via `extcodecopy`
+            // remain intact, and the buffer would otherwise overwrite
+            // them as it grows past the start of the VK area.
+            transcript_words,
             // PCS computation scratch
             pcs_computation,
             // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each)

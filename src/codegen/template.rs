@@ -28,13 +28,13 @@ pub(crate) const BLS_P_BOT16_LEFT: U256 = U256::from_be_slice(&[
 /// big-endian bytes split into a top-32 / bottom-16-left-aligned pair.
 ///
 /// (p+1)/4 = 0x0680447a8e5ff9a692c6e9ed90d2eb35d91dd2e13ce144afd9cc34a83dac3d89
-///           07aaffffac54ffffee7fbfffffffffeaab
+///           07aaffffac54ffffee7fbfffffffeaab
 pub(crate) const BLS_SQRT_EXP_TOP32: U256 = U256::from_be_slice(&[
     0x06, 0x80, 0x44, 0x7a, 0x8e, 0x5f, 0xf9, 0xa6, 0x92, 0xc6, 0xe9, 0xed, 0x90, 0xd2, 0xeb, 0x35,
     0xd9, 0x1d, 0xd2, 0xe1, 0x3c, 0xe1, 0x44, 0xaf, 0xd9, 0xcc, 0x34, 0xa8, 0x3d, 0xac, 0x3d, 0x89,
 ]);
 pub(crate) const BLS_SQRT_EXP_BOT16_LEFT: U256 = U256::from_be_slice(&[
-    0x07, 0xaa, 0xff, 0xff, 0xac, 0x54, 0xff, 0xff, 0xee, 0x7f, 0xbf, 0xff, 0xff, 0xff, 0xfe, 0xab,
+    0x07, 0xaa, 0xff, 0xff, 0xac, 0x54, 0xff, 0xff, 0xee, 0x7f, 0xbf, 0xff, 0xff, 0xff, 0xea, 0xab,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ]);
 
@@ -101,6 +101,16 @@ pub(crate) struct Halo2Verifier {
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
     pub(crate) proof_cptr: Ptr,
+    /// Calldata byte offset of the `num_instances` length-prefix word
+    /// that ABI-encodes the `instances` array. Equals
+    /// `proof_cptr + proof_len` (in bytes). Materialised as a separate
+    /// field because `proof_len` is not always a multiple of 32 once
+    /// G1 commitments are 48-byte compressed; computing it via Ptr
+    /// arithmetic in Askama would word-align and silently drop bytes.
+    pub(crate) num_instance_cptr: usize,
+    /// Calldata byte offset of the first instance value (immediately
+    /// after `num_instance_cptr`).
+    pub(crate) instance_cptr: usize,
     pub(crate) quotient_comm_cptr: Ptr,
     pub(crate) num_neg_lagranges: usize,
     /// Per-user-phase advice + user-challenge counts (excludes theta).
@@ -113,6 +123,21 @@ pub(crate) struct Halo2Verifier {
     pub(crate) num_quotients: usize,
     pub(crate) num_evals: usize,
     pub(crate) num_point_sets: usize,
+    /// Sum of `user_phases[i].num_advices` (total advice commitments).
+    pub(crate) total_advices: usize,
+    /// Sum of `meta.lookup_chunks` (total per-lookup helper commitments,
+    /// excluding the lookup accumulator itself).
+    pub(crate) lookup_helper_chunks_total: usize,
+    /// Per-lookup helper-chunk count (mirrors `meta.lookup_chunks`). The
+    /// proof emits commitments per-lookup as `(chunks helpers, 1 acc)`,
+    /// so the proof-reading loop iterates this vector to dispatch each
+    /// G1 to its correct MPTR.
+    pub(crate) lookup_chunks: Vec<usize>,
+    /// Word offset (relative to memory base) of the first decompressed
+    /// advice commitment. The remaining categories (lookup_m, perm_z,
+    /// lookup_helper, lookup_z, trashcan, quotient_limb) are laid out
+    /// contiguously after this base with a 4-word stride per G1.
+    pub(crate) comms_mptr_base: Ptr,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
 }

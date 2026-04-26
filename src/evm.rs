@@ -59,6 +59,13 @@ pub(crate) mod test {
             .stderr(Stdio::piped())
             .arg("--bin")
             .arg("--optimize")
+            // Bias the optimizer towards small code size. With the
+            // 21+ inline `decompress_g1` calls the default
+            // `--optimize-runs=200` blows past EIP-170's 24 kB
+            // contract limit; `--optimize-runs=1` keeps the helpers
+            // shared instead of being inlined.
+            .arg("--optimize-runs")
+            .arg("1")
             .arg("--via-ir")
             .arg("--evm-version")
             .arg("cancun")
@@ -214,8 +221,14 @@ pub(crate) mod test {
             let mut evm = RevmEvm::builder()
                 .with_db(db)
                 .with_spec_id(SpecId::PRAGUE)
+                .modify_cfg_env(|cfg| {
+                    cfg.limit_contract_code_size = Some(usize::MAX);
+                })
                 .modify_tx_env(|tx| {
-                    tx.gas_limit = u64::MAX;
+                    // Capped at 50M gas so an infinite loop in the
+                    // emitted Yul terminates promptly during dev
+                    // rather than spinning revm indefinitely.
+                    tx.gas_limit = 50_000_000;
                     tx.transact_to = TxKind::Call(address);
                     tx.data = calldata.into();
                 })
@@ -269,8 +282,19 @@ pub(crate) mod test {
             let mut evm = RevmEvm::builder()
                 .with_db(db)
                 .with_spec_id(SpecId::PRAGUE)
+                .modify_cfg_env(|cfg| {
+                    // Lift the EIP-170 contract size cap. The full
+                    // BLS12-381 verifier (with inline `decompress_g1`
+                    // calls per commitment) compiles to ~25 kB of
+                    // bytecode, which exceeds the 24 kB mainnet
+                    // limit; for in-process tests this is fine.
+                    cfg.limit_contract_code_size = Some(usize::MAX);
+                })
                 .modify_tx_env(|tx| {
-                    tx.gas_limit = u64::MAX;
+                    // Capped at 50M gas so an infinite loop in the
+                    // emitted Yul terminates promptly during dev
+                    // rather than spinning revm indefinitely.
+                    tx.gas_limit = 50_000_000;
                     tx.transact_to = transact_to;
                     tx.data = data.into();
                 })
