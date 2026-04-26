@@ -121,3 +121,339 @@ verifier.verifyProof(address(evilVK), forgedProof, fakeInstances); // returns tr
 ```
 
 The current `templates/Halo2Verifier.sol` blocks this path via `AUTHORIZED_VK` + `EXPECTED_VK_CODEHASH`, so on a CTF setup using the new template the attacker has to fall back to issues 3–4 (which need a vulnerable circuit) or to off-template bugs (e.g. a deployer that forgets to pin the VK at construction).
+
+
+   Halo2 BLS12-381 Solidity Verifier - Security Audit (informal)
+
+   Scope: src/codegen.rs, src/codegen/{template.rs, util.rs, pcs.rs, pcs/gwc19.rs, evaluator.rs}, src/transcript.rs, src/evm.rs, templates/Halo2Verifier.sol, 
+   templates/Halo2VerifyingKey.sol, generated/Halo2Verifier-*.sol.
+   Curve: BLS12-381 via EIP-2537 precompiles (0x0b / 0x0c / 0x0f).
+   Out of scope: halo2 prover correctness (vendored vendor/halo2/), revm/Prague EVM precompile implementations, the underlying KZG security assumption.
+
+   ──────────────────────────────────────────
+
+   1. Findings overview
+
+   ID   │ Severity      │ Title                                                                                                                                                
+   -----+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------
+   F-1  │ **Critical**  │ `static_working_memory_size` keeps the BN254 stride (`n*2+1`); the keccak buffer can overwrite challenges/VK at runtime
+   F-2  │ High          │ Fiat-Shamir desynchronisation when a phase has zero advice columns (Yul does not append the trailing `0x01`)
+   F-3  │ High          │ `read_g1_point` hashes attacker-controlled raw bytes into the transcript even when the EIP-2537 padding check fails
+   F-4  │ Medium        │ Accumulator reconstruction relies on `add` / `shl` (not `addmod`) and on contract-side limb checks, with a misleading dead branch
+   F-5  │ Medium        │ `g1_to_u256s` / `g2_to_u256s` `unwrap()` on the point-at-infinity, panicking VK generation
+   F-6  │ Medium        │ `delta` is a hard-coded scalar with no compile-time agreement check against `bls12381::Fr::DELTA`
+   F-7  │ Low           │ Trace-mode verifier silently returns `bool` instead of reverting and is no longer `view`; deploying it in production breaks callers using `try/catch`
+   F-8  │ Low           │ `pop(y)` / `pop(delta)` are cosmetic and do not clear memory
+   F-9  │ Low           │ `if mload(HAS_ACCUMULATOR_MPTR)` is read from VK but it is not cross-checked against the codegen-side `acc_encoding`
+   I-10 │ Informational │ Generator forces `vk.cs().num_instance_columns() <= 1` and `Rotation::cur()` only - silent "not yet implemented" panics if violated
+   I-11 │ Informational │ `n_inv` and `omega_inv_to_l` are never re-derived from `k`/`omega` on chain - a malicious VK that bypasses the codehash pin can lie
+   I-12 │ Informational │ `mod(hash, r)` introduces ~2^-255 bias; standard practice, kept for completeness
+
+   The mitigations that have already landed (in particular the AUTHORIZED_VK + EXPECTED_VK_CODEHASH pinning at constructor time, commit 54b2943) close the original 
+   "caller-controlled VK" hole from AUDIT.md finding #1, and the EIP-2537 pairing precompile transitively covers G2 subgroup checks (BN254 audit finding #2).
+
+   ──────────────────────────────────────────
+
+   2. Critical: keccak buffer overruns on wide circuits
+
+   F-1 - `static_working_memory_size` keeps BN254 stride
+
+   Location: src/codegen.rs::SolidityGenerator::static_working_memory_size, around the // Keccak256 input (can overwrite vk) block.
+
+   rust
+     itertools::max([
+         // Keccak256 input (can overwrite vk)
+         itertools::max(chain![
+             self.meta.num_advices().into_iter().map(|n| n * 2 + 1),   // <-- BN254 stride
+             [self.meta.num_evals + 1],
+         ])
+         .unwrap()
+         .saturating_sub(vk.len() / 0x20),
+         // PCS computation
+         pcs_computation,
+         // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each) = 24 + 1 buf
+         25,
+     ])
+     .unwrap()
+     * 0x20
+
+   After the BLS port a single G1 commitment occupies 4 EVM words, not 2 (cf. EcPoint::range in src/codegen/util.rs and read_g1_point in templates/Halo2Verifier.sol). The keccak 
+   input that the verifier accumulates between two squeezes therefore needs
+
+     phase_words = num_advices_phase * 4 + 1   (one extra word for the rolling hash at 0x00)
+
+   words, i.e. exactly twice what the formula budgets. The same understatement applies to the W phase (1 + num_rotations * 4), which is not represented at all in the chain.
+
+   The constant vk_mptr = static_working_memory_size becomes the floor of every memory layout in the contract:
+
+     0x00..hash_mptr_max          : keccak input, grows between squeezes
+     vk_mptr..vk_mptr + vk_len    : VK area (mirrored into memory by extcodecopy)
+     challenge_mptr..              : THETA / BETA / GAMMA / Y / X / NU / MU
+     theta_mptr + offsets         : ACC_LHS, ACC_RHS, X_N, ..., PAIRING_LHS/RHS
+
+   When phase_words > vk_mptr / 0x20 + vk_len / 0x20, the loop body inside read_g1_point
+
+   yul
+     mstore(hash_mptr,            x_hi)
+     mstore(add(hash_mptr, 0x20), x_lo)
+     mstore(add(hash_mptr, 0x40), y_hi)
+     mstore(add(hash_mptr, 0x60), y_lo)
+     ret2 := add(hash_mptr, 0x80)
+
+   writes through CHALLENGE_MPTR and beyond, overwriting THETA_MPTR / BETA_MPTR / GAMMA_MPTR / Y_MPTR / X_MPTR / NU_MPTR / MU_MPTR. Since challenges are written at squeeze time 
+   (mstore(challenge_mptr, mod(hash, r)) in squeeze_challenge) and read much later (e.g. let theta := mload(THETA_MPTR) inside evaluator::lookup_computations), the corrupted values
+    silently propagate into the constraint check.
+
+   Concrete trigger
+
+   For the standard Plonk fixture used in test::create_property_standard_plonk_fixture we have vk_len ≈ 60 * 32 and pcs_computation = 12 + num_rotations*4 ≈ 28 words, so the 
+   formula returns 25 * 0x20. With n = 22 advice columns in any phase the corrected formula is
+
+     n * 4 + 1       = 89 words   (correct BLS budget)
+     n * 2 + 1       = 45 words   (used by codegen)
+     saturating_sub(60) = 0          (under-counts)
+
+   and vk_mptr is computed as if 25 working words sufficed. The keccak buffer of phase-1 then extends to address 0x00 + 89 * 0x20 = 0x720, overwriting CHALLENGE_MPTR = vk_mptr + 
+   vk_len ≈ 0x500. The squeezed theta/beta/gamma are clobbered by subsequent read_g1_point writes for phase-2 advices and the verifier ends up evaluating quotient_eval_numer with 
+   attacker-aliased inputs.
+
+   Impact
+
+   •  Soundness: The corrupted challenges feed evaluator::gate_computations, permutation_computations, and lookup_computations. An attacker who knows the corruption pattern (purely
+       a function of public num_advices / num_evals / vk_len) can craft proofs that the verifier folds against the wrong polynomial relation. We did not construct an end-to-end 
+      forgery in scope, but the corruption is deterministic and aligns 32-byte words with THETA_MPTR / BETA_MPTR, so we treat this as an exploitable soundness hole rather than mere
+       DoS.
+   •  Liveness: Honest proofs from any halo2 circuit with ≥ 22 advices in some phase (every reasonably sized halo2 chip stack: ECDSA, Poseidon, range-check tables, aggregation 
+      circuits) will be silently rejected.
+
+   Recommendation
+
+   1. Replace n * 2 + 1 with n * 4 + 1 for the BLS path, and add an instances term (1 + num_instances + num_advices_phase1 * 4) for phase 1.
+   2. Add the W phase budget (1 + num_rotations * 4).
+   3. Add a debug-time assertion in Halo2Verifier::render that the rendered Yul never writes past vk_mptr for any input shape.
+   4. Long term, switch to a memory layout where the keccak buffer is allocated after all permanent state (or at a fixed bumped offset) so the formula becomes a one-shot ceiling 
+      rather than an arithmetic obligation.
+
+   ──────────────────────────────────────────
+
+   3. High-severity findings
+
+   F-2 - Fiat-Shamir mismatch on empty advice phases
+
+   Locations:
+   •  prover: src/transcript.rs::Keccak256Transcript::squeeze_challenge (the if buf_len == 0x20 { Some(1) } branch).
+   •  verifier: phase loop in templates/Halo2Verifier.sol calling squeeze_challenge (no 0x01 byte) vs. squeeze_challenge_cont (appends 0x01).
+
+   The Rust transcript appends a 0x01 byte every time it is asked to squeeze and buf happens to contain only the previous hash (buf_len == 0x20). The Yul template only emulates 
+   that semantics through squeeze_challenge_cont, which is emitted explicitly by the for-loop
+
+   jinja
+     challenge_mptr, hash_mptr := squeeze_challenge(challenge_mptr, hash_mptr, r)
+     {%- for _ in 0..num_challenges[loop.index0] - 1 %}
+     challenge_mptr := squeeze_challenge_cont(challenge_mptr, r)
+     {%- endfor %}
+
+   When a phase contains zero advice commitments (num_advices_phase_i == 0) the inner read_g1_point loop does not execute, hash_mptr stays at 0x20, and the squeeze_challenge call 
+   hashes exactly 32 bytes (the previous hash) without the trailing 0x01. The Rust transcript, on the other hand, sees buf_len == 0x20 in that exact same situation and appends 
+   0x01. The two sides diverge.
+
+   Reachability. halo2 v0.4 allows phases with no advice columns: ConstraintSystemMeta::new derives num_user_advices from cs.advice_column_phase() whose distribution is set per 
+   advice column - if all advices are pinned to phases 0 and 2, num_user_advices = [k0, 0, k2]. The num_advices() chain that is then iterated in the Yul template includes that 
+   explicit zero. Most production circuits today put every column in phase 0, so the bug is dormant; but it ships as a correctness footgun for any upcoming multi-phase circuit 
+   (lookups + custom challenges, RAM sub-arguments, etc.).
+
+   Impact. Honest proofs are rejected (completeness). For soundness, the verifier's challenges become a known function of the prover's challenges (they differ only by the 0x01 
+   byte), so an adaptive attacker could in principle replay grinding attacks across the two derivations - we did not classify this as fully exploitable but it is a non-zero 
+   soundness erosion.
+
+   Recommendation. Mirror the Rust logic in Yul: if the buffer length at squeeze time equals 0x20 (i.e. nothing has been appended since the last squeeze), call 
+   squeeze_challenge_cont. Concretely, the codegen can detect the empty phase and emit squeeze_challenge_cont instead of squeeze_challenge.
+
+   F-3 - `read_g1_point` hashes raw calldata before validating the EIP-2537 padding
+
+   Location: templates/Halo2Verifier.sol, read_g1_point.
+
+   yul
+     function read_g1_point(success, proof_cptr, hash_mptr) -> ret0, ret1, ret2 {
+         let x_hi := calldataload(proof_cptr)
+         ...
+         ret0 := and(success, iszero(shr(128, x_hi)))
+         ret0 := and(ret0,    iszero(shr(128, y_hi)))
+         mstore(hash_mptr,            x_hi)        // <-- written even when ret0 = 0
+         mstore(add(hash_mptr, 0x20), x_lo)
+         mstore(add(hash_mptr, 0x40), y_hi)
+         mstore(add(hash_mptr, 0x60), y_lo)
+         ...
+     }
+
+   The four mstores execute regardless of whether the padding check passed. Today this is benign because the verifier reverts via the global if iszero(success) { revert(0, 0) } 
+   long before any precompile observes the corrupted bytes, and the Fiat-Shamir transcript that consumes those bytes will simply produce a wrong challenge on the failing path. 
+   However:
+
+   1. The transcript hash is consumed inside squeeze_challenge_cont and then influences memory addresses (mload(NU_MPTR), mload(MU_MPTR), etc.) that drive subsequent calldata 
+      reads. A future refactor that turns one of those reads into a load through a derived pointer would let an attacker steer pointer arithmetic with under-validated bytes.
+   2. The exact same read_g1_point is reused for the W openings (4 in total), the quotient commitments, and the random commitment - i.e. for every G1 read in the proof. Any later 
+      optimisation that routes x_hi/y_hi through mod / shl arithmetic before the padding check is verified would lose the guarantee.
+
+   Recommendation. Reverse the order: set ret0 before the four mstores, and make the mstores gated on ret0 (or only write (x_lo, y_lo) and zero out the hi halves so the transcript 
+   content is canonical even on failure).
+
+   ──────────────────────────────────────────
+
+   4. Medium-severity findings
+
+   F-4 - Accumulator limb reconstruction
+
+   Location: templates/Halo2Verifier.sol, the if mload(HAS_ACCUMULATOR_MPTR) block.
+
+   Two sub-issues:
+
+   1. Native `add` / `shl` instead of `addmod`. The reconstruction sums limb << shift into (hi, lo) using EVM add. We verified that the typical (num_limbs, num_limb_bits) 
+      configurations (e.g. 4×96, 4×88) keep the bit-ranges disjoint so there is no overflow. But the verifier silently accepts any (num_limbs, num_limb_bits) from the VK, including
+       pathological ones such as num_limb_bits = 0 (the lt(limb, shl(num_limb_bits, 1)) check becomes lt(limb, 2), accepting only 0 or 1) or num_limb_bits >= 256 (shl(256, 1) == 0,
+       accepting nothing). Because the VK is now pinned through EXPECTED_VK_CODEHASH, abuse requires bypassing the pin, but a misconfigured trusted setup ceremony could still 
+      encode a foot-gun there.
+   2. Misleading dead code. Inside the per-coord switch:
+
+   yul
+        if and(eq(coord, 1), 0) { dst := add(dst, 0x40) }   // never executes (literal 0)
+        if iszero(or(eq(coord, 1), eq(coord, 3))) {         // can never hold inside `case 1`
+            dst := add(dst, 0x40)
+        }
+
+      Both branches are unreachable inside the case 1 arm (where coord ∈ {1, 3}). Reviewers can be misled into thinking they actively guard against a path they don't.
+
+   Recommendation. Use addmod for the limb sums (cheap insurance), enforce 1 ≤ num_limb_bits ≤ 128 and num_limbs * num_limb_bits ≤ 384 at the top of the block, and delete the dead 
+   branches.
+
+   F-5 - VK generation panics on identity G1/G2
+
+   Location: src/codegen/util.rs::g1_to_u256s / g2_to_u256s.
+
+   rust
+     let coords = ec_point.borrow().coordinates().unwrap();
+
+   Coordinates::from(...) returns None for the point at infinity. A trusted-setup output with any commitment equal to the identity (e.g. an empty fixed column) crashes the codegen 
+   pipeline. Not exploitable on chain, but fragile against malformed VKs and inconvenient for tooling that wants to generate a verifier first and decide later. Same concern in 
+   transcript.rs::common_point and write_point, which unwrap() after a fallible coordinate extraction.
+
+   Recommendation. Treat the identity as the all-zero EIP-2537 encoding [0; 4] / [0; 8] and propagate a Result instead of panicking.
+
+   F-6 - `delta` constant is hard-coded and only checked off-line
+
+   Location: templates/Halo2Verifier.sol
+
+   yul
+     let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999 // BLS12-381 Fr::DELTA
+
+   We verified the value matches bls12381::Fr::DELTA by running examples/check_delta.rs. However the value is embedded as a literal in the template; nothing in the build forces a 
+   regeneration if halo2curves ships a different DELTA (e.g. after a future curve update). The audit trail in the template has already shown a stale value being silently kept 
+   (4131629893567559867359510883348571134090853742863529169391034518566172092834).
+
+   Recommendation. Inject delta from the codegen side by computing it directly from bls12381::Fr::DELTA at render time, then have the template consume it via the templating engine.
+    That removes the off-line-only check and makes future curve swaps a one-liner.
+
+   ──────────────────────────────────────────
+
+   5. Low-severity & informational findings
+
+   F-7 - Trace-mode verifier returns a `bool` instead of reverting
+
+   jinja
+     function verifyProof(...) public {%- if self.trace %} returns (bool) {%- else %} view returns (bool) {%- endif %}
+
+   In trace mode the function:
+   •  drops view (logs are emitted),
+   •  returns success (1 or 0) instead of revert-ing on failure,
+   •  leaks the entire challenge transcript and the intermediate PAIRING_LHS / PAIRING_RHS via LOG1.
+
+   The challenges are not secret (they are derivable from public proof + VK), but a deployer that ships render_trace_separately() in production changes the failure semantics from 
+   revert to return false. Callers using try { verifier.verifyProof(...) } catch { ... } then silently misclassify rejected proofs as "verifier executed successfully, said no, but 
+   we will treat the absence of revert as success." Recommendation: gate the trace constructor behind an unsafe_* factory and emit a runtime require(false) if a non-trace caller 
+   invokes it.
+
+   F-8 - `pop(y) / pop(delta)`
+
+   Cosmetic. Yul pop only discards the top stack element; the local Yul variable is already destined to go out of scope. No memory is actually cleared. Already noted in AUDIT.md 
+   for the BN254 path; carried over verbatim.
+
+   F-9 - VK-driven `HAS_ACCUMULATOR_MPTR` is not cross-checked
+
+   The verifier blindly trusts the VK constants has_accumulator, acc_offset, num_acc_limbs, num_acc_limb_bits. With the AUTHORIZED_VK codehash pin in place this is fine; without it
+    (or after an upgrade that forgets to re-pin), a VK contract can lie about has_accumulator = 1 while the Rust generator was constructed without AccumulatorEncoding. The verifier
+    then drains num_limbs * 4 = 16 instance slots as accumulator limbs, mis-decodes them as G1 points, and feeds garbage to 0x0c / 0x0f. The pairing precompile reverts (no 
+   soundness break), but the user gets an inscrutable failure mode.
+
+   Recommendation. Hash the (has_accumulator, acc_offset, num_acc_limbs, num_acc_limb_bits) tuple into the codehash explicitly (it already is, transitively), and have the codegen 
+   emit a require on the constructor side that the deployer's acc_encoding agrees with vk.has_accumulator.
+
+   I-10 - Silent generator restrictions
+
+   rust
+     assert_ne!(vk.cs().num_advice_columns(), 0);
+     assert!(vk.cs().num_instance_columns() <= 1, "Multiple instance columns is not yet implemented");
+     assert!(!vk.cs().instance_queries().iter().any(|(_, rotation)| *rotation != Rotation::cur()), ...);
+
+   These are user-facing panics rather than Results. A deployer integrating the codegen into a CI pipeline gets an opaque crash. Convert to Result<…, GeneratorError>.
+
+   I-11 - `n_inv` and `omega_inv_to_l` are never re-derived on chain
+
+   The verifier uses n_inv (= 1/2^k mod r) and omega_inv_to_l (= ω^{-l}) from the VK without recomputing them from k and omega at runtime. With the codehash pin in place this is 
+   fine (the codehash binds the entire VK byte string). Without it, a malicious VK could substitute n_inv := 1 and omega_inv_to_l := 1, which would silently yield a different 
+   Lagrange basis at evaluation time. The pin closes this; we mention it because future "upgradeable VK" deployments would need to be aware that these are non-redundant trust 
+   roots.
+
+   I-12 - Bias in `mod(hash, r)`
+
+   r = 0x73eda7…00000001 ≈ 2^254.86. With a 256-bit hash, the bias is ~2^256 / r - 1 ≈ 2^-254, completely negligible. Standard practice; no action.
+
+   ──────────────────────────────────────────
+
+   6. Compatibility / hygiene observations
+
+   •  proof_to_bls_padded (src/codegen.rs) and the prover-side transcript (src/transcript.rs::common_point) agree byte-for-byte on the 16-zero-byte EIP-2537 prefix per Fp 
+      coordinate. Good.
+   •  g1_to_u256s reads Fq::to_repr() (LE) and reverses; g2_to_u256s reads Fq::to_bytes() (BE). We verified this difference against halo2derive 0.1.0's impl_field! macro:
+
+   rust
+     fn to_repr(&self) -> Self::Repr { /* hard-coded LE */ }
+     pub fn to_bytes(&self) -> [u8; …] { /* honors `endian = "big"` setting for Fq */ }
+
+   so the asymmetry is correct, but it is exactly the kind of footgun that breaks silently if a future halo2curves release changes the macro - we recommend asserting Fq::ENDIAN == 
+   BE once at the top of util.rs so a regression would be immediately observable.
+
+   •  The trailing mstore(0x00, 1); return(0x00, 0x20) in non-trace mode means the function only ever returns true or reverts; declare it view returns () and rely on revert-or-not 
+      semantics, or drop the bool return entirely. The current shape misleads callers into believing false is a possible return.
+
+   ──────────────────────────────────────────
+
+   7. Suggested follow-ups (in priority order)
+
+   1. Fix F-1. Recompute static_working_memory_size for the BLS layout (multiply advice stride by 4, add the W-phase term, add a phase-1 instances term). Add a unit test that 
+      builds a wide circuit (say 64 advices in phase 1) and asserts the rendered Yul never reads/writes through CHALLENGE_MPTR mid-transcript.
+   2. Fix F-2. Mirror the Rust buf_len == 0x20 semantics on the Yul side; the cleanest way is to track buffer occupancy in the codegen and emit squeeze_challenge_cont on empty 
+      phases.
+   3. Fix F-3. Reorder the writes in read_g1_point so the transcript only sees padded bytes when ret0 is true.
+   4. Re-enable the ignored property tests (pbt_solidity_* in src/test.rs) once the BLS prover backend is wired up; this is the only end-to-end witness for soundness assertions.
+   5. Add a cargo xtask audit target that re-runs examples/check_delta.rs and asserts the value found in templates/Halo2Verifier.sol matches at build time.
+   6. Tighten the g*_to_u256s helpers to handle the identity case (F-5) and propagate richer errors out of SolidityGenerator::new (I-10).
+
+   ──────────────────────────────────────────
+
+   8. Summary
+
+   The BLS12-381 / EIP-2537 port is structurally sound: pairing inputs are laid out per spec, the pinned-VK pattern correctly closes the largest historical hole in this codebase, 
+   and the EIP-2537 precompiles transitively cover G2 subgroup checks. The most consequential issue we found, F-1, is a numeric mistake in the static memory layout calculation that
+    survives from the BN254 era and is large enough to corrupt Fiat-Shamir state on routinely-sized circuits. F-2 breaks completeness for circuits with empty intermediate phases. 
+   F-3 is currently latent but is the kind of memory-vs-validation ordering bug that becomes exploitable under any future refactor. The remaining items are hardening and ergonomics
+    work.
+
+   Recommended next actions: fix F-1 immediately (it gates re-enablement of the ignored render / pbt tests), schedule F-2/F-3 for the next correctness sprint, and treat F-4 through
+    F-9 as code-review polish.
+
+   Plan updated
+
+⛬  The audit found one critical issue (F-1: BN254-era stride n*2+1 in static_working_memory_size can overflow keccak buffer into challenge memory on circuits with ≥22 advices in 
+   any phase), two high-severity issues (F-2: Fiat-Shamir mismatch on empty advice phases; F-3: read_g1_point hashes raw calldata before validating EIP-2537 padding), and a handful
+    of medium/low items around accumulator decoding, identity-point handling, the hard-coded delta constant, and trace-mode footguns. The pinned-VK + EXPECTED_VK_CODEHASH pattern 
+   correctly closes the original BN254 caller-controlled-VK hole, and EIP-2537 transitively gives the G2 subgroup check that the BN254 path was missing.
