@@ -791,7 +791,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         let mut lines: Vec<String> = Vec::new();
         lines.push("// pairing inputs (LHS = pi; RHS = final_com - v*G + x3*pi)".to_string());
 
-        // PAIRING_LHS = pi
+        // PAIRING_LHS = pi (paired against G2_BASE).
         for off in 0..4 {
             lines.push(format!(
                 "mstore(add(PAIRING_LHS_MPTR, {:#x}), mload(add(PI_MPTR, {:#x})))",
@@ -814,8 +814,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 .to_string(),
         );
 
-        // RHS := final_com + (-v)*G  (final_com still in 0x80..0x100? no, it's in FINAL_COM_MPTR).
-        // Load final_com into 0x80..0x100, then add into 0x00.
+        // tmp += final_com.
         for off in 0..4 {
             lines.push(format!(
                 "mstore({:#x}, mload(add(FINAL_COM_MPTR, {:#x})))",
@@ -828,7 +827,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 .to_string(),
         );
 
-        // RHS += x3 * pi.  Load pi into 0x80..0x100, scale by x3, add into 0x00.
+        // tmp += x3 * pi.
         for off in 0..4 {
             lines.push(format!(
                 "mstore({:#x}, mload(add(PI_MPTR, {:#x})))",
@@ -846,7 +845,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 .to_string(),
         );
 
-        // Persist RHS.
+        // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
         for off in 0..4 {
             lines.push(format!(
                 "mstore(add(PAIRING_RHS_MPTR, {:#x}), mload({:#x}))",

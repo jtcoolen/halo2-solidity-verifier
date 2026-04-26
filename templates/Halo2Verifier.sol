@@ -915,7 +915,38 @@ contract Halo2Verifier {
                 mstore(0x140, mload(add(last_limb, 0x40)))
                 mstore(0x160, mload(add(last_limb, 0x60)))
 
-                let x_n := mload(X_N_MPTR)
+                // The native verifier folds the quotient limbs with the
+                // *splitting factor* `x^(n-1)`, not `x^n` — see
+                // `compute_linearization_commitment` in
+                // midfall/proofs/src/plonk/linearization/verifier.rs:
+                //
+                //   let mut splitting_pow = F::ONE - *xn;
+                //   for _ in 0..quotient_limb_commitments.len() {
+                //       identities_scalars.push(splitting_pow);
+                //       splitting_pow *= splitting_factor;   // x^(n-1)
+                //   }
+                //
+                // We compute `x^(n-1)` here from the iterated squaring of
+                // `x` (mirroring the Lagrange block above): at iteration
+                // `i` we maintain
+                //   x_pow_2i        = x^(2^i)
+                //   x_pow_2i_minus1 = x^(2^i - 1)
+                // and update both per Knuth-style "all-ones" recurrence.
+                // After `k` iterations `x_pow_2i_minus1 = x^(2^k - 1) =
+                // x^(n-1)`.
+                let x := mload(X_MPTR)
+                let k := mload(K_MPTR)
+                let x_pow_2i := x
+                let x_pow_2i_minus1 := 1
+                for { let idx := 0 } lt(idx, k) { idx := add(idx, 1) } {
+                    x_pow_2i_minus1 := mulmod(
+                        mulmod(x_pow_2i_minus1, x_pow_2i_minus1, r),
+                        x,
+                        r
+                    )
+                    x_pow_2i := mulmod(x_pow_2i, x_pow_2i, r)
+                }
+                let x_split := x_pow_2i_minus1
 
                 for {
                         let mptr := sub(last_limb, 0x80)
@@ -923,7 +954,7 @@ contract Halo2Verifier {
                     }
                     lt(mptr_end, mptr)
                     {} {
-                    success := ec_mul_acc(success, x_n)
+                    success := ec_mul_acc(success, x_split)
                     mstore(0x180, mload(mptr))
                     mstore(0x1a0, mload(add(mptr, 0x20)))
                     mstore(0x1c0, mload(add(mptr, 0x40)))
