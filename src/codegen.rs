@@ -1,6 +1,6 @@
 use crate::codegen::{
     evaluator::Evaluator,
-    template::{Halo2Verifier, Halo2VerifyingKey},
+    template::{Halo2Verifier, Halo2VerifyingKey, UserPhase},
     util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
 };
 // midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
@@ -348,6 +348,26 @@ impl<'a> SolidityGenerator<'a> {
 
         let pcs_computations = self.scheme.computations(&meta, &data);
 
+        // Per-user-phase breakdown (advices + user challenges).
+        let mut challenge_offset = 0usize;
+        let user_phases: Vec<UserPhase> = meta
+            .num_user_advices
+            .iter()
+            .zip(meta.num_user_challenges.iter())
+            .map(|(&n_a, &n_c)| {
+                let phase = UserPhase {
+                    num_advices: n_a,
+                    num_challenges: n_c,
+                    challenge_offset,
+                };
+                challenge_offset += n_c;
+                phase
+            })
+            .collect();
+        let num_user_challenges: usize = meta.num_user_challenges.iter().sum();
+        let lookup_h_plus_acc: usize =
+            meta.lookup_chunks.iter().sum::<usize>() + meta.num_lookups;
+
         Halo2Verifier {
             scheme: self.scheme,
             trace,
@@ -356,13 +376,15 @@ impl<'a> SolidityGenerator<'a> {
             vk_len,
             vk_mptr,
             num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
-            num_advices: meta.num_advices(),
-            num_challenges: meta.num_challenges(),
-            num_rotations: meta.num_rotations,
-            num_evals: meta.num_evals,
-            num_quotients: meta.num_quotients,
+            user_phases,
+            num_user_challenges,
             num_lookups: meta.num_lookups,
+            num_permutation_zs: meta.num_permutation_zs,
+            lookup_h_plus_acc,
             num_trashcans: meta.num_trashcans,
+            num_quotients: meta.num_quotients,
+            num_evals: meta.num_evals,
+            num_point_sets: meta.num_point_sets,
             proof_cptr,
             quotient_comm_cptr: data.quotient_comm_cptr,
             proof_len: meta.proof_len(self.scheme),
@@ -380,19 +402,46 @@ impl<'a> SolidityGenerator<'a> {
             self.scheme.static_working_memory_size(&self.meta, &mock)
         };
 
+        // The Step 6 transcript model is a streaming Keccak256 buffer at
+        // offset 0x40 onward. Peak buffer length is bounded by the
+        // pre-squeeze byte count between two challenges; we estimate the
+        // worst case as `(absorbed_g1 * 49 + absorbed_scalar * 33 + 64)`
+        // words and round up. A generous static lower bound of 0x800
+        // bytes (64 words) suffices for the poseidon fixture and small
+        // circuits; larger circuits will scale this up.
+        let transcript_words: usize = {
+            // Worst case: domain sep + all advices + all evals absorbed
+            // before any squeeze. In practice the squeeze cadence shrinks
+            // this, but the bound is safe.
+            let total_g1: usize = self.meta.num_user_advices.iter().sum::<usize>()
+                + self.meta.num_lookups
+                + self.meta.num_permutation_zs
+                + self
+                    .meta
+                    .lookup_chunks
+                    .iter()
+                    .sum::<usize>()
+                + self.meta.num_lookups
+                + self.meta.num_trashcans
+                + self.meta.num_quotients
+                + 2; // f_com + pi
+            let total_scalar = self.meta.num_evals + self.meta.num_point_sets;
+            let bytes = 32 + total_g1 * 49 + total_scalar * 33 + 64;
+            bytes.div_ceil(0x20)
+        };
+
         itertools::max([
-            // Keccak256 input (can overwrite vk)
-            itertools::max(chain![
-                self.meta.num_advices().into_iter().map(|n| n * 2 + 1),
-                [self.meta.num_evals + 1],
-            ])
-            .unwrap()
-            .saturating_sub(vk.len() / 0x20),
-            // PCS computation
+            // Transcript buffer (streaming Keccak256)
+            transcript_words.saturating_sub(vk.len() / 0x20),
+            // PCS computation scratch
             pcs_computation,
             // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each)
             // = 24 words, plus 1-word output buffer.
             25,
+            // Modexp scratch for decompression (240 bytes input + 48
+            // bytes output = 9 words; we round up to 16 to leave room
+            // for separate scratch areas).
+            16,
         ])
         .unwrap()
             * 0x20

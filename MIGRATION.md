@@ -91,7 +91,7 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
         midfall/proofs/solidity-verifier/tests/.
 ```
 
-## What landed in Steps 1-5
+## What landed in Steps 1-6
 
 ### Steps 1-3
 
@@ -196,14 +196,81 @@ template.
 Two tests pin the IntermediateSets builder (`intermediate_sets_*`); transcript
 tests still pass.
 
-## Pending work (Steps 6-9)
+### Step 6 (2026-04-26)
+
+* `templates/Halo2Verifier.sol` — full Yul rewrite. The verifier now
+  consumes the midnight-proofs proof byte stream end-to-end:
+    1. `transcript_init()` seeds a streaming Keccak256 buffer at memory
+       `[0x00..buf_len)` with the 31-byte `"Domain separator for transcript"`.
+    2. `common_word(buf_len, w)` and `common_compressed_g1(buf_len, cptr)`
+       append `[PREFIX_COMMON=0x01, ...payload]` to the buffer.
+    3. `squeeze_to(buf_len, mptr)` implements the two-fork squeeze:
+       append `[PREFIX_CHALLENGE=0x02]`, then keccak with
+       `[..., 0x00]` and `[..., 0x01]` separately to produce a 64-byte
+       output, reseed the buffer, and sample an Fq via
+       `from_uniform_bytes(64)` = `a0 + a1 * 2^256 (mod r)` with the
+       Montgomery constant `2^256 mod r` baked in (`FR_R_2POW256_MOD`).
+    4. `decompress_g1(success, src, dst)` parses the zcash 48-byte
+       compressed encoding (top 3 flag bits + 381-bit x), runs
+       `modexp(x, 3, p)` then `modexp(y_sq, (p+1)/4, p)` to recover y,
+       and selects the correct sign by comparing `y` vs `p-y` limb-wise.
+       Identity points (infinity flag set) are written as four zero words.
+    5. `scalar_inv(x)` computes `x^(r-2) mod r` via modexp.
+    6. `byte_reverse_32(x)` swaps the byte order of a 32-byte word
+       (used to convert calldata BE u256s to LE bytes for transcript
+       hashing, since midnight-proofs hashes `Fq::to_repr()` LE bytes).
+* New MPTR layout in `templates/Halo2Verifier.sol`:
+    * `THETA, BETA, GAMMA, TRASH_CHALLENGE, Y, X` at `theta_mptr+0..+5`
+    * `X1, X2, X3, X4` at `theta_mptr+6..+9`
+    * `F_COM` (4 words) at `theta_mptr+10`, `PI` (4 words) at `+14`
+    * Lagrange / quotient / instance scratch shifted accordingly
+    * `F_EVAL`, `V`, `FINAL_COM` (4 words) added for the PCS pairing
+      reconstruction
+    * `ROT_POINTS`, `X1_POWERS`, `Q_COM`, `Q_EVAL_SET`, `Q_EVAL_CPTR_MPTR`
+      reserved for the Step 5 emitter
+* New proof-read schedule in the Yul body (mirrors
+  `midnight_proofs::plonk::verifier::parse_trace` +
+  `verify_algebraic_constraints`):
+    * domain sep -> common(VK_DIGEST) -> common(num_instances) ->
+      common(each instance, byte-reversed) ->
+    * for each user phase: read `num_advices` compressed G1 +
+      squeeze `num_challenges` Fq (cumulative offset tracked via
+      `UserPhase::challenge_offset`) ->
+    * theta -> read multiplicities -> beta, gamma -> read perm Z ->
+      read lookup helpers + accumulators -> trash_challenge ->
+      read trashcans -> y -> read quotient limbs -> x ->
+      read evals -> x1, x2 -> read f_com (decompressed at F_COM_MPTR) ->
+      x3 -> read q_evals (Q_EVAL_CPTR saved for the PCS emitter) ->
+      x4 -> read pi (decompressed at PI_MPTR)
+* The existing Lagrange / quotient / final-pairing blocks are
+  preserved unchanged (pure Fr arithmetic).
+* `src/codegen/template.rs` — adds `UserPhase { num_advices,
+  num_challenges, challenge_offset }` plus six new fields on
+  `Halo2Verifier` (`user_phases`, `num_user_challenges`,
+  `num_lookups`, `num_permutation_zs`, `lookup_h_plus_acc`,
+  `num_trashcans`, `num_quotients`, `num_evals`, `num_point_sets`)
+  consumed by the new template.
+* `src/codegen.rs::generate_verifier()` — populates the new fields
+  and threads the local `meta` clone (with `num_point_sets` baked in)
+  through the evaluator, PCS emitter, and template.
+* `src/codegen.rs::static_working_memory_size()` — replaces the old
+  per-phase Keccak input estimate with a streaming-buffer estimate
+  based on total absorbed G1 + scalar bytes; the result is only a
+  lower bound on `vk_mptr`, the actual transcript scratch lives at
+  `[0x00..0x2200)` and the modexp scratch at `[0x2200..0x2400)`.
+
+The rendered Yul produces the entire end-to-end verifier flow but is
+**not yet exercised** against a real proof — that requires the
+Step 8 example driver. Existing unit tests (`cargo test --lib`)
+continue to pass: 3 transcript tests + 2 IntermediateSets tests.
+
+## Pending work (Steps 7-9)
 
 | Step | Files | Notes |
 |------|-------|-------|
-| 6 | `templates/Halo2Verifier.sol` | rewrite the Yul body. Compressed-G1 -> EVM decompression helper has to match `<G1Projective as GroupEncoding>::from_bytes` (sign bit at top of x; subgroup check). New squeeze sequence (x1/x2/x3/x4); decompressed f_com / pi reads; `scalar_inv` helper; allocate the `*_MPTR` slots referenced by the Step 5 emitter. |
-| 7 | `templates/Halo2VerifyingKey.sol` | new constants block; per-lookup tables; num_simple_selectors prelude. |
-| 8 | `examples/`, drivers | add `verify_poseidon` example consuming the fixture. |
-| 9 | `tests/` | PBTs + soundness flips. Mirror existing tests under `midfall/proofs/solidity-verifier/tests/`. |
+| 7 | `templates/Halo2VerifyingKey.sol` | regenerate the constants block + per-lookup tables + num_simple_selectors prelude so the embedded-VK and separate-VK paths match the Step 6 layout. |
+| 8 | `examples/`, drivers | `verify_poseidon` example consuming the fixture; verify the rendered Yul compiles under solc and the precompile addresses (0x05/0x0b/0x0c/0x0f) execute on Prague-spec revm. |
+| 9 | `tests/` | PBTs + soundness flips. Mirror the existing approach in `midfall/proofs/solidity-verifier/tests/`. |
 
 ## How to validate the current state
 
@@ -219,8 +286,9 @@ test transcript::tests::common_g1_then_squeeze_matches ... ok
 test result: ok. 3 passed; 0 failed; ...
 ```
 
-`examples/`, `src/test.rs`, and the rendered Yul are *not yet* fixed
-and will fail to build until Steps 6-9 are completed. The `evm`
-feature is buildable but the rendered Solidity will reference symbolic
-`*_MPTR` / `*_CPTR` identifiers that Step 6's template rewrite needs
-to define.
+`examples/`, `src/test.rs`, and the rendered Yul are *not yet* fully
+exercised end-to-end and will fail to verify until Steps 7-9 are
+completed (in particular, Step 7 finalises the Halo2VerifyingKey
+template and Step 8 wires up an example driver that compiles the
+rendered Yul under solc and executes it against the poseidon
+fixture).
