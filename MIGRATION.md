@@ -91,7 +91,7 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
         midfall/proofs/solidity-verifier/tests/.
 ```
 
-## What landed in Steps 1-6
+## What landed in Steps 1-7
 
 ### Steps 1-3
 
@@ -264,11 +264,60 @@ The rendered Yul produces the entire end-to-end verifier flow but is
 Step 8 example driver. Existing unit tests (`cargo test --lib`)
 continue to pass: 3 transcript tests + 2 IntermediateSets tests.
 
-## Pending work (Steps 7-9)
+### Step 7 (2026-04-26)
+
+* `templates/Halo2VerifyingKey.sol` — replaced the terse leading
+  comment with a full word-by-word layout map that documents every
+  named slot consumed by the Step 6 verifier:
+
+  ```
+  word  0      : vk_digest
+  word  1      : num_instances
+  word  2..10  : k, n_inv, omega, omega_inv, omega_inv_to_l,
+                 has_accumulator, acc_offset, num_acc_limbs,
+                 num_acc_limb_bits
+  word 11..14  : G1_BASE        (4 words, EIP-2537 padded)
+  word 15..22  : G2_BASE        (8 words, EIP-2537 padded)
+  word 23..30  : NEG_S_G2_BASE  (8 words, EIP-2537 padded)
+  word 31..    : fixed_comms[i]      (4 words each)
+  word ...     : permutation_comms[i] (4 words each)
+  ```
+
+  The midnight-proofs migration deliberately bakes per-lookup chunk
+  counts, trashcan structure, and `num_simple_selectors` into the
+  Yul body (codegen-time constants), so the runtime VK layout stays
+  *exactly* the same shape as the BN254 / halo2 v0.4 era — only the
+  meaning of the words changed (Fq -> Fr scalars, EIP-2537 padded G1
+  / G2 instead of 64-byte raw points, neg_s_g2 instead of pairing
+  precomputed factors).
+
+* `src/codegen/template.rs::tests` — new test module with two
+  asserts that pin the byte layout the verifier consumes:
+    * `vk_layout_byte_consistency`: synthesises a 31-scalar +
+      2-fixed + 3-perm `Halo2VerifyingKey` and verifies
+      `len() == bytes().len() == 1632 (= 51 * 32)`. Spot-checks the
+      `vk_digest` head, `NEG_S_G2_BASE_MPTR` (word 23),
+      `fixed_comms[0]` (word 31), and `permutation_comms[0]`
+      (word 39) byte offsets.
+    * `vk_renders_and_returns_correct_length`: renders the VK
+      template and asserts the constructor emits
+      `return(0, 0x0660)` plus the expected `mstore(0x0000, ...)`
+      and `mstore(0x04e0, ...)` lines.
+
+* Manual `solc 0.8.30` compile of a representative VK render
+  (`solc --bin --optimize --via-ir --evm-version cancun`) succeeded
+  end-to-end, confirming the layout + trailing `return(0, len)`
+  produce a clean runtime bytecode (the 51-word data blob).
+
+The `cargo test --lib` suite now stands at 7/7 green:
+  * 3 transcript round-trip tests
+  * 2 IntermediateSets bucketing tests
+  * 2 VK layout / render tests
+
+## Pending work (Steps 8-9)
 
 | Step | Files | Notes |
 |------|-------|-------|
-| 7 | `templates/Halo2VerifyingKey.sol` | regenerate the constants block + per-lookup tables + num_simple_selectors prelude so the embedded-VK and separate-VK paths match the Step 6 layout. |
 | 8 | `examples/`, drivers | `verify_poseidon` example consuming the fixture; verify the rendered Yul compiles under solc and the precompile addresses (0x05/0x0b/0x0c/0x0f) execute on Prague-spec revm. |
 | 9 | `tests/` | PBTs + soundness flips. Mirror the existing approach in `midfall/proofs/solidity-verifier/tests/`. |
 
@@ -279,11 +328,15 @@ $ cargo check --lib
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.08s
 
 $ cargo test --lib
-running 3 tests
-test transcript::tests::empty_squeeze_matches_midnight_proofs ... ok
-test transcript::tests::common_scalar_then_squeeze_matches ... ok
+running 7 tests
+test codegen::pcs::gwc19::tests::intermediate_sets_dedups_commitments ... ok
+test codegen::pcs::gwc19::tests::intermediate_sets_partitions_by_rotation_set ... ok
+test codegen::template::tests::vk_layout_byte_consistency ... ok
+test codegen::template::tests::vk_renders_and_returns_correct_length ... ok
 test transcript::tests::common_g1_then_squeeze_matches ... ok
-test result: ok. 3 passed; 0 failed; ...
+test transcript::tests::common_scalar_then_squeeze_matches ... ok
+test transcript::tests::empty_squeeze_matches_midnight_proofs ... ok
+test result: ok. 7 passed; 0 failed; ...
 ```
 
 `examples/`, `src/test.rs`, and the rendered Yul are *not yet* fully

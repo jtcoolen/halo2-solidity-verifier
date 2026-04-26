@@ -156,3 +156,152 @@ mod filters {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{G1Words, Halo2VerifyingKey};
+    use ruint::aliases::U256;
+
+    fn synthetic_vk(num_fixed: usize, num_perm: usize) -> Halo2VerifyingKey {
+        // 11 named scalars + 4 g1 + 8 g2 + 8 neg_s_g2 = 31 entries (the
+        // exact layout the verifier expects for the Step 6 named
+        // VK_DIGEST_MPTR / G1_BASE_MPTR / G2_BASE_MPTR / NEG_S_G2_BASE_MPTR
+        // slots).
+        let mut constants: Vec<(&'static str, U256)> = vec![
+            ("vk_digest", U256::from(0xde_u64)),
+            ("num_instances", U256::from(1u64)),
+            ("k", U256::from(8u64)),
+            ("n_inv", U256::from(0x1234u64)),
+            ("omega", U256::from(0x5678u64)),
+            ("omega_inv", U256::from(0x9abcu64)),
+            ("omega_inv_to_l", U256::from(0xdef0u64)),
+            ("has_accumulator", U256::from(0u64)),
+            ("acc_offset", U256::from(0u64)),
+            ("num_acc_limbs", U256::from(0u64)),
+            ("num_acc_limb_bits", U256::from(0u64)),
+        ];
+        constants.extend([
+            ("g1_x_hi", U256::from(0x10u64)),
+            ("g1_x_lo", U256::from(0x11u64)),
+            ("g1_y_hi", U256::from(0x12u64)),
+            ("g1_y_lo", U256::from(0x13u64)),
+        ]);
+        constants.extend([
+            ("g2_x_c0_hi", U256::from(0x20u64)),
+            ("g2_x_c0_lo", U256::from(0x21u64)),
+            ("g2_x_c1_hi", U256::from(0x22u64)),
+            ("g2_x_c1_lo", U256::from(0x23u64)),
+            ("g2_y_c0_hi", U256::from(0x24u64)),
+            ("g2_y_c0_lo", U256::from(0x25u64)),
+            ("g2_y_c1_hi", U256::from(0x26u64)),
+            ("g2_y_c1_lo", U256::from(0x27u64)),
+        ]);
+        constants.extend([
+            ("neg_s_g2_x_c0_hi", U256::from(0x30u64)),
+            ("neg_s_g2_x_c0_lo", U256::from(0x31u64)),
+            ("neg_s_g2_x_c1_hi", U256::from(0x32u64)),
+            ("neg_s_g2_x_c1_lo", U256::from(0x33u64)),
+            ("neg_s_g2_y_c0_hi", U256::from(0x34u64)),
+            ("neg_s_g2_y_c0_lo", U256::from(0x35u64)),
+            ("neg_s_g2_y_c1_hi", U256::from(0x36u64)),
+            ("neg_s_g2_y_c1_lo", U256::from(0x37u64)),
+        ]);
+
+        let fixed_comms: Vec<G1Words> = (0..num_fixed)
+            .map(|i| {
+                let base = U256::from(0x40_u64 + i as u64 * 4);
+                (
+                    base,
+                    base + U256::from(1u64),
+                    base + U256::from(2u64),
+                    base + U256::from(3u64),
+                )
+            })
+            .collect();
+        let permutation_comms: Vec<G1Words> = (0..num_perm)
+            .map(|i| {
+                let base = U256::from(0x80_u64 + i as u64 * 4);
+                (
+                    base,
+                    base + U256::from(1u64),
+                    base + U256::from(2u64),
+                    base + U256::from(3u64),
+                )
+            })
+            .collect();
+        Halo2VerifyingKey {
+            constants,
+            fixed_comms,
+            permutation_comms,
+        }
+    }
+
+    #[test]
+    fn vk_layout_byte_consistency() {
+        // For a synthetic VK with 31 named scalars + N=2 fixed + M=3
+        // permutation commitments, expect:
+        //   len() = 31*32 + (2+3)*4*32 = 31*32 + 20*32 = 51*32 = 1632 bytes
+        //   bytes().len() == len()
+        let vk = synthetic_vk(2, 3);
+        let expected_len = 31 * 32 + (2 + 3) * 4 * 32;
+        assert_eq!(vk.len(), expected_len);
+        assert_eq!(vk.bytes().len(), expected_len);
+
+        // The first 32 bytes of bytes() should encode `vk_digest`.
+        let head = &vk.bytes()[..32];
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(head);
+        let head_u256 = U256::from_be_bytes(buf);
+        assert_eq!(head_u256, U256::from(0xde_u64));
+
+        // Word index of NEG_S_G2_BASE_MPTR = 23 (vk_mptr + 23).
+        // Verify the corresponding bytes match the synthetic value 0x30.
+        let off = 23 * 32;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&vk.bytes()[off..off + 32]);
+        let neg_s_g2_x_c0_hi = U256::from_be_bytes(buf);
+        assert_eq!(neg_s_g2_x_c0_hi, U256::from(0x30_u64));
+
+        // First fixed_comm starts at word 31.
+        let off = 31 * 32;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&vk.bytes()[off..off + 32]);
+        assert_eq!(U256::from_be_bytes(buf), U256::from(0x40_u64));
+
+        // First permutation_comm starts at word 31 + 4*N_FIXED = 39.
+        let off = 39 * 32;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&vk.bytes()[off..off + 32]);
+        assert_eq!(U256::from_be_bytes(buf), U256::from(0x80_u64));
+    }
+
+    #[test]
+    fn vk_renders_and_returns_correct_length() {
+        let vk = synthetic_vk(2, 3);
+        let mut s = String::new();
+        vk.render(&mut s).expect("VK render");
+        // The constructor must `return(0, len)` with the exact byte length
+        // the verifier loads via `extcodecopy`. Our `hex` filter
+        // left-pads odd-length hex literals with a leading zero, so 0x660
+        // (3 hex digits) renders as "0x0660".
+        let raw_hex = format!("{:x}", vk.len());
+        let padded_hex = if raw_hex.len() % 2 == 1 {
+            format!("0{raw_hex}")
+        } else {
+            raw_hex
+        };
+        let expected_return = format!("return(0, 0x{padded_hex})");
+        assert!(
+            s.contains(&expected_return),
+            "rendered VK missing expected return statement {expected_return} in:\n{s}"
+        );
+        // It should `mstore` the very first scalar (vk_digest) at offset 0.
+        assert!(s.contains("mstore(0x0000,"), "vk_digest mstore at offset 0");
+        // The first permutation commitment is at byte offset 0x4e0
+        // (39 * 32 = 1248 = 0x4e0).
+        assert!(
+            s.contains("mstore(0x04e0,"),
+            "permutation_comms[0].x_hi at byte offset 0x4e0"
+        );
+    }
+}
