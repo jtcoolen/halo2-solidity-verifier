@@ -137,8 +137,12 @@ impl<'a> SolidityGenerator<'a> {
 
 impl<'a> SolidityGenerator<'a> {
     /// Render `Halo2Verifier.sol` with verifying key embedded into writer.
+    ///
+    /// The default render path emits trace/log branches when the crate is
+    /// compiled with `--features solidity-trace`.
     pub fn render_into(&self, verifier_writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, false).render(verifier_writer)
+        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED)
+            .render(verifier_writer)
     }
 
     /// Render `Halo2Verifier.sol` with verifying key embedded and return it as `String`.
@@ -165,12 +169,15 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     /// Render `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
+    ///
+    /// The default render path emits trace/log branches when the crate is
+    /// compiled with `--features solidity-trace`.
     pub fn render_separately_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, false)
+        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED)
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())

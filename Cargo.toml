@@ -76,6 +76,9 @@ blake2b_halo2 = { path = "../midfall/vendor/blake2b_halo2" }
 [features]
 default = []
 evm = ["dep:revm"]
+# Enables Askama trace/log branches in the default Solidity render path.
+# Explicit `render_trace*` helpers can still be used without this feature.
+solidity-trace = []
 
 [[example]]
 name = "separately"

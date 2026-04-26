@@ -17,6 +17,13 @@ pub use codegen::{
 pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF};
 pub use transcript::Keccak256Transcript;
 
+/// Whether the default Solidity renderer emits trace logs.
+///
+/// Enable with `--features solidity-trace`. The explicit
+/// `render_trace*` helpers still force trace output regardless of this
+/// flag.
+pub const SOLIDITY_TRACE_ENABLED: bool = cfg!(feature = "solidity-trace");
+
 #[cfg(feature = "evm")]
 pub use evm::test::{compile_solidity, revm, CallOutcome, Evm};
 

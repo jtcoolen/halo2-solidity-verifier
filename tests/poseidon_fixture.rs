@@ -100,6 +100,8 @@ fn srs_dir() -> String {
 /// the local midfall checkout, Filecoin SRS asset, solc, and Prague
 /// EIP-2537 precompile support. Run explicitly via
 ///   cargo test --features evm --test poseidon_fixture -- --ignored --nocapture
+/// Enable Solidity trace logs with:
+///   cargo test --features evm,solidity-trace --test poseidon_fixture -- --ignored --nocapture
 #[test]
 #[ignore = "requires local midfall assets and Prague EIP-2537 precompiles"]
 fn poseidon_renders_compiles_and_verifies() {
@@ -153,16 +155,10 @@ fn poseidon_renders_compiles_and_verifies() {
     let num_instances = 1;
     let generator = SolidityGenerator::new(&srs, vk.vk(), Gwc19, num_instances)
         .set_num_committed_instances(1);
-    let trace_solidity = env::var_os("DROID_TRACE_SOLIDITY").is_some();
-    let (verifier_solidity, vk_solidity) = if trace_solidity {
-        generator
-            .render_trace_separately()
-            .expect("render_trace_separately should succeed")
-    } else {
-        generator
-            .render_separately()
-            .expect("render_separately should succeed")
-    };
+    let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
+    let (verifier_solidity, vk_solidity) = generator
+        .render_separately()
+        .expect("render_separately should succeed");
 
     // Persist for post-mortem inspection.
     let dump_dir = format!(
