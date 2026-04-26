@@ -317,7 +317,15 @@ impl<'a> SolidityGenerator<'a> {
         let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
         let data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
 
-        let evaluator = Evaluator::new(self.vk.cs(), &self.meta, &data);
+        // Run the codegen-time `construct_intermediate_sets` simulation
+        // and bake `num_point_sets` into a local meta clone. This makes
+        // `meta.proof_len()` and `meta.batch_open_extra_evals()` report
+        // the correct calldata size (which depends on the number of
+        // distinct point sets emitted by the multi-prepare PCS).
+        let mut meta = self.meta.clone();
+        meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
+
+        let evaluator = Evaluator::new(self.vk.cs(), &meta, &data);
         let quotient_eval_numer_computations = chain![
             evaluator.gate_computations(),
             evaluator.permutation_computations(),
@@ -338,7 +346,7 @@ impl<'a> SolidityGenerator<'a> {
         })
         .collect();
 
-        let pcs_computations = self.scheme.computations(&self.meta, &data);
+        let pcs_computations = self.scheme.computations(&meta, &data);
 
         Halo2Verifier {
             scheme: self.scheme,
@@ -347,17 +355,17 @@ impl<'a> SolidityGenerator<'a> {
             expected_vk_codehash,
             vk_len,
             vk_mptr,
-            num_neg_lagranges: self.meta.rotation_last.unsigned_abs() as usize,
-            num_advices: self.meta.num_advices(),
-            num_challenges: self.meta.num_challenges(),
-            num_rotations: self.meta.num_rotations,
-            num_evals: self.meta.num_evals,
-            num_quotients: self.meta.num_quotients,
-            num_lookups: self.meta.num_lookups,
-            num_trashcans: self.meta.num_trashcans,
+            num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
+            num_advices: meta.num_advices(),
+            num_challenges: meta.num_challenges(),
+            num_rotations: meta.num_rotations,
+            num_evals: meta.num_evals,
+            num_quotients: meta.num_quotients,
+            num_lookups: meta.num_lookups,
+            num_trashcans: meta.num_trashcans,
             proof_cptr,
             quotient_comm_cptr: data.quotient_comm_cptr,
-            proof_len: self.meta.proof_len(self.scheme),
+            proof_len: meta.proof_len(self.scheme),
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
             quotient_eval_numer_computations,

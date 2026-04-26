@@ -91,7 +91,9 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
         midfall/proofs/solidity-verifier/tests/.
 ```
 
-## What landed in Steps 1-3
+## What landed in Steps 1-5
+
+### Steps 1-3
 
 * `Cargo.toml` — swapped dep tree; `cargo check --lib` resolves
   midnight-proofs and midnight-curves.
@@ -140,13 +142,65 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
   un-doc'd until Step 8.
 * `src/evm.rs` — `encode_calldata` now uses `ff::PrimeField` directly.
 
-## Pending work (Steps 4-9)
+### Step 4 (2026-04-26)
+
+* `src/codegen/evaluator.rs::Evaluator::permutation_computations()` — emits the
+  midnight-proofs permutation argument: l_0 boundary, l_last boundary, set-to-set
+  continuity, and per-set `(z_next * Π(eval + β·s + γ)) - (z_cur * Π(eval + δ_pow + γ))`.
+* `src/codegen/evaluator.rs::Evaluator::lookup_computations()` — full LogUp emitter:
+  `(l_0 + l_last) * Z` boundary, per-chunk
+  `h*Π(f + β) - Σ_j Π_{i≠j}(f_i + β)` helpers (computed via prefix·suffix), and the
+  accumulator `(z_next - z - sel·Σh)(t + β) + m` constraint.
+* `src/codegen/evaluator.rs::Evaluator::trashcan_computations()` — emits
+  `compressed - (1 - q)*trash` where `compressed` folds the trashcan's
+  constraint expressions with `trash_challenge`.
+* `src/codegen/util.rs::ConstraintSystemMeta` — gains `permutation_chunk_len`
+  and `simple_selector_cols: BTreeSet<usize>` (used by the permutation emitter
+  and the fixed-eval lookup).
+
+### Step 5 (2026-04-26)
+
+* `src/codegen/pcs.rs` — module-level rewrite. Single `BatchOpenScheme::Gwc19`
+  variant kept for migration continuity; semantics now refer to the
+  midnight-proofs `KZGCommitmentScheme::multi_prepare` flow.
+* `src/codegen/pcs/gwc19.rs::queries()` — builds the verifier query list
+  mirroring `verify_algebraic_constraints`: advice queries, permutation product
+  cur/next/last, lookup m/h/z/z_next, trashcan, fixed (non-simple), perm common,
+  linearization (= computed quotient).
+* `src/codegen/pcs/gwc19.rs::construct_intermediate_sets_impl()` — codegen-time
+  port of the Rust algorithm. Buckets queries by `(commitment_id, point_set)`
+  and assigns `set_index`. `sort_sets()` then orders sets by ascending
+  cardinality (tiebreaker: original index).
+* `src/codegen/pcs/gwc19.rs::computations()` — emits Yul for the multi-prepare
+  body in six blocks:
+    1. Pre-compute `x * ω^rot` for every distinct rotation
+    2. Pre-compute `x1` powers
+    3. Per-set: `q_com[s] = Σ x1^i · c_i` and `q_eval_set[s] = Σ x1^i · evals_i`
+    4. `f_eval` via Horner over reverse(point_sets) + Lagrange interpolation
+    5. `final_com = msm_inner_product(q_coms ++ [f_com], powers(x4))`,
+       `v = inner_product(q_evals ++ [f_eval], powers(x4))`
+    6. `PAIRING_LHS = π`; `PAIRING_RHS = final_com - v·G + x3·π`
+* `src/codegen/util.rs::ConstraintSystemMeta::num_point_sets` + setter — populated
+  by `SolidityGenerator::generate_verifier` after building `Data` so that
+  `proof_len()` and `batch_open_extra_evals()` report the correct calldata size.
+* `src/codegen.rs::generate_verifier()` — clones `meta` locally, populates
+  `num_point_sets` via the IntermediateSets simulation, and threads the
+  populated meta through evaluator + PCS emission + template fields.
+
+The emitted Yul references symbolic identifiers (`X1_MPTR`, `X2_MPTR`,
+`X3_MPTR`, `X4_MPTR`, `F_COM_MPTR`, `PI_MPTR`, `Q_EVAL_CPTR`, `Q_COM_MPTR`,
+`Q_EVAL_SET_MPTR`, `ROT_POINTS_MPTR`, `X1_POWERS_MPTR`, `F_EVAL_MPTR`,
+`V_MPTR`, `FINAL_COM_MPTR`, `scalar_inv`) that Step 6 will define in the
+template.
+
+Two tests pin the IntermediateSets builder (`intermediate_sets_*`); transcript
+tests still pass.
+
+## Pending work (Steps 6-9)
 
 | Step | Files | Notes |
 |------|-------|-------|
-| 4 | `src/codegen/evaluator.rs` | port permutation/logup/trash expression emitters from `midfall/proofs/src/plonk/{permutation,logup,trash}.rs::expressions`. Each emitter must respect the squeeze ordering of `theta`, `beta`, `gamma`, `trash_challenge`. |
-| 5 | `src/codegen/pcs.rs`, `pcs/gwc19.rs` | replace the rotation-set emitter with `multi_prepare` (x1/x2/f_com/x3/q_evals/x4/pi). `q_evals` count = number of point sets returned by `construct_intermediate_sets`. |
-| 6 | `templates/Halo2Verifier.sol` | rewrite the Yul body. Compressed-G1 -> EVM decompression helper has to match `<G1Projective as GroupEncoding>::from_bytes` (sign bit at top of x; subgroup check). |
+| 6 | `templates/Halo2Verifier.sol` | rewrite the Yul body. Compressed-G1 -> EVM decompression helper has to match `<G1Projective as GroupEncoding>::from_bytes` (sign bit at top of x; subgroup check). New squeeze sequence (x1/x2/x3/x4); decompressed f_com / pi reads; `scalar_inv` helper; allocate the `*_MPTR` slots referenced by the Step 5 emitter. |
 | 7 | `templates/Halo2VerifyingKey.sol` | new constants block; per-lookup tables; num_simple_selectors prelude. |
 | 8 | `examples/`, drivers | add `verify_poseidon` example consuming the fixture. |
 | 9 | `tests/` | PBTs + soundness flips. Mirror existing tests under `midfall/proofs/solidity-verifier/tests/`. |
@@ -166,6 +220,7 @@ test result: ok. 3 passed; 0 failed; ...
 ```
 
 `examples/`, `src/test.rs`, and the rendered Yul are *not yet* fixed
-and will fail to build until Steps 4-9 are completed. The `evm`
-feature is buildable but the rendered Solidity will be incomplete (no
-permutation / lookup / trashcan / PCS Yul code is emitted).
+and will fail to build until Steps 6-9 are completed. The `evm`
+feature is buildable but the rendered Solidity will reference symbolic
+`*_MPTR` / `*_CPTR` identifiers that Step 6's template rewrite needs
+to define.

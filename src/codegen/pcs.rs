@@ -1,20 +1,70 @@
 #![allow(dead_code)]
 
+//! KZG multi-prepare PCS emitter.
+//!
+//! Step 5 of MIGRATION.md (2026-04-26). The previous halo2-era GWC19
+//! emitter (one trailing `W` commitment per rotation set, `nu`/`mu`
+//! reduction) has been replaced with the midnight-proofs
+//! `KZGCommitmentScheme::multi_prepare` flow:
+//!
+//! ```text
+//!   x1, x2  <- transcript squeeze (after evals)
+//!   for each set s:
+//!       q_com[s]      = sum_{q in s} x1^pos(q) * (msm of q's commitment)
+//!       q_eval_set[s] = sum_{q in s} x1^pos(q) * eval(q)
+//!   sort sets by ascending |set|, tiebreak by original index
+//!   read f_com (1 G1)
+//!   x3 <- transcript squeeze
+//!   read q_evals[s]  (1 Fq per set)
+//!   compute f_eval via Horner over reverse(point_sets):
+//!       acc <- 0
+//!       for (points, evals, proof_eval) in zip(point_sets, q_eval_sets, q_evals).rev():
+//!           r_eval = lagrange_interpolate(points, evals).eval(x3)
+//!           den    = prod_{p in points} (x3 - p)
+//!           acc    = acc * x2 + (proof_eval - r_eval) * den.invert()
+//!   x4 <- transcript squeeze
+//!   final_com = msm_inner_product(q_coms ++ [f_com], powers(x4))
+//!   v         = inner_product(q_evals_at_x3 ++ [f_eval], powers(x4))
+//!   read pi (1 G1)
+//!   PAIRING_LHS = pi
+//!   PAIRING_RHS = final_com - v*G1 + x3*pi
+//! ```
+//!
+//! See `midfall/proofs/src/poly/kzg/mod.rs::multi_prepare` for the
+//! reference implementation.
+//!
+//! The Yul emitted here references the following symbolic identifiers:
+//!
+//! | Identifier        | Meaning                                                   |
+//! |-------------------|-----------------------------------------------------------|
+//! | `X1_MPTR`         | x1 challenge (Fq)                                         |
+//! | `X2_MPTR`         | x2 challenge (Fq)                                         |
+//! | `X3_MPTR`         | x3 challenge (Fq)                                         |
+//! | `X4_MPTR`         | x4 challenge (Fq)                                         |
+//! | `F_COM_MPTR`      | f_com point (4 EVM words, EIP-2537 padded)                |
+//! | `PI_MPTR`         | pi point (4 EVM words, EIP-2537 padded)                   |
+//! | `Q_EVAL_CPTR`     | calldata pointer to the first q_eval scalar (Fq)          |
+//! | `G1_BASE_MPTR`    | (existing) BLS12-381 G1 generator (4 EVM words)           |
+//! | `PAIRING_LHS_MPTR`/`PAIRING_RHS_MPTR` | (existing) pairing input slots        |
+//!
+//! The Step 6 template rewrite is responsible for:
+//!   * squeezing x1..x4 into the corresponding MPTRs
+//!   * decompressing f_com / pi from the 48-byte BLS-compressed calldata
+//!     into EIP-2537 padded form at `F_COM_MPTR` / `PI_MPTR`
+//!   * exposing the q_eval calldata block via `Q_EVAL_CPTR`
+//!
+//! For Step 5 we only emit the algebraic body; the template that
+//! consumes it will be rewritten in Step 6.
+
 use crate::codegen::util::{ConstraintSystemMeta, Data};
 
 mod gwc19;
 
-/// PCS schemes supported by the codegen.
-///
-/// **Migration status (Steps 1-3, 2026-04-26)**: only GWC19 is exposed
-/// as a placeholder. The midnight-proofs PCS is `KZGCommitmentScheme`'s
-/// `multi_prepare`/`multi_open` flow (x1, x2, f_com, x3, q_evals, x4,
-/// pi); see `MIGRATION.md` Step 5 for the planned rewrite of this
-/// module. Until then, the GWC19 emitter delegates everything to a
-/// zero-output stub so the codegen tree compiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOpenScheme {
-    /// Placeholder for the midnight-proofs multi-prepare KZG flow.
+    /// Midnight-proofs multi-prepare KZG flow. The variant name is kept
+    /// from the halo2 era for migration continuity; there is only one
+    /// scheme.
     Gwc19,
 }
 
@@ -39,12 +89,21 @@ impl BatchOpenScheme {
         }
     }
 
-    /// Number of G1 commitments that appear *after* the evaluation block
-    /// in the proof byte-stream. For midnight-proofs multi-prepare this
-    /// is 2: `f_com` and `pi`.
+    /// G1 commitments emitted *after* the evaluation block. Multi-prepare
+    /// emits exactly two: `f_com` and `pi`.
     pub(crate) fn num_trailing_g1_points(&self, _meta: &ConstraintSystemMeta) -> usize {
         match self {
             Self::Gwc19 => 2,
         }
+    }
+
+    /// Number of distinct point sets the verifier reads `q_evals` for.
+    /// This is the size of the IntermediateSets vector returned by
+    /// `gwc19::queries`. The metadata is computed by `SolidityGenerator`
+    /// after building `Data` and stored back into `ConstraintSystemMeta`
+    /// via `set_num_point_sets`, so it is available downstream when the
+    /// template is rendered.
+    pub(crate) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize {
+        gwc19::num_point_sets(meta, data)
     }
 }

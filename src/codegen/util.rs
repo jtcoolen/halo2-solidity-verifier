@@ -80,6 +80,11 @@ pub(crate) struct ConstraintSystemMeta {
     pub(crate) num_committed_instances: usize,
     pub(crate) num_rotations: usize,
     pub(crate) num_evals: usize,
+    /// Number of distinct point sets returned by the codegen-side
+    /// `construct_intermediate_sets` simulation. Populated lazily by
+    /// `SolidityGenerator::generate_verifier` once it has constructed the
+    /// `Data` and run `pcs::queries`.
+    pub(crate) num_point_sets: usize,
     pub(crate) num_user_advices: Vec<usize>,
     pub(crate) num_user_challenges: Vec<usize>,
     pub(crate) advice_indices: Vec<usize>,
@@ -224,6 +229,7 @@ impl ConstraintSystemMeta {
             num_committed_instances: nb_committed_instances,
             num_evals,
             num_rotations,
+            num_point_sets: 0,
             num_user_advices,
             num_user_challenges,
             advice_indices,
@@ -352,14 +358,17 @@ impl ConstraintSystemMeta {
     }
 
     /// Extra Fq scalars in the multi-open block: one `q_eval` per
-    /// distinct point set (read at `x_3`).
+    /// distinct point set (read at `x_3`). Computed from the simulated
+    /// `construct_intermediate_sets` run; populated by the caller after
+    /// `ConstraintSystemMeta` is constructed.
     pub(crate) fn batch_open_extra_evals(&self, _scheme: BatchOpenScheme) -> usize {
-        // We don't know the exact number of point sets at codegen time
-        // without reproducing `construct_intermediate_sets`. The Yul
-        // verifier reads them in a loop bounded by "everything between
-        // the last fixed eval and the trailing pi G1" -- mirrors the
-        // approach in `midfall/proofs/solidity-verifier/src/trace_replay.rs`.
-        0
+        self.num_point_sets
+    }
+
+    /// Setter used by `SolidityGenerator` after running the codegen-side
+    /// `construct_intermediate_sets` simulation in `pcs::queries`.
+    pub(crate) fn set_num_point_sets(&mut self, n: usize) {
+        self.num_point_sets = n;
     }
 }
 
