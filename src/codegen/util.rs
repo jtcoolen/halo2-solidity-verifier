@@ -429,12 +429,31 @@ impl Data {
         let theta_mptr = challenge_mptr + meta.challenge_indices.len();
 
         // ------------------------------------------------------------
-        // The calldata layout below is *placeholder* and only used to
-        // make the codegen tree compile during Steps 1-3. The real
-        // midnight-proofs layout is finalised in Step 6 of
-        // MIGRATION.md. In particular, lookup helpers/accumulators,
-        // trashcans, and the new PCS commitments are not yet placed
-        // into this map.
+        // KNOWN BUG (Step 8 follow-up, 2026-04-26):
+        //
+        // The cursor advances below use a 4-word stride (`+ 4 *
+        // count` = 128 bytes per G1), which assumes commitments are
+        // stored in EIP-2537 *padded* form. The actual proof emits
+        // commitments in zcash-compressed form (48 bytes per G1).
+        // Because of this mismatch:
+        //   * the EcPoints below point at the wrong calldata regions
+        //     (when the verifier dereferences them via four
+        //     `calldataload(...)` calls in `EcPoint::words()`, it
+        //     reads garbage / zero-pad past `calldatasize()`);
+        //   * the derived `eval_cptr` lands ~2.7x past the actual
+        //     eval block.
+        //
+        // Fix path (see `MIGRATION.md` Step 8 follow-up):
+        //   1. allocate per-category memory MPTRs in the template,
+        //   2. decompress every G1 inline during proof reading,
+        //   3. point each EcPoint at its memory MPTR (so
+        //      `c.comm.words()` emits `mload(...)` instead of
+        //      `calldataload(...)`),
+        //   4. recompute `eval_cptr` from the correct 0x30 stride.
+        //
+        // The `proof_len` calculation above is ALREADY correct (it
+        // uses 0x30); only the in-memory addressing inherited from
+        // the BN254-era code is broken.
         // ------------------------------------------------------------
         let advice_comm_start = proof_cptr;
         let lookup_m_comm_start = advice_comm_start + 4 * meta.advice_indices.len();

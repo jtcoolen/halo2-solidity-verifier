@@ -371,17 +371,114 @@ The `cargo test --lib` suite now stands at 7/7 green:
 
   **Status**: render + compile + deploy all succeed; the verifier
   reverts mid-execution with empty payload at gas ~123 k against
-  the real proof. The remaining work is to chase the trace
-  divergence between the rendered Yul and the reference
-  verifier_trace.bin / rust_trace.json. Likely culprits:
-    * G1 decompression sign-correction logic (limb-wise compare).
-    * Per-phase advice / challenge offset computation against the
-      committed-instance column counts.
-    * Quotient limb folding / x_n_minus computation.
-    * PCS Lagrange interpolation block.
+  the real proof.
 
-  Once the trace divergence is identified, remove the `#[ignore]`
-  attribute and the test should assert end-to-end soundness.
+  ### Root-cause analysis (2026-04-26)
+
+  Bisecting the rendered Yul + dumped artefacts located the
+  failure: the PCS / quotient-fold sections read each G1
+  commitment as four contiguous calldata words (the EIP-2537
+  *padded* form, 128 bytes per point). The proof bytes that the
+  prover actually emits, however, are in zcash *compressed* form
+  (48 bytes per point). The two layouts disagree by a factor of
+  ~2.7×, so:
+
+  * `Data::new` (in `src/codegen/util.rs`) advances its calldata
+    cursors with a 4-word stride (`+ 4 * count`, i.e. 128 bytes
+    per G1) instead of the correct 48-byte stride.
+  * The PCS emitter (`src/codegen/pcs/gwc19.rs`) loads each
+    commitment with `c.comm.words()`, which expands to four
+    `calldataload(...)` calls at consecutive 32-byte offsets.
+    Against compressed proof bytes this returns garbage (or the
+    next commitment's bytes, or zeros past `calldatasize()`).
+  * The quotient-fold block in
+    `templates/Halo2Verifier.sol::~line 855` reads
+    `LAST_QUOTIENT_X_CPTR..LAST_QUOTIENT_X_CPTR+0x80` from
+    calldata for each quotient limb — same false stride.
+  * The `eval_cptr` derived from `quotient_comm_start + 4 *
+    num_quotients` lands ~1.6 kB past where evals actually live
+    (since the codegen still over-counts the G1 region by
+    ~2.7×), so the renderer emits eval reads at offsets like
+    `calldataload(0x0a64)` which is past the end of the actual
+    eval block.
+
+  The proof BYTE LAYOUT itself is internally consistent
+  (`proof_len` already uses the correct `0x30` stride; the
+  prover and `verifyProof`'s `eq(proof_len, calldataload(...))`
+  check pass) — only the codegen's *interpretation* of those
+  bytes is wrong.
+
+  ### Fix plan
+
+  The cleanest fix is to decompress every commitment during
+  proof reading and have the PCS / quotient-fold work from the
+  decompressed memory copy:
+
+  1. Allocate a contiguous decompressed-commitments memory
+     region in the verifier's static memory map. Suggested
+     offsets, anchored after the existing `Q_EVAL_CPTR_MPTR`
+     (`theta_mptr + 200`):
+
+         ADVICE_COMMS_MPTR_BASE          = theta_mptr + 220        // 4*num_advices words
+         LOOKUP_M_COMMS_MPTR_BASE        = + 4*num_advices         // 4*num_lookups words
+         PERM_Z_COMMS_MPTR_BASE          = + 4*num_lookups
+         LOOKUP_HELPER_COMMS_MPTR_BASE   = + 4*num_perm_zs
+         LOOKUP_Z_COMMS_MPTR_BASE        = + 4*helpers_total
+         TRASHCAN_COMMS_MPTR_BASE        = + 4*num_lookups
+         QUOTIENT_LIMB_COMMS_MPTR_BASE   = + 4*num_trashcans
+
+  2. In `templates/Halo2Verifier.sol`, after each
+     `common_compressed_g1(buf_len, proof_cptr)` call inside
+     the user-phase / lookup / perm / quotient loops, call
+     `decompress_g1(success, proof_cptr,
+       <appropriate MPTR + i*0x80>)` and persist the
+     decompressed point at the chosen MPTR. (The pattern
+     already exists for `f_com` and `pi`.)
+
+  3. In `src/codegen/util.rs::Data::new`, replace the
+     calldata-anchored EcPoints with memory-anchored ones:
+
+         let advice_comms = (0..meta.advice_indices.len())
+             .map(|i| EcPoint::new(Ptr::memory("ADVICE_COMMS_MPTR_BASE") + 4 * i))
+             .collect();
+         // ...same for lookup_m, perm_z, helpers, lookup_z, trashcan,
+         // quotient_limbs.
+
+     With memory-anchored pointers, `c.comm.words()` already
+     emits `mload(...)` (see `Word::Display`), so the PCS code
+     compiles correctly without any changes there.
+
+  4. Recompute `eval_cptr` from the correct compressed-G1
+     stride. The byte offset relative to `proof_cptr` is
+     `0x30 * (advices + lookups + perm_zs + helpers_total +
+     lookups + trashes + quotients)`. Because `Ptr::add(usize)`
+     is word-aligned, build the eval cursor via
+     `Ptr::calldata(proof_cptr.value().as_usize() + 0x30 *
+     pre_eval_g1_count)`.
+
+  5. Replace the calldata-anchored quotient fold in
+     `templates/Halo2Verifier.sol` (~line 855) with a memory
+     loop over `QUOTIENT_LIMB_COMMS_MPTR_BASE`:
+
+         let cptr := add(QUOTIENT_LIMB_COMMS_MPTR_BASE,
+                         mul(0x80, sub(num_quotients, 1)))
+         // load (x_hi, x_lo, y_hi, y_lo) at cptr, then fold via
+         // ec_mul_acc(x_n) + ec_add_acc.
+
+  6. Drop the `FIRST_QUOTIENT_X_CPTR` / `LAST_QUOTIENT_X_CPTR`
+     constants from the template; they no longer have meaning
+     once the quotient limbs live in memory.
+
+  Once those changes land:
+
+  * `tests/poseidon_fixture.rs` runs end-to-end (drop
+    `#[ignore]`).
+  * `cargo test --features evm` should report two passing
+    tests: the lib suite + the Step 8 fixture.
+
+  No changes are needed in
+  `src/codegen/pcs/gwc19.rs::commitment_map` or the PCS Yul
+  emission; the abstraction over `EcPoint` already works.
 
 ## Pending work (Step 8 follow-up + Step 9)
 
