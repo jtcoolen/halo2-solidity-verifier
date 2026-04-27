@@ -983,11 +983,14 @@ contract Halo2Verifier {
                     {{ line }}
                     {%- endfor %}
                 }
+                {%- if self.gas_checkpoints && !loop.last %}
+                gas_checkpoint({{ 17 + loop.index0 }}) // after PCS sub-block {{ loop.index }}
+                {%- endif %}
                 {%- endfor %}
             }
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(14) // after PCS computation block
+            gas_checkpoint(14) // after PCS computation block (= sub-block 6)
             {%- endif %}
 
             // Random-linear combine accumulator into pairing inputs.

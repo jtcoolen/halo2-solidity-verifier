@@ -472,12 +472,24 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
 ///
 /// Topic format: `(id << 248) | gas()`. `id` lives in the upper 8
 /// bits and the remaining 248 bits hold `gas()`. We discard topics
-/// where the upper byte is outside `1..=16` because the trace helpers
+/// where the upper byte is outside `1..=31` because the trace helpers
 /// (`trace_u256` / `trace_point`) emit unrelated LOG1 events with
 /// small `id` topics that may collide; here we filter to our own
 /// checkpoint range. The poseidon fixture is built without the
 /// `solidity-trace` feature in CI, so in practice the only LOG1
 /// events are ours.
+///
+/// IDs 1..=16 are the top-level section boundaries (entry, VK,
+/// transcript stages, quotient, linearization, PCS, accumulator,
+/// pairing). IDs 17.. sit *inside* the PCS computation block (one
+/// emitted between every pair of `pcs_computations` sub-blocks; the
+/// last sub-block ends at cp14) and let us attribute the 514-kg PCS
+/// bucket to each emitter sub-block. The exact mapping of id->block
+/// depends on the circuit layout (one emitter block per (block 1,
+/// block 2, *each* set in block 3, block 4, block 5, block 6) — for
+/// the Poseidon fixture with 3 point sets that's 8 emitter blocks
+/// and 7 mid-PCS checkpoints (cp17..=cp23) so this dumper allocates
+/// space up to id=31 to leave headroom for larger circuits.
 fn dump_gas_checkpoints(
     logs: &[halo2_solidity_verifier::revm::primitives::Log],
     gas_used: u64,
@@ -497,9 +509,20 @@ fn dump_gas_checkpoints(
             11 => "Lagrange + instance evaluation",
             12 => "quotient evaluation (Fr arithmetic)",
             13 => "linearization-commitment MSM",
-            14 => "PCS computation block",
+            14 => "PCS block 6 (pairing inputs LHS/RHS)",
             15 => "accumulator random-combine",
             16 => "final ec_pairing",
+            // Poseidon-specific PCS sub-block layout (3 point sets):
+            //   set 0: m=33 commits, 1 rotation
+            //   set 1: m=5  commits, 2 rotations
+            //   set 2: m=2  commits, 3 rotations
+            17 => "PCS block 1 (rotation points x*omega^rot)",
+            18 => "PCS block 2 (x1 powers)",
+            19 => "PCS block 3 set 0 q_com fold (m=33 MSM, 1 rot)",
+            20 => "PCS block 3 set 1 q_com fold (m=5 MSM, 2 rots)",
+            21 => "PCS block 3 set 2 q_com fold (m=2 MSM, 3 rots)",
+            22 => "PCS block 4 (f_eval Lagrange interpolation)",
+            23 => "PCS block 5 (final_com x4-power MSM + v)",
             _ => "<unknown>",
         }
     }
@@ -513,14 +536,18 @@ fn dump_gas_checkpoints(
             // the lowest 8 are non-zero in practice for gas values
             // < 2^64). We read the lowest 8 bytes as u64.
             let id = bytes[0];
-            if !(1..=16).contains(&id) {
+            if !(1..=31).contains(&id) {
                 return None;
             }
             let gas = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
             Some((id, gas))
         })
         .collect();
-    events.sort_by_key(|(id, _)| *id);
+    // Sort by execution order: gas_left is monotonically decreasing,
+    // so descending-gas == earliest-emitted-first. This is more
+    // robust than sort-by-id because the PCS sub-block ids
+    // (17..=21) are emitted *between* cp13 and cp14.
+    events.sort_by(|a, b| b.1.cmp(&a.1));
 
     if events.is_empty() {
         eprintln!(

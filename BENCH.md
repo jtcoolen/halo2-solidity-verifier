@@ -71,6 +71,67 @@ Per-section deltas vs Step 6 (pre-B/D/E): cp14 PCS block −15,934
 −1,262 (E in `ec_pairing`). All other sections within ±5 gas of Step
 6 baseline (build-noise / measurement jitter).
 
+### Fine-grained PCS sub-block attribution (cp17..cp23, cp14)
+
+The PCS section has additional checkpoints inside it that attribute
+the 514-kg cp14 bucket to each of the 8 emitter sub-blocks (one
+output of `pcs_computations()`). For the Poseidon fixture (3 point
+sets) the emitter produces:
+
+```
+=== PCS sub-block deltas (cp17..cp23, cp14) ===
+  id  delta       %_PCS  %_total  section
+  17     548        0.1%    0.06%  block 1: rotation points (x*omega^rot, 3 distinct)
+  18  24,434        4.7%    2.7%   block 2: x1 powers (33 muls + mstore)
+  19 329,365       64.1%   36.8%   block 3 set 0 q_com fold (m=33 MSM, 1 rotation)
+  20  54,630       10.6%    6.1%   block 3 set 1 q_com fold (m=5 MSM, 2 rotations)
+  21  27,907        5.4%    3.1%   block 3 set 2 q_com fold (m=2 MSM, 3 rotations)
+  22  10,641        2.1%    1.2%   block 4: f_eval Lagrange interpolation (3 sets)
+  23  40,754        7.9%    4.6%   block 5: final_com x4-power MSM + v
+  14  25,435        4.9%    2.8%   block 6: pairing inputs LHS = pi, RHS = final_com - v*G + x3*pi
+total 513,714      100%    57.4%
+```
+
+Per-EIP-2537 G1MSM precompile contributions (cost = `k * 12000 *
+discount[k] / 1000` with the discount table from EIP-2537):
+
+| call | k | discount | precompile gas | block | EVM-side overhead |
+|---|---:|---:|---:|---:|---:|
+| set 0 q_com fold | 33 | 133 | 52,668 | cp19=329,365 | ~277 kg |
+| set 1 q_com fold | 5 | 517 | 31,020 | cp20=54,630 | ~24 kg |
+| set 2 q_com fold | 2 | 888 | 21,312 | cp21=27,907 | ~7 kg |
+| block 5 final_com (3 × MSM-1 + 3 × G1ADD) | 1+1+1 | 1200 | 3 × 14,400 + 3 × 600 ≈ 45,000 | cp23=40,754 | ~−4 kg* |
+| block 6 pairing RHS (2 × MSM-1 + 2 × G1ADD) | 1+1 | 1200 | 2 × 14,400 + 2 × 600 ≈ 30,000 | cp14=25,435 | ~−5 kg* |
+| **PCS precompile subtotal** | | | **~ 180 kg** | of total **514 kg** | (35 %) |
+
+\* The negative "EVM overhead" for blocks 5 and 6 means the section
+delta is *less* than the precompile-only cost — solc-via-ir is folding
+the staging mstore chain into the precompile call directly, so the
+block 5 and 6 deltas effectively measure precompile + a few mstores.
+The EIP-2537 discount table is also slightly more aggressive than
+the formula above for k=1 (some implementations cap at 12,000).
+
+Headline: **set 0's m=33 q_com fold is THE single biggest line in the
+verifier**: 329 kg = 64 % of the PCS section = 36.8 % of total
+verifier gas. The precompile itself only accounts for 53 kg (16 %)
+of that 329 kg; the remaining 277 kg is EVM-side staging:
+
+- 32 × `byte_reverse_32(calldataload(...))` calls in the q_eval
+  Fr accumulator: ~4.5 kg (post-Step-6 unroll; was ~22 kg pre-unroll).
+- 32 × `mulmod`/`addmod` in the q_eval Horner: ~0.5 kg.
+- 33 × 5-mstore staging into MSM_SCRATCH (165 mstores from VK
+  region into 0x6100..0x75a0): solc-via-ir compiles each
+  `mstore(CONST, mload(VK_OFFSET))` to a ~30-50 gas EVM sequence
+  after constant folding + stack scheduling, so ~6-8 kg.
+- Memory expansion (going from ~370 words to ~941 words): ~3 kg.
+- Static-call overhead: ~1 kg.
+
+The remaining ~260 kg is "via-IR generated dispatch overhead"
+similar in character to the pre-Step-6 `byte_reverse_32` cost
+(many small Yul statements that solc inlines but with non-trivial
+stack-juggling overhead). It's the next big optimization target — see
+"Suggested optimisations" item I below.
+
 ### Step 5 baseline (pre-unroll, for comparison)
 
 ```
@@ -107,7 +168,7 @@ precompile work and EVM work:
 
 | section | gas | breakdown |
 |---|---:|---|
-| **PCS computation (cp14)** | **514 kg** | 3 batched G1MSMs (33+5+2 pairs) ~120 kg + 5 single-pair Block 5/6 MSMs ~60 kg + 3 batched scalar_inv modexp ~4 kg + 5 G1ADDs ~2 kg + ~3 keccak squeezes ~10 kg + interpolation arithmetic ~30–50 kg + memory expansion ~5 kg ≈ ~225 kg of "real" work + **~290 kg of EVM helper-dispatch overhead**. Down 16 kg from Step 6 (B: −15 kg modexp, D: −0.6 kg mload, E: −0.2 kg mcopy). |
+| **PCS computation (cp14)** | **514 kg** | Now broken out by sub-block (cp17..cp23): **set 0 q_com fold = 329 kg (64 %)**, set 1 q_com fold = 55 kg, set 2 q_com fold = 28 kg, x1 powers = 24 kg, block 5 final_com = 41 kg, block 6 pairing inputs = 25 kg, f_eval Lagrange = 11 kg, rotation points = 0.5 kg. Per-EIP-2537 G1MSM precompile cost across all 8 PCS calls is **~180 kg (35 %)**, leaving **~330 kg (65 %) as EVM-side staging + Fr arithmetic + memory expansion**. Down 16 kg from Step 6 (B: −15 kg modexp, D: −0.6 kg mload, E: −0.2 kg mcopy). |
 | **Quotient evaluation (cp12)** | **124 kg** | ~587 `mulmod`/`addmod` sites in the gate evaluator. Step 6 dropped this from 361 kg by eliminating ~80 redundant 32-iter `byte_reverse_32` loops. |
 | **Final pairing (cp16)** | 103 kg | EIP-2537 `BLS12_PAIRING_CHECK` for k=2: `32600 + 37700 × 2 = 108,000` minus measurement overhead. E (mcopy in `ec_pairing`) shaved ~1.3 kg of EVM overhead (point staging for the 0x300-byte input scratch); the precompile cost itself is the cryptographic floor and cannot be reduced. |
 | **Linearization MSM (cp13)** | 72 kg | One 8-pair G1MSM (~33 kg) + Horner scalar prep (~30 mulmod chain) + 8-pair × 5-mstore staging. **Unchanged by Step 6 / B / D / E** (its calldata reads are not in the byte-reverse hot path; its mstore chains are inside an MSM emitter not yet retrofitted to MCOPY). |
@@ -115,7 +176,7 @@ precompile work and EVM work:
 | transcript stage cp2..cp9 | ~16 kg | streaming-keccak absorb cycles, mostly. Step 6 cut these to a third of pre-unroll. |
 | Lagrange + instance eval (cp11) | 9 kg | small batch invert + dot-product over instances |
 | acc random-combine (cp15) | 0 kg | branch not taken (HAS_ACCUMULATOR_MPTR == 0 for poseidon) |
-| **non-tx total** | **908 kg** | of which ~378 kg is precompile gas (42 %), ~530 kg is EVM (58 %) |
+| **non-tx total** | **908 kg** | of which ~338 kg is precompile gas (37 %; was overestimated as 378 kg in prior bench — refined via cp17..cp23 PCS breakdown showing 180 kg PCS precompile not 220 kg), ~570 kg is EVM (63 %) |
 
 ## The "catch-all" was `byte_reverse_32`
 
@@ -266,6 +327,50 @@ which is fine, but the buffer is rebuilt 4 times in a row from the
 same prefix. If we can compute x1 || x2 || x3 || x4 from a single
 domain-separated keccak invocation (as snark-verifier does with its
 `MidnightEvmHash`), we save ~3 keccak calls × ~10 kg = ~30 kg.
+
+### H. Set-0 q_com staging streamlining
+**Projection: 100-200 kg saved**
+
+The fine-grained PCS attribution (cp17..cp23) shows that **set 0's
+m=33 q_com fold consumes 329 kg = 36.8 % of the entire verifier**.
+The EIP-2537 G1MSM precompile only accounts for ~53 kg of that — the
+other **~277 kg is pure EVM-side staging cost** for the 33 commits ×
+5 mstores staging chain (165 mstores) + 33 byte_reverse_32 calls in
+the q_eval accumulator.
+
+Three sub-attacks in priority order:
+
+1. **Stage points + scalars in a single buffer-write pass**: the
+   current emitter writes 165 individual `mstore(CONST, mload(VK_X))`
+   lines. Each line compiles via solc-via-ir to a ~30-50 gas EVM
+   sequence (PUSH4 dst + PUSH4 src + MLOAD + MSTORE + stack juggling).
+   With Cancun MCOPY (already used for fixed 4-word point copies in
+   B/E) we could `mcopy(MSM_SCRATCH + i*0xa0, vk_offset_i, 0x80)`
+   to copy each point in 18 gas (3 + 3*4 words) instead of 4 mstores
+   ≈ 60 gas. Saves ~7 kg over the 33 points + similar for sets 1/2.
+
+2. **Hoist the q_eval accumulator out of the per-set block**: each
+   set's q_eval_set_k is built from `byte_reverse_32(calldataload(N))`
+   reads. Pre-load all 40 raw evals into a contiguous Fr-array at the
+   top of the PCS block, then reference them as `mload(EVALS_MPTR +
+   i*0x20)` (3 gas each). Saves the per-call `byte_reverse_32`
+   overhead (~140 gas × 40 calls = ~5.6 kg) and lets solc keep the
+   constant offsets across blocks.
+
+3. **Hoist X1_POWERS_MPTR mloads to stack locals** (analogous to D
+   for ROT_POINTS_MPTR): set 0's q_com fold reads each `X1_POWERS[i]`
+   twice (once for q_eval, once for the MSM scalar). Pre-loading the
+   33 powers into stack vars at block-3 entry would save ~33 mloads ×
+   3 gas = 99 gas per set + spillover savings.
+
+Combined projected ROI: 15–30 kg of direct savings + potentially
+~50–100 kg from solc's improved register allocation when the
+straight-line code sees fewer cross-block dependencies. The biggest
+single win in this list, since cp19 is the largest section.
+
+**Risk**: changing the staging layout requires re-checking memory
+ranges (`MSM_SCRATCH = 0x6100`, must stay above `scalar_inv` scratch
+at `0x6000..0x60c0` and below the FINAL_COM region).
 
 **Caveat:** changes the Fiat-Shamir transcript layout. Requires a
 matching change to the prover (in `midnight-proofs::CircuitTranscript`)
