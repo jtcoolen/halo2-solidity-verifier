@@ -944,11 +944,11 @@ contract Halo2Verifier {
                 let q := QUOTIENT_LIMB_COMMS_MPTR_BASE
 
                 // Quotient-limb pairs: (Q_i, (1-x^n) · x_split^i).
+                // Use Cancun MCOPY to copy each 4-word point in one
+                // op (~18 gas) instead of the 4-mstore chain which
+                // solc-via-ir compiles to ~60-100 gas.
                 for { let i := 0 } lt(i, {{ num_quotients }}) { i := add(i, 1) } {
-                    mstore(p,            mload(q))
-                    mstore(add(p, 0x20), mload(add(q, 0x20)))
-                    mstore(add(p, 0x40), mload(add(q, 0x40)))
-                    mstore(add(p, 0x60), mload(add(q, 0x60)))
+                    mcopy(p, q, 0x80)
                     mstore(add(p, 0x80), cur_scalar)
                     cur_scalar := mulmod(cur_scalar, x_split, r)
                     p := add(p, 0xa0)
@@ -958,17 +958,12 @@ contract Halo2Verifier {
                 {%- if simple_selector_cols.len() > 0 %}
                 // Simple-selector pairs: (S_j_com, sel_acc_j). Mirrors
                 // the `Some(col_idx)` branch of
-                // `compute_linearization_commitment`.
+                // `compute_linearization_commitment`. MCOPY each 4-word
+                // point in one op.
                 {%- for col in simple_selector_cols %}
-                {
-                    let sel_com := {{ (fixed_comm_mptr + col * 0x80)|hex() }}
-                    mstore(p,            mload(sel_com))
-                    mstore(add(p, 0x20), mload(add(sel_com, 0x20)))
-                    mstore(add(p, 0x40), mload(add(sel_com, 0x40)))
-                    mstore(add(p, 0x60), mload(add(sel_com, 0x60)))
-                    mstore(add(p, 0x80), mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
-                    p := add(p, 0xa0)
-                }
+                mcopy(p, {{ (fixed_comm_mptr + col * 0x80)|hex() }}, 0x80)
+                mstore(add(p, 0x80), mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
+                p := add(p, 0xa0)
                 {%- endfor %}
                 {%- endif %}
 
@@ -985,10 +980,8 @@ contract Halo2Verifier {
                     )
                 )
 
-                mstore(QUOTIENT_MPTR,            mload(0x100))
-                mstore(add(QUOTIENT_MPTR, 0x20), mload(0x120))
-                mstore(add(QUOTIENT_MPTR, 0x40), mload(0x140))
-                mstore(add(QUOTIENT_MPTR, 0x60), mload(0x160))
+                // MCOPY the 4-word MSM result back to QUOTIENT_MPTR.
+                mcopy(QUOTIENT_MPTR, 0x100, 0x80)
             }
 
             {%- if self.gas_checkpoints %}
