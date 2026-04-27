@@ -12,10 +12,10 @@ pragma solidity ^0.8.0;
 //     form (4 words = 128 bytes per point: x_hi, x_lo, y_hi, y_lo). The
 //     proof bytes produced by midnight-proofs prover are repacked off
 //     chain (compressed -> uncompressed) before being passed to
-//     `verifyProof`. The verifier still hashes the *compressed* 48-byte
-//     encoding into the transcript (to match the native verifier); the
-//     compressed bytes are reconstructed on the fly inside
-//     `common_uncompressed_g1` from the four uncompressed words.
+//     `verifyProof`. The verifier hashes the **uncompressed** 128-byte
+//     form into the transcript verbatim (matches the patched
+//     `Hashable<Keccak256> for G1Projective::to_input` in
+//     midnight-proofs); see `common_uncompressed_g1`.
 //   * Transcript is a streaming Keccak256 with domain separator
 //     "Domain separator for transcript" + PREFIX_COMMON (0x01) before
 //     each absorbed value + PREFIX_CHALLENGE (0x00) before each squeeze.
@@ -148,15 +148,6 @@ contract Halo2Verifier {
     uint256 internal constant     TRASHCAN_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups }};
     uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups + 4 * num_trashcans }};
 
-    // ----------------------------------------------------------------------
-    // BLS12-381 base-field constants used by `common_uncompressed_g1` to
-    // compute the sign(y) bit of the on-the-fly compressed encoding.
-    // p is 381 bits so it spans 48 BE bytes (top 32 bytes in BLS_P_TOP32,
-    // bottom 16 bytes left-aligned in BLS_P_BOT16_LEFT).
-    // ----------------------------------------------------------------------
-    uint256 internal constant BLS_P_TOP32        = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624;
-    uint256 internal constant BLS_P_BOT16_LEFT   = 0x1eabfffeb153ffffb9feffffffffaaab00000000000000000000000000000000;
-
     // Fr modulus and Montgomery constant 2^256 mod r used by from_uniform_bytes.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
     uint256 internal constant FR_R_2POW256_MOD  = 0x1824b159acc5056f998c4fefecbc4ff55884b7fa0003480200000001fffffffe;
@@ -258,130 +249,50 @@ contract Halo2Verifier {
                 ret := add(buf_len, 33)
             }
 
-            // Read an uncompressed BLS12-381 G1 point from calldata
-            // (4 words = 128 bytes; EIP-2537 padded form: x_hi, x_lo,
-            // y_hi, y_lo) and absorb its compressed 48-byte zcash
-            // encoding into the transcript buffer at `buf_len`.
+            // Absorb a BLS12-381 G1 point in EIP-2537 padded
+            // uncompressed form (4 calldata words = 128 bytes:
+            // x_hi || x_lo || y_hi || y_lo, each coord = 16 zero
+            // pad bytes + 48 big-endian field bytes) into the
+            // transcript buffer at `buf_len`.
             //
-            // Compressed encoding (48 bytes):
-            //   byte 0 high 3 bits = (compression=1, infinity, sign)
-            //   x = 381 bits big-endian, top 3 bits cleared
+            // Matches the patched `Hashable<Keccak256> for
+            // midnight_curves::G1Projective::to_input` in
+            // midnight-proofs, which now emits the same 128-byte form
+            // (`midfall/proofs/src/transcript/implementors.rs`). The
+            // previous emitter hashed the 48-byte ZCash compressed
+            // encoding instead and ran a 384-bit `lex(y) > lex(p − y)`
+            // ladder + identity flag fixup to derive the sign bit on
+            // the fly; switching to the uncompressed form drops that
+            // ladder entirely.
             //
-            // The compression bit is always set. The infinity bit is
-            // set iff the point is the identity (all 4 words = 0). The
-            // sign bit is `lex(y) > lex(p - y)`, computed with a
-            // 384-bit limb subtraction (no precompiles, no modexp).
+            // Malleability: an attacker could submit non-zero bytes
+            // in the top 16 bytes of each `_hi` calldata word (the
+            // EIP-2537 precompile would reject those later, but only
+            // after they had been hashed). We mask those padding
+            // bytes to zero before the keccak absorb so the
+            // transcript only ever commits to the canonical form.
             //
             // The point's uncompressed form remains in calldata; the
             // call site is responsible for `calldatacopy`-ing it into
             // memory afterwards if it needs the on-curve coordinates.
             function common_uncompressed_g1(buf_len, cptr) -> ret {
-                let x_hi_word := calldataload(cptr)
-                let x_lo_word := calldataload(add(cptr, 0x20))
-                let y_hi_word := calldataload(add(cptr, 0x40))
-                let y_lo_word := calldataload(add(cptr, 0x60))
-
-                // x_hi/x_lo are EIP-2537 padded: top 16 bytes of each
-                // word are zero, payload sits in the bottom 16 bytes
-                // for x_hi and the full 32 bytes for x_lo.
-                let x_hi_payload := and(x_hi_word, 0xffffffffffffffffffffffffffffffff)
-                let x_lo_payload := x_lo_word
-                let y_hi_payload := and(y_hi_word, 0xffffffffffffffffffffffffffffffff)
-                let y_lo_payload := y_lo_word
-
-                let is_identity := iszero(or(or(or(x_hi_payload, x_lo_payload), y_hi_payload), y_lo_payload))
-
-                // Default flag = 0x80 (compression bit). For identity
-                // we OR in the infinity bit (0x40), giving 0xc0 and
-                // zero out the x bytes.
-                let flag := 0x80
-                if is_identity {
-                    flag := 0xc0
-                    x_hi_payload := 0
-                    x_lo_payload := 0
-                }
-
-                if iszero(is_identity) {
-                    // ---- Determine sign by comparing y vs p - y ----
-                    // p - y: subtract y from p (381-bit subtraction).
-                    // y < p so this never underflows.
-                    let p_top_int := BLS_P_TOP32
-                    let p_bot_int := shr(128, BLS_P_BOT16_LEFT)
-                    let p_l0 := shr(128, p_top_int)
-                    let p_l1 := and(p_top_int, 0xffffffffffffffffffffffffffffffff)
-                    let p_l2 := p_bot_int
-                    let y_l0 := y_hi_payload
-                    let y_l1 := shr(128, y_lo_payload)
-                    let y_l2 := and(y_lo_payload, 0xffffffffffffffffffffffffffffffff)
-
-                    let borrow := 0
-                    let py_l2  := 0
-                    switch lt(p_l2, y_l2)
-                    case 1 {
-                        py_l2 := sub(add(p_l2, 0x100000000000000000000000000000000), y_l2)
-                        borrow := 1
-                    }
-                    default {
-                        py_l2 := sub(p_l2, y_l2)
-                    }
-                    let py_l1 := 0
-                    let p_l1_b := sub(p_l1, borrow)
-                    switch lt(p_l1_b, y_l1)
-                    case 1 {
-                        py_l1 := sub(add(p_l1_b, 0x100000000000000000000000000000000), y_l1)
-                        borrow := 1
-                    }
-                    default {
-                        py_l1 := sub(p_l1_b, y_l1)
-                        borrow := 0
-                    }
-                    let py_l0 := sub(sub(p_l0, borrow), y_l0)
-
-                    // Compare y vs py limb-wise (l0, l1, l2 from MSB to LSB).
-                    let lex_y_larger := 0
-                    switch gt(y_l0, py_l0)
-                    case 1 { lex_y_larger := 1 }
-                    default {
-                        switch eq(y_l0, py_l0)
-                        case 1 {
-                            switch gt(y_l1, py_l1)
-                            case 1 { lex_y_larger := 1 }
-                            default {
-                                switch eq(y_l1, py_l1)
-                                case 1 {
-                                    if gt(y_l2, py_l2) { lex_y_larger := 1 }
-                                }
-                                default {}
-                            }
-                        }
-                        default {}
-                    }
-
-                    if lex_y_larger {
-                        flag := or(flag, 0x20)
-                    }
-                }
-
-                // Build the 48 compressed bytes:
-                //   byte 0: flag | (x_hi top byte)
-                //   byte 1..16: rest of x_hi
-                //   byte 16..48: x_lo
-                // x_hi_payload occupies the low 128 bits (16 bytes) of
-                // x_hi_word. The top 3 bits of the 381-bit x are zero
-                // by construction (since x < p < 2^381 < 2^384), so
-                // OR-ing the flag byte into the top byte is safe.
-                //
-                // Compressed-as-32-bytes top word:
-                //   shl(128, x_hi_payload | (flag << 120))
-                // i.e. the 16 payload bytes left-shifted by 128 bits
-                // and the flag in the very top byte (byte 0 of the
-                // memory word).
+                // Append PREFIX_COMMON.
                 mstore8(buf_len, 0x01)
-                let comp_top := or(shl(128, x_hi_payload), shl(248, flag))
-                mstore(add(buf_len, 1), comp_top)
-                // Bytes 16..48 of the compressed encoding = x_lo.
-                mstore(add(buf_len, 17), x_lo_payload)
-                ret := add(buf_len, 49)
+                // Memcpy the 4 calldata words (128 bytes) verbatim
+                // into the keccak buffer right after PREFIX_COMMON.
+                calldatacopy(add(buf_len, 1), cptr, 0x80)
+                // Mask the top 16 bytes of x_hi and y_hi to zero so
+                // that an attacker cannot grind the transcript by
+                // submitting non-canonical padding bytes. EIP-2537
+                // requires the top 16 bytes of each `_hi` word to be
+                // zero; we enforce it here at the hash boundary
+                // rather than at the precompile boundary so that the
+                // hash commits to canonical bytes only.
+                let x_hi_off := add(buf_len, 1)
+                let y_hi_off := add(buf_len, 0x41)
+                mstore(x_hi_off, and(mload(x_hi_off), 0xffffffffffffffffffffffffffffffff))
+                mstore(y_hi_off, and(mload(y_hi_off), 0xffffffffffffffffffffffffffffffff))
+                ret := add(buf_len, 0x81)
             }
 
             // PREFIX_CHALLENGE + two-fork keccak + reseed. Returns the new
@@ -564,22 +475,24 @@ contract Halo2Verifier {
             // byte-reverse before absorbing.
             buf_len := common_word(buf_len, byte_reverse_32(mload(VK_DIGEST_MPTR)))
 
-            // Absorb committed_pi = G1Affine::identity() (48 bytes:
-            // 0xc0 || 47 zero bytes -- BLS12-381 compressed identity
-            // encoding) when the `committed-instances` feature is on
-            // in midnight-proofs. The Hashable<G1>::to_bytes path uses
-            // the curve's GroupEncoding which yields these 48 bytes.
+            // Absorb committed_pi = G1Affine::identity() when the
+            // `committed-instances` feature is on in midnight-proofs.
+            // Under the patched `Hashable<Keccak256>::to_input` (see
+            // `midfall/proofs/src/transcript/implementors.rs`), the
+            // identity hashes as 128 zero bytes (EIP-2537 (0,0)
+            // convention), NOT the 48-byte ZCash compressed form
+            // 0xc0||47*0x00 that the previous emitter produced.
             // Native verifier absorbs this BEFORE the instance count.
             {
                 // PREFIX_COMMON (0x01) at buf_len.
                 mstore8(buf_len, 0x01)
-                // 48-byte compressed identity = 0xc0 || 47 * 0x00.
-                // Write 48 bytes of zeros starting at buf_len+1, then
-                // set the very first byte to 0xc0.
-                mstore(add(buf_len, 1), 0)
-                mstore(add(buf_len, 33), 0)
-                mstore8(add(buf_len, 1), 0xc0)
-                buf_len := add(buf_len, 49)
+                // 128 zero bytes: zero out 4 consecutive 32-byte words
+                // at buf_len+1.
+                mstore(add(buf_len, 1),    0)
+                mstore(add(buf_len, 0x21), 0)
+                mstore(add(buf_len, 0x41), 0)
+                mstore(add(buf_len, 0x61), 0)
+                buf_len := add(buf_len, 0x81)
             }
 
             {
@@ -703,9 +616,8 @@ contract Halo2Verifier {
             // ---- quotient limbs ----
             // Each uncompressed limb is calldatacopied directly to
             // QUOTIENT_LIMB_COMMS_MPTR_BASE; the Horner fold below reads
-            // them back from memory. The compressed form is reconstructed
-            // on the fly inside common_uncompressed_g1 for transcript
-            // hashing only.
+            // them back from memory. common_uncompressed_g1 absorbs the
+            // 128-byte calldata form into the transcript verbatim.
             let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_quotients * 128)|hex() }}) }
                 lt(proof_cptr, end)

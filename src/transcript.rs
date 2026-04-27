@@ -12,9 +12,14 @@
 //!
 //!   * `init`: hasher = `Keccak256::new().update("Domain separator for transcript")`.
 //!   * `common(input)`: hasher.update([1u8 PREFIX_COMMON]); hasher.update(input).
-//!     For G1, `input` is the **compressed 48-byte BLS12-381 encoding**
-//!     (`<G1Projective as GroupEncoding>::to_bytes`), not the EIP-2537
-//!     padded 128-byte form the previous transcript used.
+//!     For G1, `input` is the **EIP-2537 padded 128-byte uncompressed
+//!     form** (`x_hi || x_lo || y_hi || y_lo`, 64 bytes per coord = 16
+//!     zero pad bytes + 48 BE bytes of the BLS12-381 base-field
+//!     element; identity = 128 zero bytes). This matches the patched
+//!     `Hashable<Keccak256> for G1Projective::to_input` in
+//!     `midnight-proofs` and lets the EVM verifier hash the calldata
+//!     uncompressed bytes verbatim instead of running a 384-bit
+//!     sign-bit ladder to derive the 48-byte compressed encoding.
 //!     For Fq scalars, `input` is the canonical little-endian 32-byte
 //!     repr (`Fq::to_repr()`).
 //!   * `squeeze`: produces 64 bytes via two domain-separated finalisations
@@ -29,8 +34,8 @@
 use std::io::{self, Cursor, Read, Write};
 
 use ff::{FromUniformBytes, PrimeField};
-use group::GroupEncoding;
-use midnight_curves::{Fq, G1Projective};
+use group::{prime::PrimeCurveAffine, GroupEncoding, UncompressedEncoding};
+use midnight_curves::{Fq, G1Affine, G1Projective};
 use sha3::{Digest, Keccak256};
 
 /// Prefix matching `midnight_proofs::transcript::KECCAK256_PREFIX_CHALLENGE`.
@@ -111,13 +116,34 @@ impl<S> Keccak256Transcript<S> {
         Ok(())
     }
 
-    /// Absorb a G1 point in its compressed 48-byte BLS12-381 encoding
-    /// (matches `Hashable<Keccak256> for G1Projective`).
+    /// Absorb a G1 point in its EIP-2537 padded 128-byte uncompressed
+    /// form (matches the patched `Hashable<Keccak256> for
+    /// G1Projective::to_input` in midnight-proofs).
+    ///
+    /// Layout: `x_hi (32) || x_lo (32) || y_hi (32) || y_lo (32)` where
+    /// each coord is 16 zero pad bytes followed by 48 BE bytes of the
+    /// base-field element. Identity = 128 zero bytes.
     pub fn common_g1(&mut self, point: &G1Projective) -> io::Result<()> {
-        let repr = <G1Projective as GroupEncoding>::to_bytes(point);
-        self.absorb_bytes(repr.as_ref());
+        let bytes = g1_to_uncompressed_eip2537(point);
+        self.absorb_bytes(&bytes);
         Ok(())
     }
+}
+
+/// Encode a `G1Projective` as the 128-byte EIP-2537 padded uncompressed
+/// form used by the Fiat-Shamir transcript and the EVM verifier
+/// calldata. Mirrors `Hashable<Keccak256> for G1Projective::to_input`
+/// in midnight-proofs.
+fn g1_to_uncompressed_eip2537(point: &G1Projective) -> [u8; 128] {
+    let aff = G1Affine::from(point);
+    let mut out = [0u8; 128];
+    if !bool::from(aff.is_identity()) {
+        let raw = <G1Affine as UncompressedEncoding>::to_uncompressed(&aff);
+        let bytes: &[u8] = raw.as_ref();
+        out[16..64].copy_from_slice(&bytes[0..48]);
+        out[80..128].copy_from_slice(&bytes[48..96]);
+    }
+    out
 }
 
 impl<R: Read> Keccak256Transcript<R> {

@@ -170,8 +170,9 @@ scalar-array build + one staticcall).
 | 2 | PCS Block 3 per-set q_com fold → per-set m-pair MSM at MSM_SCRATCH=0x6100 (codegen) | 1 482 958 | −75 859 | −106 118 |
 | 3 | PCS Block 5 final_com → (n_sets+1)-pair MSM | 1 488 783 | +5 825 | reverted |
 | 4 | PCS Block 6 PAIRING_RHS → 3-pair MSM | (above included) | +0 | reverted |
+| 5 | drop on-the-fly compressed encoding: hash uncompressed 128B verbatim in transcript (patch midnight-proofs `Hashable<Keccak256>::to_input` + EVM `common_uncompressed_g1`) | 1 475 536 | −7 422 | −113 540 |
 
-**Net result: 1 589 076 → 1 482 958 gas (−106 118, −6.7%) on the Poseidon
+**Net result: 1 589 076 → 1 475 536 gas (−113 540, −7.1%) on the Poseidon
 fixture.**
 
 Findings:
@@ -198,7 +199,7 @@ Findings:
 
 ### Where the remaining gas lives
 
-After Step 2 the bottleneck shifts to:
+After Step 5 the bottleneck shifts to:
 
 - `decompress_g1` calls (still ~13 sites, ~80 kg total per audit)
 - `scalar_inv` Fermat-style ladder (~30 kg per call, multiple sites)
@@ -207,3 +208,43 @@ After Step 2 the bottleneck shifts to:
 
 The next-highest-leverage item is now **#7 (decompress_g1 library +
 --optimize-runs=200)**, projected at 30–60 kg.
+
+---
+
+## Cross-cutting change: uncompressed transcript hashing (Step 5)
+
+**Status:** applied. Saves ~7.5 kg on the Poseidon fixture.
+
+The previous emitter hashed each G1 commitment in its 48-byte ZCash
+*compressed* encoding into the keccak transcript, computing the sign
+bit on the fly via a 384-bit `lex(y) > lex(p − y)` ladder. We
+transitioned both the prover (in `midnight-proofs`'s
+`Hashable<Keccak256> for G1Projective::to_input`) and the EVM verifier
+(`common_uncompressed_g1`) to hash the **uncompressed 128-byte
+EIP-2537 padded form** verbatim (`x_hi || x_lo || y_hi || y_lo`,
+each coord = 16 zero pad bytes + 48 BE bytes of the field element).
+
+Wire format unchanged: proofs still carry G1 in the 48-byte compressed
+encoding (`Hashable::to_bytes` / `read` are unmodified). The off-chain
+`repack` step still decompresses to the 128-byte calldata form for the
+EVM precompiles, just as before.
+
+Transcript malleability is prevented by masking the 16-byte zero pad
+in `_hi` words before keccak absorbtion (defeats grinding attacks
+that submit non-canonical pad bytes which the EIP-2537 precompile
+would only reject later in the verifier).
+
+Files touched:
+
+- `vendor/.../midfall/proofs/src/transcript/implementors.rs` —
+  `Hashable<Keccak256> for G1Projective::to_input` returns 128 bytes
+  instead of `<G1Projective as GroupEncoding>::to_bytes` (compressed).
+- `src/transcript.rs::common_g1` — absorbs the same 128 bytes; the
+  `common_g1_then_squeeze_matches` round-trip test pins this to
+  `CircuitTranscript<Keccak256>`'s output.
+- `templates/Halo2Verifier.sol::common_uncompressed_g1` — replaced a
+  ~50-line sign-bit ladder with a `mstore8 + calldatacopy(0x80) + 2 ×
+  mask` sequence.
+- The committed-instance identity injection at the start of the
+  transcript was rewritten from "0xc0 || 47*0x00" to "128 × 0x00" to
+  match the new identity convention.
