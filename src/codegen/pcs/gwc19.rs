@@ -419,14 +419,32 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("let x1 := mload(X1_MPTR)".to_string());
         lines.push("mstore(X1_POWERS_MPTR, 1)".to_string());
         if nb_x1_powers > 1 {
+            // Roll the power-of-x1 sequence into a Yul `for` loop.
+            // The unrolled emission (32 sequential mulmod+mstore
+            // pairs for the Poseidon fixture) was costing ~26 kg
+            // — far above the ~700 gas the arithmetic itself
+            // requires. solc-via-ir struggles to register-allocate
+            // 32 unrolled mulmods sharing one accumulator, and the
+            // unrolled mstore-add chain inflates each line to
+            // ~50-60 gas of dispatch overhead. The rolled loop
+            // restores the basic-block heuristic and lets the
+            // optimizer schedule the inner body once.
+            //
+            // Per iteration (rolled):
+            //   lt + add(i+1) + add(p)   ≈ 9 gas (loop control)
+            //   mulmod + mstore           ≈ 11 gas (body)
+            //   ----
+            //   ~20 gas/iter, × 32 = ~640 gas + 50 setup = ~700 gas
+            let last = nb_x1_powers - 1;
             lines.push("let acc := 1".to_string());
-            for i in 1..nb_x1_powers {
-                lines.push("acc := mulmod(acc, x1, r)".to_string());
-                lines.push(format!(
-                    "mstore(add(X1_POWERS_MPTR, {:#x}), acc)",
-                    i * 0x20
-                ));
-            }
+            lines.push("let p := X1_POWERS_MPTR".to_string());
+            lines.push(format!(
+                "for {{ let i := 0 }} lt(i, {last:#x}) {{ i := add(i, 1) }} {{"
+            ));
+            lines.push("    p := add(p, 0x20)".to_string());
+            lines.push("    acc := mulmod(acc, x1, r)".to_string());
+            lines.push("    mstore(p, acc)".to_string());
+            lines.push("}".to_string());
         }
         blocks.push(lines);
     }
