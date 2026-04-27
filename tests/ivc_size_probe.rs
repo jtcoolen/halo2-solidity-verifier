@@ -225,11 +225,18 @@ fn ivc_size_probe_at_k19() {
     //   on-chain verify gas = 760 564 (k=6, post H1+H2+H3+cp13).
     //
     // The verifier bytecode scales roughly with:
-    //   - num_advices * 0.6 KB     (advice transcript + reading)
-    //   - num_lookups * 0.8 KB     (logup logic + helpers)
-    //   - num_quotients * 0.4 KB   (quotient-limb fold)
-    //   - num_evals * 0.05 KB      (eval transcript + REVERSED_EVALS)
-    //   - constant overhead ~10 KB (ec_pairing, transcript helpers, etc.)
+    //   - num_advices * 0.45 KB    (advice transcript + reading)
+    //   - num_lookups * 0.6 KB     (logup logic + helpers)
+    //   - num_quotients * 0.3 KB   (quotient-limb fold)
+    //   - num_evals * 0.04 KB      (eval transcript + REVERSED_EVALS)
+    //   - num_perm_zs * 0.3 KB     (permutation Z folding)
+    //   - constant overhead ~8 KB  (ec_pairing, transcript helpers, etc.)
+    //
+    // Coefficients calibrated against the Poseidon k=6 fixture's REAL
+    // solc --via-ir runtime bytecode = 13 792 bytes (13.8 KB) at
+    // num_advice=6, num_lookups=0, num_quotients=4, num_evals=48,
+    // num_perm_zs=1: heuristic = 8 + 2.7 + 0 + 1.2 + 1.92 + 0.3 = 14.1 KB
+    // (within ~2 % of measured).
     //
     // gas scales with:
     //   - num_advices * 1-2 kg (advice transcript common_uncompressed_g1)
@@ -239,11 +246,12 @@ fn ivc_size_probe_at_k19() {
     //   - 1 G1MSM(33+m) precompile per set = up to ~200 kg (set 0)
     //   - 1 BLS12_PAIRING = ~103 kg (final pairing)
     //   - tx base + calldata = ~85 kg
-    let est_bytecode_kb = 10.0
-        + (num_advice as f64) * 0.6
-        + (num_lookups as f64) * 0.8
-        + (num_quotients as f64) * 0.4
-        + (num_evals as f64) * 0.05;
+    let est_bytecode_kb = 8.0
+        + (num_advice as f64) * 0.45
+        + (num_lookups as f64) * 0.6
+        + (num_quotients as f64) * 0.3
+        + (num_evals as f64) * 0.04
+        + (num_perm_zs as f64) * 0.3;
     let est_gas_kg = 200.0  // PCS set 0 G1MSM (assumes m ~ prefix_g1)
         + 100.0  // pairing
         + 85.0   // tx + calldata
@@ -313,9 +321,12 @@ fn ivc_size_probe_at_k19() {
     println!();
     println!("VERIFIER COST HEURISTICS");
     println!("  estimated bytecode size       = ~{est_bytecode_kb:.1} KB");
+    println!("    Poseidon k=6 real bytecode  = 13.8 KB (calibration anchor)");
     println!("    EIP-170 contract limit      = 24.0 KB");
-    println!("    headroom                    = {:.1} KB",
-        24.0 - est_bytecode_kb);
+    println!(
+        "    headroom                    = {:.1} KB",
+        24.0 - est_bytecode_kb
+    );
     println!("  estimated verify gas          = ~{est_gas_kg:.0} kg");
     println!("    L1 reasonable budget        = 5000 kg");
     println!();
