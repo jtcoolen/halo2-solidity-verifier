@@ -173,11 +173,13 @@ scalar-array build + one staticcall).
 | 7 (B) | PCS Block 4 Lagrange interpolation: replace n separate `scalar_inv` calls per point set with one Montgomery batch invert (`{dx_j, lbasis_j}` for j=0..m, n=2m). Per set: 1 modexp + 3n−3 muls vs n modexp; `den_inv` becomes a free `prod_j dx_inv_j`. Soundness: dx_j non-zero by Fiat-Shamir, lbasis_j non-zero by `construct_intermediate_sets` de-dup. | 982 229 | −15 173 | −606 811 |
 | 8 (E) | MCOPY EC-point staging: replace 4-line `mstore(N, mload(M))` chains and 8-iter G2 mstore loops with `mcopy(dst, src, 0x80)` / `mcopy(dst, src, 0x100)` calls in `ec_pairing` (G2_BASE + NEG_S_G2_BASE + 2 G1 inputs) and PCS Blocks 5 & 6 (q_com seed, F_COM staging, FINAL_COM persist, PAIRING_LHS/RHS staging). | 980 730 | −1 499 | −608 310 |
 | 9 (D) | hoist `mload(add(ROT_POINTS_MPTR, k*0x20))` to `rot_pt_i` stack locals at the top of the f_eval block. Each rotation point is referenced O(m²) times per set across `dx_j` and `lbasis_j`; solc-via-ir cannot CSE-fold across the inline `scalar_inv` precompile boundary. | 980 125 | −605 | −608 951 |
+| 10 (H1) | MCOPY q_com fold per-commit point staging in PCS block 3 (replaces 4-mstore chains for each commit's 4-word point with `mcopy(stage, src, 0x80)`). Hits all 40 commits across 3 sets (m=33+5+2) plus the m=1 short-circuit and the post-staticcall MSM result writeback. | 955 224 | −24 901 | −633 852 |
+| 11 (H2) | Roll PCS block 2 (x1 powers) emission from 32 unrolled `mulmod+mstore` pairs into a Yul `for` loop. Direct saving cp18 −22 kg + downstream cp19 re-scheduling −26 kg from solc-via-ir reallocating registers across the (now smaller) basic block. | 907 030 | −48 194 | −682 046 |
 
-**Net result: 1 589 076 → 980 125 gas (−608 951, −38.3%) on the Poseidon
-fixture.** With current per-section breakdown: PCS 514 kg (52%), pairing
-103 kg (10%), quotient eval 124 kg (13%), linearization MSM 72 kg (7%),
-transcript+evals 80 kg (8%), other 87 kg (10%).
+**Net result: 1 589 076 → 907 030 gas (−682 046, −42.9%) on the Poseidon
+fixture.** With current per-section breakdown: PCS 441 kg (49%), pairing
+103 kg (11%), quotient eval 124 kg (14%), linearization MSM 72 kg (8%),
+transcript+evals 80 kg (9%), other 87 kg (10%).
 
 Findings:
 
