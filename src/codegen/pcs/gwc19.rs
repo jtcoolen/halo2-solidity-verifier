@@ -513,20 +513,31 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             // 1 word scalar per pair (160 bytes / pair).
             const MSM_SCRATCH: usize = 0x6100;
             if m == 1 {
-                // Single-commitment set: just copy the point.
-                for (off, w) in first.comm.words().iter().enumerate() {
-                    lines.push(format!(
-                        "mstore({}, {})",
-                        add_offset(&q_com_base, off * 0x20),
-                        w
-                    ));
-                }
+                // Single-commitment set: just copy the point. Cancun
+                // MCOPY (~15 gas) replaces the 4-mstore chain (~60 gas
+                // raw, much more under solc-via-ir).
+                lines.push(format!(
+                    "mcopy({}, {}, 0x80)",
+                    q_com_base,
+                    first.comm.ptr()
+                ));
             } else {
+                // Stage one (point, scalar) pair per commit. Each
+                // point's 4 words sit at contiguous memory offsets
+                // (EcPoint = `base..base+3*0x20`), so we can mcopy the
+                // 0x80-byte point in a single op and follow with one
+                // mstore for the scalar. This replaces the per-commit
+                // 4-mstore chain (4 × mload + 4 × mstore + add-arith,
+                // ~30-50 gas/line under solc-via-ir → ~120-200 gas
+                // per commit) with one mcopy(0x80) (~15 gas raw, plus
+                // a few EVM dispatch-overhead gas).
                 for (i, c) in commitments_in_set.iter().enumerate() {
                     let pair_base = MSM_SCRATCH + i * 0xa0;
-                    for (off, w) in c.comm.words().iter().enumerate() {
-                        lines.push(format!("mstore({:#x}, {})", pair_base + off * 0x20, w));
-                    }
+                    lines.push(format!(
+                        "mcopy({:#x}, {}, 0x80)",
+                        pair_base,
+                        c.comm.ptr()
+                    ));
                     if i == 0 {
                         lines.push(format!("mstore({:#x}, 1)", pair_base + 0x80));
                     } else {
@@ -543,13 +554,12 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     m * 0xa0,
                     MSM_SCRATCH
                 ));
-                for off in 0..4 {
-                    lines.push(format!(
-                        "mstore({}, mload({:#x}))",
-                        add_offset(&q_com_base, off * 0x20),
-                        MSM_SCRATCH + off * 0x20
-                    ));
-                }
+                // Writeback: precompile output (4-word point) at
+                // MSM_SCRATCH -> q_com_base. Same mcopy trick.
+                lines.push(format!(
+                    "mcopy({}, {:#x}, 0x80)",
+                    q_com_base, MSM_SCRATCH
+                ));
             }
 
             // Persist the per-rotation q_eval_set[s][k].
