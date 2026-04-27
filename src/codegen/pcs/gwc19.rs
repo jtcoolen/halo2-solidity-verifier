@@ -634,11 +634,37 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             }
 
             // General case: m >= 2.
-            // Accumulate dx[] and den_j[] inline; compute their product,
-            // then call scalar_inv, then expand.
             //
-            // Because we can't easily batch-invert, we call scalar_inv
-            // for each individually. For m up to ~5 this is fine.
+            // We need to invert {dx_j} for j=0..m and {lbasis_j} for
+            // j=0..m, where:
+            //
+            //   dx_j      = x3 - p_j
+            //   lbasis_j  = prod_{k != j} (p_j - p_k)
+            //
+            // Naively that's 2m + 1 separate `scalar_inv` (modexp) calls
+            // (the original code also inverted `den = prod_j dx_j`).
+            // But `den_inv` is just `prod_j dx_j_inv`, so we don't need
+            // to invert it separately. And the remaining 2m values can
+            // be Montgomery-batched into a SINGLE modexp:
+            //
+            //   p_0     = a_0
+            //   p_i     = p_{i-1} * a_i           for i = 1..n-1   (n-1 muls)
+            //   q       = scalar_inv(p_{n-1})                       (1 modexp)
+            //   a_inv_i = q * p_{i-1} ; q *= a_i  for i = n-1..1  (2(n-1) muls)
+            //   a_inv_0 = q
+            //
+            // Total: 1 modexp + (3n − 3) muls vs the original n modexp.
+            // For m=3, n=6: saves 5 modexp ≈ 7.5 kg. For m=2, n=4:
+            // saves 3 modexp ≈ 4.5 kg.
+            //
+            // Soundness: requires every input to be non-zero. dx_j is
+            // non-zero by Fiat-Shamir (x3 is uniform random; the
+            // probability that x3 = p_j for a structured rotation point
+            // is ~2^-256). lbasis_j is non-zero because the points in a
+            // set are distinct by construction (`construct_intermediate_sets`
+            // de-duplicates rotations within each set). Defensive note:
+            // a malicious prover cannot influence either, so we don't
+            // need an explicit zero check.
             //
             // The reference computes lagrange interpolation directly via
             // full polynomial construction; here we collapse the
@@ -652,13 +678,6 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     "let dx_{j} := addmod(x3, sub(r, {pt}), r)"
                 ));
             }
-            // den = prod_j dx_j
-            lines.push("let den := dx_0".to_string());
-            for j in 1..m {
-                lines.push(format!("den := mulmod(den, dx_{j}, r)"));
-            }
-            lines.push("let den_inv := scalar_inv(den)".to_string());
-
             // For each j: lagrange_basis_inv_j = inv(prod_{k!=j} (p_j - p_k))
             for j in 0..m {
                 let pj = format!(
@@ -678,7 +697,68 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                         "lbasis_{j} := mulmod(lbasis_{j}, addmod({pj}, sub(r, {pk}), r), r)"
                     ));
                 }
-                lines.push(format!("let lbasis_inv_{j} := scalar_inv(lbasis_{j})"));
+            }
+
+            // Build the Montgomery batch input list: dx_0, ..., dx_{m-1},
+            // then lbasis_0, ..., lbasis_{m-1}.
+            let mut batch_inputs: Vec<String> = Vec::with_capacity(2 * m);
+            for j in 0..m {
+                batch_inputs.push(format!("dx_{j}"));
+            }
+            for j in 0..m {
+                batch_inputs.push(format!("lbasis_{j}"));
+            }
+            let n = batch_inputs.len();
+
+            // Forward pass: build prefix products bp_0, bp_1, ..., bp_{n-1}.
+            //   bp_0     = batch_inputs[0]
+            //   bp_i     = bp_{i-1} * batch_inputs[i]
+            // Last one (bp_{n-1}) is the total product.
+            lines.push(format!("let bp_0 := {}", batch_inputs[0]));
+            for i in 1..n {
+                lines.push(format!(
+                    "let bp_{i} := mulmod(bp_{}, {}, r)",
+                    i - 1,
+                    batch_inputs[i]
+                ));
+            }
+
+            // One modexp for the whole set.
+            lines.push(format!("let bq := scalar_inv(bp_{})", n - 1));
+
+            // Backward pass: extract individual inverses. Walk from
+            // i=n-1 down to i=1, then handle i=0 last.
+            //
+            //   inv_i  = bq * bp_{i-1}
+            //   bq    *= batch_inputs[i]
+            //
+            // We name each inverse using its original variable: the
+            // first m inputs are dx_j → dx_inv_j, the next m are
+            // lbasis_j → lbasis_inv_j.
+            let inv_name = |idx: usize| -> String {
+                if idx < m {
+                    format!("dx_inv_{idx}")
+                } else {
+                    format!("lbasis_inv_{}", idx - m)
+                }
+            };
+            for i in (1..n).rev() {
+                lines.push(format!(
+                    "let {} := mulmod(bq, bp_{}, r)",
+                    inv_name(i),
+                    i - 1
+                ));
+                lines.push(format!(
+                    "bq := mulmod(bq, {}, r)",
+                    batch_inputs[i]
+                ));
+            }
+            lines.push(format!("let {} := bq", inv_name(0)));
+
+            // den_inv = prod_j dx_inv_j (free, no extra modexp).
+            lines.push("let den_inv := dx_inv_0".to_string());
+            for j in 1..m {
+                lines.push(format!("den_inv := mulmod(den_inv, dx_inv_{j}, r)"));
             }
 
             // r_eval = sum_j evals[j] * den * inv(dx_j) * lbasis_inv_j
@@ -694,7 +774,6 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                     "mload(add(Q_EVAL_SET_MPTR, {:#x}))",
                     (set_eval_offset_words + j) * 0x20
                 );
-                lines.push(format!("let dx_inv_{j} := scalar_inv(dx_{j})"));
                 lines.push(format!(
                     "let term_{j} := mulmod(mulmod({ev_j}, dx_inv_{j}, r), lbasis_inv_{j}, r)"
                 ));
