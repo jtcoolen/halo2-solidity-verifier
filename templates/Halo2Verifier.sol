@@ -132,6 +132,19 @@ contract Halo2Verifier {
                 // is rejected before we hash it into the transcript.
                 ret0 := and(success, iszero(shr(128, x_hi)))
                 ret0 := and(ret0,    iszero(shr(128, y_hi)))
+                {%- if !self.bench.skip_g1_range_check %}
+                // Enforce (hi, lo) < p where p is the BLS12-381 base-field
+                // modulus (0x1a0111ea...b9feffffffffaaab, 381 bits packed
+                // into a 16-byte hi half and a 32-byte lo half). Without
+                // this check an attacker can submit two distinct (hi, lo)
+                // encodings of the same on-curve point and grind the
+                // Fiat-Shamir transcript before the precompile rejects the
+                // proof. Comparison is lexicographic on (hi, lo).
+                let p_hi := 0x000000000000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd7
+                let p_lo := 0x64774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab
+                ret0 := and(ret0, or(lt(x_hi, p_hi), and(eq(x_hi, p_hi), lt(x_lo, p_lo))))
+                ret0 := and(ret0, or(lt(y_hi, p_hi), and(eq(y_hi, p_hi), lt(y_lo, p_lo))))
+                {%- endif %}
                 mstore(hash_mptr,            x_hi)
                 mstore(add(hash_mptr, 0x20), x_lo)
                 mstore(add(hash_mptr, 0x40), y_hi)
@@ -414,31 +427,20 @@ contract Halo2Verifier {
                         success := and(success, iszero(shr(128, hi)))
                         mstore(dst,            hi)
                         mstore(add(dst, 0x20), lo)
-                        // Advance dst by 64B (one Fp coord). Coordinate
-                        // ordering is x_hi,x_lo,y_hi,y_lo per G1 point.
-                        switch and(coord, 1)
-                        case 0 { dst := add(dst, 0x40) }
-                        case 1 {
-                            // After y of LHS we jump to start of RHS.
-                            if eq(coord, 1) {
-                                dst := ACC_RHS_MPTR
-                            }
-                            if eq(coord, 3) {
-                                // done
-                            }
-                            if and(eq(coord, 1), 0) { dst := add(dst, 0x40) }
-                            // For (coord==1) we already moved to ACC_RHS_MPTR;
-                            // for (coord==3) we leave dst alone.
-                            if iszero(or(eq(coord, 1), eq(coord, 3))) {
-                                dst := add(dst, 0x40)
-                            }
-                        }
+                        // Advance dst to the next coordinate slot. Each Fp
+                        // coordinate occupies 0x40 bytes (hi, lo); after
+                        // lhs.y we jump from ACC_LHS_MPTR's tail to the
+                        // start of ACC_RHS_MPTR. After rhs.y the loop
+                        // terminates and dst is no longer read.
+                        dst := add(dst, 0x40)
+                        if eq(coord, 1) { dst := ACC_RHS_MPTR }
                     }
                 }
             }
 
             if iszero(success) { revert(0, 0) }
 
+            {%- if !self.bench.skip_lagrange %}
             // ----------------------------------------------------------------
             // Lagrange & instance-evaluation block (pure Fr arithmetic; the
             // BN254 logic carries over unchanged because Fr fits in u256).
@@ -507,7 +509,9 @@ contract Halo2Verifier {
                 mstore(L_0_MPTR, l_0)
                 mstore(INSTANCE_EVAL_MPTR, instance_eval)
             }
+            {%- endif %}
 
+            {%- if !self.bench.skip_quotient_eval %}
             // ----------------------------------------------------------------
             // Quotient evaluation. Pure Fr arithmetic (BN254 code carries
             // over verbatim).
@@ -531,7 +535,9 @@ contract Halo2Verifier {
                 let quotient_eval := mulmod(quotient_eval_numer, mload(X_N_MINUS_1_INV_MPTR), r)
                 mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
             }
+            {%- endif %}
 
+            {%- if !self.bench.skip_quotient_fold %}
             // ----------------------------------------------------------------
             // Fold the quotient commitment via Horner with x_n as scalar.
             // The G1 ops use BLS12_G1ADD / BLS12_G1MSM precompiles. Each
@@ -564,7 +570,9 @@ contract Halo2Verifier {
                 mstore(add(QUOTIENT_MPTR, 0x40), mload(0x40))
                 mstore(add(QUOTIENT_MPTR, 0x60), mload(0x60))
             }
+            {%- endif %}
 
+            {%- if !self.bench.skip_pcs %}
             // ----------------------------------------------------------------
             // PCS-specific computation (BDFG21 / GWC19). The codegen emits
             // memory ops that already use the new EIP-2537 layout.
@@ -578,12 +586,37 @@ contract Halo2Verifier {
                 }
                 {%- endfor %}
             }
+            {%- endif %}
 
+            {%- if !self.bench.skip_random_combine %}
             // Random linear combine with the accumulator (when present).
             if mload(HAS_ACCUMULATOR_MPTR) {
-                // Hash the four points to get a Fr challenge.
-                let h := keccak256(ACC_LHS_MPTR, 0x200) // 4 G1 points = 4*128 = 0x200
-                let challenge := mod(h, r)
+                // Stage the four G1 points (ACC_LHS, ACC_RHS, PAIRING_LHS,
+                // PAIRING_RHS) contiguously in scratch memory and hash them
+                // so the challenge binds to *all four* points being combined.
+                // This matches the BN254 reference and is required for the
+                // Schwartz-Zippel argument that justifies collapsing the
+                // two pairing equations into one.
+                //
+                // Layout: 0x000..0x080 = ACC_LHS, 0x080..0x100 = ACC_RHS,
+                //         0x100..0x180 = PAIRING_LHS, 0x180..0x200 = PAIRING_RHS.
+                mstore(0x00,  mload(ACC_LHS_MPTR))
+                mstore(0x20,  mload(add(ACC_LHS_MPTR, 0x20)))
+                mstore(0x40,  mload(add(ACC_LHS_MPTR, 0x40)))
+                mstore(0x60,  mload(add(ACC_LHS_MPTR, 0x60)))
+                mstore(0x80,  mload(ACC_RHS_MPTR))
+                mstore(0xa0,  mload(add(ACC_RHS_MPTR, 0x20)))
+                mstore(0xc0,  mload(add(ACC_RHS_MPTR, 0x40)))
+                mstore(0xe0,  mload(add(ACC_RHS_MPTR, 0x60)))
+                mstore(0x100, mload(PAIRING_LHS_MPTR))
+                mstore(0x120, mload(add(PAIRING_LHS_MPTR, 0x20)))
+                mstore(0x140, mload(add(PAIRING_LHS_MPTR, 0x40)))
+                mstore(0x160, mload(add(PAIRING_LHS_MPTR, 0x60)))
+                mstore(0x180, mload(PAIRING_RHS_MPTR))
+                mstore(0x1a0, mload(add(PAIRING_RHS_MPTR, 0x20)))
+                mstore(0x1c0, mload(add(PAIRING_RHS_MPTR, 0x40)))
+                mstore(0x1e0, mload(add(PAIRING_RHS_MPTR, 0x60)))
+                let challenge := mod(keccak256(0x00, 0x200), r)
 
                 // pairing_lhs += challenge * acc_lhs
                 mstore(0x00, mload(ACC_LHS_MPTR))
@@ -617,8 +650,11 @@ contract Halo2Verifier {
                 mstore(add(PAIRING_RHS_MPTR, 0x40), mload(0x40))
                 mstore(add(PAIRING_RHS_MPTR, 0x60), mload(0x60))
             }
+            {%- endif %}
 
+            {%- if !self.bench.skip_pairing %}
             success := ec_pairing(success, PAIRING_LHS_MPTR, PAIRING_RHS_MPTR)
+            {%- endif %}
 
             {%- if self.trace %}
             // In trace builds we always run to the end so the host-side
@@ -659,8 +695,30 @@ contract Halo2Verifier {
             mstore(0x00, success)
             return(0x00, 0x20)
             {%- else %}
+            {%- if self.bench.is_active() %}
+            // Bench mode: force-observe each stage's output so the optimizer
+            // can't dead-code-eliminate stages whose downstream consumer is
+            // skipped. Computed values get XOR-mixed into a single return
+            // word; the value itself is meaningless but every read keeps the
+            // upstream stage's writes live for accurate gas attribution.
+            let bench_sink := success
+            bench_sink := xor(bench_sink, mload(L_0_MPTR))
+            bench_sink := xor(bench_sink, mload(L_LAST_MPTR))
+            bench_sink := xor(bench_sink, mload(L_BLIND_MPTR))
+            bench_sink := xor(bench_sink, mload(INSTANCE_EVAL_MPTR))
+            bench_sink := xor(bench_sink, mload(QUOTIENT_EVAL_MPTR))
+            bench_sink := xor(bench_sink, mload(QUOTIENT_MPTR))
+            bench_sink := xor(bench_sink, mload(add(QUOTIENT_MPTR, 0x60)))
+            bench_sink := xor(bench_sink, mload(PAIRING_LHS_MPTR))
+            bench_sink := xor(bench_sink, mload(add(PAIRING_LHS_MPTR, 0x60)))
+            bench_sink := xor(bench_sink, mload(PAIRING_RHS_MPTR))
+            bench_sink := xor(bench_sink, mload(add(PAIRING_RHS_MPTR, 0x60)))
+            mstore(0x00, bench_sink)
+            return(0x00, 0x20)
+            {%- else %}
             mstore(0x00, 1)
             return(0x00, 0x20)
+            {%- endif %}
             {%- endif %}
         }
     }

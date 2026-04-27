@@ -3,6 +3,8 @@ use crate::codegen::{
     template::{Halo2Verifier, Halo2VerifyingKey},
     util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
 };
+
+pub use crate::codegen::template::BenchToggles;
 // halo2 v0.4 transitively pulls halo2curves 0.7, which ships native
 // BLS12-381 support including `bls12381::Bls12381 : pairing::Engine`. We
 // take the BLS12-381 prover types directly so the proofs and VK embed real
@@ -122,7 +124,8 @@ impl<'a> SolidityGenerator<'a> {
 impl<'a> SolidityGenerator<'a> {
     /// Render `Halo2Verifier.sol` with verifying key embedded into writer.
     pub fn render_into(&self, verifier_writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, false).render(verifier_writer)
+        self.generate_verifier(false, false, BenchToggles::default())
+            .render(verifier_writer)
     }
 
     /// Render `Halo2Verifier.sol` with verifying key embedded and return it as `String`.
@@ -132,12 +135,24 @@ impl<'a> SolidityGenerator<'a> {
         Ok(verifier_output)
     }
 
+    /// Render a benchmarking variant of `Halo2Verifier.sol` with the
+    /// expensive blocks listed in `bench` elided. The output is **not**
+    /// a sound verifier; it exists so a harness can attribute gas to
+    /// individual stages by toggling one flag at a time. See
+    /// `examples/bench.rs`.
+    pub fn render_bench(&self, bench: BenchToggles) -> Result<String, fmt::Error> {
+        let mut output = String::new();
+        self.generate_verifier(false, false, bench).render(&mut output)?;
+        Ok(output)
+    }
+
     /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded into writer.
     pub fn render_trace_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, true).render(verifier_writer)
+        self.generate_verifier(false, true, BenchToggles::default())
+            .render(verifier_writer)
     }
 
     /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded and return it as a
@@ -154,7 +169,7 @@ impl<'a> SolidityGenerator<'a> {
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, false)
+        self.generate_verifier(true, false, BenchToggles::default())
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
@@ -174,7 +189,8 @@ impl<'a> SolidityGenerator<'a> {
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, true).render(verifier_writer)?;
+        self.generate_verifier(true, true, BenchToggles::default())
+            .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
     }
@@ -343,7 +359,12 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn generate_verifier(&self, separate: bool, trace: bool) -> Halo2Verifier {
+    fn generate_verifier(
+        &self,
+        separate: bool,
+        trace: bool,
+        bench: BenchToggles,
+    ) -> Halo2Verifier {
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
@@ -380,6 +401,7 @@ impl<'a> SolidityGenerator<'a> {
         Halo2Verifier {
             scheme: self.scheme,
             trace,
+            bench,
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,

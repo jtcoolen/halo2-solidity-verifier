@@ -52,18 +52,29 @@ pub(crate) mod test {
     /// # Panics
     /// Panics if executable `solc` can not be found, or compilation fails.
     pub fn compile_solidity(solidity: impl AsRef<[u8]>) -> Vec<u8> {
-        let mut process = match Command::new("solc")
-            .stdin(Stdio::piped())
+        compile_solidity_with(solidity, true)
+    }
+
+    /// Same as [`compile_solidity`], but with the `--optimize` flag
+    /// toggleable. `--via-ir` is always passed because the verifier
+    /// hits Yul/legacy stack-too-deep without it. Used by the bench
+    /// harness to keep stages observable so per-stage gas deltas can
+    /// be attributed (with --optimize, solc fuses common subexpressions
+    /// across bench variants, hiding the per-stage cost).
+    pub fn compile_solidity_with(solidity: impl AsRef<[u8]>, optimize: bool) -> Vec<u8> {
+        let mut cmd = Command::new("solc");
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .arg("--bin")
-            .arg("--optimize")
-            .arg("--via-ir")
+            .arg("--bin");
+        if optimize {
+            cmd.arg("--optimize");
+        }
+        cmd.arg("--via-ir")
             .arg("--evm-version")
             .arg("cancun")
-            .arg("-")
-            .spawn()
-        {
+            .arg("-");
+        let mut process = match cmd.spawn() {
             Ok(process) => process,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 panic!("Command 'solc' not found");

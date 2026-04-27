@@ -14,13 +14,14 @@ mod transcript;
 mod test;
 
 pub use codegen::{
-    encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, SolidityGenerator,
+    encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, BenchToggles,
+    SolidityGenerator,
 };
 pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF};
 pub use transcript::Keccak256Transcript;
 
 #[cfg(feature = "evm")]
-pub use evm::test::{compile_solidity, revm, CallOutcome, Evm};
+pub use evm::test::{compile_solidity, compile_solidity_with, revm, CallOutcome, Evm};
 
 /// Test-only helper that exposes the internal BLS12-381 G1 to EIP-2537
 /// hi/lo encoder so debugging examples can re-encode host-computed
