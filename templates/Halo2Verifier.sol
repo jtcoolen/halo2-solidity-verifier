@@ -174,7 +174,7 @@ contract Halo2Verifier {
     function verifyProof(
         bytes calldata proof,
         uint256[] calldata instances
-    ) public {%- if self.trace %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
+    ) public {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
         {%- match self.embedded_vk %}
         {%- when None %}
         address vk = AUTHORIZED_VK;
@@ -423,9 +423,23 @@ contract Halo2Verifier {
                 log1(mptr, 0x80, id)
             }
             {%- endif %}
+            {%- if self.gas_checkpoints %}
+            // Section-boundary gas-attribution checkpoint. Emits a
+            // single LOG1 (no data) with topic = (id << 248) | gas().
+            // Cost: 375 (LOG base) + 375 (1 topic) = 750 gas/call.
+            // Host-side parses the topic into (id, gas_left) and prints
+            // pairwise deltas (see `dump_gas_checkpoints`).
+            function gas_checkpoint(id) {
+                log1(0, 0, or(shl(248, id), gas()))
+            }
+            {%- endif %}
 
             let r := FR_MODULUS
             let success := true
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(1) // entry: before VK loading
+            {%- endif %}
 
             // ===============================================================
             // VK loading: either bake in the embedded VK bytes or fetch
@@ -464,6 +478,10 @@ contract Halo2Verifier {
                     eq(calldatasize(), add(INSTANCE_CPTR, mul(0x20, num_instances)))
                 )
             }
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(2) // after VK loading
+            {%- endif %}
 
             // ===============================================================
             // Transcript: domain sep + VK digest + instances + proof.
@@ -515,6 +533,10 @@ contract Halo2Verifier {
                 }
             }
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(3) // after VK digest + committed_pi + instance absorbs
+            {%- endif %}
+
             // ===============================================================
             // Per-user-phase reads + challenge squeezes.
             //
@@ -541,6 +563,10 @@ contract Halo2Verifier {
             {%- endfor %}
             {%- endfor %}
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(4) // after user-phase advice reads + user challenge squeezes
+            {%- endif %}
+
             // ---- theta ----
             buf_len := squeeze_to(buf_len, THETA_MPTR)
 
@@ -555,6 +581,10 @@ contract Halo2Verifier {
                 lookup_m_walk := add(lookup_m_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
+            {%- endif %}
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(5) // after theta squeeze + lookup multiplicities
             {%- endif %}
 
             // ---- beta, gamma ----
@@ -572,6 +602,10 @@ contract Halo2Verifier {
                 perm_z_walk := add(perm_z_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
+            {%- endif %}
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(6) // after beta/gamma + permutation Z products
             {%- endif %}
 
             {%- if lookup_h_plus_acc != 0 %}
@@ -595,6 +629,10 @@ contract Halo2Verifier {
             {%- endfor %}
             {%- endif %}
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(7) // after lookup helpers + Z accumulators
+            {%- endif %}
+
             {%- if num_trashcans != 0 %}
             // ---- trash_challenge ----
             buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)
@@ -608,6 +646,10 @@ contract Halo2Verifier {
                 trashcan_walk := add(trashcan_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
+            {%- endif %}
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(8) // after trash_challenge + trashcans
             {%- endif %}
 
             // ---- y ----
@@ -627,6 +669,10 @@ contract Halo2Verifier {
                 quotient_walk := add(quotient_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(9) // after y squeeze + quotient-limb reads
+            {%- endif %}
 
             // ---- x ----
             buf_len := squeeze_to(buf_len, X_MPTR)
@@ -675,6 +721,10 @@ contract Halo2Verifier {
             proof_cptr := add(proof_cptr, 0x80)
 
             if iszero(success) { revert(0, 0) }
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(10) // after evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi (transcript done)
+            {%- endif %}
 
             // ===============================================================
             // Lagrange & instance-evaluation block (pure Fr arithmetic).
@@ -744,6 +794,10 @@ contract Halo2Verifier {
                 mstore(INSTANCE_EVAL_MPTR, instance_eval)
             }
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(11) // after Lagrange + instance evaluation block
+            {%- endif %}
+
             // ===============================================================
             // Quotient evaluation. Pure Fr arithmetic.
             // ===============================================================
@@ -777,6 +831,10 @@ contract Halo2Verifier {
                 let quotient_eval := sub(r, quotient_eval_numer)
                 mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
             }
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(12) // after quotient evaluation (Fr arithmetic)
+            {%- endif %}
 
             // ===============================================================
             // Compute the linearization commitment as a single
@@ -874,6 +932,10 @@ contract Halo2Verifier {
                 mstore(add(QUOTIENT_MPTR, 0x60), mload(0x160))
             }
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(13) // after linearization-commitment MSM
+            {%- endif %}
+
             // ===============================================================
             // PCS computation (multi-prepare emitter from Step 5).
             // ===============================================================
@@ -886,6 +948,10 @@ contract Halo2Verifier {
                 }
                 {%- endfor %}
             }
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(14) // after PCS computation block
+            {%- endif %}
 
             // Random-linear combine accumulator into pairing inputs.
             if mload(HAS_ACCUMULATOR_MPTR) {
@@ -923,6 +989,10 @@ contract Halo2Verifier {
                 mstore(add(PAIRING_RHS_MPTR, 0x60), mload(0x160))
             }
 
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(15) // after accumulator random-combine (no-op when HAS_ACCUMULATOR_MPTR == 0)
+            {%- endif %}
+
             // The Yul `ec_pairing` helper checks
             //   e(arg0, G2_BASE) * e(arg1, NEG_S_G2_BASE) == 1
             // i.e.  e(arg0, [1]_2) = e(arg1, [s]_2).
@@ -937,6 +1007,10 @@ contract Halo2Verifier {
             // accumulator (left = pi, right = combined) and *not* the
             // pairing argument order. Pass them swapped to ec_pairing.
             success := ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)
+
+            {%- if self.gas_checkpoints %}
+            gas_checkpoint(16) // after final ec_pairing
+            {%- endif %}
 
             {%- if self.trace %}
             // In trace builds we always run to the end so the host-side

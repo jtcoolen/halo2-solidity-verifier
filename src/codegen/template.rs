@@ -93,6 +93,9 @@ pub(crate) struct Halo2Verifier {
     #[allow(dead_code)]
     pub(crate) scheme: BatchOpenScheme,
     pub(crate) trace: bool,
+    /// When true, the rendered verifier emits LOG1 gas() checkpoints at
+    /// section boundaries. See SOLIDITY_GAS_CHECKPOINTS_ENABLED.
+    pub(crate) gas_checkpoints: bool,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,

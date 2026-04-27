@@ -138,11 +138,17 @@ impl<'a> SolidityGenerator<'a> {
 impl<'a> SolidityGenerator<'a> {
     /// Render `Halo2Verifier.sol` with verifying key embedded into writer.
     ///
-    /// The default render path emits trace/log branches when the crate is
-    /// compiled with `--features solidity-trace`.
+    /// The default render path emits trace/log branches when the crate
+    /// is compiled with `--features solidity-trace`, and LOG1 gas
+    /// checkpoints when compiled with `--features
+    /// solidity-gas-checkpoints`.
     pub fn render_into(&self, verifier_writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED)
-            .render(verifier_writer)
+        self.generate_verifier(
+            false,
+            crate::SOLIDITY_TRACE_ENABLED,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+        )
+        .render(verifier_writer)
     }
 
     /// Render `Halo2Verifier.sol` with verifying key embedded and return it as `String`.
@@ -157,7 +163,8 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, true).render(verifier_writer)
+        self.generate_verifier(false, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED)
+            .render(verifier_writer)
     }
 
     /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded and return it as a
@@ -168,17 +175,42 @@ impl<'a> SolidityGenerator<'a> {
         Ok(verifier_output)
     }
 
+    /// Render a gas-checkpoint-enabled `Halo2Verifier.sol` (with VK
+    /// embedded) into writer. Emits LOG1 events at section boundaries
+    /// regardless of the `solidity-gas-checkpoints` feature flag.
+    pub fn render_with_gas_checkpoints_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED, true)
+            .render(verifier_writer)
+    }
+
+    /// Render a gas-checkpoint-enabled `Halo2Verifier.sol` (with VK
+    /// embedded) and return it as `String`.
+    pub fn render_with_gas_checkpoints(&self) -> Result<String, fmt::Error> {
+        let mut verifier_output = String::new();
+        self.render_with_gas_checkpoints_into(&mut verifier_output)?;
+        Ok(verifier_output)
+    }
+
     /// Render `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
     ///
-    /// The default render path emits trace/log branches when the crate is
-    /// compiled with `--features solidity-trace`.
+    /// The default render path emits trace/log branches when the crate
+    /// is compiled with `--features solidity-trace`, and LOG1 gas
+    /// checkpoints when compiled with `--features
+    /// solidity-gas-checkpoints`.
     pub fn render_separately_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED)
-            .render(verifier_writer)?;
+        self.generate_verifier(
+            true,
+            crate::SOLIDITY_TRACE_ENABLED,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+        )
+        .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
     }
@@ -197,7 +229,8 @@ impl<'a> SolidityGenerator<'a> {
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, true).render(verifier_writer)?;
+        self.generate_verifier(true, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED)
+            .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
     }
@@ -208,6 +241,30 @@ impl<'a> SolidityGenerator<'a> {
         let mut verifier_output = String::new();
         let mut vk_output = String::new();
         self.render_trace_separately_into(&mut verifier_output, &mut vk_output)?;
+        Ok((verifier_output, vk_output))
+    }
+
+    /// Render a gas-checkpoint-enabled `Halo2Verifier.sol` and
+    /// `Halo2VerifyingKey.sol` into writers. Emits LOG1 events at
+    /// section boundaries regardless of the
+    /// `solidity-gas-checkpoints` feature flag.
+    pub fn render_with_gas_checkpoints_separately_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED, true)
+            .render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        Ok(())
+    }
+
+    /// Render a gas-checkpoint-enabled `Halo2Verifier.sol` and
+    /// `Halo2VerifyingKey.sol` and return them as `String`s.
+    pub fn render_with_gas_checkpoints_separately(&self) -> Result<(String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        self.render_with_gas_checkpoints_separately_into(&mut verifier_output, &mut vk_output)?;
         Ok((verifier_output, vk_output))
     }
 
@@ -316,7 +373,12 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn generate_verifier(&self, separate: bool, trace: bool) -> Halo2Verifier {
+    fn generate_verifier(
+        &self,
+        separate: bool,
+        trace: bool,
+        gas_checkpoints: bool,
+    ) -> Halo2Verifier {
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
@@ -471,6 +533,7 @@ impl<'a> SolidityGenerator<'a> {
         Halo2Verifier {
             scheme: self.scheme,
             trace,
+            gas_checkpoints,
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,

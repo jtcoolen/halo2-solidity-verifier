@@ -27,6 +27,17 @@ pub use transcript::Keccak256Transcript;
 /// flag.
 pub const SOLIDITY_TRACE_ENABLED: bool = cfg!(feature = "solidity-trace");
 
+/// Whether the default Solidity renderer emits LOG1 gas() checkpoints
+/// at section boundaries. The host-side test parses these into per-
+/// section gas deltas (see `dump_gas_checkpoints` in
+/// `tests/poseidon_fixture.rs`).
+///
+/// Enable with `--features solidity-gas-checkpoints`. The explicit
+/// `render_with_gas_checkpoints*` helpers still force checkpoint
+/// emission regardless of this flag.
+pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool =
+    cfg!(feature = "solidity-gas-checkpoints");
+
 #[cfg(feature = "evm")]
 pub use evm::test::{compile_solidity, revm, CallOutcome, Evm};
 

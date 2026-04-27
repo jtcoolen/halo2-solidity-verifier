@@ -156,6 +156,8 @@ fn poseidon_renders_compiles_and_verifies() {
     let generator = SolidityGenerator::new(&srs, vk.vk(), Gwc19, num_instances)
         .set_num_committed_instances(1);
     let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
+    let gas_checkpoints_enabled =
+        halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
     let (verifier_solidity, vk_solidity) = generator
         .render_separately()
         .expect("render_separately should succeed");
@@ -387,6 +389,9 @@ fn poseidon_renders_compiles_and_verifies() {
             if trace_solidity {
                 dump_trace_logs(&logs);
             }
+            if gas_checkpoints_enabled {
+                dump_gas_checkpoints(&logs, gas_used);
+            }
             let expected: Vec<u8> = [vec![0u8; 31], vec![1]].concat();
             assert_eq!(
                 output, expected,
@@ -459,4 +464,153 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
             eprintln!("[yul-trace] {name}[{id}] = 0x{}", hex::encode(&data[0..32]));
         }
     }
+}
+
+/// Parse LOG1 events emitted by the rendered verifier when compiled
+/// with `--features solidity-gas-checkpoints` and print a per-section
+/// gas-delta breakdown.
+///
+/// Topic format: `(id << 248) | gas()`. `id` lives in the upper 8
+/// bits and the remaining 248 bits hold `gas()`. We discard topics
+/// where the upper byte is outside `1..=16` because the trace helpers
+/// (`trace_u256` / `trace_point`) emit unrelated LOG1 events with
+/// small `id` topics that may collide; here we filter to our own
+/// checkpoint range. The poseidon fixture is built without the
+/// `solidity-trace` feature in CI, so in practice the only LOG1
+/// events are ours.
+fn dump_gas_checkpoints(
+    logs: &[halo2_solidity_verifier::revm::primitives::Log],
+    gas_used: u64,
+) {
+    fn name_of(id: u8) -> &'static str {
+        match id {
+            1 => "entry (before VK loading)",
+            2 => "VK loading",
+            3 => "VK digest + committed_pi + instance absorbs",
+            4 => "user-phase advice reads + user challenge squeezes",
+            5 => "theta squeeze + lookup multiplicities",
+            6 => "beta/gamma + permutation Z products",
+            7 => "lookup helpers + Z accumulators",
+            8 => "trash_challenge + trashcans",
+            9 => "y squeeze + quotient-limb reads",
+            10 => "evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi",
+            11 => "Lagrange + instance evaluation",
+            12 => "quotient evaluation (Fr arithmetic)",
+            13 => "linearization-commitment MSM",
+            14 => "PCS computation block",
+            15 => "accumulator random-combine",
+            16 => "final ec_pairing",
+            _ => "<unknown>",
+        }
+    }
+
+    let mut events: Vec<(u8, u64)> = logs
+        .iter()
+        .filter_map(|log| {
+            let topic = log.data.topics().first()?;
+            let bytes = topic.as_slice();
+            // Upper byte = checkpoint id; lower 31 bytes = gas() (only
+            // the lowest 8 are non-zero in practice for gas values
+            // < 2^64). We read the lowest 8 bytes as u64.
+            let id = bytes[0];
+            if !(1..=16).contains(&id) {
+                return None;
+            }
+            let gas = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
+            Some((id, gas))
+        })
+        .collect();
+    events.sort_by_key(|(id, _)| *id);
+
+    if events.is_empty() {
+        eprintln!(
+            "[gas-checkpoints] no checkpoint events found in {} LOG entries",
+            logs.len()
+        );
+        return;
+    }
+
+    eprintln!();
+    eprintln!("=== gas-checkpoint breakdown (per-section deltas) ===");
+    eprintln!(
+        "{:>4}  {:>14}  {:>12}  {:>7}  section",
+        "id", "gas_left", "delta", "%"
+    );
+
+    // Each checkpoint costs ~750 gas (LOG1 base 375 + 1 topic 375 +
+    // 0 data bytes). Subtract that from each delta so the printed
+    // numbers reflect "real" section work, not measurement overhead.
+    const CHECKPOINT_COST: u64 = 750;
+
+    let total_billed = (events[events.len() - 1].1 < events[0].1)
+        .then(|| events[0].1.saturating_sub(events[events.len() - 1].1))
+        .unwrap_or(0);
+    let total_real_work = total_billed.saturating_sub(events.len() as u64 * CHECKPOINT_COST);
+
+    let mut prev_gas = events[0].1;
+    let cp1_gas = events[0].1;
+    eprintln!(
+        "{:>4}  {:>14}  {:>12}  {:>7}  {}",
+        events[0].0,
+        format_u64(prev_gas),
+        "-",
+        "-",
+        name_of(events[0].0),
+    );
+
+    for (id, gas) in events.iter().skip(1) {
+        let raw_delta = prev_gas.saturating_sub(*gas);
+        let net_delta = raw_delta.saturating_sub(CHECKPOINT_COST);
+        let pct = if total_real_work > 0 {
+            (net_delta as f64 / total_real_work as f64) * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:>4}  {:>14}  {:>12}  {:>6.1}%  {}",
+            id,
+            format_u64(*gas),
+            format_u64(net_delta),
+            pct,
+            name_of(*id),
+        );
+        prev_gas = *gas;
+    }
+
+    eprintln!();
+    eprintln!(
+        "  cp1 gas_left            = {} (verifier entry)",
+        format_u64(cp1_gas)
+    );
+    eprintln!(
+        "  cp16..cp1 gas billed    = {} (work between cp1 and cp16)",
+        format_u64(total_billed)
+    );
+    eprintln!(
+        "  - measurement overhead  = {} ({} checkpoints x {} gas)",
+        format_u64(events.len() as u64 * CHECKPOINT_COST),
+        events.len(),
+        CHECKPOINT_COST
+    );
+    eprintln!(
+        "  = real section work     = {}",
+        format_u64(total_real_work)
+    );
+    eprintln!(
+        "  total tx gas_used       = {} (incl. tx base + calldata + pre-cp1 + post-cp16)",
+        format_u64(gas_used)
+    );
+}
+
+fn format_u64(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }

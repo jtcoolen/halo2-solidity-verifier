@@ -79,6 +79,11 @@ evm = ["dep:revm"]
 # Enables Askama trace/log branches in the default Solidity render path.
 # Explicit `render_trace*` helpers can still be used without this feature.
 solidity-trace = []
+# Enables LOG1 gas() checkpoints at section boundaries in the default
+# Solidity render path. The host-side test parses the emitted logs into
+# per-section gas deltas. Adds ~12 kg measurement overhead (16 LOG1
+# events * ~750 gas each); off in production builds.
+solidity-gas-checkpoints = []
 
 [[example]]
 name = "separately"
