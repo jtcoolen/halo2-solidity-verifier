@@ -39,7 +39,10 @@ pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool =
     cfg!(feature = "solidity-gas-checkpoints");
 
 #[cfg(feature = "evm")]
-pub use evm::test::{compile_solidity, revm, CallOutcome, Evm};
+pub use evm::test::{
+    compile_solidity, compile_solidity_with_runs, revm, CallOutcome, Evm,
+    DEFAULT_OPTIMIZE_RUNS,
+};
 
 /// Test-only helper that exposes the internal BLS12-381 G1 to EIP-2537
 /// hi/lo encoder so debugging examples can re-encode host-computed

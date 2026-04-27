@@ -46,26 +46,53 @@ pub(crate) mod test {
         str,
     };
 
+    /// Default `--optimize-runs` value used by `compile_solidity`.
+    ///
+    /// Pre-Step 5 the verifier inlined `decompress_g1` at 21 sites, and
+    /// running the optimizer with `runs=200` blew past EIP-170's 24 kB
+    /// contract limit; we forced `runs=1` to keep the helpers shared.
+    /// After Step 5 dropped the on-chain decompression entirely, that
+    /// constraint went away and `runs=200` is now both safe (the
+    /// rendered bytecode comfortably fits under 24 kB) and significantly
+    /// cheaper at runtime — the optimizer can deduplicate
+    /// `common_uncompressed_g1`, `scalar_inv`, `byte_reverse_32`, the
+    /// `ec_*` helpers, and hoist `mload` traffic in the gate evaluator.
+    /// Audit item #7 / OPTIMISATION.md "A".
+    pub const DEFAULT_OPTIMIZE_RUNS: u32 = 200;
+
     /// Compile solidity with `--via-ir`, targeting Cancun bytecode (the
     /// embedded revm runner is set up for the Prague hard fork which
     /// supersedes Cancun + adds EIP-2537), then return creation bytecode.
     ///
+    /// Honors the `SOLC_OPTIMIZE_RUNS` environment variable for ad-hoc
+    /// A/B measurement; if unset, uses `DEFAULT_OPTIMIZE_RUNS`.
+    ///
     /// # Panics
     /// Panics if executable `solc` can not be found, or compilation fails.
     pub fn compile_solidity(solidity: impl AsRef<[u8]>) -> Vec<u8> {
+        let runs: u32 = std::env::var("SOLC_OPTIMIZE_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_OPTIMIZE_RUNS);
+        compile_solidity_with_runs(solidity, runs)
+    }
+
+    /// Like `compile_solidity` but with an explicit `--optimize-runs`
+    /// value. Useful for benchmarking the optimizer's runtime/code-size
+    /// tradeoff.
+    ///
+    /// # Panics
+    /// Panics if executable `solc` can not be found, or compilation fails.
+    pub fn compile_solidity_with_runs(solidity: impl AsRef<[u8]>, runs: u32) -> Vec<u8> {
+        let runs_str = runs.to_string();
         let mut process = match Command::new("solc")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .arg("--bin")
             .arg("--optimize")
-            // Bias the optimizer towards small code size. With the
-            // 21+ inline `decompress_g1` calls the default
-            // `--optimize-runs=200` blows past EIP-170's 24 kB
-            // contract limit; `--optimize-runs=1` keeps the helpers
-            // shared instead of being inlined.
             .arg("--optimize-runs")
-            .arg("1")
+            .arg(&runs_str)
             .arg("--via-ir")
             .arg("--evm-version")
             .arg("cancun")
