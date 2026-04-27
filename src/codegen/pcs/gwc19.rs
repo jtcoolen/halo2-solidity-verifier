@@ -590,6 +590,25 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("let f_eval := 0".to_string());
         // Resolve the calldata pointer to the q_evals block once.
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
+        // Hoist all distinct rotation points to stack locals; each
+        // gets read up to ~m^2 times across the set's dx_j and
+        // lbasis_j chains, so a single mload at the top of the block
+        // saves several mloads per reference.
+        for (i, _rot) in distinct_rotations.iter().enumerate() {
+            lines.push(format!(
+                "let rot_pt_{i} := mload(add(ROT_POINTS_MPTR, {:#x}))",
+                i * 0x20
+            ));
+        }
+
+        // Helper closure: rotation-point reference for codegen.
+        let rot_pt_ref = |rot: i32| -> String {
+            let idx = distinct_rotations
+                .iter()
+                .position(|r| *r == rot)
+                .expect("rotation present in distinct_rotations");
+            format!("rot_pt_{idx}")
+        };
 
         for set_idx in (0..n_sets).rev() {
             let points = &sets.point_sets[set_idx];
@@ -613,10 +632,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             //
             // Special-case |set| == 1: r_eval = evals[0], den = dx[0].
             if m == 1 {
-                let pt = format!(
-                    "mload(add(ROT_POINTS_MPTR, {:#x}))",
-                    rot_offset(&distinct_rotations, points[0])
-                );
+                let pt = rot_pt_ref(points[0]);
                 let ev = format!(
                     "mload(add(Q_EVAL_SET_MPTR, {:#x}))",
                     set_eval_offset_words * 0x20
@@ -670,29 +686,20 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             // full polynomial construction; here we collapse the
             // evaluation at x3 directly using the identity above.
             for j in 0..m {
-                let pt = format!(
-                    "mload(add(ROT_POINTS_MPTR, {:#x}))",
-                    rot_offset(&distinct_rotations, points[j])
-                );
+                let pt = rot_pt_ref(points[j]);
                 lines.push(format!(
                     "let dx_{j} := addmod(x3, sub(r, {pt}), r)"
                 ));
             }
             // For each j: lagrange_basis_inv_j = inv(prod_{k!=j} (p_j - p_k))
             for j in 0..m {
-                let pj = format!(
-                    "mload(add(ROT_POINTS_MPTR, {:#x}))",
-                    rot_offset(&distinct_rotations, points[j])
-                );
+                let pj = rot_pt_ref(points[j]);
                 lines.push(format!("let lbasis_{j} := 1"));
                 for k in 0..m {
                     if k == j {
                         continue;
                     }
-                    let pk = format!(
-                        "mload(add(ROT_POINTS_MPTR, {:#x}))",
-                        rot_offset(&distinct_rotations, points[k])
-                    );
+                    let pk = rot_pt_ref(points[k]);
                     lines.push(format!(
                         "lbasis_{j} := mulmod(lbasis_{j}, addmod({pj}, sub(r, {pk}), r), r)"
                     ));
@@ -938,6 +945,7 @@ fn add_offset(base: &str, offset: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn rot_offset(rotations: &[i32], rot: i32) -> usize {
     rotations
         .iter()
