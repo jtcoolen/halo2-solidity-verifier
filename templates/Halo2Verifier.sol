@@ -867,22 +867,31 @@ contract Halo2Verifier {
             }
 
             // ===============================================================
-            // Fold the quotient commitment via Horner with x_n as scalar.
-            // The decompressed quotient limbs live at
-            // QUOTIENT_LIMB_COMMS_MPTR_BASE (4 words per limb); fold
-            // from the last limb back to the first.
+            // Compute the linearization commitment as a single
+            // multi-pair G1MSM (optimisation #1, OPTIMISATION.md).
+            //
+            // Native math (from `compute_linearization_commitment`):
+            //   QUOTIENT = (1 - x^n) * Σ_i x_split^i * Q_i
+            //            + Σ_j sel_acc_j * S_j_com
+            // where x_split = x^(n-1) is the splitting factor and Q_i are
+            // the quotient limbs at QUOTIENT_LIMB_COMMS_MPTR_BASE.
+            //
+            // The naive emitter does
+            //   k × ec_mul_acc + k × ec_add_acc  (Horner fold)
+            //   + 1 × ec_mul_acc                 ((1-x^n) scale)
+            //   + n_sel × (ec_mul_tmp + ec_add_acc)
+            // = (k + 1 + n_sel) single-pair G1MSMs.
+            //
+            // EIP-2537 G1MSM gas is concave in pair count, so we
+            // pre-compute the Fr scalars
+            //   [(1-x^n)·1, (1-x^n)·x_split, …, (1-x^n)·x_split^{k-1},
+            //    sel_acc_0, sel_acc_1, …, sel_acc_{n_sel-1}]
+            // stage all (point, scalar) pairs contiguously at
+            // 0x100, and dispatch one staticcall(0x0c). The pair
+            // layout (160 bytes per pair) is the EIP-2537 BLS12_G1MSM
+            // input format: 4 words point || 1 word scalar.
             // ===============================================================
             {
-                let last_limb := add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {{ (0x80 * (num_quotients - 1))|hex() }})
-                mstore(0x100, mload(last_limb))
-                mstore(0x120, mload(add(last_limb, 0x20)))
-                mstore(0x140, mload(add(last_limb, 0x40)))
-                mstore(0x160, mload(add(last_limb, 0x60)))
-
-                // The native verifier folds the quotient limbs with the
-                // *splitting factor* `x^(n-1)`, not `x^n` — see
-                // `compute_linearization_commitment` in
-                // midfall/proofs/src/plonk/linearization/verifier.rs.
                 let x := mload(X_MPTR)
                 let k := mload(K_MPTR)
                 let x_pow_2i := x
@@ -896,50 +905,57 @@ contract Halo2Verifier {
                     x_pow_2i := mulmod(x_pow_2i, x_pow_2i, r)
                 }
                 let x_split := x_pow_2i_minus1
+                let one_minus_x_n := addmod(1, sub(r, x_pow_2i), r)
 
-                for {
-                        let mptr := sub(last_limb, 0x80)
-                        let mptr_end := sub(QUOTIENT_LIMB_COMMS_MPTR_BASE, 0x80)
-                    }
-                    lt(mptr_end, mptr)
-                    {} {
-                    success := ec_mul_acc(success, x_split)
-                    mstore(0x180, mload(mptr))
-                    mstore(0x1a0, mload(add(mptr, 0x20)))
-                    mstore(0x1c0, mload(add(mptr, 0x40)))
-                    mstore(0x1e0, mload(add(mptr, 0x60)))
-                    success := ec_add_acc(success)
-                    mptr := sub(mptr, 0x80)
+                // MSM input staging at 0x100 (free during this block —
+                // the per-pair ec_mul_acc / ec_add_acc temporaries that
+                // used 0x100..0x300 are gone). Each pair = 0xa0 bytes.
+                let p := 0x100
+                let cur_scalar := one_minus_x_n
+                let q := QUOTIENT_LIMB_COMMS_MPTR_BASE
+
+                // Quotient-limb pairs: (Q_i, (1-x^n) · x_split^i).
+                for { let i := 0 } lt(i, {{ num_quotients }}) { i := add(i, 1) } {
+                    mstore(p,            mload(q))
+                    mstore(add(p, 0x20), mload(add(q, 0x20)))
+                    mstore(add(p, 0x40), mload(add(q, 0x40)))
+                    mstore(add(p, 0x60), mload(add(q, 0x60)))
+                    mstore(add(p, 0x80), cur_scalar)
+                    cur_scalar := mulmod(cur_scalar, x_split, r)
+                    p := add(p, 0xa0)
+                    q := add(q, 0x80)
                 }
-                // Scale Q_folded by (1 - x^n). This matches
-                // `splitting_pow := F::ONE - *xn` in
-                // `compute_linearization_commitment`. The full scalar
-                // sequence over the limbs is then
-                //   (1-x^n), (1-x^n)*x^(n-1), (1-x^n)*x^(2(n-1)), ...
-                // i.e. (1-x^n) factored out across the Horner fold.
-                {
-                    let one_minus_x_n := addmod(1, sub(r, mload(X_N_MPTR)), r)
-                    success := ec_mul_acc(success, one_minus_x_n)
-                }
+
                 {%- if simple_selector_cols.len() > 0 %}
-                // Add Σ S_i_com * sel_acc_i (one MSM term per simple
-                // selector). Mirrors the `Some(col_idx)` branch of
-                // `compute_linearization_commitment`: each gate carrying
-                // a simple selector contributes its (selector-substituted-
-                // to-1) eval to `selector_acc[col]`, and the MSM picks
-                // up `vk.fixed_commitments[col]` with that scalar.
+                // Simple-selector pairs: (S_j_com, sel_acc_j). Mirrors
+                // the `Some(col_idx)` branch of
+                // `compute_linearization_commitment`.
                 {%- for col in simple_selector_cols %}
                 {
                     let sel_com := {{ (fixed_comm_mptr + col * 0x80)|hex() }}
-                    mstore(0x180, mload(sel_com))
-                    mstore(0x1a0, mload(add(sel_com, 0x20)))
-                    mstore(0x1c0, mload(add(sel_com, 0x40)))
-                    mstore(0x1e0, mload(add(sel_com, 0x60)))
-                    success := ec_mul_tmp(success, mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
-                    success := ec_add_acc(success)
+                    mstore(p,            mload(sel_com))
+                    mstore(add(p, 0x20), mload(add(sel_com, 0x20)))
+                    mstore(add(p, 0x40), mload(add(sel_com, 0x40)))
+                    mstore(add(p, 0x60), mload(add(sel_com, 0x60)))
+                    mstore(add(p, 0x80), mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
+                    p := add(p, 0xa0)
                 }
                 {%- endfor %}
                 {%- endif %}
+
+                // One multi-pair MSM. Result = QUOTIENT (4 words at 0x100).
+                success := and(
+                    success,
+                    staticcall(
+                        gas(),
+                        0x0c,
+                        0x100,
+                        {{ (0xa0 * (num_quotients + simple_selector_cols.len()))|hex() }},
+                        0x100,
+                        0x80
+                    )
+                )
+
                 mstore(QUOTIENT_MPTR,            mload(0x100))
                 mstore(add(QUOTIENT_MPTR, 0x20), mload(0x120))
                 mstore(add(QUOTIENT_MPTR, 0x40), mload(0x140))

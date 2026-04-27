@@ -458,80 +458,37 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             let mut lines: Vec<String> = Vec::new();
             let q_com_base = format!("add(Q_COM_MPTR, {:#x})", set_idx * 0x80);
             let q_eval_base = format!("add(Q_EVAL_SET_MPTR, {:#x})", set_idx * 0x20);
+            let m = commitments_in_set.len();
 
             lines.push(format!(
-                "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {} commitment(s)",
-                commitments_in_set.len()
+                "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, optimisation #1)"
             ));
 
-            // Initialise q_com[s] = first commitment in the set.
-            let first_pt = &commitments_in_set[0].comm;
-            // Copy first commitment to (0x00..0x80) scratch.
-            for (off, w) in first_pt.words().iter().enumerate() {
-                lines.push(format!("mstore({:#x}, {})", off * 0x20, w));
-            }
-
-            // Initialise q_eval_set[s] = first commitment's eval at the
-            // first rotation (which is x1^0 = 1, so no scaling needed).
-            let first = &commitments_in_set[0];
-            // q_eval_set[s] = sum_k x1^0 * c0.evals[k] over rotations k.
-            // We compute the eval contribution as the "inner product"
-            // with rotations[k] inside the set, but actually the
-            // midnight-proofs structure has one eval per (commitment,
-            // rotation) pair in the same set. The scaling by x1^pos
-            // applies to the *commitment* index (across commitments in
-            // the same set), NOT across rotations. Each commitment in
-            // the set contributes a sum over rotations of evals,
-            // unscaled by anything within the set; the scaling by
-            // x1^pos ties commitments together.
+            // q_eval_set[s] is itself a *vector* of |set| evaluations
+            // (not a single scalar): one per rotation in the set's
+            // point list. midnight-proofs computes
+            //   q_polys[s]    = sum_i x1^i * poly_i             (across commits in s)
+            //   q_eval_set[s] = sum_i x1^i * evals_i_at_set_points
+            // The verifier later folds this vector via Lagrange
+            // interpolation at x3 (block 4).
             //
-            // Wait -- re-checking midnight-proofs:
-            //   q_polys[set_idx] contains one poly per commitment
-            //   q_polys[set_idx] = sum_i x1^i * poly_i  (across commits)
-            //   q_eval_sets[set_idx] = sum_i x1^i * evals_i_at_set_points
-            // where evals_i_at_set_points is a vector of |set| field
-            // elements (the i-th commitment's evals across the set's
-            // rotations).
-            //
-            // So q_eval_set[s] is itself a *vector* of |set| evaluations
-            // (not a single scalar). The verifier later proves the
-            // multi-open by reducing this vector via lagrange
-            // interpolation at x3.
-            //
-            // We therefore store q_eval_set[s] as |set| consecutive
-            // words. Layout:
+            // Storage:
             //   Q_EVAL_SET_MPTR + 0x20 * (set_offset + k)
             // where set_offset is the cumulative |sets[<s]| sum.
-
-            // Keep q_eval_set[s][k] in stack locals while accumulating,
-            // then store once. This avoids an mload/mstore round-trip
-            // for every commitment after the first.
+            let first = &commitments_in_set[0];
             let set_eval_offset_words: usize = sets.point_sets[..set_idx]
                 .iter()
                 .map(|s| s.len())
                 .sum::<usize>();
+
+            // Phase 1: Fr-only eval accumulation in stack locals.
+            // Seed with the first commitment's evals (x1^0 = 1, so no
+            // scaling needed).
             for (k, ev) in first.evals.iter().enumerate() {
                 lines.push(format!("let q_eval_set_{k} := {ev}"));
             }
-
-            // For each subsequent commitment in the set, scale by
-            // x1^i and accumulate.
             for (i, c) in commitments_in_set.iter().enumerate().skip(1) {
                 let x1_pow = format!("mload(add(X1_POWERS_MPTR, {:#x}))", i * 0x20);
-
-                // q_com[s] += x1_pow * c.comm
-                // Load c.comm into 0x80..0x100 scratch.
-                for (off, w) in c.comm.words().iter().enumerate() {
-                    lines.push(format!("mstore({:#x}, {})", 0x80 + off * 0x20, w));
-                }
-                // ec_mul_tmp scales the operand at 0x80..0x100 by
-                // mload(0x100) = x1_pow scalar.
-                lines.push(format!("mstore(0x100, {x1_pow})"));
-                lines.push("success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))".to_string());
-                // ec_add_acc reads acc at 0x00 and operand at 0x80.
-                lines.push("success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))".to_string());
-
-                // q_eval_set[s][k] += x1_pow * c.evals[k]
                 for (k, ev) in c.evals.iter().enumerate() {
                     lines.push(format!(
                         "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
@@ -539,14 +496,63 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
                 }
             }
 
-            // Persist q_com[s] from 0x00..0x80 scratch into Q_COM_MPTR slot.
-            for off in 0..4 {
+            // Phase 2: G1 commitment fold via one m-pair MSM.
+            //
+            // The naive emitter did m-1 single-pair MSMs + m-1 G1ADDs
+            // (the first commit is just copied, then each subsequent
+            // one is scale-and-add). EIP-2537 G1MSM gas is concave in
+            // pair count so a single m-pair MSM with scalars
+            //   [1, x1, x1^2, …, x1^{m-1}]
+            // is much cheaper.
+            //
+            // Stage all (point, scalar) pairs at MSM_SCRATCH (0x6100),
+            // which lives above scalar_inv's 0x6000..0x60c0 scratch and
+            // well clear of the VK region (0x0ee0..0x2040) that the low
+            // memory window collides with for sets with > ~24 commits.
+            // The precompile input format is 4 words point followed by
+            // 1 word scalar per pair (160 bytes / pair).
+            const MSM_SCRATCH: usize = 0x6100;
+            if m == 1 {
+                // Single-commitment set: just copy the point.
+                for (off, w) in first.comm.words().iter().enumerate() {
+                    lines.push(format!(
+                        "mstore({}, {})",
+                        add_offset(&q_com_base, off * 0x20),
+                        w
+                    ));
+                }
+            } else {
+                for (i, c) in commitments_in_set.iter().enumerate() {
+                    let pair_base = MSM_SCRATCH + i * 0xa0;
+                    for (off, w) in c.comm.words().iter().enumerate() {
+                        lines.push(format!("mstore({:#x}, {})", pair_base + off * 0x20, w));
+                    }
+                    if i == 0 {
+                        lines.push(format!("mstore({:#x}, 1)", pair_base + 0x80));
+                    } else {
+                        lines.push(format!(
+                            "mstore({:#x}, mload(add(X1_POWERS_MPTR, {:#x})))",
+                            pair_base + 0x80,
+                            i * 0x20
+                        ));
+                    }
+                }
                 lines.push(format!(
-                    "mstore({}, mload({:#x}))",
-                    add_offset(&q_com_base, off * 0x20),
-                    off * 0x20
+                    "success := and(success, staticcall(gas(), 0x0c, {:#x}, {:#x}, {:#x}, 0x80))",
+                    MSM_SCRATCH,
+                    m * 0xa0,
+                    MSM_SCRATCH
                 ));
+                for off in 0..4 {
+                    lines.push(format!(
+                        "mstore({}, mload({:#x}))",
+                        add_offset(&q_com_base, off * 0x20),
+                        MSM_SCRATCH + off * 0x20
+                    ));
+                }
             }
+
+            // Persist the per-rotation q_eval_set[s][k].
             for k in 0..first.evals.len() {
                 lines.push(format!(
                     "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
@@ -711,6 +717,15 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
     //   v         = sum_s x4_powers[s] * q_evals_at_x3[s] + x4_powers[n_sets] * f_eval
     //
     // Accumulator at 0x00..0x80; operand at 0x80..0x100.
+    //
+    // Note: tried batching this into one (n_sets+1)-pair MSM, but for
+    // n_sets <= 3 (typical) the 4-pair MSM (~33k) is more expensive
+    // than the equivalent 3 × G1MSM-1 + 3 × G1ADD chain (~37.5k base,
+    // but the existing structure folds q_com[0] in for free as the
+    // accumulator seed, leaving 2 × G1MSM-1 + 2 × G1ADD + 1 final
+    // (f_com) MSM-1 + 1 final ADD = ~25k); the staging mstore overhead
+    // (24 stores × 9 = ~216 gas) erases the small precompile saving.
+    // The win for batched MSM only kicks in once n_sets >= 5 or so.
     // ------------------------------------------------------------------
     {
         let mut lines: Vec<String> = Vec::new();
@@ -802,6 +817,11 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
     //   tmp1 := -v * G     (G is G1 generator at G1_BASE_MPTR)
     //   tmp2 := x3 * pi
     //   PAIRING_RHS := final_com + tmp1 + tmp2
+    //
+    // Note: We tried batching this into a 3-pair MSM but per EIP-2537
+    // gas tables, 3-pair G1MSM (~27.5k gas) is *more* expensive than
+    // 2 × G1MSM-1 + 2 × G1ADD (= 25k gas) in this size regime; the
+    // multi-pair discount only starts to dominate at >= 4 pairs.
     // ------------------------------------------------------------------
     {
         let mut lines: Vec<String> = Vec::new();
