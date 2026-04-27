@@ -271,3 +271,191 @@ Files touched:
 - The committed-instance identity injection at the start of the
   transcript was rewritten from "0xc0 || 47*0x00" to "128 × 0x00" to
   match the new identity convention.
+
+
+   Status
+
+   •  Already achieved this turn: H3 pre-reverse evals + cp13 MCOPY → 907 kg → 760.6 kg (−146.5 kg, −16 %).
+   •  Cumulative since baseline: 1,589 kg → 760.6 kg (−828 kg, −52 %).
+   •  Gap to 650 kg target: ~111 kg remaining.
+
+   Cryptographic floor (cannot reduce)
+
+   precompile                │ calls │         gas
+   --------------------------+-------+-----------:
+   BLS12_G1MSM-33 (set 0)    │ 1     │     ~188 kg
+   BLS12_G1MSM-8 (cp13 lin)  │ 1     │      ~49 kg
+   BLS12_G1MSM-5 (set 1)     │ 1     │      ~34 kg
+   BLS12_G1MSM-1 (block 5/6) │ ~5    │      ~70 kg
+   BLS12_G1MSM-2 (set 2)     │ 1     │      ~21 kg
+   BLS12_G1ADD               │ ~5    │       ~3 kg
+   BLS12_PAIRING (cp16)      │ 1     │     ~103 kg
+   modexp (scalar_inv)       │ ~3    │       ~5 kg
+   **Crypto floor**          │       │ **~473 kg**
+   Tx base + 4.4 KB calldata │       │  **~85 kg**
+   **Total floor**           │       │ **~558 kg**
+
+   So 650 kg is achievable in principle — current EVM overhead is 760 − 558 = 202 kg, target is 650 − 558 = 92 kg. We need to cut 110 kg of EVM overhead.
+
+   Plan: 4 remaining optimizations
+
+   Opt I — Roll set 0 m=33 staging into a Yul for-loop  (projected −3 to −15 kg)
+
+   Currently 33 unrolled mcopy + mstore pairs (66 lines). Pre-stage 33 source addresses into a table at 0x100 (linearization-MSM scratch, free in cp19), then roll the body:
+
+   yul
+     mstore(0x100, src_0); mstore(0x120, src_1); ...     // pre-stage
+     mcopy(0x6100, mload(0x100), 0x80)                   // commit 0 (scalar=1)
+     mstore(0x6180, 1)
+     let src_p := 0x100; let pow_p := X1_POWERS_MPTR; let dst := 0x6100
+     for { let i := 1 } lt(i, 0x21) { i := add(i, 1) } {
+         src_p := add(src_p, 0x20); pow_p := add(pow_p, 0x20); dst := add(dst, 0xa0)
+         mcopy(dst, mload(src_p), 0x80)
+         mstore(add(dst, 0x80), mload(pow_p))
+     }
+
+   Same pattern as H2 (rolled x1-powers loop) which yielded an unexpected −48 kg from solc-via-ir register reallocation. Real-world impact may be larger than 3-15 kg.
+
+   Opt J — Fold the q_eval Horner into the same loop  (projected −5 to −15 kg)
+
+   The 33-line q_eval Horner accumulator can be merged with the staging loop, reusing the X1 power load between the Horner and the scalar mstore (saves 1 mload/iter):
+
+   yul
+     let acc := mload(eval_0_offset)
+     let eval_p := EVAL_TABLE  // pre-staged
+     for { let i := 1 } lt(i, 0x21) { i := add(i, 1) } {
+         let pow := mload(pow_p)
+         eval_p := add(eval_p, 0x20)
+         let ev := mload(mload(eval_p))
+         acc := addmod(acc, mulmod(ev, pow, r), r)
+         mcopy(dst, mload(src_p), 0x80)
+         mstore(add(dst, 0x80), pow)   // reuse pow
+         ...
+     }
+
+   Requires pre-staging eval addresses too (33 mstores).
+
+   Opt K — Apply Opt I+J to set 1 (m=5) and possibly set 2 (m=2)
+
+   Smaller m, smaller savings. Cutoff at m≥4 likely most efficient. Projected −2 to −5 kg combined.
+
+   Opt G — Fold consecutive keccak squeezes in cp10  (projected −20 to −30 kg)
+
+   Cross-stack change: requires prover-side coordination (transcript spec change). cp10 = 56 kg currently, mostly G1 absorption + keccak squeezes. Would need to coordinate with the
+    midnight-proofs prover to emit fewer challenge points or batch challenge derivations.
+
+   Combined target
+
+   I + J + K  → 10-35 kg saved (high uncertainty due to solc-via-ir non-linearities).
+   •  G       → another 20-30 kg if we coordinate with prover.
+
+   If all four land at the high end: −65 kg → 696 kg.
+   If at the low end: −30 kg → 731 kg.
+
+   To definitely hit 650 kg we'd likely also need:
+   •  Opt F (truncated challenges, opt-in) — change prover to emit 128-bit challenges; saves ~130 kg in scalar mulmods. Cross-stack, requires soundness analysis.
+
+   Recommendation
+
+   Proceed with I + J + K as a single PR (pure-codegen, no cross-stack risk). This is the natural follow-on to H3 and uses the same "let solc-via-ir see simpler basic blocks"
+   insight that produced the −146 kg H3 win and the −48 kg H2 win. Realistic ~20-40 kg additional savings landing 740-720 kg.
+
+   For 650 kg, F (truncated challenges) is needed — but that's a prover-side change requiring its own validation/audit loop and is out-of-scope for pure verifier work.
+
+   Shall I proceed with I + J + K?
+
+   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+   Propose Specification "Status"
+   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+   Status
+
+   •  Already achieved this turn: H3 pre-reverse evals + cp13 MCOPY → 907 kg → 760.6 kg (−146.5 kg, −16 %).
+   •  Cumulative since baseline: 1,589 kg → 760.6 kg (−828 kg, −52 %).
+   •  Gap to 650 kg target: ~111 kg remaining.
+
+   Cryptographic floor (cannot reduce)
+
+   precompile                │ calls │         gas
+   --------------------------+-------+-----------:
+   BLS12_G1MSM-33 (set 0)    │ 1     │     ~188 kg
+   BLS12_G1MSM-8 (cp13 lin)  │ 1     │      ~49 kg
+   BLS12_G1MSM-5 (set 1)     │ 1     │      ~34 kg
+   BLS12_G1MSM-1 (block 5/6) │ ~5    │      ~70 kg
+   BLS12_G1MSM-2 (set 2)     │ 1     │      ~21 kg
+   BLS12_G1ADD               │ ~5    │       ~3 kg
+   BLS12_PAIRING (cp16)      │ 1     │     ~103 kg
+   modexp (scalar_inv)       │ ~3    │       ~5 kg
+   **Crypto floor**          │       │ **~473 kg**
+   Tx base + 4.4 KB calldata │       │  **~85 kg**
+   **Total floor**           │       │ **~558 kg**
+
+   So 650 kg is achievable in principle — current EVM overhead is 760 − 558 = 202 kg, target is 650 − 558 = 92 kg. We need to cut 110 kg of EVM overhead.
+
+   Plan: 4 remaining optimizations
+
+   Opt I — Roll set 0 m=33 staging into a Yul for-loop  (projected −3 to −15 kg)
+
+   Currently 33 unrolled mcopy + mstore pairs (66 lines). Pre-stage 33 source addresses into a table at 0x100 (linearization-MSM scratch, free in cp19), then roll the body:
+
+   yul
+     mstore(0x100, src_0); mstore(0x120, src_1); ...     // pre-stage
+     mcopy(0x6100, mload(0x100), 0x80)                   // commit 0 (scalar=1)
+     mstore(0x6180, 1)
+     let src_p := 0x100; let pow_p := X1_POWERS_MPTR; let dst := 0x6100
+     for { let i := 1 } lt(i, 0x21) { i := add(i, 1) } {
+         src_p := add(src_p, 0x20); pow_p := add(pow_p, 0x20); dst := add(dst, 0xa0)
+         mcopy(dst, mload(src_p), 0x80)
+         mstore(add(dst, 0x80), mload(pow_p))
+     }
+
+   Same pattern as H2 (rolled x1-powers loop) which yielded an unexpected −48 kg from solc-via-ir register reallocation. Real-world impact may be larger than 3-15 kg.
+
+   Opt J — Fold the q_eval Horner into the same loop  (projected −5 to −15 kg)
+
+   The 33-line q_eval Horner accumulator can be merged with the staging loop, reusing the X1 power load between the Horner and the scalar mstore (saves 1 mload/iter):
+
+   yul
+     let acc := mload(eval_0_offset)
+     let eval_p := EVAL_TABLE  // pre-staged
+     for { let i := 1 } lt(i, 0x21) { i := add(i, 1) } {
+         let pow := mload(pow_p)
+         eval_p := add(eval_p, 0x20)
+         let ev := mload(mload(eval_p))
+         acc := addmod(acc, mulmod(ev, pow, r), r)
+         mcopy(dst, mload(src_p), 0x80)
+         mstore(add(dst, 0x80), pow)   // reuse pow
+         ...
+     }
+
+   Requires pre-staging eval addresses too (33 mstores).
+
+   Opt K — Apply Opt I+J to set 1 (m=5) and possibly set 2 (m=2)
+
+   Smaller m, smaller savings. Cutoff at m≥4 likely most efficient. Projected −2 to −5 kg combined.
+
+   Opt G — Fold consecutive keccak squeezes in cp10  (projected −20 to −30 kg)
+
+   Cross-stack change: requires prover-side coordination (transcript spec change). cp10 = 56 kg currently, mostly G1 absorption + keccak squeezes. Would need to coordinate with the
+    midnight-proofs prover to emit fewer challenge points or batch challenge derivations.
+
+   Combined target
+
+   I + J + K  → 10-35 kg saved (high uncertainty due to solc-via-ir non-linearities).
+   •  G       → another 20-30 kg if we coordinate with prover.
+
+   If all four land at the high end: −65 kg → 696 kg.
+   If at the low end: −30 kg → 731 kg.
+
+   To definitely hit 650 kg we'd likely also need:
+   •  Opt F (truncated challenges, opt-in) — change prover to emit 128-bit challenges; saves ~130 kg in scalar mulmods. Cross-stack, requires soundness analysis.
+
+   Recommendation
+
+   Proceed with I + J + K as a single PR (pure-codegen, no cross-stack risk). This is the natural follow-on to H3 and uses the same "let solc-via-ir see simpler basic blocks"
+   insight that produced the −146 kg H3 win and the −48 kg H2 win. Realistic ~20-40 kg additional savings landing 740-720 kg.
+
+   For 650 kg, F (truncated challenges) is needed — but that's a prover-side change requiring its own validation/audit loop and is out-of-scope for pure verifier work.
+
+   Shall I proceed with I + J + K?
