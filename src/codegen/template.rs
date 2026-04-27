@@ -141,6 +141,12 @@ pub(crate) struct Halo2Verifier {
     /// lookup_helper, lookup_z, trashcan, quotient_limb) are laid out
     /// contiguously after this base with a 4-word stride per G1.
     pub(crate) comms_mptr_base: Ptr,
+    /// Memory base of the pre-reversed-evals buffer (Optimisation H3).
+    /// The transcript-side `evaluations` loop spills the byte-reversed
+    /// `eval_le` value to this buffer so that every later eval
+    /// reference renders as `mload(...)` (3 gas) instead of
+    /// `byte_reverse_32(calldataload(...))` (~145 gas).
+    pub(crate) reversed_evals_mptr: Ptr,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
     /// Sorted simple-selector fixed-column indices. Each is rendered

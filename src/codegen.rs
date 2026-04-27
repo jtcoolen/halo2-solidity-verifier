@@ -552,6 +552,7 @@ impl<'a> SolidityGenerator<'a> {
             lookup_helper_chunks_total,
             lookup_chunks: meta.lookup_chunks.clone(),
             comms_mptr_base: data.comms_mptr_base,
+            reversed_evals_mptr: data.reversed_evals_mptr,
             proof_cptr,
             num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
             instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + 0x20,

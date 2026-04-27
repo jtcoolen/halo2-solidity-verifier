@@ -438,6 +438,13 @@ pub(crate) struct Data {
     /// Calldata pointer to the first compressed quotient G1 in the proof
     /// stream. Used by the quotient-fold loop in the template.
     pub(crate) quotient_limb_cptr: Ptr,
+    /// Memory base of the pre-reversed-evals buffer (Optimisation H3).
+    /// The transcript-side `evaluations` loop spills the byte-reversed
+    /// `eval_le` value to `REVERSED_EVALS_MPTR + i * 0x20` so that
+    /// every later eval reference can `mload` instead of paying the
+    /// per-call `byte_reverse_32(calldataload(N))` cost (~145 gas → 3
+    /// gas).
+    pub(crate) reversed_evals_mptr: Ptr,
 }
 
 impl Data {
@@ -492,8 +499,7 @@ impl Data {
         let eval_cd = cd_byte;
 
         let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
-        let eval_cptr = Ptr::calldata(eval_cd);
-        let w_cptr = eval_cptr + meta.num_evals;
+        let w_cptr = Ptr::calldata(eval_cd) + meta.num_evals;
 
         // -- memory bases for decompressed commitments (4 words each) --
         // The template emits a named Solidity constant for each base so
@@ -505,7 +511,51 @@ impl Data {
             Value::Integer(b) => (b as usize) / 0x20,
             _ => unreachable!("theta_mptr is always an integer offset"),
         };
-        let comms_mptr_base = Ptr::memory((theta_words + 220) * 0x20);
+        // ------------------------------------------------------------
+        // Optimisation H3: pre-reverse polynomial evaluations.
+        //
+        // Each polynomial evaluation in the proof is referenced
+        // multiple times across the gate evaluator (cp12) and the PCS
+        // q_eval Horner accumulators (cp14). Each reference renders as
+        // `byte_reverse_32(calldataload(N))` (~145 gas) since calldata
+        // bytes are LE-encoded `Fq::to_repr` form but Yul interprets
+        // them as BE. For the Poseidon fixture this expands to 174
+        // byte_reverse_32 calls hitting only 48 distinct calldata
+        // addresses (3.6× reuse).
+        //
+        // The transcript-side `evaluations` loop in the template
+        // already computes `byte_reverse_32(calldataload(...))` once
+        // per eval (to range-check `eval_le < r`) and discards the
+        // reversed value. We hijack that by adding a single `mstore`
+        // per iter — ~5 gas amortised — to spill the reversed value
+        // into a contiguous memory buffer at REVERSED_EVALS_MPTR.
+        // Every later eval reference then becomes `mload(N)` (3 gas)
+        // instead of `byte_reverse_32(calldataload(N))` (~145 gas).
+        //
+        // To make this transparent to the codegen, we construct
+        // `eval_cptr` as a *Memory* Ptr pointing at REVERSED_EVALS_MPTR
+        // instead of a Calldata Ptr. All eval Words built via
+        // `Word::range(eval_cptr)` (committed_instance_evals,
+        // advice_evals, fixed_evals, permutation_evals,
+        // permutation_z_evals, lookup_evals, trashcan_evals) inherit
+        // the Memory location, so `Word::Display` renders them as
+        // `mload(...)` automatically.
+        //
+        // The calldata-side reading code (transcript loop) keeps a
+        // separate `eval_cd` byte offset for the per-iter
+        // `calldataload(proof_cptr)`.
+        //
+        // Memory layout:
+        //   theta_mptr + 208  G1_IDENTITY_MPTR (4 words)
+        //   theta_mptr + 220  REVERSED_EVALS_MPTR (num_evals words)
+        //   theta_mptr + 220 + num_evals  comms_mptr_base
+        //
+        // The 8-word gap between G1_IDENTITY (212) and 220 is preserved
+        // for alignment / future use.
+        let reversed_evals_mptr = Ptr::memory((theta_words + 220) * 0x20);
+        let eval_cptr = reversed_evals_mptr;
+        let comms_words_offset = 220 + meta.num_evals;
+        let comms_mptr_base = Ptr::memory((theta_words + comms_words_offset) * 0x20);
         let advice_words = 4 * meta.advice_indices.len();
         let lookup_m_words = 4 * meta.num_lookups;
         let perm_z_words = 4 * meta.num_permutation_zs;
@@ -689,6 +739,7 @@ impl Data {
             computed_quotient_eval,
             comms_mptr_base,
             quotient_limb_cptr: Ptr::calldata(quotient_limb_cd),
+            reversed_evals_mptr,
         }
     }
 }

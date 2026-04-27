@@ -125,6 +125,17 @@ contract Halo2Verifier {
     // ec_add / ec_mul precompiles accept.
     uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 208 }};
 
+    // Pre-reversed polynomial-eval buffer (Optimisation H3). Each Fq
+    // evaluation in the proof byte stream is LE-encoded (`Fq::to_repr`)
+    // but Yul's `calldataload` reads BE, so every reference would
+    // normally pay ~145 gas of `byte_reverse_32(calldataload(...))`.
+    // The transcript-side `evaluations` loop already computes the
+    // byte-reversed value once (for range-checking `eval_le < r`); we
+    // spill it to this buffer so the 174 downstream eval references
+    // (in the gate evaluator + PCS q_eval Horner) become 3-gas
+    // `mload(...)` instead.
+    uint256 internal constant     REVERSED_EVALS_MPTR = {{ reversed_evals_mptr }};
+
     // ----------------------------------------------------------------------
     // Per-category bases for decompressed G1 commitments. The proof emits
     // G1 commitments in zcash-compressed form (48 bytes each); this region
@@ -715,14 +726,25 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, X_MPTR)
 
             // ---- evaluations ----
-            for { let end := add(proof_cptr, {{ (num_evals * 32)|hex() }}) }
-                lt(proof_cptr, end)
-                {} {
-                let eval_be := calldataload(proof_cptr)
-                let eval_le := byte_reverse_32(eval_be)
-                success := and(success, lt(eval_le, r))
-                buf_len := common_word(buf_len, eval_be)
-                proof_cptr := add(proof_cptr, 0x20)
+            // Optimisation H3: spill the byte-reversed eval_le into the
+            // REVERSED_EVALS_MPTR buffer in the same iteration we
+            // already compute it for range-checking. ~5 gas amortised
+            // per iter; replaces ~145 gas of byte_reverse_32 per
+            // downstream reference (174 references in the verifier,
+            // ~25 kg total saving).
+            {
+                let eval_buf := REVERSED_EVALS_MPTR
+                for { let end := add(proof_cptr, {{ (num_evals * 32)|hex() }}) }
+                    lt(proof_cptr, end)
+                    {} {
+                    let eval_be := calldataload(proof_cptr)
+                    let eval_le := byte_reverse_32(eval_be)
+                    success := and(success, lt(eval_le, r))
+                    mstore(eval_buf, eval_le)
+                    eval_buf := add(eval_buf, 0x20)
+                    buf_len := common_word(buf_len, eval_be)
+                    proof_cptr := add(proof_cptr, 0x20)
+                }
             }
 
             // ---- x1, x2 ----
