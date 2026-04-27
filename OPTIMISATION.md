@@ -83,22 +83,20 @@ consistency check via one or two `mulmod`s plus a final `addmod` of
 surrounding PCS layout supports it.
 
 ## 5. MCOPY the G2 / scratch staging
-**~5-10 kg saved**
+**Status: applied (Step 8/E). Saved ~1.5 kg measured.**
 
-`ec_pairing` has two `for i in 0..8 { mstore(...) mload(...) }` loops to
-copy the two G2 points into the precompile input scratch. Cancun ships
-MCOPY (`0x5e`) — replace each loop with one MCOPY of 0x100 bytes. Same
-trick on each
+`ec_pairing` had two `for i in 0..8 { mstore(...) mload(...) }` loops to
+copy the two G2 points into the precompile input scratch, plus two
+4-line G1 mstore chains. Cancun ships MCOPY (`0x5e`); each loop is now
+one `mcopy(dst, src, 0x100)` and each G1 chain is `mcopy(dst, src,
+0x80)`. Same trick applied to PCS Block 5/6 EC-point staging
+(q_com seed, F_COM, FINAL_COM, PAIRING_LHS/RHS, G1_BASE, PI).
 
-```yul
-mstore(0x180, mload(sel_com))
-mstore(0x1a0, mload(add(sel_com, 0x20)))
-mstore(0x1c0, mload(add(sel_com, 0x40)))
-mstore(0x1e0, mload(add(sel_com, 0x60)))
-```
-
-block (one MCOPY of 0x80 bytes). Note: once #1 batches the staging into a
-single contiguous strip the per-pair mstore chain disappears entirely.
+Measured saving was lower than the original 5–10 kg projection (1,499
+gas) because solc-via-ir was already folding many of the
+mstore-then-mload pairs into stack locals; the visible win comes from
+the patterns where the round-trip crossed a precompile call boundary
+(which solc cannot fold).
 
 ## 6. Drop pairs whose scalar is zero
 **0-30 kg, depends on circuit**
@@ -172,10 +170,13 @@ scalar-array build + one staticcall).
 | 4 | PCS Block 6 PAIRING_RHS → 3-pair MSM | (above included) | +0 | reverted |
 | 5 | drop on-the-fly compressed encoding: hash uncompressed 128B verbatim in transcript (patch midnight-proofs `Hashable<Keccak256>::to_input` + EVM `common_uncompressed_g1`) | 1 475 536 | −7 422 | −113 540 |
 | 6 | unroll `byte_reverse_32` (31 of 32 iterations straight-line + 1-trip guard loop). Each of the ~184 call sites drops from ~700 gas (32-iter shift loop body) to ~140 gas (32 byte-extract + or-shl ops). The trailing 1-trip loop is required to keep solc from inlining the entire 32-step body at every call site under `--via-ir`; full inlining triggers a pathology where the verifier consumes the full block gas limit. | 997 438 | −478 098 | −591 638 |
+| 7 (B) | PCS Block 4 Lagrange interpolation: replace n separate `scalar_inv` calls per point set with one Montgomery batch invert (`{dx_j, lbasis_j}` for j=0..m, n=2m). Per set: 1 modexp + 3n−3 muls vs n modexp; `den_inv` becomes a free `prod_j dx_inv_j`. Soundness: dx_j non-zero by Fiat-Shamir, lbasis_j non-zero by `construct_intermediate_sets` de-dup. | 982 229 | −15 173 | −606 811 |
+| 8 (E) | MCOPY EC-point staging: replace 4-line `mstore(N, mload(M))` chains and 8-iter G2 mstore loops with `mcopy(dst, src, 0x80)` / `mcopy(dst, src, 0x100)` calls in `ec_pairing` (G2_BASE + NEG_S_G2_BASE + 2 G1 inputs) and PCS Blocks 5 & 6 (q_com seed, F_COM staging, FINAL_COM persist, PAIRING_LHS/RHS staging). | 980 730 | −1 499 | −608 310 |
+| 9 (D) | hoist `mload(add(ROT_POINTS_MPTR, k*0x20))` to `rot_pt_i` stack locals at the top of the f_eval block. Each rotation point is referenced O(m²) times per set across `dx_j` and `lbasis_j`; solc-via-ir cannot CSE-fold across the inline `scalar_inv` precompile boundary. | 980 125 | −605 | −608 951 |
 
-**Net result: 1 589 076 → 997 438 gas (−591 638, −37.2%) on the Poseidon
-fixture.** With current per-section breakdown: PCS 530 kg (53%), pairing
-104 kg (10%), quotient eval 124 kg (12%), linearization MSM 72 kg (7%),
+**Net result: 1 589 076 → 980 125 gas (−608 951, −38.3%) on the Poseidon
+fixture.** With current per-section breakdown: PCS 514 kg (52%), pairing
+103 kg (10%), quotient eval 124 kg (13%), linearization MSM 72 kg (7%),
 transcript+evals 80 kg (8%), other 87 kg (10%).
 
 Findings:

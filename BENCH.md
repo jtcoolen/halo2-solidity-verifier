@@ -29,41 +29,47 @@ The 16 checkpoints sit at semantic section boundaries — see
 
 ## Measured breakdown (Poseidon fixture, k=6, midfall HEAD)
 
-The breakdown below was captured **after** Step 6 (the
-`byte_reverse_32` 31-iter unroll, see OPTIMISATION.md). The previous
-Step-5 baseline (1,475,560 gas before this optimisation) is preserved
-as a comparison column — every section that touched calldata-backed
-evals saw 5-30× reductions because the per-call cost of
-`byte_reverse_32` dropped from ~700 gas to ~140 gas.
+The breakdown below was captured **after** Step 6 + Optimisations B/D/E
+(the `byte_reverse_32` 31-iter unroll plus PCS-block tuning, see
+OPTIMISATION.md). The Step-5 baseline (1,475,560 gas before any of
+this) is preserved as a comparison column — every section that
+touched calldata-backed evals saw 5-30× reductions when Step 6 dropped
+the per-call cost of `byte_reverse_32` from ~700 gas to ~140 gas, and
+the PCS block saw a further 17 kg cut from B/D/E.
 
-### Step 6 (current HEAD)
+### Step 6 + B/D/E (current HEAD)
 
 ```
 === gas-checkpoint breakdown (per-section deltas) ===
   id        gas_left         delta        %  section
-   1      49,916,005             -        -  entry (before VK loading)
-   2      49,913,758         1,497     0.2%  VK loading
-   3      49,910,452         2,556     0.3%  VK digest + committed_pi + instance absorbs
-   4      49,906,512         3,190     0.3%  user-phase advice reads + user challenge squeezes
-   5      49,903,198         2,564     0.3%  theta squeeze + lookup multiplicities
-   6      49,898,039         4,409     0.5%  beta/gamma + permutation Z products
-   7      49,896,713           576     0.1%  lookup helpers + Z accumulators
-   8      49,893,620         2,343     0.3%  trash_challenge + trashcans
-   9      49,889,920         2,950     0.3%  y squeeze + quotient-limb reads
-  10      49,834,109        55,061     6.0%  evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi
-  11      49,824,628         8,731     1.0%  Lagrange + instance evaluation
-  12      49,700,279       123,599    13.5%  quotient evaluation (Fr arithmetic)
-  13      49,627,236        72,293     7.9%  linearization-commitment MSM
-  14      49,096,965       529,521    58.0%  PCS computation block
-  15      49,096,176            39     0.0%  accumulator random-combine
-  16      48,990,996       104,430    11.4%  final ec_pairing
+   1      49,916,161             -        -  entry (before VK loading)
+   2      49,913,914         1,497     0.2%  VK loading
+   3      49,910,608         2,556     0.3%  VK digest + committed_pi + instance absorbs
+   4      49,906,668         3,190     0.4%  user-phase advice reads + user challenge squeezes
+   5      49,903,354         2,564     0.3%  theta squeeze + lookup multiplicities
+   6      49,898,195         4,409     0.5%  beta/gamma + permutation Z products
+   7      49,896,869           576     0.1%  lookup helpers + Z accumulators
+   8      49,893,776         2,343     0.3%  trash_challenge + trashcans
+   9      49,890,076         2,950     0.3%  y squeeze + quotient-limb reads
+  10      49,834,265        55,061     6.1%  evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi
+  11      49,824,784         8,731     1.0%  Lagrange + instance evaluation
+  12      49,700,435       123,599    13.8%  quotient evaluation (Fr arithmetic)
+  13      49,627,389        72,296     8.1%  linearization-commitment MSM
+  14      49,113,052       513,587    57.3%  PCS computation block
+  15      49,112,263            39     0.0%  accumulator random-combine
+  16      49,008,345       103,168    11.5%  final ec_pairing
 
-  cp1 gas_left            = 49,916,005 (verifier entry)
-  cp16..cp1 gas billed    = 925,009 (work between cp1 and cp16)
+  cp1 gas_left            = 49,916,161 (verifier entry)
+  cp16..cp1 gas billed    = 907,816 (work between cp1 and cp16)
   - measurement overhead  = 12,000 (16 checkpoints x 750 gas)
-  = real section work     = 913,009
-  total tx gas_used       = 1,009,800 (incl. tx base + calldata + pre-cp1 + post-cp16)
+  = real section work     = 895,816
+  total tx gas_used       = 992,451 (incl. tx base + calldata + pre-cp1 + post-cp16)
 ```
+
+Per-section deltas vs Step 6 (pre-B/D/E): cp14 PCS block −15,934
+(−15,173 from B + −189 from E + −572 from D); cp16 final pairing
+−1,262 (E in `ec_pairing`). All other sections within ±5 gas of Step
+6 baseline (build-noise / measurement jitter).
 
 ### Step 5 baseline (pre-unroll, for comparison)
 
@@ -101,15 +107,15 @@ precompile work and EVM work:
 
 | section | gas | breakdown |
 |---|---:|---|
-| **PCS computation (cp14)** | **530 kg** | 3 batched G1MSMs (33+5+2 pairs) ~120 kg + 5 single-pair Block 5/6 MSMs ~60 kg + 14 `scalar_inv` modexp ~20 kg + 5 G1ADDs ~2 kg + ~3 keccak squeezes ~10 kg + interpolation arithmetic ~30–50 kg + memory expansion ~5 kg ≈ ~240 kg of "real" work + **~290 kg of EVM helper-dispatch overhead** |
+| **PCS computation (cp14)** | **514 kg** | 3 batched G1MSMs (33+5+2 pairs) ~120 kg + 5 single-pair Block 5/6 MSMs ~60 kg + 3 batched scalar_inv modexp ~4 kg + 5 G1ADDs ~2 kg + ~3 keccak squeezes ~10 kg + interpolation arithmetic ~30–50 kg + memory expansion ~5 kg ≈ ~225 kg of "real" work + **~290 kg of EVM helper-dispatch overhead**. Down 16 kg from Step 6 (B: −15 kg modexp, D: −0.6 kg mload, E: −0.2 kg mcopy). |
 | **Quotient evaluation (cp12)** | **124 kg** | ~587 `mulmod`/`addmod` sites in the gate evaluator. Step 6 dropped this from 361 kg by eliminating ~80 redundant 32-iter `byte_reverse_32` loops. |
-| **Final pairing (cp16)** | 104 kg | EIP-2537 `BLS12_PAIRING_CHECK` for k=2: `32600 + 37700 × 2 = 108,000` minus measurement overhead. **Cryptographic floor; cannot be reduced.** |
-| **Linearization MSM (cp13)** | 72 kg | One 8-pair G1MSM (~33 kg) + Horner scalar prep (~30 mulmod chain) + 8-pair × 5-mstore staging. **Unchanged by Step 6** (its calldata reads are not in the byte-reverse hot path). |
+| **Final pairing (cp16)** | 103 kg | EIP-2537 `BLS12_PAIRING_CHECK` for k=2: `32600 + 37700 × 2 = 108,000` minus measurement overhead. E (mcopy in `ec_pairing`) shaved ~1.3 kg of EVM overhead (point staging for the 0x300-byte input scratch); the precompile cost itself is the cryptographic floor and cannot be reduced. |
+| **Linearization MSM (cp13)** | 72 kg | One 8-pair G1MSM (~33 kg) + Horner scalar prep (~30 mulmod chain) + 8-pair × 5-mstore staging. **Unchanged by Step 6 / B / D / E** (its calldata reads are not in the byte-reverse hot path; its mstore chains are inside an MSM emitter not yet retrofitted to MCOPY). |
 | **Eval + transcript tail (cp10)** | 55 kg | 48 evals × ~10 gas (calldataload + byte_reverse + lt + common_word, post-unroll) + 4 keccak squeezes (challenge buffer ~1.6 KB → ~30 kg/squeeze) + 2 `common_uncompressed_g1` calls + memory growth. Step 6 cut ~115 kg here (was 170 kg). |
 | transcript stage cp2..cp9 | ~16 kg | streaming-keccak absorb cycles, mostly. Step 6 cut these to a third of pre-unroll. |
 | Lagrange + instance eval (cp11) | 9 kg | small batch invert + dot-product over instances |
 | acc random-combine (cp15) | 0 kg | branch not taken (HAS_ACCUMULATOR_MPTR == 0 for poseidon) |
-| **non-tx total** | **925 kg** | of which ~382 kg is precompile gas (41 %), ~543 kg is EVM (59 %) |
+| **non-tx total** | **908 kg** | of which ~378 kg is precompile gas (42 %), ~530 kg is EVM (58 %) |
 
 ## The "catch-all" was `byte_reverse_32`
 
@@ -272,20 +278,21 @@ follow-up after A is shipped.
 
 ## Realistic projection after Step 6
 
-| step | description | projected gas | delta |
+| step | description | gas | delta |
 |---|---|---:|---:|
 | Step 5 (pre-unroll) | with instrumentation overhead | 1,488 kg | — |
 | Step 5 (production) | instrumentation off | 1,476 kg | −12 kg |
-| **Step 6 (HEAD, production)** | **byte_reverse_32 unrolled** | **997 kg** | **−478 kg** |
-| Step 6 (HEAD, instrumented) | with checkpoints overhead | 1,010 kg | — |
-| + B | Montgomery batch scalar inversion | ~980 kg | −15 kg |
+| Step 6 (production) | byte_reverse_32 unrolled | 997 kg | −478 kg |
+| Step 6 (instrumented) | with checkpoints overhead | 1,010 kg | — |
+| Step 6 + B (production) | Montgomery batch scalar inv | 982 kg | −15 kg |
+| Step 6 + B + E (production) | + MCOPY EC point staging | 981 kg | −1.5 kg |
+| **Step 6 + B + D + E (HEAD, production)** | **+ hoist rotation mloads** | **980 kg** | **−0.6 kg** |
+| Step 6 + B+D+E (instrumented) | with checkpoints overhead | 992 kg | — |
 | + C | constant-fold `mulmod(_, 1)` / `addmod(_, 0)` | ~970 kg | −10 kg |
-| + D | hoist `Y_MPTR`/rotation mloads | ~960 kg | −10 kg |
-| + E | MCOPY EC point staging | ~950 kg | −10 kg |
-| + F (opt-in) | `truncated-challenges` (128-bit) | ~815 kg | −135 kg |
-| + G (cross-stack) | fold consecutive keccak squeezes | ~780 kg | −35 kg |
+| + F (opt-in) | `truncated-challenges` (128-bit) | ~840 kg | −130 kg |
+| + G (cross-stack) | fold consecutive keccak squeezes | ~810 kg | −30 kg |
 
-**Achieved non-opt-in: 997 kg (−491 kg, −33 % from baseline).** The
+**Achieved non-opt-in: 980 kg (−508 kg, −34 % from baseline).** The
 remaining 950-kg floor is dominated by:
 
 | component | est gas |
@@ -308,9 +315,9 @@ the floor is dominated by EIP-2537 pricing and the cryptographic work.
 
 - The instrumentation is purely additive: with `--features
   solidity-gas-checkpoints` off, the rendered verifier is byte-for-byte
-  the production output. The default test currently confirms **997,438
-  gas** (post-Step-6); the 12-kg overhead seen with checkpoints on is
-  exactly `16 × 750`.
+  the production output. The default test currently confirms **980,125
+  gas** (post-Step-6 + B + D + E); the 12-kg overhead seen with
+  checkpoints on is exactly `16 × 750`.
 - `SOLC_OPTIMIZE_RUNS=N` overrides `compile_solidity`'s default at run
   time. `DEFAULT_OPTIMIZE_RUNS = 200`. An A/B sweep showed the gas
   number is essentially flat across `runs ∈ {1, 50, 200, 1000,
