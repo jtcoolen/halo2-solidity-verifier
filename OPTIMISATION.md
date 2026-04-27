@@ -171,9 +171,12 @@ scalar-array build + one staticcall).
 | 3 | PCS Block 5 final_com → (n_sets+1)-pair MSM | 1 488 783 | +5 825 | reverted |
 | 4 | PCS Block 6 PAIRING_RHS → 3-pair MSM | (above included) | +0 | reverted |
 | 5 | drop on-the-fly compressed encoding: hash uncompressed 128B verbatim in transcript (patch midnight-proofs `Hashable<Keccak256>::to_input` + EVM `common_uncompressed_g1`) | 1 475 536 | −7 422 | −113 540 |
+| 6 | unroll `byte_reverse_32` (31 of 32 iterations straight-line + 1-trip guard loop). Each of the ~184 call sites drops from ~700 gas (32-iter shift loop body) to ~140 gas (32 byte-extract + or-shl ops). The trailing 1-trip loop is required to keep solc from inlining the entire 32-step body at every call site under `--via-ir`; full inlining triggers a pathology where the verifier consumes the full block gas limit. | 997 438 | −478 098 | −591 638 |
 
-**Net result: 1 589 076 → 1 475 536 gas (−113 540, −7.1%) on the Poseidon
-fixture.**
+**Net result: 1 589 076 → 997 438 gas (−591 638, −37.2%) on the Poseidon
+fixture.** With current per-section breakdown: PCS 530 kg (53%), pairing
+104 kg (10%), quotient eval 124 kg (12%), linearization MSM 72 kg (7%),
+transcript+evals 80 kg (8%), other 87 kg (10%).
 
 Findings:
 
@@ -199,15 +202,32 @@ Findings:
 
 ### Where the remaining gas lives
 
-After Step 5 the bottleneck shifts to:
+After Step 5 the bottleneck shifted to:
 
 - `decompress_g1` calls (still ~13 sites, ~80 kg total per audit)
 - `scalar_inv` Fermat-style ladder (~30 kg per call, multiple sites)
 - The 3 G1MSM-1 + G1ADD chain in Block 5 (final_com fold, ~75 kg)
 - Pairing precompile itself (~120 kg, can't be reduced)
+- ~184 `byte_reverse_32` 32-iteration loops embedded in calldata reads
+  for advice, fixed, instance, and Q_EVAL (Step 6 attacked this).
 
-The next-highest-leverage item is now **#7 (decompress_g1 library +
---optimize-runs=200)**, projected at 30–60 kg.
+The next-highest-leverage item was originally projected to be **#7
+(decompress_g1 library + --optimize-runs=200)** at 30–60 kg, but
+investigation showed:
+
+- `decompress_g1` was already removed in Step 5 (the on-the-fly compressed
+  encoding is gone).
+- A full sweep of `--optimize-runs ∈ {1, 50, 200, 1000, 100000}` showed
+  only ~2 kg sensitivity — `--via-ir` already optimises aggressively
+  regardless of the runs setting.
+
+The actual top item turned out to be **byte_reverse_32 itself** (Step 6),
+which was emitted unconditionally for every Calldata-backed Word reference
+and ran a 32-iteration shift loop at each call site (~700 gas/call ×
+~184 calls = ~129 kg observed plus secondary effects). Unrolling 31 of
+the 32 iterations into straight-line code dropped the per-call cost to
+~140 gas and saved 478 kg — far above the 30–60 kg projection for
+the now-irrelevant Item #7.
 
 ---
 
