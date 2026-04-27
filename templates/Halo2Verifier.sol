@@ -436,23 +436,17 @@ contract Halo2Verifier {
             }
 
             function ec_pairing(success, lhs_mptr, rhs_mptr) -> ret {
+                // Lay out two (G1, G2) pairs at scratch..scratch+0x300:
+                //   [lhs_g1 (0x80) | G2_BASE (0x100) | rhs_g1 (0x80) | NEG_S_G2_BASE (0x100)]
+                // Cancun MCOPY (3 + 3·words gas) replaces what used to
+                // be a 4-step mstore chain for each G1 (~60 gas) and an
+                // 8-iter mstore loop for each G2 (~240 gas). Net saving
+                // here is ~500 gas per ec_pairing call.
                 let scratch := 0x300
-                mstore(scratch,                  mload(lhs_mptr))
-                mstore(add(scratch, 0x20),       mload(add(lhs_mptr, 0x20)))
-                mstore(add(scratch, 0x40),       mload(add(lhs_mptr, 0x40)))
-                mstore(add(scratch, 0x60),       mload(add(lhs_mptr, 0x60)))
-                let g2 := G2_BASE_MPTR
-                for { let i := 0 } lt(i, 8) { i := add(i, 1) } {
-                    mstore(add(scratch, add(0x80, mul(i, 0x20))), mload(add(g2, mul(i, 0x20))))
-                }
-                mstore(add(scratch, 0x180), mload(rhs_mptr))
-                mstore(add(scratch, 0x1a0), mload(add(rhs_mptr, 0x20)))
-                mstore(add(scratch, 0x1c0), mload(add(rhs_mptr, 0x40)))
-                mstore(add(scratch, 0x1e0), mload(add(rhs_mptr, 0x60)))
-                let nsg2 := NEG_S_G2_BASE_MPTR
-                for { let i := 0 } lt(i, 8) { i := add(i, 1) } {
-                    mstore(add(scratch, add(0x200, mul(i, 0x20))), mload(add(nsg2, mul(i, 0x20))))
-                }
+                mcopy(scratch,              lhs_mptr,                 0x80)
+                mcopy(add(scratch, 0x80),   G2_BASE_MPTR,             0x100)
+                mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
+                mcopy(add(scratch, 0x200),  NEG_S_G2_BASE_MPTR,       0x100)
                 ret := and(success, staticcall(gas(), 0x0f, scratch, 0x300, scratch, 0x20))
                 ret := and(ret, mload(scratch))
             }

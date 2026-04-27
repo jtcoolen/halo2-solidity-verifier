@@ -814,13 +814,9 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
         // Seed acc with q_com[0] (x4^0 = 1).
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore({:#x}, mload(add(Q_COM_MPTR, {:#x})))",
-                off * 0x20,
-                off * 0x20
-            ));
-        }
+        // 4-word point copy via Cancun MCOPY: ~15 gas vs ~60 for the
+        // mstore/mload chain. Same for every other 4-word copy below.
+        lines.push("mcopy(0x0, Q_COM_MPTR, 0x80)".to_string());
         // v = q_evals[0] (calldata, midnight-proofs Fr::to_repr() is LE -> byte-reverse)
         lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
         lines.push("let x4_pow := 1".to_string());
@@ -828,13 +824,10 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         for s in 1..n_sets {
             lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
             // Load q_com[s] into operand slot.
-            for off in 0..4 {
-                lines.push(format!(
-                    "mstore({:#x}, mload(add(Q_COM_MPTR, {:#x})))",
-                    0x80 + off * 0x20,
-                    s * 0x80 + off * 0x20
-                ));
-            }
+            lines.push(format!(
+                "mcopy(0x80, add(Q_COM_MPTR, {:#x}), 0x80)",
+                s * 0x80
+            ));
             // Scale operand by x4_pow.
             lines.push("mstore(0x100, x4_pow)".to_string());
             lines.push(
@@ -855,13 +848,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
 
         // Final f_com term: x4^n_sets.
         lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore({:#x}, mload(add(F_COM_MPTR, {:#x})))",
-                0x80 + off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(0x80, F_COM_MPTR, 0x80)".to_string());
         lines.push("mstore(0x100, x4_pow)".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))"
@@ -874,13 +861,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("v := addmod(v, mulmod(mload(F_EVAL_MPTR), x4_pow, r), r)".to_string());
 
         // Persist final_com to FINAL_COM_MPTR.
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore(add(FINAL_COM_MPTR, {:#x}), mload({:#x}))",
-                off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(FINAL_COM_MPTR, 0x0, 0x80)".to_string());
         lines.push("mstore(V_MPTR, v)".to_string());
 
         blocks.push(lines);
@@ -907,22 +888,10 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("// pairing inputs (LHS = pi; RHS = final_com - v*G + x3*pi)".to_string());
 
         // PAIRING_LHS = pi (paired against G2_BASE).
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore(add(PAIRING_LHS_MPTR, {:#x}), mload(add(PI_MPTR, {:#x})))",
-                off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(PAIRING_LHS_MPTR, PI_MPTR, 0x80)".to_string());
 
         // tmp = (-v) * G  =>  load G into 0x00, scale by (r - v).
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore({:#x}, mload(add(G1_BASE_MPTR, {:#x})))",
-                off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(0x0, G1_BASE_MPTR, 0x80)".to_string());
         lines.push("mstore(0x80, sub(r, mload(V_MPTR)))".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0c, 0x00, 0xa0, 0x00, 0x80))"
@@ -930,26 +899,14 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         );
 
         // tmp += final_com.
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore({:#x}, mload(add(FINAL_COM_MPTR, {:#x})))",
-                0x80 + off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(0x80, FINAL_COM_MPTR, 0x80)".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))"
                 .to_string(),
         );
 
         // tmp += x3 * pi.
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore({:#x}, mload(add(PI_MPTR, {:#x})))",
-                0x80 + off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(0x80, PI_MPTR, 0x80)".to_string());
         lines.push("mstore(0x100, mload(X3_MPTR))".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))"
@@ -961,13 +918,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         );
 
         // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
-        for off in 0..4 {
-            lines.push(format!(
-                "mstore(add(PAIRING_RHS_MPTR, {:#x}), mload({:#x}))",
-                off * 0x20,
-                off * 0x20
-            ));
-        }
+        lines.push("mcopy(PAIRING_RHS_MPTR, 0x0, 0x80)".to_string());
 
         blocks.push(lines);
     }
