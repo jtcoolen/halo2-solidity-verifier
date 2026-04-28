@@ -80,7 +80,20 @@ pub(crate) struct ConstraintSystemMeta {
     pub(crate) simple_selector_cols: BTreeSet<usize>,
     pub(crate) num_committed_instances: usize,
     pub(crate) num_rotations: usize,
+    /// Number of Fr scalars in the main eval block of the proof
+    /// (committed-instance + advice + fixed + perm + lookup + trash
+    /// evals). When `fewer-point-sets` is on, the codegen bumps this
+    /// to include the dummy-query evals via `set_num_dummy_evals` so
+    /// that the memory layout (REVERSED_EVALS_MPTR buffer +
+    /// comms_mptr_base) and the transcript-loop count both grow by
+    /// the dummy count.
     pub(crate) num_evals: usize,
+    /// Number of dummy `(commitment, point)` queries the
+    /// `fewer-point-sets` path appends to the raw query list. Each
+    /// dummy is read as one extra Fr at the end of the main eval
+    /// block. Populated lazily by `SolidityGenerator::generate_verifier`
+    /// after running `BatchOpenScheme::num_dummy_queries`.
+    pub(crate) num_dummy_evals: usize,
     /// Number of distinct point sets returned by the codegen-side
     /// `construct_intermediate_sets` simulation. Populated lazily by
     /// `SolidityGenerator::generate_verifier` once it has constructed the
@@ -190,10 +203,13 @@ impl ConstraintSystemMeta {
                 nums[*p as usize] += 1;
                 nums
             });
-            let offsets = nums.iter().take(num_phase - 1).fold(vec![0usize], |mut offsets, n| {
-                offsets.push(offsets.last().unwrap() + n);
-                offsets
-            });
+            let offsets = nums
+                .iter()
+                .take(num_phase - 1)
+                .fold(vec![0usize], |mut offsets, n| {
+                    offsets.push(offsets.last().unwrap() + n);
+                    offsets
+                });
             let index = phase
                 .iter()
                 .scan(offsets, |state, p| {
@@ -215,7 +231,10 @@ impl ConstraintSystemMeta {
                 .iter()
                 .filter(|(col, _)| *col < nb_committed_instances)
                 .map(|q| q.1),
-            (num_permutation_zs > 0).then_some([0, 1]).into_iter().flatten(),
+            (num_permutation_zs > 0)
+                .then_some([0, 1])
+                .into_iter()
+                .flatten(),
             (num_permutation_zs > 1).then_some(rotation_last),
             (num_lookups > 0).then_some([0, 1]).into_iter().flatten(),
             (num_trashcans > 0).then_some(0),
@@ -239,6 +258,7 @@ impl ConstraintSystemMeta {
             simple_selector_cols,
             num_committed_instances: nb_committed_instances,
             num_evals,
+            num_dummy_evals: 0,
             num_rotations,
             num_point_sets: 0,
             num_user_advices,
@@ -274,8 +294,7 @@ impl ConstraintSystemMeta {
             out.push(self.num_permutation_zs);
         }
         // lookup helpers + accumulators
-        let lookup_h_plus_acc: usize =
-            self.lookup_chunks.iter().sum::<usize>() + self.num_lookups;
+        let lookup_h_plus_acc: usize = self.lookup_chunks.iter().sum::<usize>() + self.num_lookups;
         if lookup_h_plus_acc != 0 {
             out.push(lookup_h_plus_acc);
         }
@@ -309,7 +328,7 @@ impl ConstraintSystemMeta {
             // multiplicities).
             *counts.last_mut().unwrap() += 1; // theta
             counts.push(2); // beta, gamma after multiplicities
-            // After permutation_products + lookup_helpers, before trashcans.
+                            // After permutation_products + lookup_helpers, before trashcans.
             if self.num_trashcans != 0 {
                 counts.push(1); // trash_challenge
             }
@@ -343,8 +362,8 @@ impl ConstraintSystemMeta {
         // `verifyProof`. The Yul verifier reconstructs the compressed
         // 48-byte form on the fly inside `common_uncompressed_g1` for
         // transcript hashing only.
-        let g1_count: usize = self.num_advices().iter().sum::<usize>()
-            + self.batch_open_g1_count(scheme);
+        let g1_count: usize =
+            self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count(scheme);
         g1_count * 0x80 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
     }
 
@@ -378,6 +397,24 @@ impl ConstraintSystemMeta {
     /// `construct_intermediate_sets` simulation in `pcs::queries`.
     pub(crate) fn set_num_point_sets(&mut self, n: usize) {
         self.num_point_sets = n;
+    }
+
+    /// Setter used by `SolidityGenerator` after running
+    /// `BatchOpenScheme::num_dummy_queries` over the raw query list.
+    /// Bumps `num_evals` by `n` so that the memory layout of `Data`
+    /// (REVERSED_EVALS_MPTR buffer + downstream `comms_mptr_base`) and
+    /// the transcript-loop iteration count in the rendered template
+    /// both grow to include the dummy slots.
+    pub(crate) fn set_num_dummy_evals(&mut self, n: usize) {
+        self.num_dummy_evals = n;
+        self.num_evals += n;
+    }
+
+    /// Number of "main" eval Words (the slots used by the gate
+    /// evaluator, permutation Z, lookup, etc.); excludes the dummy
+    /// slots appended for fewer-point-sets.
+    pub(crate) fn num_main_evals(&self) -> usize {
+        self.num_evals - self.num_dummy_evals
     }
 }
 
@@ -445,6 +482,15 @@ pub(crate) struct Data {
     /// per-call `byte_reverse_32(calldataload(N))` cost (~145 gas → 3
     /// gas).
     pub(crate) reversed_evals_mptr: Ptr,
+    /// Eval Words for the dummy queries appended by the
+    /// fewer-point-sets path. Empty when the feature is disabled. The
+    /// dummy buffer is laid out immediately after the main reversed-
+    /// evals buffer; `dummy_eval_words[i]` points at
+    /// `REVERSED_EVALS_MPTR + (num_evals + i) * 0x20`. The transcript
+    /// loop reads `num_dummy_evals` extra Fr scalars after the main
+    /// eval block and spills them into this buffer the same way the
+    /// main loop does.
+    pub(crate) dummy_eval_words: Vec<Word>,
 }
 
 impl Data {
@@ -569,7 +615,9 @@ impl Data {
         let trashcan_comm_mem_base = lookup_z_comm_mem_base + lookup_z_words;
         let _ = trashcan_words; // included in template arithmetic
 
-        let fixed_comms = EcPoint::range(fixed_comm_mptr).take(meta.num_fixeds).collect();
+        let fixed_comms = EcPoint::range(fixed_comm_mptr)
+            .take(meta.num_fixeds)
+            .collect();
         // Committed instance commitments: all point at the same memory
         // slot (G1_IDENTITY_MPTR) since the zk_stdlib `verify` path
         // passes `committed_pi = G1::identity()`. The memory at that
@@ -635,12 +683,9 @@ impl Data {
             .map(|(q, w)| (*q, w))
             .collect();
         let mut eval_walk = eval_cptr + meta.num_committed_instances;
-        let advice_evals = izip!(
-            meta.advice_queries.iter().cloned(),
-            Word::range(eval_walk)
-        )
-        .take(meta.advice_queries.len())
-        .collect::<HashMap<_, _>>();
+        let advice_evals = izip!(meta.advice_queries.iter().cloned(), Word::range(eval_walk))
+            .take(meta.advice_queries.len())
+            .collect::<HashMap<_, _>>();
         eval_walk = eval_walk + meta.advice_queries.len();
 
         // fixed-non-simple evals. The proof byte stream contains
@@ -740,7 +785,30 @@ impl Data {
             comms_mptr_base,
             quotient_limb_cptr: Ptr::calldata(quotient_limb_cd),
             reversed_evals_mptr,
+            // Default: no dummy queries (fewer-point-sets disabled).
+            // The caller can populate this via `set_dummy_eval_words`
+            // after running `BatchOpenScheme::num_dummy_queries` to
+            // size the buffer.
+            dummy_eval_words: Vec::new(),
         }
+    }
+
+    /// Allocate `n` dummy eval Words at
+    /// `REVERSED_EVALS_MPTR + (num_main_evals + i) * 0x20` for i in 0..n,
+    /// for the `fewer-point-sets` path.
+    ///
+    /// Wiring: `SolidityGenerator::generate_verifier` builds `Data`
+    /// twice. The first build (with `num_dummy_evals = 0`) lets us
+    /// run `BatchOpenScheme::num_dummy_queries` over the raw query
+    /// list. The second build is against a `ConstraintSystemMeta`
+    /// whose `num_evals` already includes the dummies (see
+    /// [`ConstraintSystemMeta::set_num_dummy_evals`]); this method
+    /// then populates `dummy_eval_words` with Word handles pointing
+    /// at the dummy slots in the same `REVERSED_EVALS_MPTR` buffer.
+    pub(crate) fn set_dummy_eval_words(&mut self, num_main_evals: usize, n: usize) {
+        self.dummy_eval_words = (0..n)
+            .map(|i| Word::from(self.reversed_evals_mptr + num_main_evals + i))
+            .collect();
     }
 }
 
@@ -833,9 +901,7 @@ impl Add<usize> for Value {
     fn add(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int + (rhs as isize) * 0x20),
-            Value::Identifier(name, off) => {
-                Value::Identifier(name, off + (rhs as isize) * 0x20)
-            }
+            Value::Identifier(name, off) => Value::Identifier(name, off + (rhs as isize) * 0x20),
         }
     }
 }
@@ -845,9 +911,7 @@ impl Sub<usize> for Value {
     fn sub(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int - (rhs as isize) * 0x20),
-            Value::Identifier(name, off) => {
-                Value::Identifier(name, off - (rhs as isize) * 0x20)
-            }
+            Value::Identifier(name, off) => Value::Identifier(name, off - (rhs as isize) * 0x20),
         }
     }
 }
@@ -1066,22 +1130,24 @@ pub(crate) fn group_backward_adjacent_words<'a>(
 pub(crate) fn group_backward_adjacent_ec_points<'a>(
     ec_point: impl IntoIterator<Item = &'a EcPoint>,
 ) -> Vec<(Location, Vec<&'a EcPoint>)> {
-    ec_point.into_iter().fold(Vec::new(), |mut ec_point_groups, ec_point| {
-        if let Some(last_group) = ec_point_groups.last_mut() {
-            let last_ec_point = **last_group.1.last().unwrap();
-            if last_group.0 == ec_point.loc()
-                && last_ec_point.ptr().value().is_integer()
-                && last_ec_point.ptr() - 4 == ec_point.ptr()
-            {
-                last_group.1.push(ec_point)
+    ec_point
+        .into_iter()
+        .fold(Vec::new(), |mut ec_point_groups, ec_point| {
+            if let Some(last_group) = ec_point_groups.last_mut() {
+                let last_ec_point = **last_group.1.last().unwrap();
+                if last_group.0 == ec_point.loc()
+                    && last_ec_point.ptr().value().is_integer()
+                    && last_ec_point.ptr() - 4 == ec_point.ptr()
+                {
+                    last_group.1.push(ec_point)
+                } else {
+                    ec_point_groups.push((ec_point.loc(), vec![ec_point]))
+                }
+                ec_point_groups
             } else {
-                ec_point_groups.push((ec_point.loc(), vec![ec_point]))
+                vec![(ec_point.loc(), vec![ec_point])]
             }
-            ec_point_groups
-        } else {
-            vec![(ec_point.loc(), vec![ec_point])]
-        }
-    })
+        })
 }
 
 // ----------------------------------------------------------------------------

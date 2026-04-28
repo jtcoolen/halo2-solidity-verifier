@@ -147,6 +147,16 @@ pub(crate) struct Halo2Verifier {
     /// reference renders as `mload(...)` (3 gas) instead of
     /// `byte_reverse_32(calldataload(...))` (~145 gas).
     pub(crate) reversed_evals_mptr: Ptr,
+    /// Scratch base for simple-selector linearization accumulators.
+    /// These values are needed only between quotient-eval emission and
+    /// the linearization MSM, so the region may be reused by later PCS
+    /// scratch tables.
+    pub(crate) selector_acc_mptr: usize,
+    /// Scratch base for the Lagrange batch-inversion prefix products.
+    /// The public-instance vector can be wide, so the helper must not
+    /// spill its temporary prefix products immediately above X_N_MPTR
+    /// where they would overlap the permanent eval/commitment regions.
+    pub(crate) batch_invert_scratch_mptr: usize,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
     /// Sorted simple-selector fixed-column indices. Each is rendered
@@ -156,6 +166,34 @@ pub(crate) struct Halo2Verifier {
     /// Memory pointer base for the embedded VK fixed commitments. Used
     /// to resolve per-column G1 offsets in the simple-selector MSM.
     pub(crate) fixed_comm_mptr: usize,
+    /// When true, mirrors midnight-proofs/truncated-challenges:
+    ///   - x3 is masked to 128 bits immediately after squeeze
+    ///   - x1 / x4 powers are masked to 128 bits at use, with the
+    ///     internal full-precision accumulator preserved
+    /// Driven by `cfg!(feature = "truncated-challenges")` in
+    /// `SolidityGenerator::generate_verifier`.
+    pub(crate) truncated_challenges: bool,
+    /// When true, mirrors midnight-proofs/fewer-point-sets: the
+    /// transcript reads `num_dummy_evals` extra Fr scalars after the
+    /// main eval block, and the codegen-side query list is augmented
+    /// with the corresponding dummy queries before construct_intermediate_sets.
+    /// Driven by `cfg!(feature = "fewer-point-sets")`.
+    pub(crate) fewer_point_sets: bool,
+    /// Number of dummy evals appended to the proof's eval block when
+    /// `fewer_point_sets` is enabled. Zero otherwise.
+    pub(crate) num_dummy_evals: usize,
+    /// Fixed bases serialized by `AssignedAccumulator<S>::as_public_input`
+    /// for the RHS accumulator MSM, in the exact lexicographic
+    /// `BTreeMap` order used by midnight-circuits. This is the public
+    /// accumulator's fixed-scalar width, not necessarily every fixed
+    /// commitment stored in the VK contract. Each tuple is
+    /// `(point_mptr, negate_scalar)`: `-G` is represented as the
+    /// regular generator with the scalar negated modulo Fr.
+    pub(crate) acc_fixed_bases: Vec<(usize, bool)>,
+    /// Scratch base for staging the accumulator MSM input. Chosen
+    /// after the verifier's permanent memory map so the variable-size
+    /// `(point, scalar)` table cannot clobber VK/challenge state.
+    pub(crate) acc_msm_scratch: usize,
 }
 
 impl Halo2VerifyingKey {

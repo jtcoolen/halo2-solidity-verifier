@@ -135,6 +135,8 @@ contract Halo2Verifier {
     // (in the gate evaluator + PCS q_eval Horner) become 3-gas
     // `mload(...)` instead.
     uint256 internal constant     REVERSED_EVALS_MPTR = {{ reversed_evals_mptr }};
+    uint256 internal constant      SELECTOR_ACC_MPTR = {{ selector_acc_mptr|hex() }};
+    uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ batch_invert_scratch_mptr|hex() }};
 
     // ----------------------------------------------------------------------
     // Per-category bases for decompressed G1 commitments. The proof emits
@@ -162,6 +164,12 @@ contract Halo2Verifier {
     // Fr modulus and Montgomery constant 2^256 mod r used by from_uniform_bytes.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
     uint256 internal constant FR_R_2POW256_MOD  = 0x1824b159acc5056f998c4fefecbc4ff55884b7fa0003480200000001fffffffe;
+
+    // BLS12-381 Fp modulus minus one, split like an EIP-2537 coordinate:
+    // high word = 16 zero bytes || top 16 coordinate bytes, low word =
+    // bottom 32 coordinate bytes.
+    uint256 internal constant BLS_P_HI             = 0x000000000000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd7;
+    uint256 internal constant BLS_P_MINUS_ONE_LO   = 0x64774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa;
 
     // Prefix bytes for the Keccak256 transcript (matches the `Domain
     // separator for transcript` literal in midnight-proofs). The string
@@ -253,18 +261,9 @@ contract Halo2Verifier {
             }
 
             // Inverse of a Fr scalar via modexp(x, r-2, r). Uses memory
-            // [0x6000..0x60e0] as scratch — chosen to live ABOVE every
-            // labeled MPTR in this verifier so callers don't have to
-            // worry about clobbering theta/beta/gamma (originally placed
-            // at 0x2000, which collided with `THETA_MPTR = 0x2040`,
-            // `BETA_MPTR = 0x2060`, `GAMMA_MPTR = 0x2080` and silently
-            // overwrote the squeezed challenges with the modexp input
-            // bytes — a ~960k-gas pairing rejection that took a few
-            // hours to track down). The full memory map ends at the
-            // last QUOTIENT_LIMB_COMMS_MPTR_BASE slot (well below
-            // 0x5000 even for 32-quotient-limb circuits), so 0x6000 is
-            // a safe permanent home; if a future codegen change moves
-            // any MPTR past 0x6000, bump this constant in lock-step.
+            // [0x6000..0x60e0] as temporary scratch; callers invoke this
+            // only after the regions it may overlap have already been
+            // consumed.
             function scalar_inv(x) -> inv {
                 let p := 0x6000
                 mstore(p,            0x20)        // base len
@@ -394,8 +393,8 @@ contract Halo2Verifier {
             // scratch; the streaming transcript buffer at [0x00..buf_len)
             // is no longer needed once all challenges are squeezed.
 
-            function batch_invert(success, mptr_start, mptr_end, r) -> ret {
-                let gp_mptr := mptr_end
+            function batch_invert(success, mptr_start, mptr_end, scratch_mptr, r) -> ret {
+                let gp_mptr := scratch_mptr
                 let gp := mload(mptr_start)
                 let mptr := add(mptr_start, 0x20)
                 for {} lt(mptr, sub(mptr_end, 0x20)) {} {
@@ -460,6 +459,99 @@ contract Halo2Verifier {
                 mcopy(add(scratch, 0x200),  NEG_S_G2_BASE_MPTR,       0x100)
                 ret := and(success, staticcall(gas(), 0x0f, scratch, 0x300, scratch, 0x20))
                 ret := and(ret, mload(scratch))
+            }
+
+            // ---------- IVC accumulator public-input decoding ----------
+            //
+            // `AssignedForeignPoint<BLS12-381>` exposes each base-field coordinate
+            // through `AssignedField::as_public_input`: seven radix-2^56 limbs of
+            // (coord - 1) are packed four-at-a-time into native field elements.
+            // The x coordinate's first packed word carries the identity flag by
+            // adding one raw radix base. Rebuild EIP-2537 padded
+            // (x_hi, x_lo, y_hi, y_lo) words from that encoding.
+            function load_acc_coord_shifted(src, bits, n, base, limbs_per_word, first_adjust) -> hi, lo {
+                let mask := sub(base, 1)
+                for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                    let packed := calldataload(add(src, mul(div(i, limbs_per_word), 0x20)))
+                    if and(iszero(i), first_adjust) {
+                        packed := sub(packed, first_adjust)
+                    }
+                    let limb := and(shr(mul(mod(i, limbs_per_word), bits), packed), mask)
+
+                    let shift := mul(i, bits)
+                    if lt(shift, 256) {
+                        lo := add(lo, shl(shift, limb))
+                        if gt(add(shift, bits), 256) {
+                            hi := add(hi, shr(sub(256, shift), limb))
+                        }
+                    }
+                    if iszero(lt(shift, 256)) {
+                        hi := add(hi, shl(sub(shift, 256), limb))
+                    }
+                }
+            }
+
+            function is_bls_p_minus_one(hi, lo) -> yes {
+                yes := and(eq(hi, BLS_P_HI), eq(lo, BLS_P_MINUS_ONE_LO))
+            }
+
+            function load_acc_coord(src, allow_id, bits, n, base, limbs_per_word) -> ok, hi, lo, is_id {
+                ok := 1
+                if and(allow_id, iszero(lt(calldataload(src), base))) {
+                    let adj_hi, adj_lo := load_acc_coord_shifted(src, bits, n, base, limbs_per_word, base)
+                    is_id := is_bls_p_minus_one(adj_hi, adj_lo)
+                }
+
+                hi, lo := load_acc_coord_shifted(src, bits, n, base, limbs_per_word, mul(is_id, base))
+                ok := and(
+                    ok,
+                    or(lt(hi, BLS_P_HI), and(eq(hi, BLS_P_HI), iszero(gt(lo, BLS_P_MINUS_ONE_LO))))
+                )
+
+                let was_p_minus_one := is_bls_p_minus_one(hi, lo)
+                if was_p_minus_one {
+                    hi := 0
+                    lo := 0
+                }
+                if iszero(was_p_minus_one) {
+                    let next_lo := add(lo, 1)
+                    hi := add(hi, lt(next_lo, lo))
+                    lo := next_lo
+                }
+
+                // EIP-2537 pads each 48-byte Fp coordinate to 64 bytes,
+                // so the high word must fit in its low 128 bits.
+                ok := and(ok, lt(hi, shl(128, 1)))
+            }
+
+            function load_acc_point(dst, src, bits, n, base) -> ok {
+                let limbs_per_word := 4
+                let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
+                let x_ok, x_hi, x_lo, is_id := load_acc_coord(src, 1, bits, n, base, limbs_per_word)
+                let y_ok, y_hi, y_lo, y_id := load_acc_coord(
+                    add(src, mul(coord_words, 0x20)),
+                    0,
+                    bits,
+                    n,
+                    base,
+                    limbs_per_word
+                )
+                pop(y_id)
+                ok := and(x_ok, y_ok)
+
+                if is_id {
+                    ok := and(ok, iszero(or(or(x_hi, x_lo), or(y_hi, y_lo))))
+                    mstore(dst, 0)
+                    mstore(add(dst, 0x20), 0)
+                    mstore(add(dst, 0x40), 0)
+                    mstore(add(dst, 0x60), 0)
+                }
+                if iszero(is_id) {
+                    mstore(dst, x_hi)
+                    mstore(add(dst, 0x20), x_lo)
+                    mstore(add(dst, 0x40), y_hi)
+                    mstore(add(dst, 0x60), y_lo)
+                }
             }
 
             {%- if self.trace %}
@@ -758,6 +850,14 @@ contract Halo2Verifier {
 
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
+            {%- if truncated_challenges %}
+            // truncated-challenges: x3 is the f_com evaluation point and
+            // is used directly (not as a power base); midnight-proofs
+            // truncates it to 128 bits at squeeze time, so we must mirror
+            // that here. The `and` cost (~3 gas) is negligible compared to
+            // the modexp ladders downstream that consume x3.
+            mstore(X3_MPTR, and(mload(X3_MPTR), 0xffffffffffffffffffffffffffffffff))
+            {%- endif %}
 
             // ---- q_evals (one Fq per point set) ----
             mstore(Q_EVAL_CPTR_MPTR, proof_cptr)
@@ -811,7 +911,7 @@ contract Halo2Verifier {
                 }
                 let x_n_minus_1 := addmod(x_n, sub(r, 1), r)
                 mstore(mptr_end, x_n_minus_1)
-                success := batch_invert(success, X_N_MPTR, add(mptr_end, 0x20), r)
+                success := batch_invert(success, X_N_MPTR, add(mptr_end, 0x20), BATCH_INV_SCRATCH_MPTR, r)
 
                 mptr := X_N_MPTR
                 let l_i_common := mulmod(x_n_minus_1, mload(N_INV_MPTR), r)
@@ -962,7 +1062,7 @@ contract Halo2Verifier {
                 // point in one op.
                 {%- for col in simple_selector_cols %}
                 mcopy(p, {{ (fixed_comm_mptr + col * 0x80)|hex() }}, 0x80)
-                mstore(add(p, 0x80), mload({{ (0x5000 + loop.index0 * 0x20)|hex() }}))
+                mstore(add(p, 0x80), mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }})))
                 p := add(p, 0xa0)
                 {%- endfor %}
                 {%- endif %}
@@ -1008,40 +1108,75 @@ contract Halo2Verifier {
             gas_checkpoint(14) // after PCS computation block (= sub-block 6)
             {%- endif %}
 
-            // Random-linear combine accumulator into pairing inputs.
+            // Rebuild the public IVC accumulator from `instances` and
+            // verify its pairing equation separately. Midnight's native
+            // accumulator batching challenge is Poseidon-based; using a
+            // second pairing here is simpler and avoids changing the
+            // verifier's transcript surface.
             if mload(HAS_ACCUMULATOR_MPTR) {
-                let h := keccak256(ACC_LHS_MPTR, 0x200) // 4 G1 points = 4*128 = 0x200
-                let challenge := mod(h, r)
+                let bits := mload(NUM_ACC_LIMB_BITS_MPTR)
+                let n := mload(NUM_ACC_LIMBS_MPTR)
+                // The BLS12-381 self-emulation currently exposes Fp
+                // coordinates as 7 radix-2^56 limbs.
+                success := and(success, eq(bits, 56))
+                success := and(success, eq(n, 7))
 
-                mstore(0x100, mload(ACC_LHS_MPTR))
-                mstore(0x120, mload(add(ACC_LHS_MPTR, 0x20)))
-                mstore(0x140, mload(add(ACC_LHS_MPTR, 0x40)))
-                mstore(0x160, mload(add(ACC_LHS_MPTR, 0x60)))
-                success := ec_mul_acc(success, challenge)
-                mstore(0x180, mload(PAIRING_LHS_MPTR))
-                mstore(0x1a0, mload(add(PAIRING_LHS_MPTR, 0x20)))
-                mstore(0x1c0, mload(add(PAIRING_LHS_MPTR, 0x40)))
-                mstore(0x1e0, mload(add(PAIRING_LHS_MPTR, 0x60)))
-                success := ec_add_acc(success)
-                mstore(PAIRING_LHS_MPTR,            mload(0x100))
-                mstore(add(PAIRING_LHS_MPTR, 0x20), mload(0x120))
-                mstore(add(PAIRING_LHS_MPTR, 0x40), mload(0x140))
-                mstore(add(PAIRING_LHS_MPTR, 0x60), mload(0x160))
+                let limb_base := shl(bits, 1)
+                let limbs_per_word := 4
+                let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
+                let acc_instance_ptr := add(INSTANCE_CPTR, mul(mload(ACC_OFFSET_MPTR), 0x20))
 
-                mstore(0x100, mload(ACC_RHS_MPTR))
-                mstore(0x120, mload(add(ACC_RHS_MPTR, 0x20)))
-                mstore(0x140, mload(add(ACC_RHS_MPTR, 0x40)))
-                mstore(0x160, mload(add(ACC_RHS_MPTR, 0x60)))
-                success := ec_mul_acc(success, challenge)
-                mstore(0x180, mload(PAIRING_RHS_MPTR))
-                mstore(0x1a0, mload(add(PAIRING_RHS_MPTR, 0x20)))
-                mstore(0x1c0, mload(add(PAIRING_RHS_MPTR, 0x40)))
-                mstore(0x1e0, mload(add(PAIRING_RHS_MPTR, 0x60)))
-                success := ec_add_acc(success)
-                mstore(PAIRING_RHS_MPTR,            mload(0x100))
-                mstore(add(PAIRING_RHS_MPTR, 0x20), mload(0x120))
-                mstore(add(PAIRING_RHS_MPTR, 0x40), mload(0x140))
-                mstore(add(PAIRING_RHS_MPTR, 0x60), mload(0x160))
+                // LHS layout: point limbs (x,y), scalar. The collapsed
+                // accumulator has no fixed-base scalars on the LHS.
+                let lhs_scalar_ptr := add(acc_instance_ptr, mul(mul(2, coord_words), 0x20))
+                success := and(
+                    success,
+                    load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
+                )
+                let acc_scratch := {{ acc_msm_scratch|hex() }}
+                mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
+                mstore(add(acc_scratch, 0x80), calldataload(lhs_scalar_ptr))
+                success := and(
+                    success,
+                    staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
+                )
+
+                // RHS layout: point limbs (x,y), scalar, then fixed-base
+                // scalars in BTreeMap key order (`-G`, fixed_i, perm_i
+                // lexicographically by name).
+                let rhs_instance_ptr := add(lhs_scalar_ptr, 0x20)
+                let rhs_scalar_ptr := add(rhs_instance_ptr, mul(mul(2, coord_words), 0x20))
+                success := and(
+                    success,
+                    load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
+                )
+                mcopy(acc_scratch, ACC_RHS_MPTR, 0x80)
+                mstore(add(acc_scratch, 0x80), calldataload(rhs_scalar_ptr))
+                let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
+                let acc_pair_ptr := add(acc_scratch, 0xa0)
+                {%- for (base_mptr, negate_scalar) in acc_fixed_bases %}
+                mcopy(acc_pair_ptr, {{ base_mptr|hex() }}, 0x80)
+                let fixed_scalar_{{ loop.index0 }} := calldataload(fixed_scalar_ptr)
+                {%- if negate_scalar %}
+                fixed_scalar_{{ loop.index0 }} := mod(sub(r, fixed_scalar_{{ loop.index0 }}), r)
+                {%- endif %}
+                mstore(add(acc_pair_ptr, 0x80), fixed_scalar_{{ loop.index0 }})
+                fixed_scalar_ptr := add(fixed_scalar_ptr, 0x20)
+                acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                {%- endfor %}
+                success := and(
+                    success,
+                    staticcall(
+                        gas(),
+                        0x0c,
+                        acc_scratch,
+                        {{ (0xa0 * (1 + acc_fixed_bases.len()))|hex() }},
+                        ACC_RHS_MPTR,
+                        0x80
+                    )
+                )
+
+                success := ec_pairing(success, ACC_RHS_MPTR, ACC_LHS_MPTR)
             }
 
             {%- if self.gas_checkpoints %}

@@ -35,13 +35,12 @@ use midnight_circuits::{
     hash::poseidon::PoseidonChip,
     instructions::{hash::HashCPU, AssignmentInstructions, PublicInputInstructions},
 };
+use midnight_curves::Fq;
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
 };
-use midnight_zk_stdlib::{
-    utils::plonk_api::srs_for_test, Relation, ZkStdLib, ZkStdLibArch,
-};
+use midnight_zk_stdlib::{utils::plonk_api::srs_for_test, Relation, ZkStdLib, ZkStdLibArch};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use sha3::Keccak256;
@@ -50,7 +49,7 @@ use halo2_solidity_verifier::{
     compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, SolidityGenerator,
 };
 
-type F = midnight_curves::Fq;
+type F = Fq;
 
 #[derive(Clone, Default)]
 struct PoseidonExample;
@@ -93,7 +92,11 @@ impl Relation for PoseidonExample {
 }
 
 fn srs_dir() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../midfall/zk_stdlib/examples/assets").to_string()
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../midfall/zk_stdlib/examples/assets"
+    )
+    .to_string()
 }
 
 /// Step 8 end-to-end smoke. Marked `#[ignore]` because it depends on
@@ -153,11 +156,10 @@ fn poseidon_renders_compiles_and_verifies() {
     // same VK. ZkStdLib creates two instance columns (one committed,
     // one non-committed); set num_committed_instances accordingly.
     let num_instances = 1;
-    let generator = SolidityGenerator::new(&srs, vk.vk(), Gwc19, num_instances)
-        .set_num_committed_instances(1);
+    let generator =
+        SolidityGenerator::new(&srs, vk.vk(), Gwc19, num_instances).set_num_committed_instances(1);
     let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
-    let gas_checkpoints_enabled =
-        halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
+    let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
     let (verifier_solidity, vk_solidity) = generator
         .render_separately()
         .expect("render_separately should succeed");
@@ -202,175 +204,12 @@ fn poseidon_renders_compiles_and_verifies() {
     let vk_address = evm.create(vk_creation_code);
     let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
 
-    // The midnight-proofs prover writes G1 commitments in the
-    // 48-byte zcash-compressed encoding. The Solidity verifier
-    // expects them in 128-byte uncompressed EIP-2537 padded form
-    // (4 words: x_hi, x_lo, y_hi, y_lo). Re-pack the proof off
-    // chain so the on-chain side never has to run the modexp-based
-    // sqrt; the verifier reconstructs the compressed encoding on
-    // the fly inside `common_uncompressed_g1` for transcript
-    // hashing only.
-    let repacked = {
-        let cs = vk.vk().cs();
-        let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
-        // Group counts in transcript order:
-        let mut g1_groups: Vec<usize> = Vec::new();
-        // user phases: each phase contributes its advice columns. We
-        // simplify and emit a single block per phase (the `verify` loop
-        // reads all of them sequentially anyway).
-        let advice_phase = cs.advice_column_phase();
-        let max_phase = *advice_phase.iter().max().unwrap_or(&0);
-        for phase in 0..=max_phase {
-            let n = advice_phase.iter().filter(|p| **p == phase).count();
-            if n != 0 {
-                g1_groups.push(n);
-            }
-        }
-        // multiplicities (one per lookup)
-        if cs.lookups().len() != 0 {
-            g1_groups.push(cs.lookups().len());
-        }
-        // perm Z products
-        if perm_chunks != 0 {
-            g1_groups.push(perm_chunks);
-        }
-        // per-lookup helpers + acc; nb_chunks per lookup
-        for l in cs.lookups().iter() {
-            let nb_chunks = l.chunk_by_degree(cs.degree()).num_chunks();
-            g1_groups.push(nb_chunks); // helpers
-            g1_groups.push(1); // acc
-        }
-        // trashcans
-        if cs.trashcans().len() != 0 {
-            g1_groups.push(cs.trashcans().len());
-        }
-        // quotient limbs
-        let num_quotients = cs.degree() - 1;
-        g1_groups.push(num_quotients);
-
-        // num_evals = committed_instance + advice + fixed_non_simple +
-        //             permutation_columns + perm_set_evals +
-        //             per_lookup(1 + chunks + 1 + 1) + trashcans
-        // ZkStdLib's prover always passes NB_COMMITTED_INSTANCES = 1.
-        // The committed-instance commitment is NOT in the proof bytes
-        // (it's `committed_pi = G1::identity()` passed as a separate
-        // verifier argument), but each instance_query whose
-        // column_idx < NB_COMMITTED_INSTANCES contributes ONE eval
-        // slot to the proof byte stream (read from transcript at
-        // x in `verify_algebraic_constraints`).
-        let nb_committed_instances = 1usize;
-        let num_committed_instance_evals = cs
-            .instance_queries()
-            .iter()
-            .filter(|(col, _)| col.index() < nb_committed_instances)
-            .count();
-        let num_fixed_non_simple = cs.num_fixed_columns() - cs.num_simple_selectors();
-        let perm_set_count = if perm_chunks == 0 { 0 } else { 3 * perm_chunks - 1 };
-        let lookup_eval_count: usize = cs
-            .lookups()
-            .iter()
-            .map(|l| 1 + l.chunk_by_degree(cs.degree()).num_chunks() + 1 + 1)
-            .sum();
-        let num_evals = num_committed_instance_evals
-            + cs.advice_queries().len()
-            + num_fixed_non_simple
-            + cs.permutation().columns.len()
-            + perm_set_count
-            + lookup_eval_count
-            + cs.trashcans().len();
-
-        // Multi-prepare tail: f_com (1 G1) + q_evals (one per point set
-        // - derived from the codegen-side intermediate-set construction).
-        // For Gwc19 the number of point sets equals the number of
-        // distinct (commitment-set, point-set) groupings; we recover it
-        // by counting distinct rotations across all queries (advice +
-        // fixed-non-simple + perm + lookup + trash + quotient + f_com
-        // queries). The queries this codegen emits use the rotation set
-        // that the prover/verifier emit q_evals for, which is computed
-        // by the codegen-side `intermediate_sets`. To avoid duplicating
-        // the codegen logic here, we read the proof tail by *length*:
-        // the proof's last 32 + 0x80 bytes (q_eval x 1 + pi x 1) follows
-        // an unknown number of q_evals + f_com. We compute it as
-        // (proof_len - prefix_len - num_evals * 32 - 1 G1 - 1 G1) / 32.
-        let prefix_g1_count: usize = g1_groups.iter().sum();
-        let prefix_compressed_len = prefix_g1_count * 48 + num_evals * 32;
-        let trailing_compressed_len = 48 + 48; // f_com + pi
-        let q_evals_len = proof
-            .len()
-            .checked_sub(prefix_compressed_len + trailing_compressed_len)
-            .expect("proof too short for declared groups");
-        assert_eq!(
-            q_evals_len % 32,
-            0,
-            "q_evals tail must be a multiple of 32 bytes"
-        );
-        let num_point_sets = q_evals_len / 32;
-        eprintln!(
-            "[repack] g1_groups = {:?}, prefix_g1 = {}, num_evals = {}, num_point_sets = {}, proof_len = {}",
-            g1_groups, prefix_g1_count, num_evals, num_point_sets, proof.len()
-        );
-
-        // Now walk and repack.
-        let mut out: Vec<u8> = Vec::with_capacity(
-            prefix_g1_count * 128 + num_evals * 32 + 128 + num_point_sets * 32 + 128,
-        );
-        let mut cursor = 0usize;
-        use group::prime::PrimeCurveAffine;
-        use group::GroupEncoding;
-        let push_g1 = |cursor: &mut usize, out: &mut Vec<u8>| {
-            let mut comp = <midnight_curves::G1Affine as GroupEncoding>::Repr::default();
-            comp.as_mut()
-                .copy_from_slice(&proof[*cursor..*cursor + 48]);
-            let cur = *cursor;
-            *cursor += 48;
-            let pt: midnight_curves::G1Affine =
-                Option::from(<midnight_curves::G1Affine as GroupEncoding>::from_bytes(&comp))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "decompress failed at proof[{cur}..{}]: bytes = 0x{}",
-                            cur + 48,
-                            hex::encode(comp.as_ref())
-                        )
-                    });
-            // For identity, write all zeros (EIP-2537 identity).
-            if bool::from(pt.is_identity()) {
-                out.extend_from_slice(&[0u8; 128]);
-                return;
-            }
-            let x_be = pt.x().to_bytes_be();
-            let y_be = pt.y().to_bytes_be();
-            // Encode EIP-2537 padded (4x32 BE words):
-            //   word0 = 16 zero || x[0..16]
-            //   word1 = x[16..48]  (32 bytes)
-            //   word2 = 16 zero || y[0..16]
-            //   word3 = y[16..48]
-            out.extend_from_slice(&[0u8; 16]);
-            out.extend_from_slice(&x_be[0..16]);
-            out.extend_from_slice(&x_be[16..48]);
-            out.extend_from_slice(&[0u8; 16]);
-            out.extend_from_slice(&y_be[0..16]);
-            out.extend_from_slice(&y_be[16..48]);
-        };
-        for &n in &g1_groups {
-            for _ in 0..n {
-                push_g1(&mut cursor, &mut out);
-            }
-        }
-        // evals (Fr 32-byte LE) - pass through.
-        out.extend_from_slice(&proof[cursor..cursor + num_evals * 32]);
-        cursor += num_evals * 32;
-        // f_com
-        push_g1(&mut cursor, &mut out);
-        // q_evals
-        out.extend_from_slice(&proof[cursor..cursor + num_point_sets * 32]);
-        cursor += num_point_sets * 32;
-        // pi
-        push_g1(&mut cursor, &mut out);
-        assert_eq!(cursor, proof.len(), "proof not fully consumed");
-        out
-    };
+    // Re-pack the prover's 48-byte compressed G1 commitments into the
+    // 128-byte EIP-2537 form expected by the generated Solidity.
+    let repacked = generator.repack_compressed_proof(&proof);
 
     let calldata = encode_calldata_bls_padded(&generator, &repacked, &[instance]);
+    std::fs::write(format!("{dump_dir}/calldata.bin"), &calldata).ok();
     eprintln!(
         "[poseidon_fixture] calldata = {} bytes (compressed_proof={}, repacked={}, instances={})",
         calldata.len(),
@@ -380,7 +219,7 @@ fn poseidon_renders_compiles_and_verifies() {
     );
 
     use halo2_solidity_verifier::CallOutcome;
-    match evm.try_call(verifier_address, calldata) {
+    match evm.try_call_with_gas(verifier_address, calldata, 5_000_000_000) {
         CallOutcome::Success {
             logs,
             gas_used,
@@ -394,7 +233,8 @@ fn poseidon_renders_compiles_and_verifies() {
             }
             let expected: Vec<u8> = [vec![0u8; 31], vec![1]].concat();
             assert_eq!(
-                output, expected,
+                output,
+                expected,
                 "verifier should accept the proof; gas_used = {gas_used}, output = 0x{}",
                 hex::encode(&output)
             );
@@ -490,10 +330,7 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
 /// the Poseidon fixture with 3 point sets that's 8 emitter blocks
 /// and 7 mid-PCS checkpoints (cp17..=cp23) so this dumper allocates
 /// space up to id=31 to leave headroom for larger circuits.
-fn dump_gas_checkpoints(
-    logs: &[halo2_solidity_verifier::revm::primitives::Log],
-    gas_used: u64,
-) {
+fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log], gas_used: u64) {
     fn name_of(id: u8) -> &'static str {
         match id {
             1 => "entry (before VK loading)",
