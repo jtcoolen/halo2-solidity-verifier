@@ -244,6 +244,19 @@ pub(crate) mod test {
         /// Useful for fuzzing or trace-driven debugging where we want to
         /// observe failures rather than abort the run.
         pub fn try_call(&mut self, address: Address, calldata: Vec<u8>) -> CallOutcome {
+            self.try_call_with_gas(address, calldata, 50_000_000)
+        }
+
+        /// Like [`try_call`] but with a caller-controlled gas ceiling.
+        /// Necessary for very wide circuits (e.g. the IVC verifier at
+        /// k = 19 with ~20+ advice columns) whose verifier doesn't fit
+        /// within the default 50M cap during dev.
+        pub fn try_call_with_gas(
+            &mut self,
+            address: Address,
+            calldata: Vec<u8>,
+            gas_limit: u64,
+        ) -> CallOutcome {
             let db = std::mem::take(&mut self.db);
             let mut evm = RevmEvm::builder()
                 .with_db(db)
@@ -252,10 +265,7 @@ pub(crate) mod test {
                     cfg.limit_contract_code_size = Some(usize::MAX);
                 })
                 .modify_tx_env(|tx| {
-                    // Capped at 50M gas so an infinite loop in the
-                    // emitted Yul terminates promptly during dev
-                    // rather than spinning revm indefinitely.
-                    tx.gas_limit = 50_000_000;
+                    tx.gas_limit = gas_limit;
                     tx.transact_to = TxKind::Call(address);
                     tx.data = calldata.into();
                 })

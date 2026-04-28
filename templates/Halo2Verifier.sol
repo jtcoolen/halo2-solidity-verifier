@@ -758,6 +758,14 @@ contract Halo2Verifier {
 
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
+            {%- if truncated_challenges %}
+            // truncated-challenges: x3 is the f_com evaluation point and
+            // is used directly (not as a power base); midnight-proofs
+            // truncates it to 128 bits at squeeze time, so we must mirror
+            // that here. The `and` cost (~3 gas) is negligible compared to
+            // the modexp ladders downstream that consume x3.
+            mstore(X3_MPTR, and(mload(X3_MPTR), 0xffffffffffffffffffffffffffffffff))
+            {%- endif %}
 
             // ---- q_evals (one Fq per point set) ----
             mstore(Q_EVAL_CPTR_MPTR, proof_cptr)

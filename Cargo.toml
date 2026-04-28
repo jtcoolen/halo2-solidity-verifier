@@ -45,6 +45,16 @@ rand_chacha = "0.3.1"
 # we need to deserialize the VK and rebuild the SolidityGenerator.
 midnight-circuits = { path = "../midfall/circuits", features = ["testing"] }
 midnight-zk-stdlib = { path = "../midfall/zk_stdlib", features = ["testing"] }
+# IVC final-step Keccak proof end-to-end test (tests/ivc_keccak_solidity.rs).
+# All three features are required so the off-chain prove_final_step output
+# matches what the rendered Solidity verifier expects on-chain (Keccak
+# transcript + truncated challenges + dummy queries from fewer-point-sets).
+midnight-aggregation = { path = "../midfall/aggregation", features = [
+    "keccak-transcript",
+    "truncated-challenges",
+    "fewer-point-sets",
+] }
+sha2 = "0.10"
 # halo2_maingate is upstream maingate from halo2wrong, pinned to v0.3-shaped
 # halo2_proofs. It does not compile against halo2 v0.4 (which we now use), so
 # the maingate-backed render tests in src/test.rs are commented out for the
@@ -84,6 +94,25 @@ solidity-trace = []
 # per-section gas deltas. Adds ~12 kg measurement overhead (16 LOG1
 # events * ~750 gas each); off in production builds.
 solidity-gas-checkpoints = []
+# Mirrors midnight-proofs/truncated-challenges. When enabled, the
+# rendered verifier:
+#   1. Truncates `x3` (the f_com evaluation point) to its lower 128
+#      bits immediately after squeezing.
+#   2. Truncates each `x1` power (used as MSM scalars for q_com) and
+#      each `x4` power (used for the final commitment fold) to 128
+#      bits at the point of use; the internal full-precision
+#      accumulator is preserved so power i+1 keeps full entropy.
+# Required for proofs from a midnight-proofs prover compiled with
+# matching feature settings; using the wrong setting on either side
+# silently produces invalid pairings.
+truncated-challenges = ["midnight-proofs/truncated-challenges"]
+# Mirrors midnight-proofs/fewer-point-sets. When enabled, the rendered
+# verifier appends dummy `(commitment, point)` queries to merge
+# distinct multi-open point sets, lowering the verifier MSM length at
+# the cost of `num_dummy_queries` extra Fr scalars in the proof.
+# Required for proofs from a midnight-proofs prover compiled with
+# matching feature settings.
+fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
 
 [[example]]
 name = "separately"

@@ -80,7 +80,20 @@ pub(crate) struct ConstraintSystemMeta {
     pub(crate) simple_selector_cols: BTreeSet<usize>,
     pub(crate) num_committed_instances: usize,
     pub(crate) num_rotations: usize,
+    /// Number of Fr scalars in the main eval block of the proof
+    /// (committed-instance + advice + fixed + perm + lookup + trash
+    /// evals). When `fewer-point-sets` is on, the codegen bumps this
+    /// to include the dummy-query evals via `set_num_dummy_evals` so
+    /// that the memory layout (REVERSED_EVALS_MPTR buffer +
+    /// comms_mptr_base) and the transcript-loop count both grow by
+    /// the dummy count.
     pub(crate) num_evals: usize,
+    /// Number of dummy `(commitment, point)` queries the
+    /// `fewer-point-sets` path appends to the raw query list. Each
+    /// dummy is read as one extra Fr at the end of the main eval
+    /// block. Populated lazily by `SolidityGenerator::generate_verifier`
+    /// after running `BatchOpenScheme::num_dummy_queries`.
+    pub(crate) num_dummy_evals: usize,
     /// Number of distinct point sets returned by the codegen-side
     /// `construct_intermediate_sets` simulation. Populated lazily by
     /// `SolidityGenerator::generate_verifier` once it has constructed the
@@ -239,6 +252,7 @@ impl ConstraintSystemMeta {
             simple_selector_cols,
             num_committed_instances: nb_committed_instances,
             num_evals,
+            num_dummy_evals: 0,
             num_rotations,
             num_point_sets: 0,
             num_user_advices,
@@ -379,6 +393,24 @@ impl ConstraintSystemMeta {
     pub(crate) fn set_num_point_sets(&mut self, n: usize) {
         self.num_point_sets = n;
     }
+
+    /// Setter used by `SolidityGenerator` after running
+    /// `BatchOpenScheme::num_dummy_queries` over the raw query list.
+    /// Bumps `num_evals` by `n` so that the memory layout of `Data`
+    /// (REVERSED_EVALS_MPTR buffer + downstream `comms_mptr_base`) and
+    /// the transcript-loop iteration count in the rendered template
+    /// both grow to include the dummy slots.
+    pub(crate) fn set_num_dummy_evals(&mut self, n: usize) {
+        self.num_dummy_evals = n;
+        self.num_evals += n;
+    }
+
+    /// Number of "main" eval Words (the slots used by the gate
+    /// evaluator, permutation Z, lookup, etc.); excludes the dummy
+    /// slots appended for fewer-point-sets.
+    pub(crate) fn num_main_evals(&self) -> usize {
+        self.num_evals - self.num_dummy_evals
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -445,6 +477,15 @@ pub(crate) struct Data {
     /// per-call `byte_reverse_32(calldataload(N))` cost (~145 gas → 3
     /// gas).
     pub(crate) reversed_evals_mptr: Ptr,
+    /// Eval Words for the dummy queries appended by the
+    /// fewer-point-sets path. Empty when the feature is disabled. The
+    /// dummy buffer is laid out immediately after the main reversed-
+    /// evals buffer; `dummy_eval_words[i]` points at
+    /// `REVERSED_EVALS_MPTR + (num_evals + i) * 0x20`. The transcript
+    /// loop reads `num_dummy_evals` extra Fr scalars after the main
+    /// eval block and spills them into this buffer the same way the
+    /// main loop does.
+    pub(crate) dummy_eval_words: Vec<Word>,
 }
 
 impl Data {
@@ -740,7 +781,30 @@ impl Data {
             comms_mptr_base,
             quotient_limb_cptr: Ptr::calldata(quotient_limb_cd),
             reversed_evals_mptr,
+            // Default: no dummy queries (fewer-point-sets disabled).
+            // The caller can populate this via `set_dummy_eval_words`
+            // after running `BatchOpenScheme::num_dummy_queries` to
+            // size the buffer.
+            dummy_eval_words: Vec::new(),
         }
+    }
+
+    /// Allocate `n` dummy eval Words at
+    /// `REVERSED_EVALS_MPTR + (num_main_evals + i) * 0x20` for i in 0..n,
+    /// for the `fewer-point-sets` path.
+    ///
+    /// Wiring: `SolidityGenerator::generate_verifier` builds `Data`
+    /// twice. The first build (with `num_dummy_evals = 0`) lets us
+    /// run `BatchOpenScheme::num_dummy_queries` over the raw query
+    /// list. The second build is against a `ConstraintSystemMeta`
+    /// whose `num_evals` already includes the dummies (see
+    /// [`ConstraintSystemMeta::set_num_dummy_evals`]); this method
+    /// then populates `dummy_eval_words` with Word handles pointing
+    /// at the dummy slots in the same `REVERSED_EVALS_MPTR` buffer.
+    pub(crate) fn set_dummy_eval_words(&mut self, num_main_evals: usize, n: usize) {
+        self.dummy_eval_words = (0..n)
+            .map(|i| Word::from(self.reversed_evals_mptr + num_main_evals + i))
+            .collect();
     }
 }
 

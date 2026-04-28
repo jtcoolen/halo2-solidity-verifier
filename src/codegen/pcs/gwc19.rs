@@ -164,6 +164,105 @@ pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
 }
 
 // ---------------------------------------------------------------------------
+// Dummy-query computation (codegen-time port of
+// `midfall/proofs/src/poly/kzg/utils.rs::compute_dummy_queries`, gated
+// behind the `fewer-point-sets` feature on the Rust side).
+// ---------------------------------------------------------------------------
+
+/// A dummy query: append `(query_index, point)` to the raw query list,
+/// reusing `raw_queries[query_index].comm` as the commitment and
+/// allocating a new eval Word for the dummy proof scalar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DummyQuery {
+    /// Index into the *raw* query list (the output of `queries`)
+    /// whose commitment this dummy reuses.
+    pub query_index: usize,
+    /// Rotation point at which the dummy query opens.
+    pub rotation: i32,
+}
+
+/// Run the dummy-query computation over the raw query list.
+///
+/// Mirrors `compute_dummy_queries` 1:1: groups queries by commitment
+/// (using the [`EcPoint`] identity, which is the underlying memory
+/// pointer), unions all non-singleton point sets, and emits the
+/// missing `(first_index, point)` pairs that, once added, make every
+/// non-singleton point set identical.
+///
+/// The output order is deterministic (insertion order of groups *
+/// insertion order of points), matching the prover's transcript layout.
+pub(crate) fn compute_dummy_queries(queries: &[Query]) -> Vec<DummyQuery> {
+    // Group by commitment, tracking each group's first occurrence
+    // index in `queries` and the rotations already covered.
+    let mut groups: Vec<(usize, Vec<i32>)> = Vec::new();
+    for (i, q) in queries.iter().enumerate() {
+        match groups.iter_mut().find(|(idx, _)| queries[*idx].comm == q.comm) {
+            Some((_, points)) if !points.contains(&q.rotation) => {
+                points.push(q.rotation);
+            }
+            Some(_) => {
+                panic!(
+                    "duplicate (commitment, rotation) query at index {i}: \
+                     compute_dummy_queries cannot run on a non-deduplicated \
+                     query list"
+                );
+            }
+            None => groups.push((i, vec![q.rotation])),
+        }
+    }
+
+    // Union of all non-singleton point sets, in insertion order.
+    let mut union: Vec<i32> = Vec::new();
+    for (_, points) in &groups {
+        if points.len() <= 1 {
+            continue;
+        }
+        for &p in points {
+            if !union.contains(&p) {
+                union.push(p);
+            }
+        }
+    }
+
+    // Emit missing (first_index, point) pairs in deterministic order.
+    let mut out: Vec<DummyQuery> = Vec::new();
+    for (idx, existing) in &groups {
+        for &p in &union {
+            if !existing.contains(&p) {
+                out.push(DummyQuery {
+                    query_index: *idx,
+                    rotation: p,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Augment `raw_queries` with dummy queries; the i-th dummy uses
+/// `dummy_eval_words[i]` as its eval Word. Caller must ensure
+/// `dummy_eval_words.len() == compute_dummy_queries(raw_queries).len()`.
+pub(crate) fn augment_queries_with_dummies(
+    raw_queries: &[Query],
+    dummy_eval_words: &[Word],
+) -> Vec<Query> {
+    let dummies = compute_dummy_queries(raw_queries);
+    assert_eq!(
+        dummies.len(),
+        dummy_eval_words.len(),
+        "augment_queries_with_dummies: expected {} dummy eval Words, got {}",
+        dummies.len(),
+        dummy_eval_words.len()
+    );
+    let mut out = raw_queries.to_vec();
+    for (d, eval) in dummies.iter().zip(dummy_eval_words.iter()) {
+        let comm = raw_queries[d.query_index].comm;
+        out.push(Query::new(comm, d.rotation, *eval));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // IntermediateSets simulation (codegen-time port of
 // `midfall/proofs/src/poly/kzg/utils.rs::construct_intermediate_sets`).
 // ---------------------------------------------------------------------------
@@ -295,11 +394,28 @@ fn sort_sets(input: IntermediateSets) -> IntermediateSets {
 }
 
 pub(crate) fn intermediate_sets(meta: &ConstraintSystemMeta, data: &Data) -> IntermediateSets {
-    sort_sets(construct_intermediate_sets_impl(&queries(meta, data)))
+    let raw = queries(meta, data);
+    let queries = if data.dummy_eval_words.is_empty() {
+        raw
+    } else {
+        // fewer-point-sets path: append dummy queries built against the
+        // pre-allocated dummy eval Words (Data::set_dummy_evals).
+        augment_queries_with_dummies(&raw, &data.dummy_eval_words)
+    };
+    sort_sets(construct_intermediate_sets_impl(&queries))
 }
 
 pub(super) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize {
     intermediate_sets(meta, data).point_sets.len()
+}
+
+/// Returns the number of dummy queries (and thus the number of extra
+/// Fr scalars in the proof's eval block) emitted by the
+/// fewer-point-sets path for this circuit's query topology. Call this
+/// over the *raw* (unaugmented) queries to size the dummy buffer
+/// before constructing the augmented `Data`.
+pub(super) fn num_dummy_queries(meta: &ConstraintSystemMeta, data: &Data) -> usize {
+    compute_dummy_queries(&queries(meta, data)).len()
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +434,15 @@ pub(super) fn static_working_memory_size(_meta: &ConstraintSystemMeta, _data: &D
 /// Emit the multi-prepare Yul body. The output is the same vec-of-vec-of-strings
 /// shape the rest of the codegen uses; each inner Vec<String> is a discrete
 /// Yul code block (rendered between `{` and `}` in the template).
-pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<String>> {
+pub(super) fn computations(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    truncated_challenges: bool,
+) -> Vec<Vec<String>> {
+    /// 128-bit mask for `truncate(scalar)` in midnight-proofs:
+    /// `truncate` keeps the lower `ceil(NUM_BITS/8)/2 = 16` bytes
+    /// of the LE Fr representation, which is the lower 128 bits.
+    const TRUNC_MASK_128: &str = "0xffffffffffffffffffffffffffffffff";
     let sets = intermediate_sets(meta, data);
     let n_sets = sets.point_sets.len();
     if n_sets == 0 {
@@ -435,6 +559,14 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             //   mulmod + mstore           ≈ 11 gas (body)
             //   ----
             //   ~20 gas/iter, × 32 = ~640 gas + 50 setup = ~700 gas
+            //
+            // truncated-challenges: midnight-proofs computes
+            //   power[i] = truncate(x1^i)
+            // where the internal x1^i accumulator stays at full
+            // precision (powers(x1).map(truncate) in Rust). We mirror
+            // that here by storing `and(acc, mask)` while keeping
+            // `acc` itself in full precision. The +3 gas/iter cost is
+            // negligible vs the ~640 gas of the loop body.
             let last = nb_x1_powers - 1;
             lines.push("let acc := 1".to_string());
             lines.push("let p := X1_POWERS_MPTR".to_string());
@@ -443,7 +575,11 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             ));
             lines.push("    p := add(p, 0x20)".to_string());
             lines.push("    acc := mulmod(acc, x1, r)".to_string());
-            lines.push("    mstore(p, acc)".to_string());
+            if truncated_challenges {
+                lines.push(format!("    mstore(p, and(acc, {TRUNC_MASK_128}))"));
+            } else {
+                lines.push("    mstore(p, acc)".to_string());
+            }
             lines.push("}".to_string());
         }
         blocks.push(lines);
@@ -472,15 +608,78 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             by_set[c.set_index].push(c);
         }
 
+        // ------------------------------------------------------------------
+        // Memory layout for Block 3 (Phase 2 / Opt I+J — rolled q_eval/q_com).
+        //
+        // For "wide" sets (m >= ROLL_THRESHOLD), the previously-unrolled
+        // `m * n_rot` straight-line addmod block + `m` mcopy/mstore staging
+        // pair block is collapsed into a single Yul `for` loop. The loop
+        // body indexes two pre-staged scratch tables that hold the source
+        // addresses (point base + per-rotation eval addr) of each commit.
+        //
+        // Per-set scratch layout:
+        //   POINT_SRC_TABLE_MPTR     m * 0x20 bytes  (one address per commit)
+        //   EVAL_SRC_TABLE_MPTR      m * n_rot * 0x20 bytes (eval addrs)
+        //   MSM_SCRATCH              m * 0xa0 bytes  (point+scalar pairs)
+        //
+        // The tables are placed ABOVE the previous MSM_SCRATCH=0x6100, sized
+        // for the worst-case m across all sets so that the same constants
+        // can be reused per-set without collision. The +~3 KB memory
+        // expansion costs ~3 kg, dwarfed by the >100 kg saving on wide
+        // sets (cf. OPTIMISATION.md cp19/H2 −48 kg from rolling the
+        // 32-step x1-powers loop alone).
+        //
+        // Sets with m < ROLL_THRESHOLD keep the unrolled emission (faster
+        // for tiny m where loop overhead dominates).
+        // ------------------------------------------------------------------
+        const ROLL_THRESHOLD: usize = 4;
+        let max_m = by_set.iter().map(|c| c.len()).max().unwrap_or(0);
+        let max_n_rot = by_set
+            .iter()
+            .filter(|c| !c.is_empty())
+            .map(|c| c[0].evals.len())
+            .max()
+            .unwrap_or(0);
+        // Phase-2.1 staging tables must live ABOVE every commitment slot
+        // — `comms_mptr_base` starts the advice-comm region, then
+        // lookup_m, perm_z, lookup_helpers, lookup_z, trashcan,
+        // quotient-limb (all 4-word EIP-2537 padded points). The codegen
+        // uses the same arithmetic as the template's
+        // `QUOTIENT_LIMB_COMMS_MPTR_BASE` constant, plus 4 words for each
+        // quotient limb. Hardcoded `0x6100` (the previous Poseidon-only
+        // MSM_SCRATCH) silently overlapped ADVICE_COMMS_MPTR_BASE for the
+        // IVC fixture (110 instances, ~250 advice columns) and fed the
+        // staticcall garbage point coords, costing ~5B gas on the
+        // BLS12_G1MSM precompile path.
+        let comms_top_words = data.comms_mptr_base.value().as_usize() / 0x20
+            + 4 * (
+                meta.num_user_advices.iter().sum::<usize>()
+                    + meta.num_lookups
+                    + meta.num_permutation_zs
+                    + meta.lookup_chunks.iter().sum::<usize>()
+                    + meta.num_lookups
+                    + meta.num_trashcans
+                    + meta.num_quotients
+            );
+        // Round up to 0x20 alignment (it already is since words are 32-byte aligned).
+        let needs_rolled_path = max_m >= ROLL_THRESHOLD;
+        let point_src_table_mptr: usize = comms_top_words * 0x20;
+        let eval_src_table_mptr: usize = if needs_rolled_path {
+            point_src_table_mptr + max_m * 0x20
+        } else {
+            point_src_table_mptr
+        };
+        let msm_scratch: usize = if needs_rolled_path {
+            eval_src_table_mptr + max_m * max_n_rot * 0x20
+        } else {
+            point_src_table_mptr
+        };
+
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let mut lines: Vec<String> = Vec::new();
             let q_com_base = format!("add(Q_COM_MPTR, {:#x})", set_idx * 0x80);
             let q_eval_base = format!("add(Q_EVAL_SET_MPTR, {:#x})", set_idx * 0x20);
             let m = commitments_in_set.len();
-
-            lines.push(format!(
-                "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, optimisation #1)"
-            ));
 
             // q_eval_set[s] is itself a *vector* of |set| evaluations
             // (not a single scalar): one per rotation in the set's
@@ -494,98 +693,208 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
             //   Q_EVAL_SET_MPTR + 0x20 * (set_offset + k)
             // where set_offset is the cumulative |sets[<s]| sum.
             let first = &commitments_in_set[0];
+            let n_rot = first.evals.len();
             let set_eval_offset_words: usize = sets.point_sets[..set_idx]
                 .iter()
                 .map(|s| s.len())
                 .sum::<usize>();
 
-            // Phase 1: Fr-only eval accumulation in stack locals.
-            // Seed with the first commitment's evals (x1^0 = 1, so no
-            // scaling needed).
-            for (k, ev) in first.evals.iter().enumerate() {
-                lines.push(format!("let q_eval_set_{k} := {ev}"));
-            }
-            for (i, c) in commitments_in_set.iter().enumerate().skip(1) {
-                let x1_pow = format!("mload(add(X1_POWERS_MPTR, {:#x}))", i * 0x20);
-                for (k, ev) in c.evals.iter().enumerate() {
-                    lines.push(format!(
-                        "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
-                    ));
-                }
-            }
-
-            // Phase 2: G1 commitment fold via one m-pair MSM.
-            //
-            // The naive emitter did m-1 single-pair MSMs + m-1 G1ADDs
-            // (the first commit is just copied, then each subsequent
-            // one is scale-and-add). EIP-2537 G1MSM gas is concave in
-            // pair count so a single m-pair MSM with scalars
-            //   [1, x1, x1^2, …, x1^{m-1}]
-            // is much cheaper.
-            //
-            // Stage all (point, scalar) pairs at MSM_SCRATCH (0x6100),
-            // which lives above scalar_inv's 0x6000..0x60c0 scratch and
-            // well clear of the VK region (0x0ee0..0x2040) that the low
-            // memory window collides with for sets with > ~24 commits.
-            // The precompile input format is 4 words point followed by
-            // 1 word scalar per pair (160 bytes / pair).
-            const MSM_SCRATCH: usize = 0x6100;
-            if m == 1 {
-                // Single-commitment set: just copy the point. Cancun
-                // MCOPY (~15 gas) replaces the 4-mstore chain (~60 gas
-                // raw, much more under solc-via-ir).
+            if m >= ROLL_THRESHOLD {
+                // -------- Rolled path (Opt I + Opt J merged) ----------
                 lines.push(format!(
-                    "mcopy({}, {}, 0x80)",
-                    q_com_base,
-                    first.comm.ptr()
+                    "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, rolled, m>={ROLL_THRESHOLD})"
                 ));
-            } else {
-                // Stage one (point, scalar) pair per commit. Each
-                // point's 4 words sit at contiguous memory offsets
-                // (EcPoint = `base..base+3*0x20`), so we can mcopy the
-                // 0x80-byte point in a single op and follow with one
-                // mstore for the scalar. This replaces the per-commit
-                // 4-mstore chain (4 × mload + 4 × mstore + add-arith,
-                // ~30-50 gas/line under solc-via-ir → ~120-200 gas
-                // per commit) with one mcopy(0x80) (~15 gas raw, plus
-                // a few EVM dispatch-overhead gas).
+
+                // 1. Pre-stage source-point addresses at POINT_SRC_TABLE_MPTR.
+                //    Each entry is the base address of c[i].comm (4-word point).
+                lines.push("// stage commit-point source addresses".to_string());
                 for (i, c) in commitments_in_set.iter().enumerate() {
-                    let pair_base = MSM_SCRATCH + i * 0xa0;
                     lines.push(format!(
-                        "mcopy({:#x}, {}, 0x80)",
-                        pair_base,
+                        "mstore({:#x}, {})",
+                        point_src_table_mptr + i * 0x20,
                         c.comm.ptr()
                     ));
-                    if i == 0 {
-                        lines.push(format!("mstore({:#x}, 1)", pair_base + 0x80));
-                    } else {
+                }
+
+                // 2. Pre-stage source-eval addresses at EVAL_SRC_TABLE_MPTR.
+                //    Layout: row-major i over commits, k over rotations.
+                //    Stride between commit rows = n_rot * 0x20.
+                lines.push("// stage per-(commit, rotation) eval source addresses".to_string());
+                for (i, c) in commitments_in_set.iter().enumerate() {
+                    debug_assert_eq!(c.evals.len(), n_rot);
+                    for (k, ev) in c.evals.iter().enumerate() {
+                        // Each ev is a Word; for memory-anchored evals
+                        // (which is the case after H3) `ev.ptr()` renders
+                        // to the bare address. For calldata-anchored
+                        // evals we'd have to fall back to the unrolled
+                        // path; the default test fixtures all go through
+                        // REVERSED_EVALS_MPTR so this branch is hot.
+                        debug_assert!(
+                            matches!(ev.loc(), crate::codegen::util::Location::Memory),
+                            "rolled q_eval emission requires memory-anchored evals"
+                        );
                         lines.push(format!(
-                            "mstore({:#x}, mload(add(X1_POWERS_MPTR, {:#x})))",
-                            pair_base + 0x80,
-                            i * 0x20
+                            "mstore({:#x}, {})",
+                            eval_src_table_mptr + (i * n_rot + k) * 0x20,
+                            ev.ptr()
                         ));
                     }
                 }
+
+                // 3. Seed q_eval_set_k stack locals from c[0].evals[k]
+                //    (x1^0 = 1, so no scaling needed).
+                for (k, ev) in first.evals.iter().enumerate() {
+                    lines.push(format!("let q_eval_set_{k} := {ev}"));
+                }
+
+                // 4. Stage commit 0 at MSM_SCRATCH (point + scalar=1).
+                lines.push(format!(
+                    "mcopy({:#x}, {}, 0x80)",
+                    msm_scratch,
+                    first.comm.ptr()
+                ));
+                lines.push(format!("mstore({:#x}, 1)", msm_scratch + 0x80));
+
+                // 5. Single Yul `for` loop: stage commits 1..m-1 +
+                //    accumulate evals using a single x1 power load per
+                //    iteration (vs n_rot loads in the unrolled form).
+                //
+                //    Loop variables:
+                //      pow_p : ptr into X1_POWERS_MPTR (i*0x20)
+                //      eval_p: ptr into EVAL_SRC_TABLE_MPTR (i*n_rot*0x20)
+                //      pt_p  : ptr into POINT_SRC_TABLE_MPTR (i*0x20)
+                //      dst   : ptr into MSM_SCRATCH (i*0xa0)
+                //
+                //    Per iter: 1 mload(pow), n_rot * (mload + mulmod +
+                //    addmod) for the evals, 1 mcopy + 1 mstore for the
+                //    staging, 4 ptr-bump adds. Compared to the unrolled
+                //    block this halves the total mload count and gives
+                //    solc-via-ir a single basic block to schedule.
+                let n_rot_stride = n_rot * 0x20;
+                lines.push(format!(
+                    "let pow_p := add(X1_POWERS_MPTR, 0x20)"
+                ));
+                lines.push(format!(
+                    "let eval_p := add({:#x}, {:#x})",
+                    eval_src_table_mptr, n_rot_stride
+                ));
+                lines.push(format!(
+                    "let pt_p := add({:#x}, 0x20)",
+                    point_src_table_mptr
+                ));
+                lines.push(format!("let dst := add({:#x}, 0xa0)", msm_scratch));
+                lines.push(format!(
+                    "for {{ let i := 1 }} lt(i, {:#x}) {{ i := add(i, 1) }} {{",
+                    m
+                ));
+                lines.push("    let pow := mload(pow_p)".to_string());
+                for k in 0..n_rot {
+                    if k == 0 {
+                        lines.push(
+                            "    q_eval_set_0 := addmod(q_eval_set_0, mulmod(mload(mload(eval_p)), pow, r), r)"
+                                .to_string(),
+                        );
+                    } else {
+                        lines.push(format!(
+                            "    q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod(mload(mload(add(eval_p, {:#x}))), pow, r), r)",
+                            k * 0x20
+                        ));
+                    }
+                }
+                lines.push("    mcopy(dst, mload(pt_p), 0x80)".to_string());
+                lines.push("    mstore(add(dst, 0x80), pow)".to_string());
+                lines.push("    pow_p := add(pow_p, 0x20)".to_string());
+                lines.push(format!(
+                    "    eval_p := add(eval_p, {:#x})",
+                    n_rot_stride
+                ));
+                lines.push("    pt_p := add(pt_p, 0x20)".to_string());
+                lines.push("    dst := add(dst, 0xa0)".to_string());
+                lines.push("}".to_string());
+
+                // 6. MSM call + writeback.
                 lines.push(format!(
                     "success := and(success, staticcall(gas(), 0x0c, {:#x}, {:#x}, {:#x}, 0x80))",
-                    MSM_SCRATCH,
+                    msm_scratch,
                     m * 0xa0,
-                    MSM_SCRATCH
+                    msm_scratch
                 ));
-                // Writeback: precompile output (4-word point) at
-                // MSM_SCRATCH -> q_com_base. Same mcopy trick.
                 lines.push(format!(
                     "mcopy({}, {:#x}, 0x80)",
-                    q_com_base, MSM_SCRATCH
+                    q_com_base, msm_scratch
                 ));
-            }
 
-            // Persist the per-rotation q_eval_set[s][k].
-            for k in 0..first.evals.len() {
+                // 7. Persist q_eval_set[s][k].
+                for k in 0..n_rot {
+                    lines.push(format!(
+                        "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
+                        (set_eval_offset_words + k) * 0x20
+                    ));
+                }
+            } else {
+                // -------- Unrolled path (preserved for m < ROLL_THRESHOLD) --
                 lines.push(format!(
-                    "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
-                    (set_eval_offset_words + k) * 0x20
+                    "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, optimisation #1)"
                 ));
+
+                // Phase 1: Fr-only eval accumulation in stack locals.
+                for (k, ev) in first.evals.iter().enumerate() {
+                    lines.push(format!("let q_eval_set_{k} := {ev}"));
+                }
+                for (i, c) in commitments_in_set.iter().enumerate().skip(1) {
+                    let x1_pow = format!("mload(add(X1_POWERS_MPTR, {:#x}))", i * 0x20);
+                    for (k, ev) in c.evals.iter().enumerate() {
+                        lines.push(format!(
+                            "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
+                        ));
+                    }
+                }
+
+                // Phase 2: G1 commitment fold via one m-pair MSM (or mcopy
+                // for m=1).
+                if m == 1 {
+                    lines.push(format!(
+                        "mcopy({}, {}, 0x80)",
+                        q_com_base,
+                        first.comm.ptr()
+                    ));
+                } else {
+                    for (i, c) in commitments_in_set.iter().enumerate() {
+                        let pair_base = msm_scratch + i * 0xa0;
+                        lines.push(format!(
+                            "mcopy({:#x}, {}, 0x80)",
+                            pair_base,
+                            c.comm.ptr()
+                        ));
+                        if i == 0 {
+                            lines.push(format!("mstore({:#x}, 1)", pair_base + 0x80));
+                        } else {
+                            lines.push(format!(
+                                "mstore({:#x}, mload(add(X1_POWERS_MPTR, {:#x})))",
+                                pair_base + 0x80,
+                                i * 0x20
+                            ));
+                        }
+                    }
+                    lines.push(format!(
+                        "success := and(success, staticcall(gas(), 0x0c, {:#x}, {:#x}, {:#x}, 0x80))",
+                        msm_scratch,
+                        m * 0xa0,
+                        msm_scratch
+                    ));
+                    lines.push(format!(
+                        "mcopy({}, {:#x}, 0x80)",
+                        q_com_base, msm_scratch
+                    ));
+                }
+
+                // Persist q_eval_set[s][k].
+                for k in 0..first.evals.len() {
+                    lines.push(format!(
+                        "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
+                        (set_eval_offset_words + k) * 0x20
+                    ));
+                }
             }
 
             blocks.push(lines);
@@ -854,10 +1163,41 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         lines.push("mcopy(0x0, Q_COM_MPTR, 0x80)".to_string());
         // v = q_evals[0] (calldata, midnight-proofs Fr::to_repr() is LE -> byte-reverse)
         lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
-        lines.push("let x4_pow := 1".to_string());
+        // truncated-challenges: midnight-proofs uses
+        //   truncated_powers(x4)[i] = truncate(x4^i)
+        // i.e. the internal accumulator stays full precision while
+        // each emitted power is truncated to 128 bits. We mirror that
+        // by maintaining `x4_pow_full` (the full-precision Fr running
+        // product, advanced by `mulmod(_, x4, r)`) separately from
+        // `x4_pow` (the truncated value used as the MSM scalar / Fr
+        // coefficient in `v`).
+        //
+        // When the feature is OFF the two collapse into one variable
+        // and the emitted code is byte-identical to the pre-Phase-3
+        // path.
+        if truncated_challenges {
+            lines.push("let x4_pow_full := 1".to_string());
+            lines.push("let x4_pow := 1".to_string());
+        } else {
+            lines.push("let x4_pow := 1".to_string());
+        }
+
+        // Helper closure: emit the lines that advance `x4_pow` to the
+        // next power. Renders to one mulmod when the feature is off,
+        // or to one mulmod + one and(_, mask) when it is on.
+        let advance_x4_pow = |lines: &mut Vec<String>| {
+            if truncated_challenges {
+                lines.push("x4_pow_full := mulmod(x4_pow_full, x4, r)".to_string());
+                lines.push(format!(
+                    "x4_pow := and(x4_pow_full, {TRUNC_MASK_128})"
+                ));
+            } else {
+                lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
+            }
+        };
 
         for s in 1..n_sets {
-            lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
+            advance_x4_pow(&mut lines);
             // Load q_com[s] into operand slot.
             lines.push(format!(
                 "mcopy(0x80, add(Q_COM_MPTR, {:#x}), 0x80)",
@@ -882,7 +1222,7 @@ pub(super) fn computations(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Vec<
         }
 
         // Final f_com term: x4^n_sets.
-        lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
+        advance_x4_pow(&mut lines);
         lines.push("mcopy(0x80, F_COM_MPTR, 0x80)".to_string());
         lines.push("mstore(0x100, x4_pow)".to_string());
         lines.push(
@@ -1049,5 +1389,110 @@ mod tests {
         assert_eq!(result.commitments[0].evals.len(), 2);
         assert_eq!(result.point_sets.len(), 1);
         assert_eq!(result.point_sets[0].len(), 2);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3: dummy-query computation (fewer-point-sets path).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn compute_dummy_queries_emits_no_dummies_when_all_singletons() {
+        // Every commitment has exactly one rotation - no point sets to
+        // unify. Output must be empty.
+        let queries = vec![
+            Query::new(pt(0x100), 0, ev(0x200)),
+            Query::new(pt(0x110), 0, ev(0x220)),
+            Query::new(pt(0x120), 5, ev(0x240)),
+        ];
+        assert_eq!(compute_dummy_queries(&queries), Vec::new());
+    }
+
+    #[test]
+    fn compute_dummy_queries_emits_no_dummies_for_aligned_pairs() {
+        // Two non-singleton commitments share the same rotation set.
+        // No dummies are needed.
+        let queries = vec![
+            Query::new(pt(0x100), 0, ev(0x200)),
+            Query::new(pt(0x100), 1, ev(0x210)),
+            Query::new(pt(0x110), 0, ev(0x220)),
+            Query::new(pt(0x110), 1, ev(0x230)),
+        ];
+        assert_eq!(compute_dummy_queries(&queries), Vec::new());
+    }
+
+    #[test]
+    fn compute_dummy_queries_unifies_two_distinct_pairs() {
+        // c1 at {0, 1}, c2 at {0, 2}. Union = {0, 1, 2}; c1 needs a
+        // dummy at 2; c2 needs a dummy at 1.
+        let queries = vec![
+            Query::new(pt(0x100), 0, ev(0x200)),
+            Query::new(pt(0x100), 1, ev(0x210)),
+            Query::new(pt(0x110), 0, ev(0x220)),
+            Query::new(pt(0x110), 2, ev(0x230)),
+        ];
+        let dummies = compute_dummy_queries(&queries);
+        // c1's first occurrence is index 0; c2's first occurrence is 2.
+        // Insertion order of union: rot 0, rot 1, rot 2 (from c1 first,
+        // then c2 contributes 2). For c1 (existing {0, 1}), missing 2.
+        // For c2 (existing {0, 2}), missing 1.
+        assert_eq!(
+            dummies,
+            vec![
+                DummyQuery {
+                    query_index: 0,
+                    rotation: 2,
+                },
+                DummyQuery {
+                    query_index: 2,
+                    rotation: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_dummy_queries_skips_singletons() {
+        // c0 at {0} (singleton, untouched), c1 at {0, 1}, c2 at {0, 2}.
+        // Union of non-singletons = {0, 1, 2}. c0 is a singleton so it
+        // is NOT padded. c1 needs dummy at 2; c2 needs dummy at 1.
+        let queries = vec![
+            Query::new(pt(0x0f0), 0, ev(0x100)), // c0 (singleton)
+            Query::new(pt(0x100), 0, ev(0x200)), // c1
+            Query::new(pt(0x100), 1, ev(0x210)),
+            Query::new(pt(0x110), 0, ev(0x220)), // c2
+            Query::new(pt(0x110), 2, ev(0x230)),
+        ];
+        let dummies = compute_dummy_queries(&queries);
+        assert_eq!(
+            dummies,
+            vec![
+                DummyQuery {
+                    query_index: 1, // c1's first occurrence
+                    rotation: 2,
+                },
+                DummyQuery {
+                    query_index: 3, // c2's first occurrence
+                    rotation: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn augmented_queries_collapse_to_single_set() {
+        // After adding dummies, the augmented query list must yield
+        // exactly ONE non-singleton point set covering {0, 1, 2}.
+        let raw = vec![
+            Query::new(pt(0x100), 0, ev(0x200)),
+            Query::new(pt(0x100), 1, ev(0x210)),
+            Query::new(pt(0x110), 0, ev(0x220)),
+            Query::new(pt(0x110), 2, ev(0x230)),
+        ];
+        let dummy_words = vec![ev(0x300), ev(0x320)];
+        let augmented = augment_queries_with_dummies(&raw, &dummy_words);
+        assert_eq!(augmented.len(), 6);
+        let sets = sort_sets(construct_intermediate_sets_impl(&augmented));
+        assert_eq!(sets.point_sets.len(), 1, "all merged into one set");
+        assert_eq!(sets.point_sets[0].len(), 3);
     }
 }

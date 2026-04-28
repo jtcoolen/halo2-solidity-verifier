@@ -83,9 +83,10 @@ impl BatchOpenScheme {
         &self,
         meta: &ConstraintSystemMeta,
         data: &Data,
+        truncated_challenges: bool,
     ) -> Vec<Vec<String>> {
         match self {
-            Self::Gwc19 => gwc19::computations(meta, data),
+            Self::Gwc19 => gwc19::computations(meta, data, truncated_challenges),
         }
     }
 
@@ -105,5 +106,15 @@ impl BatchOpenScheme {
     /// template is rendered.
     pub(crate) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize {
         gwc19::num_point_sets(meta, data)
+    }
+
+    /// Number of dummy `(commitment, point)` queries the
+    /// fewer-point-sets path appends to the raw query list. Each dummy
+    /// pulls one extra Fr scalar from the proof transcript before the
+    /// x1/x2 squeeze. Pass the *raw* (un-augmented) `Data` to size the
+    /// dummy buffer; the result is then plumbed back into a fresh
+    /// `Data` via `Data::set_dummy_eval_words`.
+    pub(crate) fn num_dummy_queries(meta: &ConstraintSystemMeta, data: &Data) -> usize {
+        gwc19::num_dummy_queries(meta, data)
     }
 }

@@ -388,14 +388,38 @@ impl<'a> SolidityGenerator<'a> {
         });
         let vk_len = vk.len();
         let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-        let data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
 
-        // Run the codegen-time `construct_intermediate_sets` simulation
-        // and bake `num_point_sets` into a local meta clone. This makes
-        // `meta.proof_len()` and `meta.batch_open_extra_evals()` report
-        // the correct calldata size (which depends on the number of
-        // distinct point sets emitted by the multi-prepare PCS).
+        // ------------------------------------------------------------------
+        // Phase 3 / fewer-point-sets two-pass `Data` construction.
+        //
+        // Pass 1: build `Data` against the *raw* meta (no dummy evals).
+        //   This gives us the raw query list whose commitment identity
+        //   structure feeds `compute_dummy_queries`.
+        //
+        // Pass 2: bump meta.num_evals by the dummy count (so the
+        //   memory layout - REVERSED_EVALS_MPTR buffer + downstream
+        //   comms_mptr_base - grows to fit the dummies), rebuild Data,
+        //   and populate the dummy eval Words.
+        //
+        // When the `fewer-point-sets` Cargo feature is OFF, the dummy
+        // count is forced to zero; pass 2 collapses to "rebuild Data
+        // against unchanged meta", and the result is byte-identical
+        // to the pre-Phase-3 single-pass path.
+        // ------------------------------------------------------------------
+        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
         let mut meta = self.meta.clone();
+        let n_dummy = if cfg!(feature = "fewer-point-sets") {
+            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
+        } else {
+            0
+        };
+        let main_evals = meta.num_evals;
+        meta.set_num_dummy_evals(n_dummy);
+        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
+        if n_dummy > 0 {
+            data.set_dummy_eval_words(main_evals, n_dummy);
+        }
+
         meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
 
         let evaluator = Evaluator::new(self.vk.cs(), &meta, &data);
@@ -503,7 +527,8 @@ impl<'a> SolidityGenerator<'a> {
             quotient_eval_numer_computations.push(tail);
         }
 
-        let pcs_computations = self.scheme.computations(&meta, &data);
+        let pcs_computations =
+            self.scheme.computations(&meta, &data, cfg!(feature = "truncated-challenges"));
 
         // Per-user-phase breakdown (advices + user challenges).
         let mut challenge_offset = 0usize;
@@ -564,7 +589,155 @@ impl<'a> SolidityGenerator<'a> {
             pcs_computations,
             simple_selector_cols: sorted_simple.clone(),
             fixed_comm_mptr: fixed_comm_mptr_byte,
+            truncated_challenges: cfg!(feature = "truncated-challenges"),
+            fewer_point_sets: cfg!(feature = "fewer-point-sets"),
+            num_dummy_evals: meta.num_dummy_evals,
         }
+    }
+
+    /// Repack a midnight-proofs proof from the on-the-wire compressed
+    /// form (each G1 = 48 bytes ZCash compressed) into the EIP-2537
+    /// padded form (each G1 = 4 × 32-byte BE words) the rendered
+    /// Solidity verifier reads from calldata.
+    ///
+    /// This is the off-chain repack step the verifier expects: the
+    /// EVM does **not** run the modexp-based BLS12-381 decompression
+    /// at every G1 site (which would cost ~80 kg / commitment); the
+    /// caller pays that cost off-chain once.
+    ///
+    /// The walk is driven entirely by the bound `&self.vk` /
+    /// `&self.meta` (so it correctly handles the non-trivial proof
+    /// shapes the codegen produces: per-phase advices, lookup
+    /// multiplicities + chunked helpers + accumulators, perm Z
+    /// products, trashcans, quotient limbs, eval block, dummy evals
+    /// from `fewer-point-sets`, f_com, q_evals per point set, pi).
+    ///
+    /// # Panics
+    /// - Panics if any G1 in the input fails to decompress (off-curve
+    ///   / bad subgroup / malformed compressed encoding).
+    /// - Panics if `compressed` is shorter than the schema requires.
+    pub fn repack_compressed_proof(&self, compressed: &[u8]) -> Vec<u8> {
+        use group::prime::PrimeCurveAffine;
+        use group::GroupEncoding;
+
+        // ----------------------------------------------------------
+        // Re-run the same num_dummy_evals / num_point_sets simulation
+        // `generate_verifier` runs, so the repack walks the **exact**
+        // proof layout the rendered Solidity body reads.
+        // ----------------------------------------------------------
+        let proof_cptr = Ptr::calldata(0x64);
+        let vk = self.generate_vk();
+        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
+
+        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
+        let mut meta = self.meta.clone();
+        let n_dummy = if cfg!(feature = "fewer-point-sets") {
+            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
+        } else {
+            0
+        };
+        let main_evals = meta.num_evals;
+        meta.set_num_dummy_evals(n_dummy);
+        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
+        if n_dummy > 0 {
+            data.set_dummy_eval_words(main_evals, n_dummy);
+        }
+        let n_point_sets = BatchOpenScheme::num_point_sets(&meta, &data);
+
+        // ----------------------------------------------------------
+        // Build the prefix-G1 group counts in transcript order.
+        // (Mirrors the ordering used by the codegen and tested in
+        // `tests/poseidon_fixture.rs`.)
+        // ----------------------------------------------------------
+        let cs = self.vk.cs();
+        let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
+        let mut g1_groups: Vec<usize> = Vec::new();
+
+        // User phases: each phase contributes its advice columns.
+        let advice_phase = cs.advice_column_phase();
+        let max_phase = *advice_phase.iter().max().unwrap_or(&0);
+        for phase in 0..=max_phase {
+            let n = advice_phase.iter().filter(|p| **p == phase).count();
+            if n != 0 {
+                g1_groups.push(n);
+            }
+        }
+        if !cs.lookups().is_empty() {
+            g1_groups.push(cs.lookups().len());
+        }
+        if perm_chunks != 0 {
+            g1_groups.push(perm_chunks);
+        }
+        for l in cs.lookups().iter() {
+            let nb_chunks = l.chunk_by_degree(cs.degree()).num_chunks();
+            g1_groups.push(nb_chunks);
+            g1_groups.push(1);
+        }
+        if !cs.trashcans().is_empty() {
+            g1_groups.push(cs.trashcans().len());
+        }
+        let num_quotients = cs.degree() - 1;
+        g1_groups.push(num_quotients);
+        let prefix_g1_count: usize = g1_groups.iter().sum();
+
+        let total_evals = meta.num_evals; // already includes dummy evals
+        let expected_compressed_len =
+            prefix_g1_count * 48 + total_evals * 32 + 48 + n_point_sets * 32 + 48;
+        assert_eq!(
+            compressed.len(),
+            expected_compressed_len,
+            "compressed proof length mismatch: expected {expected_compressed_len} bytes (prefix_g1={prefix_g1_count}, num_evals={total_evals}, num_point_sets={n_point_sets}, +f_com+pi), got {}",
+            compressed.len()
+        );
+
+        let mut out: Vec<u8> = Vec::with_capacity(
+            prefix_g1_count * 128 + total_evals * 32 + 128 + n_point_sets * 32 + 128,
+        );
+        let mut cursor = 0usize;
+        let push_g1 = |cursor: &mut usize, out: &mut Vec<u8>| {
+            let mut comp = <G1Affine as GroupEncoding>::Repr::default();
+            comp.as_mut().copy_from_slice(&compressed[*cursor..*cursor + 48]);
+            let cur = *cursor;
+            *cursor += 48;
+            let pt: G1Affine =
+                Option::from(<G1Affine as GroupEncoding>::from_bytes(&comp))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "decompress failed at compressed[{cur}..{}]: bytes = 0x{}",
+                            cur + 48,
+                            hex::encode(comp.as_ref())
+                        )
+                    });
+            if bool::from(pt.is_identity()) {
+                out.extend_from_slice(&[0u8; 128]);
+                return;
+            }
+            let x_be = pt.x().to_bytes_be();
+            let y_be = pt.y().to_bytes_be();
+            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(&x_be[0..16]);
+            out.extend_from_slice(&x_be[16..48]);
+            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(&y_be[0..16]);
+            out.extend_from_slice(&y_be[16..48]);
+        };
+        for &n in &g1_groups {
+            for _ in 0..n {
+                push_g1(&mut cursor, &mut out);
+            }
+        }
+        // evals (Fr 32-byte LE) - pass through (incl. dummy slots).
+        out.extend_from_slice(&compressed[cursor..cursor + total_evals * 32]);
+        cursor += total_evals * 32;
+        // f_com
+        push_g1(&mut cursor, &mut out);
+        // q_evals
+        out.extend_from_slice(&compressed[cursor..cursor + n_point_sets * 32]);
+        cursor += n_point_sets * 32;
+        // pi
+        push_g1(&mut cursor, &mut out);
+        assert_eq!(cursor, compressed.len(), "compressed proof not fully consumed");
+        out
     }
 
     fn static_working_memory_size(&self, vk: &Halo2VerifyingKey, proof_cptr: Ptr) -> usize {
@@ -575,46 +748,66 @@ impl<'a> SolidityGenerator<'a> {
         };
 
         // The Step 6 transcript model is a streaming Keccak256 buffer at
-        // offset 0x40 onward. Peak buffer length is bounded by the
-        // pre-squeeze byte count between two challenges; we estimate the
-        // worst case as `(absorbed_g1 * 49 + absorbed_scalar * 33 + 64)`
-        // words and round up. A generous static lower bound of 0x800
-        // bytes (64 words) suffices for the poseidon fixture and small
-        // circuits; larger circuits will scale this up.
+        // memory `[0..buf_len)`. The buffer monotonically grows between
+        // two challenge squeezes and is reset to 64 bytes after each
+        // squeeze, so the *peak* buf_len equals the longest absorb run
+        // between two consecutive squeezes. For midnight-proofs verifiers
+        // the dominating run is whichever of the following is largest:
+        //   (a) initial absorbs (vk_digest + committed_pi + num_instances
+        //       + all instance scalars + all phase-1 advices) before the
+        //       first user-phase challenge squeeze (`theta`), or
+        //   (b) the evaluation block (all `num_evals` scalars) absorbed
+        //       after the `y` squeeze and before the next squeeze.
+        //
+        // We compute a per-run conservative upper bound for each and
+        // take the max, then add the 64-byte post-squeeze seed cushion.
+        //
+        // Per-absorb costs in the patched (uncompressed-G1) emitter:
+        //   - PREFIX_COMMON || word        = 33 bytes  (`common_word`)
+        //   - PREFIX_COMMON || 128 bytes   = 129 bytes (`common_uncompressed_g1`)
+        //   - PREFIX_CHALLENGE || forks    = 64 bytes  (post-squeeze seed)
+        // The earlier (compressed-G1) emitter used 49 bytes per G1; the
+        // 49 used here is wrong now that the verifier hashes the 128-byte
+        // EIP-2537 padded form, so we use 129. Mismatching the bound
+        // causes the keccak buffer to overrun `VK_MPTR` mid-verify and
+        // silently corrupt `K_MPTR`, `OMEGA_MPTR`, etc., producing a
+        // multi-billion-gas spin in the Lagrange block.
         let transcript_words: usize = {
-            // The streaming Keccak256 buffer at memory `[0..buf_len)`
-            // grows monotonically between two challenge squeezes and is
-            // reset to 64 bytes after each squeeze, so the actual peak
-            // is the longest distance between consecutive squeezes —
-            // dominated by the evaluation block (`num_evals` scalars)
-            // since none of the user phases interleave more than a
-            // dozen G1 reads. We bound it by the absorption cost of
-            // *all* G1s (49 bytes each) and *all* scalars (33 bytes
-            // each) plus a 64-byte cushion for the post-squeeze seed.
-            // This is conservative but always safe.
+            // (a) initial run: vk_digest (33) + committed_pi (129)
+            //     + num_instances scalar (33) + num_instances * 33
+            //     + phase_1_advices * 129 + 64 cushion.
+            let phase_1_advices = self.meta.num_user_advices.first().copied().unwrap_or(0);
+            let initial_run = 33                      // vk_digest
+                + 129                                 // committed_pi
+                + 33                                  // num_instances scalar
+                + self.num_instances * 33             // committed instances
+                + phase_1_advices * 129               // phase-1 advices
+                + 64;                                 // post-squeeze seed cushion
+
+            // (b) eval-block run: quotient_limbs (Keccak common_uncompressed
+            //     of each quotient G1) + num_evals scalars + num_point_sets
+            //     scalars + 64 cushion.
+            let eval_run = self.meta.num_quotients * 129
+                + self.meta.num_evals * 33
+                + self.meta.num_point_sets * 33
+                + 64;
+
+            // Catch-all: any other phase. We bound it by every G1 + every
+            // scalar absorbed across the whole transcript; this is a
+            // strict overestimate but cheap and finite.
             let total_g1: usize = self.meta.num_user_advices.iter().sum::<usize>()
                 + self.meta.num_lookups
                 + self.meta.num_permutation_zs
-                + self
-                    .meta
-                    .lookup_chunks
-                    .iter()
-                    .sum::<usize>()
+                + self.meta.lookup_chunks.iter().sum::<usize>()
                 + self.meta.num_lookups
                 + self.meta.num_trashcans
                 + self.meta.num_quotients
                 + 2; // f_com + pi
-            // `num_point_sets` is computed only AFTER this function
-            // returns (it depends on the codegen-side
-            // `construct_intermediate_sets` simulation which itself
-            // needs `vk_mptr`), so we approximate it with a generous
-            // upper bound — `num_evals` is always at least as large as
-            // the number of opening sets, and adding 32 extra slots of
-            // headroom guarantees the buffer stays clear of `VK_MPTR`
-            // even for circuits with unusual rotation patterns.
             let total_scalar = self.meta.num_evals + self.meta.num_point_sets + 32;
-            let bytes = 64 + total_g1 * 49 + total_scalar * 33 + 64;
-            bytes.div_ceil(0x20)
+            let total_run = 64 + total_g1 * 129 + total_scalar * 33 + 64;
+
+            let peak = initial_run.max(eval_run).max(total_run);
+            peak.div_ceil(0x20)
         };
 
         itertools::max([

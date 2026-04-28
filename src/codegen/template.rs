@@ -156,6 +156,22 @@ pub(crate) struct Halo2Verifier {
     /// Memory pointer base for the embedded VK fixed commitments. Used
     /// to resolve per-column G1 offsets in the simple-selector MSM.
     pub(crate) fixed_comm_mptr: usize,
+    /// When true, mirrors midnight-proofs/truncated-challenges:
+    ///   - x3 is masked to 128 bits immediately after squeeze
+    ///   - x1 / x4 powers are masked to 128 bits at use, with the
+    ///     internal full-precision accumulator preserved
+    /// Driven by `cfg!(feature = "truncated-challenges")` in
+    /// `SolidityGenerator::generate_verifier`.
+    pub(crate) truncated_challenges: bool,
+    /// When true, mirrors midnight-proofs/fewer-point-sets: the
+    /// transcript reads `num_dummy_evals` extra Fr scalars after the
+    /// main eval block, and the codegen-side query list is augmented
+    /// with the corresponding dummy queries before construct_intermediate_sets.
+    /// Driven by `cfg!(feature = "fewer-point-sets")`.
+    pub(crate) fewer_point_sets: bool,
+    /// Number of dummy evals appended to the proof's eval block when
+    /// `fewer_point_sets` is enabled. Zero otherwise.
+    pub(crate) num_dummy_evals: usize,
 }
 
 impl Halo2VerifyingKey {
