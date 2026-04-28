@@ -26,6 +26,16 @@
 //!     --test ivc_keccak_solidity \
 //!     -- --ignored --nocapture
 //! ```
+//!
+//! Enable the detailed gas benchmark with:
+//!
+//! ```text
+//! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+//!   cargo test --release \
+//!     --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+//!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+//!     -- --ignored --nocapture
+//! ```
 
 #![cfg(all(
     feature = "evm",
@@ -458,7 +468,7 @@ fn ivc_final_keccak_solidity_e2e() {
         .output()
         .is_err()
     {
-        eprintln!("[ivc-keccak-solidity] solc not found on PATH; skipping");
+        println!("[ivc-keccak-solidity] solc not found on PATH; skipping");
         return;
     }
 
@@ -570,6 +580,7 @@ fn ivc_final_keccak_solidity_e2e() {
     let generator = SolidityGenerator::new(&ivc_srs, verifier.vk().vk(), Gwc19, num_instances)
         .set_num_committed_instances(1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(outer_acc_offset, 7, 56)));
+    let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
     let (verifier_solidity, vk_solidity) = generator
@@ -596,6 +607,7 @@ fn ivc_final_keccak_solidity_e2e() {
         .flat_map(|f| <F as ff::PrimeField>::to_repr(f).as_ref().to_vec())
         .collect();
     std::fs::write(format!("{dump_dir}/instance.le"), &pi_bytes).ok();
+    println!("[ivc-keccak-solidity] saved generated contracts under {dump_dir}");
 
     // ----------------------------------------------------------
     // Compile + deploy on Prague-spec revm.
@@ -603,18 +615,53 @@ fn ivc_final_keccak_solidity_e2e() {
     let t0 = Instant::now();
     let vk_creation_code = compile_solidity(&vk_solidity);
     let verifier_creation_code = compile_solidity(&verifier_solidity);
+    let vk_creation_size = vk_creation_code.len();
+    let verifier_creation_size = verifier_creation_code.len();
+    std::fs::write(
+        format!("{dump_dir}/Halo2Verifier.creation.bin"),
+        &verifier_creation_code,
+    )
+    .ok();
+    std::fs::write(
+        format!("{dump_dir}/Halo2VerifyingKey.creation.bin"),
+        &vk_creation_code,
+    )
+    .ok();
     println!(
-        "[ivc-keccak-solidity] solc compile completed in {:.2?} (verifier bytecode = {} bytes, vk bytecode = {} bytes)",
+        "[ivc-keccak-solidity] solc compile completed in {:.2?} (verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes)",
         t0.elapsed(),
-        verifier_creation_code.len(),
-        vk_creation_code.len()
+        verifier_creation_size,
+        vk_creation_size
     );
 
     let mut evm = Evm::default();
     let vk_address = evm.create(vk_creation_code);
     let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
+    let vk_runtime_size = evm.code_size(vk_address);
+    let verifier_runtime_size = evm.code_size(verifier_address);
+    let contract_size_summary = format!(
+        "Halo2Verifier.sol source bytes: {}\n\
+         Halo2VerifyingKey.sol source bytes: {}\n\
+         Halo2Verifier creation bytecode bytes: {verifier_creation_size}\n\
+         Halo2VerifyingKey creation bytecode bytes: {vk_creation_size}\n\
+         Halo2Verifier deployed runtime bytes: {verifier_runtime_size}\n\
+         Halo2VerifyingKey deployed runtime bytes: {vk_runtime_size}\n\
+         total deployed runtime bytes: {}\n",
+        verifier_solidity.len(),
+        vk_solidity.len(),
+        verifier_runtime_size + vk_runtime_size
+    );
+    std::fs::write(
+        format!("{dump_dir}/contract-sizes.txt"),
+        contract_size_summary,
+    )
+    .ok();
     println!(
         "[ivc-keccak-solidity] deployed (vk = {vk_address:?}, verifier = {verifier_address:?})"
+    );
+    println!(
+        "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, total runtime = {} bytes",
+        verifier_runtime_size + vk_runtime_size
     );
 
     // ----------------------------------------------------------
@@ -644,8 +691,13 @@ fn ivc_final_keccak_solidity_e2e() {
     // ----------------------------------------------------------
     match evm.try_call_with_gas(verifier_address, calldata, 5_000_000_000) {
         CallOutcome::Success {
-            gas_used, output, ..
+            gas_used,
+            output,
+            logs,
         } => {
+            if gas_checkpoints_enabled {
+                dump_gas_checkpoints(&logs, gas_used);
+            }
             let expected: Vec<u8> = [vec![0u8; 31], vec![1]].concat();
             assert_eq!(
                 output,
@@ -667,4 +719,165 @@ fn ivc_final_keccak_solidity_e2e() {
             panic!("verifier halted at gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+/// Parse LOG1 checkpoint events emitted by `--features solidity-gas-checkpoints`
+/// and print a section-level gas breakdown for the final IVC verifier.
+fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log], gas_used: u64) {
+    let mut events: Vec<(u8, u64)> = logs
+        .iter()
+        .filter_map(|log| {
+            let topic = log.data.topics().first()?;
+            let bytes = topic.as_slice();
+            // Gas checkpoints encode `(id << 248) | gas()` so the upper byte is
+            // the checkpoint id. Trace logs use small raw topics and therefore
+            // have an upper byte of zero.
+            let id = bytes[0];
+            if id == 0 {
+                return None;
+            }
+            let gas = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
+            Some((id, gas))
+        })
+        .collect();
+
+    events.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if events.is_empty() {
+        println!(
+            "[ivc-keccak-solidity][gas] no checkpoint events found in {} LOG entries",
+            logs.len()
+        );
+        return;
+    }
+
+    let pcs_set_count = events
+        .iter()
+        .filter_map(|(id, _)| (*id >= 17).then_some(*id))
+        .max()
+        .and_then(|max_id| max_id.checked_sub(20));
+
+    println!();
+    println!("=== IVC Keccak Solidity gas-checkpoint breakdown ===");
+    if let Some(n) = pcs_set_count {
+        println!("[ivc-keccak-solidity][gas] inferred PCS point sets = {n}");
+    }
+    println!(
+        "{:>4}  {:>14}  {:>12}  {:>7}  section",
+        "id", "gas_left", "delta", "%"
+    );
+
+    // LOG1 with one topic and no data costs about 750 gas. Subtract one
+    // checkpoint from each pairwise delta so the table reflects verifier work
+    // instead of measurement overhead.
+    const CHECKPOINT_COST: u64 = 750;
+
+    let total_billed = events[0].1.saturating_sub(events[events.len() - 1].1);
+    let total_real_work = total_billed.saturating_sub(events.len() as u64 * CHECKPOINT_COST);
+
+    let mut prev_gas = events[0].1;
+    let cp1_gas = events[0].1;
+    println!(
+        "{:>4}  {:>14}  {:>12}  {:>7}  {}",
+        events[0].0,
+        format_u64(prev_gas),
+        "-",
+        "-",
+        checkpoint_name(events[0].0, pcs_set_count),
+    );
+
+    for (id, gas) in events.iter().skip(1) {
+        let raw_delta = prev_gas.saturating_sub(*gas);
+        let net_delta = raw_delta.saturating_sub(CHECKPOINT_COST);
+        let pct = if total_real_work > 0 {
+            (net_delta as f64 / total_real_work as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{:>4}  {:>14}  {:>12}  {:>6.1}%  {}",
+            id,
+            format_u64(*gas),
+            format_u64(net_delta),
+            pct,
+            checkpoint_name(*id, pcs_set_count),
+        );
+        prev_gas = *gas;
+    }
+
+    println!();
+    println!(
+        "  cp1 gas_left            = {} (verifier entry)",
+        format_u64(cp1_gas)
+    );
+    println!(
+        "  last..cp1 gas billed    = {} (work between first and last checkpoint)",
+        format_u64(total_billed)
+    );
+    println!(
+        "  - measurement overhead  = {} ({} checkpoints x {} gas)",
+        format_u64(events.len() as u64 * CHECKPOINT_COST),
+        events.len(),
+        CHECKPOINT_COST
+    );
+    println!(
+        "  = real section work     = {}",
+        format_u64(total_real_work)
+    );
+    println!(
+        "  total tx gas_used       = {} (incl. tx base + calldata + pre-cp1 + post-last)",
+        format_u64(gas_used)
+    );
+}
+
+fn checkpoint_name(id: u8, pcs_set_count: Option<u8>) -> String {
+    match id {
+        1 => "entry (before VK loading)".to_string(),
+        2 => "VK loading".to_string(),
+        3 => "VK digest + committed_pi + instance absorbs".to_string(),
+        4 => "user-phase advice reads + user challenge squeezes".to_string(),
+        5 => "theta squeeze + lookup multiplicities".to_string(),
+        6 => "beta/gamma + permutation Z products".to_string(),
+        7 => "lookup helpers + Z accumulators".to_string(),
+        8 => "trash_challenge + trashcans".to_string(),
+        9 => "y squeeze + quotient-limb reads".to_string(),
+        10 => "evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi".to_string(),
+        11 => "Lagrange + instance evaluation".to_string(),
+        12 => "quotient evaluation (Fr arithmetic)".to_string(),
+        13 => "linearization-commitment MSM".to_string(),
+        14 => "PCS block 6 (pairing inputs LHS/RHS)".to_string(),
+        15 => "public accumulator pairing check".to_string(),
+        16 => "final proof ec_pairing".to_string(),
+        17 => "PCS block 1 (rotation points x*omega^rot)".to_string(),
+        18 => "PCS block 2 (x1 powers)".to_string(),
+        id if id >= 19 => {
+            if let Some(n) = pcs_set_count {
+                let idx = id - 19;
+                if idx < n {
+                    return format!("PCS block 3 set {idx} (q_com/q_eval fold)");
+                }
+                if idx == n {
+                    return "PCS block 4 (f_eval Lagrange interpolation)".to_string();
+                }
+                if idx == n + 1 {
+                    return "PCS block 5 (final_com x4-power MSM + v)".to_string();
+                }
+            }
+            format!("PCS sub-block checkpoint {id}")
+        }
+        _ => "<unknown>".to_string(),
+    }
+}
+
+fn format_u64(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }

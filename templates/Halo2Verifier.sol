@@ -1180,7 +1180,7 @@ contract Halo2Verifier {
             }
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(15) // after accumulator random-combine (no-op when HAS_ACCUMULATOR_MPTR == 0)
+            gas_checkpoint(15) // after public accumulator pairing check (no-op when HAS_ACCUMULATOR_MPTR == 0)
             {%- endif %}
 
             // The Yul `ec_pairing` helper checks
