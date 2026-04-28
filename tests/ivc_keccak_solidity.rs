@@ -72,8 +72,8 @@ use rand::{rngs::OsRng, Rng};
 use sha2::Digest;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme::Gwc19,
-    CallOutcome, Evm, SolidityGenerator,
+    compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding,
+    BatchOpenScheme::Gwc19, CallOutcome, Evm, SolidityGenerator,
 };
 
 type S = BlstrsEmulation;
@@ -461,6 +461,7 @@ fn ivc_constraint_system(arch: ZkStdLibArch, k: u32) -> (ConstraintSystem<F>, Ev
 fn ivc_final_keccak_solidity_e2e() {
     const IVC_K: u32 = 19;
     const STEPS: usize = 3;
+    const SOLC_OPTIMIZE_RUNS: u32 = 1;
 
     // Bail out cleanly when solc isn't on PATH.
     if std::process::Command::new("solc")
@@ -613,8 +614,8 @@ fn ivc_final_keccak_solidity_e2e() {
     // Compile + deploy on Prague-spec revm.
     // ----------------------------------------------------------
     let t0 = Instant::now();
-    let vk_creation_code = compile_solidity(&vk_solidity);
-    let verifier_creation_code = compile_solidity(&verifier_solidity);
+    let vk_creation_code = compile_solidity_with_runs(&vk_solidity, SOLC_OPTIMIZE_RUNS);
+    let verifier_creation_code = compile_solidity_with_runs(&verifier_solidity, SOLC_OPTIMIZE_RUNS);
     let vk_creation_size = vk_creation_code.len();
     let verifier_creation_size = verifier_creation_code.len();
     std::fs::write(
@@ -628,7 +629,7 @@ fn ivc_final_keccak_solidity_e2e() {
     )
     .ok();
     println!(
-        "[ivc-keccak-solidity] solc compile completed in {:.2?} (verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes)",
+        "[ivc-keccak-solidity] solc compile completed in {:.2?} (optimize-runs = {SOLC_OPTIMIZE_RUNS}, no CBOR; verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes)",
         t0.elapsed(),
         verifier_creation_size,
         vk_creation_size
@@ -640,7 +641,9 @@ fn ivc_final_keccak_solidity_e2e() {
     let vk_runtime_size = evm.code_size(vk_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
     let contract_size_summary = format!(
-        "Halo2Verifier.sol source bytes: {}\n\
+        "solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
+         solc CBOR metadata: omitted\n\
+         Halo2Verifier.sol source bytes: {}\n\
          Halo2VerifyingKey.sol source bytes: {}\n\
          Halo2Verifier creation bytecode bytes: {verifier_creation_size}\n\
          Halo2VerifyingKey creation bytecode bytes: {vk_creation_size}\n\

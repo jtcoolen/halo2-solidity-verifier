@@ -82,7 +82,8 @@ pub(crate) mod test {
 
     /// Like `compile_solidity` but with an explicit `--optimize-runs`
     /// value. Useful for benchmarking the optimizer's runtime/code-size
-    /// tradeoff.
+    /// tradeoff. Omits CBOR metadata so reported bytecode sizes reflect
+    /// executable verifier code rather than compiler provenance.
     ///
     /// # Panics
     /// Panics if executable `solc` can not be found, or compilation fails.
@@ -99,6 +100,7 @@ pub(crate) mod test {
             .arg("--via-ir")
             .arg("--evm-version")
             .arg("cancun")
+            .arg("--no-cbor-metadata")
             .arg("-")
             .spawn()
         {
