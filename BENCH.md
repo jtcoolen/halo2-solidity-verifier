@@ -1,12 +1,13 @@
 # Per-section gas attribution
 
-Measured breakdown of the 1.48 M gas Poseidon-fixture verification on the
-midfall branch, captured via the `solidity-gas-checkpoints` cargo feature.
+Measured breakdowns of the Poseidon-fixture verifier and the IVC Keccak final
+verifier on the midfall branch, captured via the `solidity-gas-checkpoints`
+cargo feature.
 This document is the measurement counterpart to `OPTIMISATION.md`: where
 that one lists *what changes are available*, this one says *which sections
 are actually expensive enough to be worth changing*.
 
-## Running the bench
+## Running the Poseidon fixture bench
 
 The verifier emits a LOG1 at every section boundary when compiled with
 `--features solidity-gas-checkpoints`. The host-side test
@@ -26,6 +27,94 @@ overhead, subtracted from the printed deltas).
 
 The 16 checkpoints sit at semantic section boundaries — see
 `templates/Halo2Verifier.sol` (search for `gas_checkpoint(`).
+
+## Running the IVC Keccak final bench
+
+The IVC bench proves three inner SHA-256 statements, emits the final IVC proof
+under a Keccak transcript, renders separate verifier/VK contracts, compiles
+them with solc, deploys them in Prague-spec revm, and verifies the final proof
+end to end. It is marked ignored because it is slow.
+
+```
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  -- --ignored --nocapture
+```
+
+For a compile-only check before spending the proving time:
+
+```
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  --no-run
+```
+
+The test writes generated artifacts to:
+
+```
+target/ivc-keccak-solidity-dump/
+```
+
+Useful follow-up commands:
+
+```
+cat target/ivc-keccak-solidity-dump/contract-sizes.txt
+ls -lh target/ivc-keccak-solidity-dump
+```
+
+### IVC Keccak final run, 2026-04-29
+
+Run shape:
+
+- 3 inner SHA proofs: 1.81 s total.
+- IVC setup: 33.88 s.
+- IVC steps: 76.57 s, 62.44 s, 56.94 s for the final Keccak step.
+- Native `verify_final`: 30.59 ms.
+- Compressed final proof: 9,952 bytes.
+- Repacked EIP-2537-padded proof: 12,672 bytes.
+- Calldata: 16,324 bytes, with 110 public-input field elements.
+
+Contract size summary with `SOLC_OPTIMIZE_RUNS = 1` and no CBOR metadata:
+
+```
+Halo2Verifier.sol source bytes: 421,753
+Halo2VerifyingKey.sol source bytes: 27,237
+Halo2Verifier creation bytecode bytes: 52,237
+Halo2VerifyingKey creation bytecode bytes: 5,926
+Halo2Verifier deployed runtime bytes: 51,991
+Halo2VerifyingKey deployed runtime bytes: 6,752
+total deployed runtime bytes: 58,743
+```
+
+Gas summary:
+
+```
+total tx gas_used       = 2,083,979
+real section work       = 1,801,810
+checkpoint overhead     = 15,750 (21 checkpoints x 750 gas)
+```
+
+Largest sections:
+
+| section | gas | note |
+|---|---:|---|
+| PCS block 3 set 0 q_com/q_eval fold | 494,054 | biggest PCS fold |
+| public accumulator pairing check | 467,803 | decodes the carried IVC accumulator, rebuilds its RHS fixed-base MSM, then pairs |
+| evaluations + transcript tail | 248,795 | eval reads, challenge squeezes, proof accumulator prep |
+| linearization-commitment MSM | 119,469 | verifier linearization commitment |
+| quotient evaluation | 107,966 | Fr arithmetic |
+| final proof ec_pairing | 103,168 | final proof/KZG accumulator pairing after PCS inputs are already prepared |
+| Lagrange + instance evaluation | 82,709 | public instance evaluation |
+
+The IVC public accumulator is *variable-base collapsed* but not fully
+collapsed over fixed bases. Its LHS is one point with scalar 1; its RHS is one
+point with scalar 1 plus fixed-base scalars for `-G`, fixed commitments, and
+permutation commitments. That is why the public accumulator checkpoint is much
+more expensive than the final proof pairing checkpoint.
 
 ## Measured breakdown (Poseidon fixture, k=6, midfall HEAD)
 
