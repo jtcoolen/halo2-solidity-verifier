@@ -2,8 +2,8 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
-    Keccak256Transcript, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, Keccak256Transcript,
+    SolidityGenerator,
 };
 
 fn main() {
@@ -29,11 +29,10 @@ fn main() {
         evm.create_with_address_arg(compile_solidity(&verifier_solidity), vk_address);
 
     println!("call traced verifier");
-    let (gas_cost, output, logs) =
-        evm.call_with_logs(
-            verifier_address,
-            encode_calldata_bls_padded(&generator, &proof, &instances),
-        );
+    let (gas_cost, output, logs) = evm.call_with_logs(
+        verifier_address,
+        encode_calldata_bls_padded(&generator, &proof, &instances),
+    );
     assert_eq!(output, [vec![0; 31], vec![1]].concat());
 
     println!("Trace gas cost: {gas_cost}");

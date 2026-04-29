@@ -2,8 +2,8 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
-    Keccak256Transcript, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, Keccak256Transcript,
+    SolidityGenerator,
 };
 
 const K_RANGE: Range<u32> = 10..17;
@@ -44,8 +44,7 @@ fn main() {
         // precompiles -- the pairing should now return 1 for valid
         // proofs.
         let vk_address = evm.create(vk_creation_code);
-        let verifier_address =
-            evm.create_with_address_arg(verifier_creation_code, vk_address);
+        let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
         let calldata = {
             let instances = circuit.instances();
             let proof = create_proof_checked(&params[&k], &pk, circuit, &instances, &mut rng);
@@ -65,10 +64,7 @@ fn main() {
                 );
             }
             Err(_) => {
-                println!(
-                    "  -> verifier reverted; calldata = {} B",
-                    calldata.len()
-                );
+                println!("  -> verifier reverted; calldata = {} B", calldata.len());
             }
         }
     }

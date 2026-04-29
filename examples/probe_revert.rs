@@ -39,20 +39,22 @@ fn main() {
 
             let mut evm = Evm::default();
             let vk_address = evm.create(compile_solidity(&vk_solidity));
-            let verifier_address = evm
-                .create_with_address_arg(compile_solidity(&verifier_solidity), vk_address);
+            let verifier_address =
+                evm.create_with_address_arg(compile_solidity(&verifier_solidity), vk_address);
 
             let proof = create_proof_checked(&params, &pk, circuit, &instances, &mut rng);
             let calldata = encode_calldata_bls_padded(&generator, &proof, &instances);
 
             match evm.try_call(verifier_address, calldata) {
-                CallOutcome::Success { gas_used, output, .. }
-                    if output == [vec![0u8; 31], vec![1]].concat() =>
-                {
+                CallOutcome::Success {
+                    gas_used, output, ..
+                } if output == [vec![0u8; 31], vec![1]].concat() => {
                     println!("seed={seed} k={k}: ACCEPT (gas={gas_used})");
                     totals.push((gas_used, "ok"));
                 }
-                CallOutcome::Success { gas_used, output, .. } => {
+                CallOutcome::Success {
+                    gas_used, output, ..
+                } => {
                     println!(
                         "seed={seed} k={k}: ran but returned {} bytes (gas={gas_used})",
                         output.len()
@@ -138,8 +140,7 @@ impl StandardPlonkConfig {
             meta.enable_equality(column);
         }
         meta.create_gate("sp", |meta| {
-            let [w_l, w_r, w_o] =
-                [w_l, w_r, w_o].map(|c| meta.query_advice(c, Rotation::cur()));
+            let [w_l, w_r, w_o] = [w_l, w_r, w_o].map(|c| meta.query_advice(c, Rotation::cur()));
             let [q_l, q_r, q_o, q_m, q_c] =
                 [q_l, q_r, q_o, q_m, q_c].map(|c| meta.query_fixed(c, Rotation::cur()));
             let pi = meta.query_instance(pi, Rotation::cur());

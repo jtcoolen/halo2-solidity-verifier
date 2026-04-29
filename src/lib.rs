@@ -35,21 +35,17 @@ pub const SOLIDITY_TRACE_ENABLED: bool = cfg!(feature = "solidity-trace");
 /// Enable with `--features solidity-gas-checkpoints`. The explicit
 /// `render_with_gas_checkpoints*` helpers still force checkpoint
 /// emission regardless of this flag.
-pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool =
-    cfg!(feature = "solidity-gas-checkpoints");
+pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool = cfg!(feature = "solidity-gas-checkpoints");
 
 #[cfg(feature = "evm")]
 pub use evm::test::{
-    compile_solidity, compile_solidity_with_runs, revm, CallOutcome, Evm,
-    DEFAULT_OPTIMIZE_RUNS,
+    compile_solidity, compile_solidity_with_runs, revm, CallOutcome, Evm, DEFAULT_OPTIMIZE_RUNS,
 };
 
 /// Test-only helper that exposes the internal BLS12-381 G1 to EIP-2537
 /// hi/lo encoder so debugging examples can re-encode host-computed
 /// points using the exact same pipeline the Solidity verifier consumes.
 #[doc(hidden)]
-pub fn __test_only_g1_to_u256s(
-    point: &midnight_curves::G1Affine,
-) -> [ruint::aliases::U256; 4] {
+pub fn __test_only_g1_to_u256s(point: &midnight_curves::G1Affine) -> [ruint::aliases::U256; 4] {
     crate::codegen::util::g1_to_u256s(point)
 }

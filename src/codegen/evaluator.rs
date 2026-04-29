@@ -147,7 +147,9 @@ impl<'a> Evaluator<'a> {
             let one_minus_z0 = self.fresh_var();
             lines.push(format!("let {one_minus_z0} := addmod(1, sub(r, {z0}), r)"));
             let bnd_first = self.fresh_var();
-            lines.push(format!("let {bnd_first} := mulmod({l0}, {one_minus_z0}, r)"));
+            lines.push(format!(
+                "let {bnd_first} := mulmod({l0}, {one_minus_z0}, r)"
+            ));
             out.push((lines, bnd_first));
         }
 
@@ -165,7 +167,9 @@ impl<'a> Evaluator<'a> {
                 "let {zn_sq_minus_zn} := addmod({zn_sq}, sub(r, {zn}), r)"
             ));
             let bnd_last = self.fresh_var();
-            lines.push(format!("let {bnd_last} := mulmod({llast}, {zn_sq_minus_zn}, r)"));
+            lines.push(format!(
+                "let {bnd_last} := mulmod({llast}, {zn_sq_minus_zn}, r)"
+            ));
             out.push((lines, bnd_last));
         }
 
@@ -192,10 +196,8 @@ impl<'a> Evaluator<'a> {
 
         // 4. Per-set product equality.
         let delta = fe_to_u256::<Fq>(&Fq::DELTA);
-        for (set_idx, ((z_cur, z_next, _), chunk_cols)) in z_evals
-            .iter()
-            .zip(columns.chunks(chunk_len))
-            .enumerate()
+        for (set_idx, ((z_cur, z_next, _), chunk_cols)) in
+            z_evals.iter().zip(columns.chunks(chunk_len)).enumerate()
         {
             self.reset();
             let mut lines = Vec::new();
@@ -265,9 +267,7 @@ impl<'a> Evaluator<'a> {
             }
 
             let diff = self.fresh_var();
-            lines.push(format!(
-                "let {diff} := addmod({left}, sub(r, {right}), r)"
-            ));
+            lines.push(format!("let {diff} := addmod({left}, sub(r, {right}), r)"));
             let constraint = self.fresh_var();
             lines.push(format!("let {constraint} := mulmod({active}, {diff}, r)"));
             out.push((lines, constraint));
@@ -360,9 +360,7 @@ impl<'a> Evaluator<'a> {
                     let (mut compressed_lines, compressed_var) = compressed;
                     lines.append(&mut compressed_lines);
                     let fb = self.fresh_var();
-                    lines.push(format!(
-                        "let {fb} := addmod({compressed_var}, {beta}, r)"
-                    ));
+                    lines.push(format!("let {fb} := addmod({compressed_var}, {beta}, r)"));
                     f_plus_beta_vars.push(fb);
                 }
 
@@ -718,10 +716,7 @@ impl<'a> Evaluator<'a> {
                 let column_index = query.column_index();
                 let rotation = query.rotation().0;
                 let eval = self.instance_eval_at(column_index, rotation);
-                self.init_var(
-                    eval,
-                    Some(column_eval_var("i", column_index, rotation)),
-                )
+                self.init_var(eval, Some(column_eval_var("i", column_index, rotation)))
             },
             &|challenge| {
                 self.init_var(
@@ -735,15 +730,13 @@ impl<'a> Evaluator<'a> {
                 (acc, var)
             },
             &|(mut lhs_acc, lhs_var), (rhs_acc, rhs_var)| {
-                let (lines, var) =
-                    self.init_var(format!("addmod({lhs_var}, {rhs_var}, r)"), None);
+                let (lines, var) = self.init_var(format!("addmod({lhs_var}, {rhs_var}, r)"), None);
                 lhs_acc.extend(rhs_acc);
                 lhs_acc.extend(lines);
                 (lhs_acc, var)
             },
             &|(mut lhs_acc, lhs_var), (rhs_acc, rhs_var)| {
-                let (lines, var) =
-                    self.init_var(format!("mulmod({lhs_var}, {rhs_var}, r)"), None);
+                let (lines, var) = self.init_var(format!("mulmod({lhs_var}, {rhs_var}, r)"), None);
                 lhs_acc.extend(rhs_acc);
                 lhs_acc.extend(lines);
                 (lhs_acc, var)
@@ -780,7 +773,9 @@ impl<'a> Evaluator<'a> {
             (vec![], self.var_cache.borrow()[&value].clone())
         } else {
             let var = var.unwrap_or_else(|| self.next_var());
-            self.var_cache.borrow_mut().insert(value.clone(), var.clone());
+            self.var_cache
+                .borrow_mut()
+                .insert(value.clone(), var.clone());
             (vec![format!("let {var} := {value}")], var)
         }
     }

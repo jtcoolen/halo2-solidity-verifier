@@ -43,7 +43,10 @@ fn main() {
     let logs = match outcome {
         CallOutcome::Success { logs, .. } => logs,
         CallOutcome::Revert { gas_used, output } => {
-            panic!("solidity reverted gas={gas_used} output_len={}", output.len());
+            panic!(
+                "solidity reverted gas={gas_used} output_len={}",
+                output.len()
+            );
         }
         CallOutcome::Halt { gas_used, reason } => {
             panic!("solidity halted gas={gas_used} reason={reason}");
@@ -52,11 +55,8 @@ fn main() {
     let mut sol_nu = None;
     let mut sol_mu = None;
     for log in &logs {
-        let trace_id = u64::from_be_bytes(
-            log.data.topics()[0].as_slice()[24..32]
-                .try_into()
-                .unwrap(),
-        );
+        let trace_id =
+            u64::from_be_bytes(log.data.topics()[0].as_slice()[24..32].try_into().unwrap());
         if trace_id == 13 {
             sol_nu = Some(hex::encode(log.data.data.as_ref()));
         }
@@ -132,8 +132,7 @@ impl StandardPlonkConfig {
             meta.enable_equality(column);
         }
         meta.create_gate("sp", |meta| {
-            let [w_l, w_r, w_o] =
-                [w_l, w_r, w_o].map(|c| meta.query_advice(c, Rotation::cur()));
+            let [w_l, w_r, w_o] = [w_l, w_r, w_o].map(|c| meta.query_advice(c, Rotation::cur()));
             let [q_l, q_r, q_o, q_m, q_c] =
                 [q_l, q_r, q_o, q_m, q_c].map(|c| meta.query_fixed(c, Rotation::cur()));
             let pi = meta.query_instance(pi, Rotation::cur());

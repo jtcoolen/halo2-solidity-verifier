@@ -6,16 +6,22 @@ use halo2_proofs::{
     transcript::{Transcript, TranscriptRead},
 };
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm,
-    Keccak256Transcript, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, Keccak256Transcript,
+    SolidityGenerator,
 };
 use itertools::{chain, Itertools};
 use ruint::aliases::U256;
 use std::{collections::BTreeMap, io};
 
 fn main() {
-    let k: u32 = std::env::var("K").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
-    let seed: u64 = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let k: u32 = std::env::var("K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
+    let seed: u64 = std::env::var("SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     println!("compare_trace: k={k} seed={seed}");
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -82,10 +88,7 @@ fn main() {
                 println!("  {slot} = {coord}");
             }
         } else {
-            println!(
-                "{name} = {}",
-                decode_word(log.data.data.as_ref(), 0),
-            );
+            println!("{name} = {}", decode_word(log.data.data.as_ref(), 0),);
         }
     }
     println!("--- end solidity trace ---");
@@ -107,9 +110,16 @@ fn main() {
 
     let mut any_mismatch = false;
     for name in TRACE_NAMES {
-        let solidity_value = solidity.get(*name).map(|s| s.as_str()).unwrap_or("(missing)");
+        let solidity_value = solidity
+            .get(*name)
+            .map(|s| s.as_str())
+            .unwrap_or("(missing)");
         let rust_value = rust.get(*name).map(|s| s.as_str()).unwrap_or("(missing)");
-        let diff = if solidity_value == rust_value { "" } else { "  <-- MISMATCH" };
+        let diff = if solidity_value == rust_value {
+            ""
+        } else {
+            "  <-- MISMATCH"
+        };
         if !diff.is_empty() {
             any_mismatch = true;
         }
@@ -306,18 +316,24 @@ impl TraceMeta {
             chain![
                 advice_queries.iter().map(|q| q.1),
                 fixed_queries.iter().map(|q| q.1),
-                (num_permutation_zs > 0).then_some([
-                    halo2_proofs::poly::Rotation::cur(),
-                    halo2_proofs::poly::Rotation::next(),
-                ]).into_iter().flatten(),
+                (num_permutation_zs > 0)
+                    .then_some([
+                        halo2_proofs::poly::Rotation::cur(),
+                        halo2_proofs::poly::Rotation::next(),
+                    ])
+                    .into_iter()
+                    .flatten(),
                 (num_permutation_zs > 1).then_some(halo2_proofs::poly::Rotation(
                     -(cs.blinding_factors_pub() as i32 + 1),
                 )),
-                (num_lookup_zs > 0).then_some([
-                    halo2_proofs::poly::Rotation::prev(),
-                    halo2_proofs::poly::Rotation::cur(),
-                    halo2_proofs::poly::Rotation::next(),
-                ]).into_iter().flatten(),
+                (num_lookup_zs > 0)
+                    .then_some([
+                        halo2_proofs::poly::Rotation::prev(),
+                        halo2_proofs::poly::Rotation::cur(),
+                        halo2_proofs::poly::Rotation::next(),
+                    ])
+                    .into_iter()
+                    .flatten(),
             ]
             .unique()
             .count()
@@ -436,7 +452,9 @@ fn compute_rust_pairing_points(
         E::G1: halo2_proofs::halo2curves::CurveExt<AffineExt = E::G1Affine>,
     {
         fn new() -> Self {
-            Self { msm: DualMSM::new() }
+            Self {
+                msm: DualMSM::new(),
+            }
         }
     }
 
@@ -463,8 +481,12 @@ fn compute_rust_pairing_points(
     {
         type Output = DualMSM<E>;
 
-        fn new(_params: &'params halo2_backend::poly::kzg::commitment::ParamsVerifierKZG<E>) -> Self {
-            Self { msm: DualMSM::new() }
+        fn new(
+            _params: &'params halo2_backend::poly::kzg::commitment::ParamsVerifierKZG<E>,
+        ) -> Self {
+            Self {
+                msm: DualMSM::new(),
+            }
         }
 
         fn process(
@@ -662,6 +684,7 @@ mod application {
 }
 
 mod prelude {
+    pub use halo2_backend::plonk::circuit::ConstraintSystemBack;
     pub use halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner, Value},
         halo2curves::{
@@ -674,7 +697,6 @@ mod prelude {
         },
         poly::{commitment::Params, kzg::commitment::ParamsKZG, Rotation},
     };
-    pub use halo2_backend::plonk::circuit::ConstraintSystemBack;
     pub use rand::{rngs::StdRng, RngCore, SeedableRng};
 
     pub fn seeded_std_rng() -> StdRng {
