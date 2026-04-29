@@ -13,8 +13,8 @@ The Midnight dependencies resolve from the published midfall branch:
 https://github.com/EYBlockchain/midfall.git#keccak
 ```
 
-The benchmark still needs local SRS files. Set `SRS_DIR` to the directory that
-contains `bls_filecoin_2p13` and the Midnight SRS assets.
+The benchmark needs local SRS files. The helper script below downloads missing
+assets into `.srs/` by default; set `SRS_DIR` to reuse an existing directory.
 
 ## Running the Poseidon fixture bench
 
@@ -44,7 +44,26 @@ under a Keccak transcript, renders separate verifier/VK contracts, compiles
 them with solc, deploys them in Prague-spec revm, and verifies the final proof
 end to end. It is marked ignored because it is slow.
 
-Fetch/build the GitHub midfall dependencies and compile the ignored test first:
+Recommended runner:
+
+```
+scripts/run_ivc_bench.sh
+```
+
+Compile-only preflight:
+
+```
+scripts/run_ivc_bench.sh --check-only
+```
+
+Use an existing SRS directory or also run the off-circuit Midfall twin:
+
+```
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+  scripts/run_ivc_bench.sh --native-midfall
+```
+
+Manual compile command:
 
 ```
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
@@ -54,7 +73,7 @@ cargo test --release \
   --no-run
 ```
 
-Run the full gas-checkpoint bench:
+Manual full gas-checkpoint command:
 
 ```
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \

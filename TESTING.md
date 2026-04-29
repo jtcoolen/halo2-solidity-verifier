@@ -14,8 +14,9 @@ Midnight crates resolve from the published midfall GitHub branch configured in
 https://github.com/EYBlockchain/midfall.git#keccak
 ```
 
-The ignored proving benches still need local SRS files. Point `SRS_DIR` at the
-directory containing the Filecoin and Midnight SRS assets.
+The ignored proving benches need local SRS files. `scripts/run_ivc_bench.sh`
+downloads the IVC bench assets into `.srs/` by default, or you can point
+`SRS_DIR` at an existing Filecoin/Midnight SRS directory.
 
 ```bash
 rustc --version    # should report 1.90.0
@@ -158,21 +159,20 @@ prints section-level gas checkpoints.
 Compile-only check:
 
 ```bash
-SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
-cargo test --release \
-  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
-  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  --no-run
+scripts/run_ivc_bench.sh --check-only
 ```
 
 Full bench:
 
 ```bash
+scripts/run_ivc_bench.sh
+```
+
+Use an existing SRS directory and also run the native Midfall final-proof twin:
+
+```bash
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
-cargo test --release \
-  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
-  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  -- --ignored --nocapture
+  scripts/run_ivc_bench.sh --native-midfall
 ```
 
 Generated contracts, calldata, proof bytes, and size reports are written to:
