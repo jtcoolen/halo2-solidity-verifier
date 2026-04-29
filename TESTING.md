@@ -7,6 +7,16 @@ The workspace is pinned to the toolchain in [`rust-toolchain.toml`](./rust-toolc
 (currently Rust 1.90.0). Solidity-touching tests and examples additionally
 require `solc` on `PATH`; any 0.8.x release works.
 
+Midnight crates resolve from the published midfall GitHub branch configured in
+`Cargo.toml`:
+
+```text
+https://github.com/EYBlockchain/midfall.git#keccak
+```
+
+The ignored proving benches still need local SRS files. Point `SRS_DIR` at the
+directory containing the Filecoin and Midnight SRS assets.
+
 ```bash
 rustc --version    # should report 1.90.0
 solc --version     # should report 0.8.x
@@ -137,6 +147,39 @@ What each one covers:
   must produce identical Solidity sources for both embedded and separate.
 - `compile_solidity_is_deterministic_for_same_source` — same Solidity source
   must compile to identical bytecode (smoke test for `solc` reproducibility).
+
+### IVC Keccak Solidity bench
+
+This slow ignored test proves three inner SHA-256 statements, emits the final
+IVC proof under a Keccak transcript, renders the Solidity verifier/VK, deploys
+them in Prague-spec `revm`, verifies on-chain, reports contract sizes, and
+prints section-level gas checkpoints.
+
+Compile-only check:
+
+```bash
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  --no-run
+```
+
+Full bench:
+
+```bash
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  -- --ignored --nocapture
+```
+
+Generated contracts, calldata, proof bytes, and size reports are written to:
+
+```text
+target/ivc-keccak-solidity-dump/
+```
 
 ### Run absolutely everything
 

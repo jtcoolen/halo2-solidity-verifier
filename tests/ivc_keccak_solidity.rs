@@ -17,6 +17,9 @@
 //!   5. Assert success and dump gas.
 //!
 //! Required features: `evm`, `truncated-challenges`, `fewer-point-sets`.
+//! Midnight crates are pulled from the published midfall `keccak` branch
+//! configured in `Cargo.toml`; `SRS_DIR` still needs to point at local SRS
+//! assets.
 //! Run:
 //!
 //! ```text

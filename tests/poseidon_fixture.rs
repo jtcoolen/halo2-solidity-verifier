@@ -19,11 +19,10 @@
 //! Yul renders cleanly and the Prague-spec EVM accepts the proof.
 //!
 //! NOTE: this test depends on `midnight-zk-stdlib` + `midnight-circuits`
-//! (path deps under `../midfall/`) which carry the full poseidon chip
-//! configuration. The crate's `Cargo.toml` `[patch.crates-io]` block
-//! redirects every `midnight-*` reference to the local midfall checkout
-//! so cargo resolves a single canonical crate copy across the whole
-//! dep graph.
+//! from the published midfall branch configured in `Cargo.toml`. The
+//! `[patch]` blocks redirect every `midnight-*` reference to that same
+//! Git source so cargo resolves a single canonical crate copy across
+//! the whole dep graph.
 
 #![cfg(feature = "evm")]
 
@@ -92,16 +91,18 @@ impl Relation for PoseidonExample {
 }
 
 fn srs_dir() -> String {
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../midfall/zk_stdlib/examples/assets"
-    )
-    .to_string()
+    env::var("SRS_DIR").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../midfall/zk_stdlib/examples/assets"
+        )
+        .to_string()
+    })
 }
 
 /// Step 8 end-to-end smoke. Marked `#[ignore]` because it depends on
-/// the local midfall checkout, Filecoin SRS asset, solc, and Prague
-/// EIP-2537 precompile support. Run explicitly via
+/// the Filecoin SRS asset, solc, and Prague EIP-2537 precompile
+/// support. Run explicitly via
 ///   cargo test --features evm --test poseidon_fixture -- --ignored --nocapture
 /// Enable Solidity trace logs with:
 ///   cargo test --features evm,solidity-trace --test poseidon_fixture -- --ignored --nocapture

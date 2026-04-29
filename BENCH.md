@@ -7,6 +7,15 @@ This document is the measurement counterpart to `OPTIMISATION.md`: where
 that one lists *what changes are available*, this one says *which sections
 are actually expensive enough to be worth changing*.
 
+The Midnight dependencies resolve from the published midfall branch:
+
+```
+https://github.com/EYBlockchain/midfall.git#keccak
+```
+
+The benchmark still needs local SRS files. Set `SRS_DIR` to the directory that
+contains `bls_filecoin_2p13` and the Midnight SRS assets.
+
 ## Running the Poseidon fixture bench
 
 The verifier emits a LOG1 at every section boundary when compiled with
@@ -35,15 +44,7 @@ under a Keccak transcript, renders separate verifier/VK contracts, compiles
 them with solc, deploys them in Prague-spec revm, and verifies the final proof
 end to end. It is marked ignored because it is slow.
 
-```
-SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
-cargo test --release \
-  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
-  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  -- --ignored --nocapture
-```
-
-For a compile-only check before spending the proving time:
+Fetch/build the GitHub midfall dependencies and compile the ignored test first:
 
 ```
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
@@ -51,6 +52,16 @@ cargo test --release \
   --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
   --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
   --no-run
+```
+
+Run the full gas-checkpoint bench:
+
+```
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  -- --ignored --nocapture
 ```
 
 The test writes generated artifacts to:

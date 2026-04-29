@@ -5,16 +5,16 @@ edition = "2021"
 
 [dependencies]
 # Migration target: depend on midnight-proofs (the midfall fork of halo2 v0.4)
-# directly via a path dep. midnight-proofs ships logup, the trash argument,
-# the midnight KZG multi-prepare PCS, and a Keccak256 transcript with a
-# domain-separator + 64-byte squeeze. midnight-curves carries BLS12-381
+# from the published GitHub branch. midnight-proofs ships logup, the trash
+# argument, the midnight KZG multi-prepare PCS, and a Keccak256 transcript with
+# a domain-separator + 64-byte squeeze. midnight-curves carries BLS12-381
 # natively (Fq scalar = midnight_curves::Fq, G1 = midnight_curves::G1Affine,
 # pairing engine = midnight_curves::Bls12).
 #
 # The vendored halo2 v0.4 tree under vendor/halo2/ is now obsolete and is
 # kept on disk only for the transcript / codegen tests that have not yet
 # been ported (see MIGRATION.md). It is no longer in the build graph.
-midnight-proofs = { path = "../midfall/proofs", default-features = false, features = ["keccak-transcript", "committed-instances", "circuit-params"] }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", default-features = false, features = ["keccak-transcript", "committed-instances", "circuit-params"] }
 midnight-curves = { version = "0.2.0" }
 ff = "0.13"
 group = "0.13"
@@ -40,16 +40,16 @@ revm = { version = "19", default-features = false, features = ["std", "blst"] }
 rand_chacha = "0.3.1"
 # Step 8: pull in midnight-circuits + midnight-zk-stdlib only as dev-deps so
 # the lib build stays minimal. These provide the PoseidonExample circuit
-# type the poseidon fixture (../midfall/proofs/solidity-verifier/fixtures/
+# type the poseidon fixture (midfall/proofs/solidity-verifier/fixtures/
 # poseidon/{proof.bin, vk.bin, instance.be}) was generated against, which
 # we need to deserialize the VK and rebuild the SolidityGenerator.
-midnight-circuits = { path = "../midfall/circuits", features = ["testing"] }
-midnight-zk-stdlib = { path = "../midfall/zk_stdlib", features = ["testing"] }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
+midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 # IVC final-step Keccak proof end-to-end test (tests/ivc_keccak_solidity.rs).
 # All three features are required so the off-chain prove_final_step output
 # matches what the rendered Solidity verifier expects on-chain (Keccak
 # transcript + truncated challenges + dummy queries from fewer-point-sets).
-midnight-aggregation = { path = "../midfall/aggregation", features = [
+midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = [
     "keccak-transcript",
     "truncated-challenges",
     "fewer-point-sets",
@@ -62,26 +62,26 @@ sha2 = "0.10"
 # dep can be re-enabled.
 # halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
 
-# Step 8 cross-crate path patches.
+# Step 8 cross-crate Git patches.
 #
 # midnight-zk-stdlib + midnight-circuits depend on `midnight-proofs` /
 # `midnight-curves` / `midnight-circuits` from crates.io and on
 # `blake2b_halo2` from a Github source. We redirect each of those to the
-# local midfall checkout so cargo resolves a single canonical copy of
-# every dep — otherwise `Hashable<G1Projective>` etc. become ambiguous
+# published midfall branch so cargo resolves a single canonical copy of
+# every dep - otherwise `Hashable<G1Projective>` etc. become ambiguous
 # across two isomorphic-but-distinct crate copies.
 [patch.crates-io]
-midnight-proofs = { path = "../midfall/proofs" }
-midnight-curves = { path = "../midfall/curves" }
-midnight-circuits = { path = "../midfall/circuits" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [patch."https://github.com/midnightntwrk/midnight-zk"]
-midnight-proofs = { path = "../midfall/proofs" }
-midnight-curves = { path = "../midfall/curves" }
-midnight-circuits = { path = "../midfall/circuits" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [patch."https://github.com/eryxcoop/blake2b_halo2"]
-blake2b_halo2 = { path = "../midfall/vendor/blake2b_halo2" }
+blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [features]
 default = []
