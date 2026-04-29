@@ -151,7 +151,7 @@ What each one covers:
 
 ### IVC Keccak Solidity bench
 
-This slow ignored test proves three inner SHA-256 statements, emits the final
+This slow ignored test proves one inner SHA-256 statement, emits the final
 IVC proof under a Keccak transcript, renders the Solidity verifier/VK, deploys
 them in Prague-spec `revm`, verifies on-chain, reports contract sizes, and
 prints section-level gas checkpoints.

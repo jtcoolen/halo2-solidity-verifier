@@ -39,7 +39,7 @@ The 16 checkpoints sit at semantic section boundaries — see
 
 ## Running the IVC Keccak final bench
 
-The IVC bench proves three inner SHA-256 statements, emits the final IVC proof
+The IVC bench proves one inner SHA-256 statement, emits the final IVC proof
 under a Keccak transcript, renders separate verifier/VK contracts, compiles
 them with solc, deploys them in Prague-spec revm, and verifies the final proof
 end to end. It is marked ignored because it is slow.
@@ -100,31 +100,31 @@ ls -lh target/ivc-keccak-solidity-dump
 
 Run shape:
 
-- 3 inner SHA proofs: 1.81 s total.
-- IVC setup: 33.88 s.
-- IVC steps: 76.57 s, 62.44 s, 56.94 s for the final Keccak step.
-- Native `verify_final`: 30.59 ms.
+- 1 inner SHA proof: 0.59 s.
+- IVC setup: 47.82 s.
+- IVC final Keccak step: 64.22 s.
+- Native `verify_final`: 10.01 ms.
 - Compressed final proof: 9,952 bytes.
 - Repacked EIP-2537-padded proof: 12,672 bytes.
-- Calldata: 16,324 bytes, with 110 public-input field elements.
+- Calldata: 14,980 bytes, with 68 public-input field elements.
 
 Contract size summary with `SOLC_OPTIMIZE_RUNS = 1` and no CBOR metadata:
 
 ```
-Halo2Verifier.sol source bytes: 421,753
+Halo2Verifier.sol source bytes: 426,899
 Halo2VerifyingKey.sol source bytes: 27,237
-Halo2Verifier creation bytecode bytes: 52,237
-Halo2VerifyingKey creation bytecode bytes: 5,926
-Halo2Verifier deployed runtime bytes: 51,991
+Halo2Verifier creation bytecode bytes: 53,571
+Halo2VerifyingKey creation bytecode bytes: 5,925
+Halo2Verifier deployed runtime bytes: 53,325
 Halo2VerifyingKey deployed runtime bytes: 6,752
-total deployed runtime bytes: 58,743
+total deployed runtime bytes: 60,077
 ```
 
 Gas summary:
 
 ```
-total tx gas_used       = 2,083,979
-real section work       = 1,801,810
+total tx gas_used       = 1,617,543
+real section work       = 1,374,422
 checkpoint overhead     = 15,750 (21 checkpoints x 750 gas)
 ```
 
@@ -132,19 +132,21 @@ Largest sections:
 
 | section | gas | note |
 |---|---:|---|
-| PCS block 3 set 0 q_com/q_eval fold | 494,054 | biggest PCS fold |
-| public accumulator pairing check | 467,803 | decodes the carried IVC accumulator, rebuilds its RHS fixed-base MSM, then pairs |
+| PCS block 3 set 0 q_com/q_eval fold | 494,377 | biggest PCS fold |
 | evaluations + transcript tail | 248,795 | eval reads, challenge squeezes, proof accumulator prep |
 | linearization-commitment MSM | 119,469 | verifier linearization commitment |
 | quotient evaluation | 107,966 | Fr arithmetic |
+| public accumulator pairing check | 105,329 | trivial one-step outer accumulator; skips identity/zero-scalar MSM calls |
 | final proof ec_pairing | 103,168 | final proof/KZG accumulator pairing after PCS inputs are already prepared |
-| Lagrange + instance evaluation | 82,709 | public instance evaluation |
+| Lagrange + instance evaluation | 55,002 | public instance evaluation |
 
-The IVC public accumulator is *variable-base collapsed* but not fully
-collapsed over fixed bases. Its LHS is one point with scalar 1; its RHS is one
-point with scalar 1 plus fixed-base scalars for `-G`, fixed commitments, and
-permutation commitments. That is why the public accumulator checkpoint is much
-more expensive than the final proof pairing checkpoint.
+The application-level accumulator carried in the decider state is now fully
+collapsed over the inner verifier's fixed bases: it exposes only
+`lhs point, lhs scalar = 1, rhs point, rhs scalar = 1`. The outer IVC
+self-accumulator still follows Midfall's variable-base-collapsed shape, because
+its fixed bases are the self VK; for the one-step final proof it is trivial, so
+the Solidity verifier detects the packed identity encoding and skips
+identity/zero-scalar MSM precompile calls.
 
 ## Measured breakdown (Poseidon fixture, k=6, midfall HEAD)
 

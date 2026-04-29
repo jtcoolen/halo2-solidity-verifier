@@ -568,25 +568,32 @@ impl<'a> SolidityGenerator<'a> {
                 .num_instances
                 .checked_sub(acc_encoding.offset + point_and_scalar_words)
                 .expect("accumulator public input exceeds num_instances");
-            let num_perm_bases = vk.permutation_comms.len();
-            let num_fixed_bases = fixed_scalar_count
-                .checked_sub(1 + num_perm_bases)
-                .expect("accumulator fixed scalar count is smaller than -G + permutations");
+            // A fully-collapsed public accumulator has no fixed-base scalar
+            // tail: just (lhs point, lhs scalar=1, rhs point, rhs scalar=1).
+            // Older partially-collapsed accumulators still expose the RHS
+            // fixed scalars for -G, fixed commitments, and permutation
+            // commitments in BTreeMap key order.
+            if fixed_scalar_count != 0 {
+                let num_perm_bases = vk.permutation_comms.len();
+                let num_fixed_bases = fixed_scalar_count
+                    .checked_sub(1 + num_perm_bases)
+                    .expect("accumulator fixed scalar count is smaller than -G + permutations");
 
-            acc_fixed_bases.push(("-G".to_string(), g1_base_mptr_byte, true));
-            for i in 0..num_fixed_bases {
-                acc_fixed_bases.push((
-                    format!("self_vk_fixed_com_{i}"),
-                    fixed_comm_mptr_byte + i * 0x80,
-                    false,
-                ));
-            }
-            for i in 0..num_perm_bases {
-                acc_fixed_bases.push((
-                    format!("self_vk_perm_com_{i}"),
-                    permutation_comm_mptr_byte + i * 0x80,
-                    false,
-                ));
+                acc_fixed_bases.push(("-G".to_string(), g1_base_mptr_byte, true));
+                for i in 0..num_fixed_bases {
+                    acc_fixed_bases.push((
+                        format!("self_vk_fixed_com_{i}"),
+                        fixed_comm_mptr_byte + i * 0x80,
+                        false,
+                    ));
+                }
+                for i in 0..num_perm_bases {
+                    acc_fixed_bases.push((
+                        format!("self_vk_perm_com_{i}"),
+                        permutation_comm_mptr_byte + i * 0x80,
+                        false,
+                    ));
+                }
             }
         }
         acc_fixed_bases.sort_by(|a, b| a.0.cmp(&b.0));

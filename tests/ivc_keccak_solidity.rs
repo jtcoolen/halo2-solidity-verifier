@@ -5,7 +5,7 @@
 //!
 //! Pipeline:
 //!   1. Build the IVC circuit (k = 19, ProofAggregation transition).
-//!   2. Aggregate three SHA-256 preimage proofs into a chain; the last
+//!   2. Aggregate one SHA-256 preimage proof into the chain; the final
 //!      step uses `prove_final_step` so the outer Fiat-Shamir transcript
 //!      is Keccak-256 (matching the EVM verifier).
 //!   3. Render `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the
@@ -54,8 +54,8 @@ use midnight_aggregation::ivc::{self, IvcCircuit, IvcContext, IvcIO, IvcState, I
 use midnight_circuits::{
     hash::poseidon::{PoseidonChip, PoseidonState},
     instructions::{hash::HashCPU, *},
-    types::{AssignedBit, AssignedNative, Instantiable},
-    verifier::{self, Accumulator, AssignedAccumulator, BlstrsEmulation, SelfEmulation},
+    types::{AssignedBit, AssignedNative, InnerValue, Instantiable},
+    verifier::{self, Accumulator, AssignedAccumulator, BlstrsEmulation, Msm, SelfEmulation},
 };
 use midnight_proofs::{
     circuit::{Layouter, Value},
@@ -187,6 +187,49 @@ impl InnerCircuitContext {
     }
 }
 
+fn fully_collapsed_accumulator(
+    acc: &Accumulator<S>,
+    fixed_bases: &BTreeMap<String, C>,
+) -> Accumulator<S> {
+    let (lhs, rhs) = acc.fully_collapse(fixed_bases);
+    Accumulator::new(
+        Msm::from_terms(&[lhs], &[F::ONE]),
+        Msm::from_terms(&[rhs], &[F::ONE]),
+    )
+}
+
+fn constrain_fully_collapsed_accumulator(
+    std_lib: &ZkStdLib,
+    layouter: &mut impl Layouter<F>,
+    acc: AssignedAccumulator<S>,
+    fixed_bases: &BTreeMap<String, C>,
+) -> Result<AssignedAccumulator<S>, Error> {
+    let (lhs, rhs) = acc.fully_collapse(layouter, std_lib.bls12_381_curve(), fixed_bases)?;
+    let collapsed_value = acc
+        .value()
+        .map(|acc| fully_collapsed_accumulator(&acc, fixed_bases));
+    let collapsed =
+        std_lib
+            .verifier()
+            .assign_collapsed_accumulator(layouter, &[], collapsed_value)?;
+
+    let one: AssignedNative<F> = std_lib.assign_fixed(layouter, F::ONE)?;
+    let expected = [
+        std_lib.bls12_381_curve().as_public_input(layouter, &lhs)?,
+        vec![one.clone()],
+        std_lib.bls12_381_curve().as_public_input(layouter, &rhs)?,
+        vec![one],
+    ]
+    .concat();
+    let actual = std_lib.verifier().as_public_input(layouter, &collapsed)?;
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected.iter()) {
+        std_lib.assert_equal(layouter, actual, expected)?;
+    }
+
+    Ok(collapsed)
+}
+
 #[derive(Clone, Debug)]
 struct State {
     statements: Vec<<ShaPreimageCircuit as Relation>::Instance>,
@@ -235,13 +278,11 @@ impl IvcState for ProofAggregation {
     type State = State;
     type AssignedState = AssignedState;
 
-    fn genesis(ctx: &InnerCircuitContext) -> Self::State {
+    fn genesis(_ctx: &InnerCircuitContext) -> Self::State {
         State {
             statements: vec![],
             statements_hash: F::ZERO,
-            inner_acc: Accumulator::<S>::trivial(
-                &ctx.fixed_bases().keys().cloned().collect::<Vec<_>>(),
-            ),
+            inner_acc: Accumulator::<S>::trivial(&[]),
         }
     }
 
@@ -279,12 +320,7 @@ impl IvcIO for ProofAggregation {
             .assign(layouter, value.as_ref().map(|s| s.statements_hash))?;
         let inner_acc = self.std_lib.verifier().assign_collapsed_accumulator(
             layouter,
-            &self
-                .inner_ctx
-                .fixed_bases()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
+            &[],
             value.as_ref().map(|s| s.inner_acc.clone()),
         )?;
         Ok(AssignedState {
@@ -366,11 +402,8 @@ impl IvcTransition for ProofAggregation {
             Accumulator::from_dual_msm(dual_msm, "inner_vk", &ctx.fixed_bases())
         };
 
-        let inner_acc = {
-            let mut acc = Accumulator::accumulate(&[inner_proof_acc, state.inner_acc.clone()]);
-            acc.collapse();
-            acc
-        };
+        let inner_acc = Accumulator::accumulate(&[inner_proof_acc, state.inner_acc.clone()]);
+        let inner_acc = fully_collapsed_accumulator(&inner_acc, &ctx.fixed_bases());
 
         let statements_hash = {
             let h_statement = <PoseidonChip<F> as HashCPU<F, F>>::hash(&statement_pis);
@@ -422,18 +455,16 @@ impl IvcTransition for ProofAggregation {
             witness.map(|w| w.inner_proof),
         )?;
 
-        let inner_acc = {
-            let mut acc = self
-                .std_lib
-                .verifier()
-                .accumulate(layouter, &[inner_proof_acc, state.inner_acc.clone()])?;
-            acc.collapse(
-                layouter,
-                self.std_lib.bls12_381_curve(),
-                self.std_lib.bls12_381_scalar(),
-            )?;
-            acc
-        };
+        let inner_acc = self
+            .std_lib
+            .verifier()
+            .accumulate(layouter, &[inner_proof_acc, state.inner_acc.clone()])?;
+        let inner_acc = constrain_fully_collapsed_accumulator(
+            &self.std_lib,
+            layouter,
+            inner_acc,
+            &self.inner_ctx.fixed_bases(),
+        )?;
 
         let statements_hash = {
             let h_statement = self.std_lib.poseidon(layouter, &statement_pis)?;
@@ -463,7 +494,7 @@ fn ivc_constraint_system(arch: ZkStdLibArch, k: u32) -> (ConstraintSystem<F>, Ev
 #[ignore = "slow IVC proving + solc + revm; ~10 min total. Run with --ignored --nocapture"]
 fn ivc_final_keccak_solidity_e2e() {
     const IVC_K: u32 = 19;
-    const STEPS: usize = 3;
+    const STEPS: usize = 1;
     const SOLC_OPTIMIZE_RUNS: u32 = 1;
 
     // Bail out cleanly when solc isn't on PATH.

@@ -170,6 +170,9 @@ contract Halo2Verifier {
     // bottom 32 coordinate bytes.
     uint256 internal constant BLS_P_HI             = 0x000000000000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd7;
     uint256 internal constant BLS_P_MINUS_ONE_LO   = 0x64774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa;
+    uint256 internal constant BLS_P_MINUS_ONE_PACKED_0 = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa;
+    uint256 internal constant BLS_P_MINUS_ONE_PACKED_0_WITH_ID_FLAG = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffbafeffffffffaaaa;
+    uint256 internal constant BLS_P_MINUS_ONE_PACKED_1 = 0x0000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd764774b84;
 
     // Prefix bytes for the Keccak256 transcript (matches the `Domain
     // separator for transcript` literal in midnight-proofs). The string
@@ -473,7 +476,7 @@ contract Halo2Verifier {
                 let mask := sub(base, 1)
                 for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                     let packed := calldataload(add(src, mul(div(i, limbs_per_word), 0x20)))
-                    if and(iszero(i), first_adjust) {
+                    if and(iszero(div(i, limbs_per_word)), first_adjust) {
                         packed := sub(packed, first_adjust)
                     }
                     let limb := and(shr(mul(mod(i, limbs_per_word), bits), packed), mask)
@@ -493,6 +496,19 @@ contract Halo2Verifier {
 
             function is_bls_p_minus_one(hi, lo) -> yes {
                 yes := and(eq(hi, BLS_P_HI), eq(lo, BLS_P_MINUS_ONE_LO))
+            }
+
+            function is_acc_encoded_identity(src) -> yes {
+                yes := and(
+                    and(
+                        eq(calldataload(src), BLS_P_MINUS_ONE_PACKED_0_WITH_ID_FLAG),
+                        eq(calldataload(add(src, 0x20)), BLS_P_MINUS_ONE_PACKED_1)
+                    ),
+                    and(
+                        eq(calldataload(add(src, 0x40)), BLS_P_MINUS_ONE_PACKED_0),
+                        eq(calldataload(add(src, 0x60)), BLS_P_MINUS_ONE_PACKED_1)
+                    )
+                )
             }
 
             function load_acc_coord(src, allow_id, bits, n, base, limbs_per_word) -> ok, hi, lo, is_id {
@@ -524,33 +540,44 @@ contract Halo2Verifier {
                 ok := and(ok, lt(hi, shl(128, 1)))
             }
 
-            function load_acc_point(dst, src, bits, n, base) -> ok {
-                let limbs_per_word := 4
-                let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
-                let x_ok, x_hi, x_lo, is_id := load_acc_coord(src, 1, bits, n, base, limbs_per_word)
-                let y_ok, y_hi, y_lo, y_id := load_acc_coord(
-                    add(src, mul(coord_words, 0x20)),
-                    0,
-                    bits,
-                    n,
-                    base,
-                    limbs_per_word
-                )
-                pop(y_id)
-                ok := and(x_ok, y_ok)
-
+            function load_acc_point(dst, src, bits, n, base) -> ok, is_id {
+                is_id := is_acc_encoded_identity(src)
                 if is_id {
-                    ok := and(ok, iszero(or(or(x_hi, x_lo), or(y_hi, y_lo))))
+                    ok := 1
                     mstore(dst, 0)
                     mstore(add(dst, 0x20), 0)
                     mstore(add(dst, 0x40), 0)
                     mstore(add(dst, 0x60), 0)
                 }
                 if iszero(is_id) {
-                    mstore(dst, x_hi)
-                    mstore(add(dst, 0x20), x_lo)
-                    mstore(add(dst, 0x40), y_hi)
-                    mstore(add(dst, 0x60), y_lo)
+                    let limbs_per_word := 4
+                    let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
+                    let x_ok, x_hi, x_lo, x_is_id := load_acc_coord(src, 1, bits, n, base, limbs_per_word)
+                    let y_ok, y_hi, y_lo, y_id := load_acc_coord(
+                        add(src, mul(coord_words, 0x20)),
+                        0,
+                        bits,
+                        n,
+                        base,
+                        limbs_per_word
+                    )
+                    pop(y_id)
+                    ok := and(x_ok, y_ok)
+                    is_id := x_is_id
+
+                    if is_id {
+                        ok := and(ok, iszero(or(or(x_hi, x_lo), or(y_hi, y_lo))))
+                        mstore(dst, 0)
+                        mstore(add(dst, 0x20), 0)
+                        mstore(add(dst, 0x40), 0)
+                        mstore(add(dst, 0x60), 0)
+                    }
+                    if iszero(is_id) {
+                        mstore(dst, x_hi)
+                        mstore(add(dst, 0x20), x_lo)
+                        mstore(add(dst, 0x40), y_hi)
+                        mstore(add(dst, 0x60), y_lo)
+                    }
                 }
             }
 
@@ -1129,52 +1156,64 @@ contract Halo2Verifier {
                 // LHS layout: point limbs (x,y), scalar. The collapsed
                 // accumulator has no fixed-base scalars on the LHS.
                 let lhs_scalar_ptr := add(acc_instance_ptr, mul(mul(2, coord_words), 0x20))
-                success := and(
-                    success,
-                    load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
-                )
+                let lhs_ok, lhs_is_id := load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
+                success := and(success, lhs_ok)
                 let acc_scratch := {{ acc_msm_scratch|hex() }}
-                mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
-                mstore(add(acc_scratch, 0x80), calldataload(lhs_scalar_ptr))
-                success := and(
-                    success,
-                    staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
-                )
+                if iszero(lhs_is_id) {
+                    mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
+                    mstore(add(acc_scratch, 0x80), calldataload(lhs_scalar_ptr))
+                    success := and(
+                        success,
+                        staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
+                    )
+                }
 
                 // RHS layout: point limbs (x,y), scalar, then fixed-base
                 // scalars in BTreeMap key order (`-G`, fixed_i, perm_i
                 // lexicographically by name).
                 let rhs_instance_ptr := add(lhs_scalar_ptr, 0x20)
                 let rhs_scalar_ptr := add(rhs_instance_ptr, mul(mul(2, coord_words), 0x20))
-                success := and(
-                    success,
-                    load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
-                )
-                mcopy(acc_scratch, ACC_RHS_MPTR, 0x80)
-                mstore(add(acc_scratch, 0x80), calldataload(rhs_scalar_ptr))
+                let rhs_ok, rhs_is_id := load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
+                success := and(success, rhs_ok)
+                let acc_pair_ptr := acc_scratch
+                if iszero(rhs_is_id) {
+                    mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
+                    mstore(add(acc_pair_ptr, 0x80), calldataload(rhs_scalar_ptr))
+                    acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                }
                 let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
-                let acc_pair_ptr := add(acc_scratch, 0xa0)
                 {%- for (base_mptr, negate_scalar) in acc_fixed_bases %}
-                mcopy(acc_pair_ptr, {{ base_mptr|hex() }}, 0x80)
                 let fixed_scalar_{{ loop.index0 }} := calldataload(fixed_scalar_ptr)
                 {%- if negate_scalar %}
                 fixed_scalar_{{ loop.index0 }} := mod(sub(r, fixed_scalar_{{ loop.index0 }}), r)
                 {%- endif %}
-                mstore(add(acc_pair_ptr, 0x80), fixed_scalar_{{ loop.index0 }})
+                if fixed_scalar_{{ loop.index0 }} {
+                    mcopy(acc_pair_ptr, {{ base_mptr|hex() }}, 0x80)
+                    mstore(add(acc_pair_ptr, 0x80), fixed_scalar_{{ loop.index0 }})
+                    acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                }
                 fixed_scalar_ptr := add(fixed_scalar_ptr, 0x20)
-                acc_pair_ptr := add(acc_pair_ptr, 0xa0)
                 {%- endfor %}
-                success := and(
-                    success,
-                    staticcall(
-                        gas(),
-                        0x0c,
-                        acc_scratch,
-                        {{ (0xa0 * (1 + acc_fixed_bases.len()))|hex() }},
-                        ACC_RHS_MPTR,
-                        0x80
+                let acc_msm_len := sub(acc_pair_ptr, acc_scratch)
+                if acc_msm_len {
+                    success := and(
+                        success,
+                        staticcall(
+                            gas(),
+                            0x0c,
+                            acc_scratch,
+                            acc_msm_len,
+                            ACC_RHS_MPTR,
+                            0x80
+                        )
                     )
-                )
+                }
+                if iszero(acc_msm_len) {
+                    mstore(ACC_RHS_MPTR, 0)
+                    mstore(add(ACC_RHS_MPTR, 0x20), 0)
+                    mstore(add(ACC_RHS_MPTR, 0x40), 0)
+                    mstore(add(ACC_RHS_MPTR, 0x60), 0)
+                }
 
                 success := ec_pairing(success, ACC_RHS_MPTR, ACC_LHS_MPTR)
             }
