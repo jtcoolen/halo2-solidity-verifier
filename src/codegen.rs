@@ -114,6 +114,11 @@ const Q_OP_ADD_CONST: u8 = 0x0e;
 const Q_OP_MUL_CONST: u8 = 0x0f;
 const Q_OP_ADD_MEM_U16: u8 = 0x10;
 const Q_OP_MUL_MEM_U16: u8 = 0x11;
+const Q_OP_ADD_MUL_MEM_MEM_CONST_U8: u8 = 0x12;
+const Q_OP_ADD_MUL_CONST_U8_MEM_U16: u8 = 0x13;
+const Q_OP_ADD_MUL_MEM_MEM: u8 = 0x14;
+const Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8: u8 = 0x15;
+const Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16: u8 = 0x16;
 
 const Q_MEM_L0: u8 = 0x01;
 const Q_MEM_L_LAST: u8 = 0x02;
@@ -145,6 +150,13 @@ enum QuotientMem {
 enum QuotientLeaf {
     Const(U256),
     Mem(QuotientMem),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QuotientProductAdd {
+    MemMemConstU8 { lhs: u16, rhs: u16, scalar: U256 },
+    ConstU8Mem { scalar: U256, ptr: u16 },
+    MemMem { lhs: u16, rhs: u16 },
 }
 
 #[derive(Default)]
@@ -183,7 +195,7 @@ impl QuotientProgramBuilder {
 
     fn finish(self) -> QuotientProgramBuild {
         QuotientProgramBuild {
-            bytes: self.bytes,
+            bytes: compact_quotient_runs(&self.bytes),
             consts: self.consts,
             max_stack: self.max_stack,
         }
@@ -240,24 +252,11 @@ impl QuotientProgramBuilder {
     fn emit_expr(&mut self, expr: &QuotientExpr) {
         match expr {
             QuotientExpr::Const(value) => {
-                let slot = self.const_slot(*value);
-                if let Ok(slot) = u8::try_from(slot) {
-                    self.bytes.push(Q_OP_PUSH_CONST_U8);
-                    self.bytes.push(slot);
-                } else {
-                    self.bytes.push(Q_OP_PUSH_CONST);
-                    self.u16(slot as usize);
-                }
+                self.emit_const(*value);
                 self.push_stack();
             }
             QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
-                if let Ok(ptr) = u16::try_from(*ptr) {
-                    self.bytes.push(Q_OP_PUSH_MEM_U16);
-                    self.u16(ptr as usize);
-                } else {
-                    self.bytes.push(Q_OP_PUSH_MEM_LITERAL);
-                    self.u32(*ptr);
-                }
+                self.emit_mem_literal(*ptr);
                 self.push_stack();
             }
             QuotientExpr::Mem(QuotientMem::Token(token)) => {
@@ -272,14 +271,16 @@ impl QuotientProgramBuilder {
                 self.push_stack();
             }
             QuotientExpr::Add(lhs, rhs) => {
-                self.emit_binary_expr(
-                    lhs,
-                    rhs,
-                    Q_OP_ADD,
-                    Q_OP_ADD_CONST_U8,
-                    Q_OP_ADD_CONST,
-                    Q_OP_ADD_MEM_U16,
-                );
+                if !self.try_emit_add_product(lhs, rhs) && !self.try_emit_add_product(rhs, lhs) {
+                    self.emit_binary_expr(
+                        lhs,
+                        rhs,
+                        Q_OP_ADD,
+                        Q_OP_ADD_CONST_U8,
+                        Q_OP_ADD_CONST,
+                        Q_OP_ADD_MEM_U16,
+                    );
+                }
             }
             QuotientExpr::Mul(lhs, rhs) => {
                 self.emit_binary_expr(
@@ -294,6 +295,103 @@ impl QuotientProgramBuilder {
             QuotientExpr::Neg(expr) => {
                 self.emit_expr(expr);
                 self.op0(Q_OP_NEG);
+            }
+        }
+    }
+
+    fn emit_const(&mut self, value: U256) {
+        let slot = self.const_slot(value);
+        if let Ok(slot) = u8::try_from(slot) {
+            self.bytes.push(Q_OP_PUSH_CONST_U8);
+            self.bytes.push(slot);
+        } else {
+            self.bytes.push(Q_OP_PUSH_CONST);
+            self.u16(slot as usize);
+        }
+    }
+
+    fn emit_mem_literal(&mut self, ptr: u32) {
+        if let Ok(ptr) = u16::try_from(ptr) {
+            self.bytes.push(Q_OP_PUSH_MEM_U16);
+            self.u16(ptr as usize);
+        } else {
+            self.bytes.push(Q_OP_PUSH_MEM_LITERAL);
+            self.u32(ptr);
+        }
+    }
+
+    fn try_emit_add_product(&mut self, base: &QuotientExpr, product: &QuotientExpr) -> bool {
+        let mut leaves = Vec::new();
+        if !collect_product_leaves(product, &mut leaves) {
+            return false;
+        }
+        let Some(product) = self.product_add_macro(&leaves) else {
+            return false;
+        };
+
+        self.emit_expr(base);
+        self.emit_product_add(product);
+        true
+    }
+
+    fn product_add_macro(&self, leaves: &[QuotientLeaf]) -> Option<QuotientProductAdd> {
+        let mut mems = Vec::new();
+        let mut consts = Vec::new();
+        for leaf in leaves {
+            match *leaf {
+                QuotientLeaf::Mem(QuotientMem::Literal(ptr)) => {
+                    mems.push(u16::try_from(ptr).ok()?);
+                }
+                QuotientLeaf::Const(value) => {
+                    if !self.const_fits_u8_slot(value) {
+                        return None;
+                    }
+                    consts.push(value);
+                }
+                QuotientLeaf::Mem(QuotientMem::Token(_))
+                | QuotientLeaf::Mem(QuotientMem::TokenOffset(_, _)) => return None,
+            }
+        }
+
+        match (mems.as_slice(), consts.as_slice()) {
+            ([lhs, rhs], [scalar]) => Some(QuotientProductAdd::MemMemConstU8 {
+                lhs: *lhs,
+                rhs: *rhs,
+                scalar: *scalar,
+            }),
+            ([ptr], [scalar]) => Some(QuotientProductAdd::ConstU8Mem {
+                scalar: *scalar,
+                ptr: *ptr,
+            }),
+            ([lhs, rhs], []) => Some(QuotientProductAdd::MemMem {
+                lhs: *lhs,
+                rhs: *rhs,
+            }),
+            _ => None,
+        }
+    }
+
+    fn emit_product_add(&mut self, product: QuotientProductAdd) {
+        match product {
+            QuotientProductAdd::MemMemConstU8 { lhs, rhs, scalar } => {
+                let slot = self.const_slot(scalar);
+                let slot = u8::try_from(slot).expect("const slot checked");
+                self.bytes.push(Q_OP_ADD_MUL_MEM_MEM_CONST_U8);
+                self.u16(lhs as usize);
+                self.u16(rhs as usize);
+                self.bytes.push(slot);
+            }
+            QuotientProductAdd::ConstU8Mem { scalar, ptr } => {
+                let slot = self.const_slot(scalar);
+                let slot = u8::try_from(slot).expect("const slot checked");
+                self.bytes.push(Q_OP_ADD_MUL_CONST_U8_MEM_U16);
+                self.u16(ptr as usize);
+                self.bytes.push(slot);
+            }
+            QuotientProductAdd::MemMem { lhs, rhs } => {
+                self.bytes.push(Q_OP_ADD_MUL_MEM_MEM);
+                self.u16(lhs as usize);
+                self.u16(rhs as usize);
             }
         }
     }
@@ -405,6 +503,72 @@ impl QuotientProgramBuilder {
             slot as u16
         }
     }
+
+    fn const_fits_u8_slot(&self, value: U256) -> bool {
+        self.const_slots
+            .get(&value)
+            .is_some_and(|slot| u8::try_from(*slot).is_ok())
+            || (!self.const_slots.contains_key(&value) && self.consts.len() <= u8::MAX as usize)
+    }
+}
+
+fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let op = bytes[idx];
+        if matches!(
+            op,
+            Q_OP_ADD_MUL_MEM_MEM_CONST_U8 | Q_OP_ADD_MUL_CONST_U8_MEM_U16
+        ) {
+            let len = quotient_op_len(bytes, idx);
+            let run_operands_len = len - 1;
+            let run_op = match op {
+                Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8,
+                Q_OP_ADD_MUL_CONST_U8_MEM_U16 => Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
+                _ => unreachable!(),
+            };
+
+            let run_start = idx;
+            let mut run_len = 0usize;
+            while idx < bytes.len() && bytes[idx] == op && run_len < u16::MAX as usize {
+                idx += len;
+                run_len += 1;
+            }
+
+            if run_len >= 4 {
+                out.push(run_op);
+                out.extend_from_slice(&(run_len as u16).to_be_bytes());
+                for term in 0..run_len {
+                    let term_start = run_start + term * len + 1;
+                    out.extend_from_slice(&bytes[term_start..term_start + run_operands_len]);
+                }
+            } else {
+                out.extend_from_slice(&bytes[run_start..idx]);
+            }
+        } else {
+            let len = quotient_op_len(bytes, idx);
+            out.extend_from_slice(&bytes[idx..idx + len]);
+            idx += len;
+        }
+    }
+    out
+}
+
+fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
+    match bytes[idx] {
+        Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
+        | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 => 3,
+        Q_OP_PUSH_MEM_LITERAL => 5,
+        Q_OP_PUSH_MEM_TOKEN => 2,
+        Q_OP_PUSH_MEM_TOKEN_OFFSET => 6,
+        Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => 2,
+        Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN => 1,
+        Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => 6,
+        Q_OP_ADD_MUL_CONST_U8_MEM_U16 => 4,
+        Q_OP_ADD_MUL_MEM_MEM => 5,
+        op => panic!("unknown quotient op {op:#x} at byte {idx}"),
+    }
 }
 
 fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
@@ -412,6 +576,23 @@ fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
         QuotientExpr::Const(value) => Some(QuotientLeaf::Const(*value)),
         QuotientExpr::Mem(mem) => Some(QuotientLeaf::Mem(*mem)),
         QuotientExpr::Add(_, _) | QuotientExpr::Mul(_, _) | QuotientExpr::Neg(_) => None,
+    }
+}
+
+fn collect_product_leaves(expr: &QuotientExpr, leaves: &mut Vec<QuotientLeaf>) -> bool {
+    match expr {
+        QuotientExpr::Mul(lhs, rhs) => {
+            collect_product_leaves(lhs, leaves) && collect_product_leaves(rhs, leaves)
+        }
+        QuotientExpr::Const(_) | QuotientExpr::Mem(_) => {
+            if let Some(leaf) = quotient_leaf(expr) {
+                leaves.push(leaf);
+                true
+            } else {
+                false
+            }
+        }
+        QuotientExpr::Add(_, _) | QuotientExpr::Neg(_) => false,
     }
 }
 

@@ -1009,6 +1009,8 @@ contract Halo2Verifier {
                 let q_pc := q_program_mptr
                 let q_end := add(q_program_mptr, {{ program.len|hex() }})
                 let q_sp := {{ program.stack_mptr|hex() }}
+                let q_top := 0
+                let q_has_top := 0
 
                 for { } lt(q_pc, q_end) { } {
                     let q_op := byte(0, mload(q_pc))
@@ -1017,15 +1019,23 @@ contract Halo2Verifier {
                     switch q_op
                     case 0x01 {
                         let qconst := shr(240, mload(q_pc))
-                        mstore(q_sp, mload(add(q_const_mptr, shl(5, qconst))))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(add(q_const_mptr, shl(5, qconst)))
+                        q_has_top := 1
                         q_pc := add(q_pc, 2)
                     }
                     case 0x02 {
                         let q_ptr := shr(224, mload(q_pc))
                         q_pc := add(q_pc, 4)
-                        mstore(q_sp, mload(q_ptr))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(q_ptr)
+                        q_has_top := 1
                     }
                     case 0x03 {
                         let q_token := byte(0, mload(q_pc))
@@ -1042,8 +1052,12 @@ contract Halo2Verifier {
                         case 0x08 { q_ptr := TRASH_CHALLENGE_MPTR }
                         case 0x09 { q_ptr := INSTANCE_EVAL_MPTR }
                         default { revert(0, 0) }
-                        mstore(q_sp, mload(q_ptr))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(q_ptr)
+                        q_has_top := 1
                     }
                     case 0x04 {
                         let q_token := byte(0, mload(q_pc))
@@ -1061,76 +1075,143 @@ contract Halo2Verifier {
                         case 0x08 { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
                         case 0x09 { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
                         default { revert(0, 0) }
-                        mstore(q_sp, mload(q_ptr))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(q_ptr)
+                        q_has_top := 1
                     }
                     case 0x05 {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        mstore(q_sp, mload(q_ptr))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(q_ptr)
+                        q_has_top := 1
                     }
                     case 0x06 {
                         q_sp := sub(q_sp, 0x20)
-                        let q_b := mload(q_sp)
-                        let q_a_ptr := sub(q_sp, 0x20)
-                        mstore(q_a_ptr, addmod(mload(q_a_ptr), q_b, r))
+                        q_top := addmod(mload(q_sp), q_top, r)
                     }
                     case 0x07 {
                         q_sp := sub(q_sp, 0x20)
-                        let q_b := mload(q_sp)
-                        let q_a_ptr := sub(q_sp, 0x20)
-                        mstore(q_a_ptr, mulmod(mload(q_a_ptr), q_b, r))
+                        q_top := mulmod(mload(q_sp), q_top, r)
                     }
                     case 0x08 {
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, sub(r, mload(q_top)))
+                        q_top := sub(r, q_top)
                     }
                     case 0x09 {
                         let qconst := byte(0, mload(q_pc))
-                        mstore(q_sp, mload(add(q_const_mptr, shl(5, qconst))))
-                        q_sp := add(q_sp, 0x20)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        q_top := mload(add(q_const_mptr, shl(5, qconst)))
+                        q_has_top := 1
                         q_pc := add(q_pc, 1)
                     }
                     case 0x0c {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, addmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                        q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
                     case 0x0d {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, mulmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                        q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
                     case 0x0e {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, addmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                        q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
                     case 0x0f {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, mulmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                        q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
                     case 0x10 {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, addmod(mload(q_top), mload(q_ptr), r))
+                        q_top := addmod(q_top, mload(q_ptr), r)
                     }
                     case 0x11 {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        let q_top := sub(q_sp, 0x20)
-                        mstore(q_top, mulmod(mload(q_top), mload(q_ptr), r))
+                        q_top := mulmod(q_top, mload(q_ptr), r)
+                    }
+                    case 0x12 {
+                        let q_lhs := shr(240, mload(q_pc))
+                        let q_rhs := shr(240, mload(add(q_pc, 2)))
+                        let qconst := byte(0, mload(add(q_pc, 4)))
+                        q_pc := add(q_pc, 5)
+                        q_top := addmod(
+                            q_top,
+                            mulmod(
+                                mulmod(mload(q_lhs), mload(q_rhs), r),
+                                mload(add(q_const_mptr, shl(5, qconst))),
+                                r
+                            ),
+                            r
+                        )
+                    }
+                    case 0x13 {
+                        let q_ptr := shr(240, mload(q_pc))
+                        let qconst := byte(0, mload(add(q_pc, 2)))
+                        q_pc := add(q_pc, 3)
+                        q_top := addmod(
+                            q_top,
+                            mulmod(mload(q_ptr), mload(add(q_const_mptr, shl(5, qconst))), r),
+                            r
+                        )
+                    }
+                    case 0x14 {
+                        let q_lhs := shr(240, mload(q_pc))
+                        let q_rhs := shr(240, mload(add(q_pc, 2)))
+                        q_pc := add(q_pc, 4)
+                        q_top := addmod(q_top, mulmod(mload(q_lhs), mload(q_rhs), r), r)
+                    }
+                    case 0x15 {
+                        let q_count := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_run_end := add(q_pc, mul(q_count, 5))
+                        for { } lt(q_pc, q_run_end) { } {
+                            let q_lhs := shr(240, mload(q_pc))
+                            let q_rhs := shr(240, mload(add(q_pc, 2)))
+                            let qconst := byte(0, mload(add(q_pc, 4)))
+                            q_pc := add(q_pc, 5)
+                            q_top := addmod(
+                                q_top,
+                                mulmod(
+                                    mulmod(mload(q_lhs), mload(q_rhs), r),
+                                    mload(add(q_const_mptr, shl(5, qconst))),
+                                    r
+                                ),
+                                r
+                            )
+                        }
+                    }
+                    case 0x16 {
+                        let q_count := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_run_end := add(q_pc, mul(q_count, 3))
+                        for { } lt(q_pc, q_run_end) { } {
+                            let q_ptr := shr(240, mload(q_pc))
+                            let qconst := byte(0, mload(add(q_pc, 2)))
+                            q_pc := add(q_pc, 3)
+                            q_top := addmod(
+                                q_top,
+                                mulmod(mload(q_ptr), mload(add(q_const_mptr, shl(5, qconst))), r),
+                                r
+                            )
+                        }
                     }
                     case 0x0a {
-                        q_sp := sub(q_sp, 0x20)
-                        let q_eval := mload(q_sp)
+                        let q_eval := q_top
+                        q_has_top := 0
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
                         for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
@@ -1143,8 +1224,8 @@ contract Halo2Verifier {
                     case 0x0b {
                         let q_sel_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
-                        q_sp := sub(q_sp, 0x20)
-                        let q_eval := mload(q_sp)
+                        let q_eval := q_top
+                        q_has_top := 0
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
                         for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
