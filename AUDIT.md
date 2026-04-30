@@ -1,5 +1,193 @@
 # CTF Vulnerability Analysis: Halo2 Solidity Verifier
 
+## 2026-04-30 audit addendum: current Halo2 BLS12-381 Solidity/Yul verifier
+
+Scope: `templates/Halo2Verifier.sol`, `src/codegen.rs`, and the compact quotient
+interpreter generated for the current IVC verifier branch.
+
+This pass focuses on verifier soundness, fail-closed behavior, proof/call-data
+canonicality, and deployment risks in the generated Solidity/Yul verifier.
+
+### Findings overview
+
+| ID | Severity | Title |
+| --- | --- | --- |
+| A-1 | Medium/High | EIP-2537 precompile calls can fail open on unsupported or mismatched chains |
+| A-2 | Medium | Non-canonical G1 encodings are transcript-normalized instead of rejected |
+| A-3 | Low/Medium | `verifyProof(bytes,uint256[])` hand-parses calldata but does not enforce canonical ABI offsets |
+| A-4 | Low | Compact quotient VM is correctness-critical and needs differential tests |
+| A-5 | Informational | Current verifier remains over the 24KB EIP-170 runtime limit |
+
+### A-1. EIP-2537 precompile calls can fail open on unsupported or mismatched chains
+
+Severity: Medium/High, depending on deployment target.
+
+The verifier assumes the BLS12-381 precompiles at `0x0b`, `0x0c`, and `0x0f`
+exist and implement the expected EIP-2537 semantics. The helper functions only
+use the `staticcall` success bit, and `ec_pairing` additionally reads
+`mload(scratch)` without checking that the call returned exactly one word.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `ec_add_acc`, `ec_mul_acc`, `ec_add_tmp`,
+  `ec_mul_tmp`
+- `templates/Halo2Verifier.sol`: `ec_pairing`
+- `templates/Halo2Verifier.sol`: public accumulator MSM calls
+- `templates/Halo2Verifier.sol`: final proof pairing check
+
+On a chain where those precompiles are absent or incompatible, a call to an
+empty account can return success with zero return data. In that case output
+memory may contain stale values. The pairing helper is especially sensitive:
+
+```yul
+ret := staticcall(gas(), 0x0f, pairing_input_mptr, 0x240, scratch, 0x20)
+ret := and(ret, mload(scratch))
+```
+
+If the precompile is absent, `ret` may be true and `mload(scratch)` is not a
+trusted pairing result.
+
+Impact:
+
+- Invalid proofs may be accepted on an unsupported or mismatched EVM fork.
+- The verifier does not fail closed when its required cryptographic precompiles
+  are unavailable.
+
+Recommendation:
+
+- After every precompile call, require the exact expected `returndatasize()`.
+- Require `0x80` bytes for G1 add/MSM-style point outputs.
+- Require `0x20` bytes for pairing and scalar inversion/modexp-style outputs.
+- Add a constructor self-test that rejects deployment if the target chain does
+  not implement the expected BLS12-381 precompile semantics.
+
+### A-2. Non-canonical G1 encodings are transcript-normalized instead of rejected
+
+Severity: Medium.
+
+`common_uncompressed_g1` copies 128 bytes from calldata, masks the high 16 bytes
+of `x_hi` and `y_hi` before transcript absorption, but does not reject nonzero
+padding.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `common_uncompressed_g1`
+- `templates/Halo2Verifier.sol`: proof commitment reads that call
+  `read_g1_point`
+
+This creates proof malleability: multiple calldata encodings can hash to the
+same transcript point. The current design is only safe if every absorbed point
+is later validated by an EIP-2537 precompile in a way that rejects the original
+non-canonical bytes. That invariant is fragile for generated verifiers because a
+commitment can become unused, zero-weighted, or protocol-dependent.
+
+Impact:
+
+- Non-canonical proofs can be accepted.
+- Callers that commit to calldata or proof bytes may observe multiple encodings
+  of the same transcript.
+- Future circuits or codegen changes can accidentally absorb a malformed point
+  that is never validated by a precompile.
+
+Recommendation:
+
+- Reject nonzero padding in `x_hi` and `y_hi` at transcript read time.
+- Reject coordinates outside the BLS12-381 base field before absorption.
+- Prefer validating every absorbed G1 point independently of whether it later
+  appears in an MSM.
+
+### A-3. `verifyProof(bytes,uint256[])` hand-parses calldata but does not enforce canonical ABI offsets
+
+Severity: Low/Medium.
+
+The public Solidity signature uses dynamic ABI arguments:
+
+```solidity
+function verifyProof(bytes calldata proof, uint256[] calldata instances)
+    public
+    view
+    returns (bool)
+```
+
+The assembly body ignores Solidity's decoded `proof` and `instances` offsets
+and instead reads fixed calldata locations such as `PROOF_LEN_CPTR`,
+`PROOF_CPTR`, and `INSTANCE_CPTR`. The verifier checks the assumed proof length,
+instance count, and total `calldatasize()`, but does not check that the ABI head
+offsets actually point to those locations.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `verifyProof` signature
+- `templates/Halo2Verifier.sol`: proof length, instance count, and calldata size
+  checks
+
+This is probably not a direct soundness break because the verifier consistently
+uses its raw calldata layout. It is still calldata malleability and can surprise
+wrappers, calldata hash commitments, relayers, and off-chain tooling that expect
+canonical ABI encoding.
+
+Recommendation:
+
+- Either use `proof.offset`, `proof.length`, `instances.offset`, and
+  `instances.length` directly in assembly.
+- Or explicitly assert that the ABI head offsets match the expected canonical
+  layout before parsing proof bytes.
+
+### A-4. Compact quotient VM is correctness-critical and needs differential tests
+
+Severity: Low.
+
+The compact quotient identity interpreter introduces a generated bytecode
+program plus a Yul VM. The program is not user-controlled, so this is not an
+injection issue. However, a compiler or optimizer bug in this layer can silently
+change the quotient identity that the verifier checks.
+
+Relevant code:
+
+- `src/codegen.rs`: compact quotient opcode definitions
+- `src/codegen.rs`: identity expression parser and program builder
+- `templates/Halo2Verifier.sol`: quotient VM dispatch loop
+
+Recommended tests:
+
+- Render both the old straight-line quotient evaluator and the compact VM for
+  the same circuit, then assert identical quotient values.
+- Fuzz identity expression trees against the VM lowering.
+- Include gates, simple selectors, lookups, permutations, constants, rotations,
+  trash challenges, and zero-term edge cases.
+- Keep a debug render mode that can emit both implementations for differential
+  testing.
+
+### A-5. Current verifier remains over the 24KB EIP-170 runtime limit
+
+Severity: Informational.
+
+The latest IVC architecture notes report:
+
+- verifier runtime: approximately 25,598 bytes
+- EIP-170 limit: 24,576 bytes
+
+Relevant code/documentation:
+
+- `ARCHITECTURE.md`: compact quotient VM results and remaining size budget
+
+This is not a proof-soundness issue, but it is a deployment blocker on
+mainnet-like chains that enforce EIP-170 unless the verifier is split further or
+the target chain disables/raises the contract size limit.
+
+### Open questions
+
+- Is the deployment target guaranteed to support the exact EIP-2537 precompile
+  addresses and return semantics used by this verifier?
+- Is calldata uniqueness important for the consuming protocol?
+- Are proof bytes or calldata hashes committed elsewhere by relayers, bridges,
+  settlement contracts, or off-chain indexers?
+- Should the generated verifier be treated as a generic Halo2 verifier, or as a
+  Midnight/Midfall-specific verifier with a fixed transcript, accumulator
+  encoding, and proof layout?
+
+---
+
 I analyzed both the current template (`templates/Halo2Verifier.sol`) and the legacy artifact (`generated/Halo2Verifier.sol`). Here are the findings, ranked by exploitability.
 
 ---
