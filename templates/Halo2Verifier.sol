@@ -999,6 +999,24 @@ contract Halo2Verifier {
                 {%- for col in simple_selector_cols %}
                 mstore(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }}), 0)
                 {%- endfor %}
+                {%- if simple_selector_cols.len() > 0 %}
+                let q_sel_scale := 1
+                let q_sel_inv_scale := 1
+                let q_y_inv := 0
+                {
+                    // Keep this inversion away from scalar_inv's fixed 0x6000
+                    // scratch: large separated VKs occupy that range.
+                    let q_inv_scratch := {{ program.stack_mptr|hex() }}
+                    mstore(q_inv_scratch,            0x20)
+                    mstore(add(q_inv_scratch, 0x20), 0x20)
+                    mstore(add(q_inv_scratch, 0x40), 0x20)
+                    mstore(add(q_inv_scratch, 0x60), y)
+                    mstore(add(q_inv_scratch, 0x80), sub(FR_MODULUS, 2))
+                    mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)
+                    if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }
+                    q_y_inv := mload(q_inv_scratch)
+                }
+                {%- endif %}
 
                 let q_pc := q_program_mptr
                 let q_end := add(q_program_mptr, {{ program.len|hex() }})
@@ -1208,10 +1226,8 @@ contract Halo2Verifier {
                         q_has_top := 0
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
-                        for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
-                            let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
-                            mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), y, r))
-                        }
+                        q_sel_scale := mulmod(q_sel_scale, y, r)
+                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
                         {%- endif %}
                         quotient_eval_numer := addmod(quotient_eval_numer, q_eval, r)
                     }
@@ -1222,18 +1238,23 @@ contract Halo2Verifier {
                         q_has_top := 0
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
-                        for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
-                            let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
-                            mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), y, r))
-                        }
+                        q_sel_scale := mulmod(q_sel_scale, y, r)
+                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
                         {%- endif %}
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
-                        mstore(q_target_ptr, addmod(mload(q_target_ptr), q_eval, r))
+                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, q_sel_inv_scale, r), r))
                     }
                     default {
                         revert(0, 0)
                     }
                 }
+
+                {%- if simple_selector_cols.len() > 0 %}
+                for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
+                    let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
+                    mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), q_sel_scale, r))
+                }
+                {%- endif %}
 
                 let quotient_eval := sub(r, quotient_eval_numer)
                 mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
