@@ -158,6 +158,7 @@ pub(crate) struct Halo2Verifier {
     /// where they would overlap the permanent eval/commitment regions.
     pub(crate) batch_invert_scratch_mptr: usize,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
+    pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
     /// Sorted simple-selector fixed-column indices. Each is rendered
     /// into a Yul snippet that adds `S_i_com * sel_acc_i` to the
@@ -194,6 +195,16 @@ pub(crate) struct Halo2Verifier {
     /// after the verifier's permanent memory map so the variable-size
     /// `(point, scalar)` table cannot clobber VK/challenge state.
     pub(crate) acc_msm_scratch: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QuotientProgram {
+    pub(crate) consts: Vec<U256>,
+    pub(crate) chunks: Vec<U256>,
+    pub(crate) len: usize,
+    pub(crate) const_mptr: usize,
+    pub(crate) stack_mptr: usize,
+    pub(crate) program_mptr: usize,
 }
 
 impl Halo2VerifyingKey {

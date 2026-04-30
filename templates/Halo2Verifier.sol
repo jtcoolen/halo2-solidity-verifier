@@ -988,6 +988,182 @@ contract Halo2Verifier {
             // Quotient evaluation. Pure Fr arithmetic.
             // ===============================================================
             {
+                {%- match quotient_program %}
+                {%- when Some with (program) %}
+                let y := mload(Y_MPTR)
+                let q_const_mptr := {{ program.const_mptr|hex() }}
+                {%- for value in program.consts %}
+                mstore(add(q_const_mptr, {{ (loop.index0 * 0x20)|hex() }}), {{ value|hex_padded(64) }})
+                {%- endfor %}
+
+                let q_program_mptr := {{ program.program_mptr|hex() }}
+                {%- for chunk in program.chunks %}
+                mstore(add(q_program_mptr, {{ (loop.index0 * 0x20)|hex() }}), {{ chunk|hex_padded(64) }})
+                {%- endfor %}
+
+                let quotient_eval_numer := 0
+                {%- for col in simple_selector_cols %}
+                mstore(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }}), 0)
+                {%- endfor %}
+
+                let q_pc := q_program_mptr
+                let q_end := add(q_program_mptr, {{ program.len|hex() }})
+                let q_sp := {{ program.stack_mptr|hex() }}
+
+                for { } lt(q_pc, q_end) { } {
+                    let q_op := byte(0, mload(q_pc))
+                    q_pc := add(q_pc, 1)
+
+                    switch q_op
+                    case 0x01 {
+                        let qconst := shr(240, mload(q_pc))
+                        mstore(q_sp, mload(add(q_const_mptr, shl(5, qconst))))
+                        q_sp := add(q_sp, 0x20)
+                        q_pc := add(q_pc, 2)
+                    }
+                    case 0x02 {
+                        let q_ptr := shr(224, mload(q_pc))
+                        q_pc := add(q_pc, 4)
+                        mstore(q_sp, mload(q_ptr))
+                        q_sp := add(q_sp, 0x20)
+                    }
+                    case 0x03 {
+                        let q_token := byte(0, mload(q_pc))
+                        q_pc := add(q_pc, 1)
+                        let q_ptr := 0
+                        switch q_token
+                        case 0x01 { q_ptr := L_0_MPTR }
+                        case 0x02 { q_ptr := L_LAST_MPTR }
+                        case 0x03 { q_ptr := L_BLIND_MPTR }
+                        case 0x04 { q_ptr := BETA_MPTR }
+                        case 0x05 { q_ptr := GAMMA_MPTR }
+                        case 0x06 { q_ptr := X_MPTR }
+                        case 0x07 { q_ptr := THETA_MPTR }
+                        case 0x08 { q_ptr := TRASH_CHALLENGE_MPTR }
+                        case 0x09 { q_ptr := INSTANCE_EVAL_MPTR }
+                        default { revert(0, 0) }
+                        mstore(q_sp, mload(q_ptr))
+                        q_sp := add(q_sp, 0x20)
+                    }
+                    case 0x04 {
+                        let q_token := byte(0, mload(q_pc))
+                        let q_off := shr(224, mload(add(q_pc, 1)))
+                        q_pc := add(q_pc, 5)
+                        let q_ptr := 0
+                        switch q_token
+                        case 0x01 { q_ptr := add(L_0_MPTR, q_off) }
+                        case 0x02 { q_ptr := add(L_LAST_MPTR, q_off) }
+                        case 0x03 { q_ptr := add(L_BLIND_MPTR, q_off) }
+                        case 0x04 { q_ptr := add(BETA_MPTR, q_off) }
+                        case 0x05 { q_ptr := add(GAMMA_MPTR, q_off) }
+                        case 0x06 { q_ptr := add(X_MPTR, q_off) }
+                        case 0x07 { q_ptr := add(THETA_MPTR, q_off) }
+                        case 0x08 { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
+                        case 0x09 { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
+                        default { revert(0, 0) }
+                        mstore(q_sp, mload(q_ptr))
+                        q_sp := add(q_sp, 0x20)
+                    }
+                    case 0x05 {
+                        let q_ptr := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        mstore(q_sp, mload(q_ptr))
+                        q_sp := add(q_sp, 0x20)
+                    }
+                    case 0x06 {
+                        q_sp := sub(q_sp, 0x20)
+                        let q_b := mload(q_sp)
+                        let q_a_ptr := sub(q_sp, 0x20)
+                        mstore(q_a_ptr, addmod(mload(q_a_ptr), q_b, r))
+                    }
+                    case 0x07 {
+                        q_sp := sub(q_sp, 0x20)
+                        let q_b := mload(q_sp)
+                        let q_a_ptr := sub(q_sp, 0x20)
+                        mstore(q_a_ptr, mulmod(mload(q_a_ptr), q_b, r))
+                    }
+                    case 0x08 {
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, sub(r, mload(q_top)))
+                    }
+                    case 0x09 {
+                        let qconst := byte(0, mload(q_pc))
+                        mstore(q_sp, mload(add(q_const_mptr, shl(5, qconst))))
+                        q_sp := add(q_sp, 0x20)
+                        q_pc := add(q_pc, 1)
+                    }
+                    case 0x0c {
+                        let qconst := byte(0, mload(q_pc))
+                        q_pc := add(q_pc, 1)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, addmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                    }
+                    case 0x0d {
+                        let qconst := byte(0, mload(q_pc))
+                        q_pc := add(q_pc, 1)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, mulmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                    }
+                    case 0x0e {
+                        let qconst := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, addmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                    }
+                    case 0x0f {
+                        let qconst := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, mulmod(mload(q_top), mload(add(q_const_mptr, shl(5, qconst))), r))
+                    }
+                    case 0x10 {
+                        let q_ptr := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, addmod(mload(q_top), mload(q_ptr), r))
+                    }
+                    case 0x11 {
+                        let q_ptr := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_top := sub(q_sp, 0x20)
+                        mstore(q_top, mulmod(mload(q_top), mload(q_ptr), r))
+                    }
+                    case 0x0a {
+                        q_sp := sub(q_sp, 0x20)
+                        let q_eval := mload(q_sp)
+                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        {%- if simple_selector_cols.len() > 0 %}
+                        for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
+                            let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
+                            mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), y, r))
+                        }
+                        {%- endif %}
+                        quotient_eval_numer := addmod(quotient_eval_numer, q_eval, r)
+                    }
+                    case 0x0b {
+                        let q_sel_idx := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        q_sp := sub(q_sp, 0x20)
+                        let q_eval := mload(q_sp)
+                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        {%- if simple_selector_cols.len() > 0 %}
+                        for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
+                            let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
+                            mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), y, r))
+                        }
+                        {%- endif %}
+                        let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
+                        mstore(q_target_ptr, addmod(mload(q_target_ptr), q_eval, r))
+                    }
+                    default {
+                        revert(0, 0)
+                    }
+                }
+
+                let quotient_eval := sub(r, quotient_eval_numer)
+                mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
+                pop(y)
+                {%- when None %}
                 let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999 // BLS12-381 Fr::DELTA
                 let y := mload(Y_MPTR)
 
@@ -1016,6 +1192,7 @@ contract Halo2Verifier {
                 // NOT divide by (x^n - 1) here.
                 let quotient_eval := sub(r, quotient_eval_numer)
                 mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
+                {%- endmatch %}
             }
 
             {%- if self.gas_checkpoints %}

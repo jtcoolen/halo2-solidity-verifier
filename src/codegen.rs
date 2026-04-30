@@ -1,6 +1,6 @@
 use crate::codegen::{
     evaluator::Evaluator,
-    template::{Halo2Verifier, Halo2VerifyingKey, UserPhase},
+    template::{Halo2Verifier, Halo2VerifyingKey, QuotientProgram, UserPhase},
     util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
 };
 // midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
@@ -23,7 +23,10 @@ use midnight_proofs::{
 };
 use ruint::aliases::U256;
 use sha3::{Digest, Keccak256};
-use std::fmt::{self, Debug};
+use std::{
+    collections::HashMap,
+    fmt::{self, Debug},
+};
 
 mod evaluator;
 mod pcs;
@@ -76,6 +79,424 @@ impl AccumulatorEncoding {
             num_limb_bits,
         }
     }
+}
+
+// Compact quotient-identity bytecode interpreted by the generated Yul verifier.
+// The identities are still derived from the same evaluator output; this only
+// changes how the arithmetic is represented in deployed bytecode.
+#[derive(Clone, Copy, Debug)]
+enum QuotientTarget {
+    Main,
+    Selector(usize),
+}
+
+#[derive(Debug)]
+struct QuotientProgramBuild {
+    bytes: Vec<u8>,
+    consts: Vec<U256>,
+    max_stack: usize,
+}
+
+const Q_OP_PUSH_CONST: u8 = 0x01;
+const Q_OP_PUSH_MEM_LITERAL: u8 = 0x02;
+const Q_OP_PUSH_MEM_TOKEN: u8 = 0x03;
+const Q_OP_PUSH_MEM_TOKEN_OFFSET: u8 = 0x04;
+const Q_OP_PUSH_MEM_U16: u8 = 0x05;
+const Q_OP_ADD: u8 = 0x06;
+const Q_OP_MUL: u8 = 0x07;
+const Q_OP_NEG: u8 = 0x08;
+const Q_OP_PUSH_CONST_U8: u8 = 0x09;
+const Q_OP_FOLD_MAIN: u8 = 0x0a;
+const Q_OP_FOLD_SELECTOR: u8 = 0x0b;
+const Q_OP_ADD_CONST_U8: u8 = 0x0c;
+const Q_OP_MUL_CONST_U8: u8 = 0x0d;
+const Q_OP_ADD_CONST: u8 = 0x0e;
+const Q_OP_MUL_CONST: u8 = 0x0f;
+const Q_OP_ADD_MEM_U16: u8 = 0x10;
+const Q_OP_MUL_MEM_U16: u8 = 0x11;
+
+const Q_MEM_L0: u8 = 0x01;
+const Q_MEM_L_LAST: u8 = 0x02;
+const Q_MEM_L_BLIND: u8 = 0x03;
+const Q_MEM_BETA: u8 = 0x04;
+const Q_MEM_GAMMA: u8 = 0x05;
+const Q_MEM_X: u8 = 0x06;
+const Q_MEM_THETA: u8 = 0x07;
+const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
+const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
+
+#[derive(Clone, Debug)]
+enum QuotientExpr {
+    Const(U256),
+    Mem(QuotientMem),
+    Add(Box<QuotientExpr>, Box<QuotientExpr>),
+    Mul(Box<QuotientExpr>, Box<QuotientExpr>),
+    Neg(Box<QuotientExpr>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QuotientMem {
+    Literal(u32),
+    Token(u8),
+    TokenOffset(u8, u32),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QuotientLeaf {
+    Const(U256),
+    Mem(QuotientMem),
+}
+
+#[derive(Default)]
+struct QuotientProgramBuilder {
+    bytes: Vec<u8>,
+    consts: Vec<U256>,
+    const_slots: HashMap<U256, u16>,
+    vars: HashMap<String, QuotientExpr>,
+    stack_depth: usize,
+    max_stack: usize,
+}
+
+impl QuotientProgramBuilder {
+    fn identity(&mut self, lines: &[String], final_var: &str, target: QuotientTarget) {
+        self.vars.clear();
+        self.stack_depth = 0;
+
+        for line in lines {
+            self.assignment(line);
+        }
+        self.expr(final_var);
+        match target {
+            QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
+            QuotientTarget::Selector(idx) => {
+                self.bytes.push(Q_OP_FOLD_SELECTOR);
+                self.u16(idx);
+                self.pop_stack();
+            }
+        }
+        if matches!(target, QuotientTarget::Main) {
+            self.pop_stack();
+        }
+
+        assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
+    }
+
+    fn finish(self) -> QuotientProgramBuild {
+        QuotientProgramBuild {
+            bytes: self.bytes,
+            consts: self.consts,
+            max_stack: self.max_stack,
+        }
+    }
+
+    fn assignment(&mut self, line: &str) {
+        let line = line.trim();
+        let line = line.strip_prefix("let ").unwrap_or(line);
+        let (dst, expr) = line
+            .split_once(" := ")
+            .unwrap_or_else(|| panic!("unsupported quotient assignment: {line}"));
+        let expr = self.parse_expr(expr.trim());
+        self.vars.insert(dst.trim().to_string(), expr);
+    }
+
+    fn expr(&mut self, expr: &str) {
+        let expr = self.parse_expr(expr);
+        self.emit_expr(&expr);
+    }
+
+    fn parse_expr(&self, expr: &str) -> QuotientExpr {
+        let expr = expr.trim();
+        if let Some(args) = call_args(expr, "addmod") {
+            assert_eq!(args.len(), 3, "addmod arity");
+            assert_eq!(args[2].trim(), "r", "addmod modulus");
+            QuotientExpr::Add(
+                Box::new(self.parse_expr(&args[0])),
+                Box::new(self.parse_expr(&args[1])),
+            )
+        } else if let Some(args) = call_args(expr, "mulmod") {
+            assert_eq!(args.len(), 3, "mulmod arity");
+            assert_eq!(args[2].trim(), "r", "mulmod modulus");
+            QuotientExpr::Mul(
+                Box::new(self.parse_expr(&args[0])),
+                Box::new(self.parse_expr(&args[1])),
+            )
+        } else if let Some(args) = call_args(expr, "sub") {
+            assert_eq!(args.len(), 2, "sub arity");
+            assert_eq!(args[0].trim(), "r", "only sub(r, x) is supported");
+            QuotientExpr::Neg(Box::new(self.parse_expr(&args[1])))
+        } else if let Some(args) = call_args(expr, "mload") {
+            assert_eq!(args.len(), 1, "mload arity");
+            QuotientExpr::Mem(parse_mem(&args[0]))
+        } else if is_literal(expr) {
+            QuotientExpr::Const(parse_u256(expr))
+        } else {
+            self.vars
+                .get(expr)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown quotient variable: {expr}"))
+        }
+    }
+
+    fn emit_expr(&mut self, expr: &QuotientExpr) {
+        match expr {
+            QuotientExpr::Const(value) => {
+                let slot = self.const_slot(*value);
+                if let Ok(slot) = u8::try_from(slot) {
+                    self.bytes.push(Q_OP_PUSH_CONST_U8);
+                    self.bytes.push(slot);
+                } else {
+                    self.bytes.push(Q_OP_PUSH_CONST);
+                    self.u16(slot as usize);
+                }
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+                if let Ok(ptr) = u16::try_from(*ptr) {
+                    self.bytes.push(Q_OP_PUSH_MEM_U16);
+                    self.u16(ptr as usize);
+                } else {
+                    self.bytes.push(Q_OP_PUSH_MEM_LITERAL);
+                    self.u32(*ptr);
+                }
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::Token(token)) => {
+                self.bytes.push(Q_OP_PUSH_MEM_TOKEN);
+                self.bytes.push(*token);
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::TokenOffset(token, offset)) => {
+                self.bytes.push(Q_OP_PUSH_MEM_TOKEN_OFFSET);
+                self.bytes.push(*token);
+                self.u32(*offset);
+                self.push_stack();
+            }
+            QuotientExpr::Add(lhs, rhs) => {
+                self.emit_binary_expr(
+                    lhs,
+                    rhs,
+                    Q_OP_ADD,
+                    Q_OP_ADD_CONST_U8,
+                    Q_OP_ADD_CONST,
+                    Q_OP_ADD_MEM_U16,
+                );
+            }
+            QuotientExpr::Mul(lhs, rhs) => {
+                self.emit_binary_expr(
+                    lhs,
+                    rhs,
+                    Q_OP_MUL,
+                    Q_OP_MUL_CONST_U8,
+                    Q_OP_MUL_CONST,
+                    Q_OP_MUL_MEM_U16,
+                );
+            }
+            QuotientExpr::Neg(expr) => {
+                self.emit_expr(expr);
+                self.op0(Q_OP_NEG);
+            }
+        }
+    }
+
+    fn emit_binary_expr(
+        &mut self,
+        lhs: &QuotientExpr,
+        rhs: &QuotientExpr,
+        stack_op: u8,
+        const_u8_op: u8,
+        const_op: u8,
+        mem_u16_op: u8,
+    ) {
+        if let Some(leaf) = quotient_leaf(rhs) {
+            self.emit_expr(lhs);
+            if self.emit_acc_leaf(leaf, const_u8_op, const_op, mem_u16_op) {
+                return;
+            }
+            self.emit_expr(rhs);
+            self.op_binary(stack_op);
+            return;
+        }
+        if let Some(leaf) = quotient_leaf(lhs) {
+            self.emit_expr(rhs);
+            if self.emit_acc_leaf(leaf, const_u8_op, const_op, mem_u16_op) {
+                return;
+            }
+            self.emit_expr(lhs);
+            self.op_binary(stack_op);
+            return;
+        }
+
+        self.emit_expr(lhs);
+        self.emit_expr(rhs);
+        self.op_binary(stack_op);
+    }
+
+    fn emit_acc_leaf(
+        &mut self,
+        leaf: QuotientLeaf,
+        const_u8_op: u8,
+        const_op: u8,
+        mem_u16_op: u8,
+    ) -> bool {
+        match leaf {
+            QuotientLeaf::Const(value) => {
+                let slot = self.const_slot(value);
+                if let Ok(slot) = u8::try_from(slot) {
+                    self.bytes.push(const_u8_op);
+                    self.bytes.push(slot);
+                } else {
+                    self.bytes.push(const_op);
+                    self.u16(slot as usize);
+                }
+                true
+            }
+            QuotientLeaf::Mem(QuotientMem::Literal(ptr)) => {
+                if let Ok(ptr) = u16::try_from(ptr) {
+                    self.bytes.push(mem_u16_op);
+                    self.u16(ptr as usize);
+                    true
+                } else {
+                    false
+                }
+            }
+            QuotientLeaf::Mem(QuotientMem::Token(_))
+            | QuotientLeaf::Mem(QuotientMem::TokenOffset(_, _)) => false,
+        }
+    }
+
+    fn op0(&mut self, op: u8) {
+        self.bytes.push(op);
+    }
+
+    fn op_binary(&mut self, op: u8) {
+        self.bytes.push(op);
+        self.pop_stack();
+    }
+
+    fn push_stack(&mut self) {
+        self.stack_depth += 1;
+        self.max_stack = self.max_stack.max(self.stack_depth);
+    }
+
+    fn pop_stack(&mut self) {
+        self.stack_depth = self
+            .stack_depth
+            .checked_sub(1)
+            .expect("quotient VM stack underflow");
+    }
+
+    fn u16(&mut self, value: usize) {
+        assert!(value <= u16::MAX as usize, "quotient VM u16 overflow");
+        self.bytes.extend_from_slice(&(value as u16).to_be_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn const_slot(&mut self, value: U256) -> u16 {
+        if let Some(slot) = self.const_slots.get(&value) {
+            *slot
+        } else {
+            let slot = self.consts.len();
+            assert!(slot <= u16::MAX as usize, "too many quotient constants");
+            self.consts.push(value);
+            self.const_slots.insert(value, slot as u16);
+            slot as u16
+        }
+    }
+}
+
+fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
+    match expr {
+        QuotientExpr::Const(value) => Some(QuotientLeaf::Const(*value)),
+        QuotientExpr::Mem(mem) => Some(QuotientLeaf::Mem(*mem)),
+        QuotientExpr::Add(_, _) | QuotientExpr::Mul(_, _) | QuotientExpr::Neg(_) => None,
+    }
+}
+
+fn parse_mem(ptr: &str) -> QuotientMem {
+    let ptr = ptr.trim();
+    if let Some(value) = parse_u32_literal(ptr) {
+        QuotientMem::Literal(value)
+    } else if let Some(token) = mem_token(ptr) {
+        QuotientMem::Token(token)
+    } else if let Some(args) = call_args(ptr, "add") {
+        assert_eq!(args.len(), 2, "add pointer arity");
+        let token = mem_token(args[0].trim())
+            .unwrap_or_else(|| panic!("unsupported quotient mload base: {}", args[0]));
+        let offset = parse_u32_literal(args[1].trim())
+            .unwrap_or_else(|| panic!("unsupported quotient mload offset: {}", args[1]));
+        QuotientMem::TokenOffset(token, offset)
+    } else {
+        panic!("unsupported quotient mload pointer: {ptr}");
+    }
+}
+
+fn is_literal(value: &str) -> bool {
+    value.starts_with("0x")
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+fn parse_u256(value: &str) -> U256 {
+    if let Some(hex) = value.strip_prefix("0x") {
+        U256::from_str_radix(hex, 16).expect("valid hex U256")
+    } else {
+        U256::from_str_radix(value, 10).expect("valid decimal U256")
+    }
+}
+
+fn parse_u32_literal(value: &str) -> Option<u32> {
+    if !is_literal(value) {
+        return None;
+    }
+    let parsed = parse_u256(value);
+    parsed.try_into().ok()
+}
+
+fn mem_token(name: &str) -> Option<u8> {
+    Some(match name {
+        "L_0_MPTR" => Q_MEM_L0,
+        "L_LAST_MPTR" => Q_MEM_L_LAST,
+        "L_BLIND_MPTR" => Q_MEM_L_BLIND,
+        "BETA_MPTR" => Q_MEM_BETA,
+        "GAMMA_MPTR" => Q_MEM_GAMMA,
+        "X_MPTR" => Q_MEM_X,
+        "THETA_MPTR" => Q_MEM_THETA,
+        "TRASH_CHALLENGE_MPTR" => Q_MEM_TRASH_CHALLENGE,
+        "INSTANCE_EVAL_MPTR" => Q_MEM_INSTANCE_EVAL,
+        _ => return None,
+    })
+}
+
+fn call_args(expr: &str, name: &str) -> Option<Vec<String>> {
+    let prefix = format!("{name}(");
+    if !expr.starts_with(&prefix) || !expr.ends_with(')') {
+        return None;
+    }
+    Some(split_top_level(&expr[prefix.len()..expr.len() - 1]))
+}
+
+fn split_top_level(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1).expect("balanced quotient expression"),
+            ',' if depth == 0 => {
+                args.push(input[start..idx].trim().to_string());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(input[start..].trim().to_string());
+    args
 }
 
 impl<'a> SolidityGenerator<'a> {
@@ -434,6 +855,13 @@ impl<'a> SolidityGenerator<'a> {
         let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         sorted_simple.sort_unstable();
         let sel_var = |col: usize| format!("sel_acc_{col}");
+        let quotient_program_build = self.build_quotient_program(
+            &gate_items,
+            &perm_items,
+            &lookup_items,
+            &trash_items,
+            &sorted_simple,
+        );
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -447,6 +875,20 @@ impl<'a> SolidityGenerator<'a> {
         let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
         let selector_acc_mptr = after_comms.next_multiple_of(0x20);
         let batch_invert_scratch_mptr = selector_acc_mptr;
+        let quotient_program = {
+            let stack_mptr =
+                (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+            let const_mptr = stack_mptr + quotient_program_build.max_stack.max(1) * 0x20;
+            let program_mptr = const_mptr + quotient_program_build.consts.len() * 0x20;
+            Some(QuotientProgram {
+                consts: quotient_program_build.consts,
+                chunks: Self::program_chunks(&quotient_program_build.bytes),
+                len: quotient_program_build.bytes.len(),
+                const_mptr,
+                stack_mptr,
+                program_mptr,
+            })
+        };
 
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
 
@@ -637,6 +1079,7 @@ impl<'a> SolidityGenerator<'a> {
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
             quotient_eval_numer_computations,
+            quotient_program,
             pcs_computations,
             simple_selector_cols: sorted_simple.clone(),
             fixed_comm_mptr: fixed_comm_mptr_byte,
@@ -646,6 +1089,51 @@ impl<'a> SolidityGenerator<'a> {
             acc_fixed_bases,
             acc_msm_scratch,
         }
+    }
+
+    fn build_quotient_program(
+        &self,
+        gate_items: &[(Vec<String>, String, Option<usize>)],
+        perm_items: &[(Vec<String>, String)],
+        lookup_items: &[(Vec<String>, String)],
+        trash_items: &[(Vec<String>, String)],
+        sorted_simple: &[usize],
+    ) -> QuotientProgramBuild {
+        let mut builder = QuotientProgramBuilder::default();
+
+        for (lines, var, sel_idx) in gate_items {
+            let target = match sel_idx {
+                Some(col) => {
+                    let idx = sorted_simple
+                        .iter()
+                        .position(|simple| simple == col)
+                        .expect("selector column present");
+                    QuotientTarget::Selector(idx)
+                }
+                None => QuotientTarget::Main,
+            };
+            builder.identity(lines, var, target);
+        }
+        for (lines, var) in perm_items {
+            builder.identity(lines, var, QuotientTarget::Main);
+        }
+        for (lines, var) in lookup_items {
+            builder.identity(lines, var, QuotientTarget::Main);
+        }
+        for (lines, var) in trash_items {
+            builder.identity(lines, var, QuotientTarget::Main);
+        }
+
+        builder.finish()
+    }
+
+    fn program_chunks(bytes: &[u8]) -> Vec<U256> {
+        let mut padded = bytes.to_vec();
+        padded.resize(padded.len().next_multiple_of(32), 0);
+        padded
+            .chunks(32)
+            .map(U256::from_be_slice)
+            .collect::<Vec<_>>()
     }
 
     /// Repack a midnight-proofs proof from the on-the-wire compressed
