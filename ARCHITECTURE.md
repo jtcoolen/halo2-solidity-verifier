@@ -29,9 +29,11 @@ arithmetic identities:
    trees.
 3. Repeated field constants are moved into a constant pool.
 4. Expressions are encoded as dense bytecode opcodes.
-5. The generated Solidity verifier includes a small Yul stack VM that executes
-   the bytecode and folds each identity into `quotient_eval_numer` or a
-   simple-selector accumulator.
+5. The generated VK runtime stores the constant pool and packed quotient
+   bytecode.
+6. The generated Solidity verifier includes a small Yul stack VM that reads
+   that pinned VK payload, executes the bytecode, and folds each identity into
+   `quotient_eval_numer` or a simple-selector accumulator.
 
 The verifier semantics do not change. The transcript, proof format, public
 inputs, PCS checks, and final pairing checks are the same. The tradeoff is
@@ -45,10 +47,26 @@ The interpreter uses three generated memory regions:
 - `const_mptr`: table of pooled `Fr` constants.
 - `program_mptr`: packed quotient bytecode.
 
-The permanent verifier memory layout is computed first. The stack, constants,
-and program are placed after the proof commitment/evaluation regions so they do
-not clobber VK data, transcript challenges, PCS scratch space, or selector
-accumulators.
+`const_mptr` and `program_mptr` point inside the VK runtime bytes that the
+verifier already copied with `extcodecopy`. The permanent memory layout places
+the challenge region after the full VK runtime, so the quotient payload remains
+available until the quotient interpreter executes.
+
+Only the VM stack is scratch memory. It is placed after the proof
+commitment/evaluation regions so it does not clobber VK data, transcript
+challenges, PCS scratch space, or selector accumulators.
+
+### Pinned VK Payload
+
+Earlier compact-interpreter versions embedded the quotient constant pool and
+program in the verifier as many `PUSH32` + `mstore` immediates. That kept the VK
+small, but it left the verifier just above the 24KB EIP-170 runtime limit.
+
+The current generator moves that static payload into `Halo2VerifyingKey.sol`.
+The verifier still pins the VK by both runtime length and codehash, so calldata
+cannot redirect or mutate the program. This is a size split, not a trust-model
+change: the quotient program is still generated from the same circuit metadata,
+and a verifier deployment accepts exactly one VK runtime hash.
 
 ### Opcode Strategy
 
@@ -112,26 +130,30 @@ interpreter and macro encoding.
 Latest measured result:
 
 ```text
-Halo2Verifier.sol source bytes:          140,868
-Halo2Verifier creation bytecode bytes:    25,844
-Halo2Verifier deployed runtime bytes:     25,598
-Halo2VerifyingKey deployed runtime bytes:  6,752
-total deployed runtime bytes:             32,350
+Halo2Verifier.sol source bytes:           92,564
+Halo2VerifyingKey.sol source bytes:       74,007
+Halo2Verifier creation bytecode bytes:    11,678
+Halo2VerifyingKey creation bytecode bytes: 20,115
+Halo2Verifier deployed runtime bytes:     11,432
+Halo2VerifyingKey deployed runtime bytes: 19,712
+total deployed runtime bytes:             31,144
 
 compressed proof bytes:                    9,952
 EIP-2537 padded proof bytes:              12,672
 calldata bytes:                           13,188
 
-quotient evaluation gas:               1,045,546
-total tx gas:                          2,492,912
+quotient evaluation gas:               1,038,567
+total tx gas:                          2,494,591
 ```
 
 Compared to the first compact interpreter commit, the product-add and run macro
 layer reduced the quotient section from `2,578,177` gas to `1,045,546` gas and
 the verifier runtime from `30,278` bytes to `25,598` bytes.
 
-The verifier is still slightly above the 24KB EIP-170 limit. The remaining gap
-is about 1KB for the verifier runtime alone.
+Moving the quotient payload into the pinned VK then reduced the verifier
+runtime from `25,598` bytes to `11,432` bytes. The VK grew from `6,752` bytes to
+`19,712` bytes, so both deployable contracts are now independently below the
+24KB EIP-170 limit.
 
 ### Validation Commands
 

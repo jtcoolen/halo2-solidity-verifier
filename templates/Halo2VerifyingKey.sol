@@ -23,19 +23,25 @@ pragma solidity ^0.8.0;
 //   word 11..14 : G1_BASE                   (4 words, EIP-2537 padded)
 //   word 15..22 : G2_BASE                   (8 words, EIP-2537 padded)
 //   word 23..30 : NEG_S_G2_BASE             (8 words, EIP-2537 padded)
-//   word 31..30 + 4*N_FIXED      : fixed_comms (4 words each)
-//   word 31 + 4*N_FIXED ..       : permutation_comms (4 words each)
+//   word 31..30 + Q_PAYLOAD      : quotient VM constants + packed bytecode
+//   word 31 + Q_PAYLOAD ..       : fixed_comms (4 words each)
+//   word 31 + Q_PAYLOAD + 4*N_FIXED ..
+//                                : permutation_comms (4 words each)
 //
 // Notes:
 //   * `extcodehash` of this contract is pinned by the linked verifier
 //     via `EXPECTED_VK_CODEHASH`, so any byte tweak (including a
 //     byte-padding miss) is detected at deploy time.
+//   * The quotient identity interpreter's static program is stored in
+//     this pinned VK runtime. The verifier reads it from memory after
+//     `extcodecopy`, avoiding verifier-side PUSH32/mstore immediates
+//     while keeping the program covered by EXPECTED_VK_CODEHASH.
 //   * The midnight-proofs migration bakes the per-lookup chunk counts,
 //     trashcan structure, and num_simple_selectors into the codegen
 //     side (the Yul body emitted by the evaluator), so they do **not**
-//     appear as runtime constants in this VK. Adding new circuits with
-//     different lookup/trashcan shapes regenerates the verifier code,
-//     not the VK layout.
+//     appear as separate user-configurable runtime parameters. Adding
+//     new circuits with different lookup/trashcan shapes regenerates
+//     the verifier code and VK layout together.
 contract Halo2VerifyingKey {
     constructor() {
         assembly {

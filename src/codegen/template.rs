@@ -47,6 +47,10 @@ pub(crate) struct Halo2VerifyingKey {
     pub(crate) constants: Vec<(&'static str, U256)>,
     pub(crate) fixed_comms: Vec<G1Words>,
     pub(crate) permutation_comms: Vec<G1Words>,
+    pub(crate) quotient_const_offset_words: Option<usize>,
+    pub(crate) quotient_const_words: usize,
+    pub(crate) quotient_program_offset_words: Option<usize>,
+    pub(crate) quotient_program_words: usize,
 }
 
 impl Halo2VerifyingKey {
@@ -323,6 +327,10 @@ mod tests {
             constants,
             fixed_comms,
             permutation_comms,
+            quotient_const_offset_words: None,
+            quotient_const_words: 0,
+            quotient_program_offset_words: None,
+            quotient_program_words: 0,
         }
     }
 

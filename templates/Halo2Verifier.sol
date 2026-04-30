@@ -47,9 +47,10 @@ contract Halo2Verifier {
     uint256 internal constant  LAST_QUOTIENT_X_CPTR = {{ quotient_comm_cptr + 4 * (num_quotients - 1) }};
 
     // ----------------------------------------------------------------------
-    // Verifying-key memory map. The VK header lives at VK_MPTR; the
-    // commitments live just above. After VK comes the challenge slots
-    // (challenge_mptr..) and the per-stage scratch (theta_mptr..).
+    // Verifying-key memory map. The VK header lives at VK_MPTR, followed
+    // by the quotient VM payload and commitments. After the full VK
+    // runtime comes the challenge slots (challenge_mptr..) and the
+    // per-stage scratch (theta_mptr..).
     // ----------------------------------------------------------------------
     uint256 internal constant                VK_MPTR = {{ vk_mptr }};
     uint256 internal constant         VK_DIGEST_MPTR = {{ vk_mptr }};
@@ -992,14 +993,7 @@ contract Halo2Verifier {
                 {%- when Some with (program) %}
                 let y := mload(Y_MPTR)
                 let q_const_mptr := {{ program.const_mptr|hex() }}
-                {%- for value in program.consts %}
-                mstore(add(q_const_mptr, {{ (loop.index0 * 0x20)|hex() }}), {{ value|hex_padded(64) }})
-                {%- endfor %}
-
                 let q_program_mptr := {{ program.program_mptr|hex() }}
-                {%- for chunk in program.chunks %}
-                mstore(add(q_program_mptr, {{ (loop.index0 * 0x20)|hex() }}), {{ chunk|hex_padded(64) }})
-                {%- endfor %}
 
                 let quotient_eval_numer := 0
                 {%- for col in simple_selector_cols %}

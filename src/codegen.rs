@@ -870,7 +870,7 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output))
     }
 
-    fn generate_vk(&self) -> Halo2VerifyingKey {
+    fn generate_base_vk(&self) -> Halo2VerifyingKey {
         let mut constants: Vec<(&'static str, U256)> = Vec::new();
         {
             let domain = self.vk.get_domain();
@@ -970,25 +970,65 @@ impl<'a> SolidityGenerator<'a> {
             constants,
             fixed_comms,
             permutation_comms,
+            quotient_const_offset_words: None,
+            quotient_const_words: 0,
+            quotient_program_offset_words: None,
+            quotient_program_words: 0,
         }
     }
 
-    fn generate_verifier(
-        &self,
-        separate: bool,
-        trace: bool,
-        gas_checkpoints: bool,
-    ) -> Halo2Verifier {
+    fn generate_vk(&self) -> Halo2VerifyingKey {
         let proof_cptr = Ptr::calldata(0x64);
-
-        let vk = self.generate_vk();
-        let expected_vk_codehash = separate.then(|| {
-            let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
-            U256::from_be_bytes(digest)
-        });
-        let vk_len = vk.len();
+        let mut vk = self.generate_base_vk();
         let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
 
+        let (pre_meta, pre_data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (pre_quotient_program_build, _) =
+            self.compact_quotient_program_for(&pre_meta, &pre_data);
+        let quotient_const_words = pre_quotient_program_build.consts.len();
+        let quotient_program_words = Self::program_chunks(&pre_quotient_program_build.bytes).len();
+        let quotient_const_offset_words = vk.constants.len();
+        let quotient_program_offset_words = quotient_const_offset_words + quotient_const_words;
+
+        vk.constants
+            .extend((0..quotient_const_words).map(|_| ("quotient_const", U256::ZERO)));
+        vk.constants
+            .extend((0..quotient_program_words).map(|_| ("quotient_program", U256::ZERO)));
+
+        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (quotient_program_build, _) = self.compact_quotient_program_for(&meta, &data);
+        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+        assert_eq!(
+            quotient_program_build.consts.len(),
+            quotient_const_words,
+            "quotient const table changed after VK payload reservation"
+        );
+        assert_eq!(
+            quotient_program_chunks.len(),
+            quotient_program_words,
+            "quotient program length changed after VK payload reservation"
+        );
+
+        for (i, value) in quotient_program_build.consts.iter().copied().enumerate() {
+            vk.constants[quotient_const_offset_words + i] = ("quotient_const", value);
+        }
+        for (i, value) in quotient_program_chunks.iter().copied().enumerate() {
+            vk.constants[quotient_program_offset_words + i] = ("quotient_program", value);
+        }
+
+        vk.quotient_const_offset_words = Some(quotient_const_offset_words);
+        vk.quotient_const_words = quotient_const_words;
+        vk.quotient_program_offset_words = Some(quotient_program_offset_words);
+        vk.quotient_program_words = quotient_program_words;
+        vk
+    }
+
+    fn meta_data_for_vk(
+        &self,
+        vk: &Halo2VerifyingKey,
+        vk_mptr: Ptr,
+        proof_cptr: Ptr,
+    ) -> (ConstraintSystemMeta, Data) {
         // ------------------------------------------------------------------
         // Phase 3 / fewer-point-sets two-pass `Data` construction.
         //
@@ -1006,7 +1046,7 @@ impl<'a> SolidityGenerator<'a> {
         // against unchanged meta", and the result is byte-identical
         // to the pre-Phase-3 single-pass path.
         // ------------------------------------------------------------------
-        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
+        let raw_data = Data::new(&self.meta, vk, vk_mptr, proof_cptr);
         let mut meta = self.meta.clone();
         let n_dummy = if cfg!(feature = "fewer-point-sets") {
             BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
@@ -1015,12 +1055,51 @@ impl<'a> SolidityGenerator<'a> {
         };
         let main_evals = meta.num_evals;
         meta.set_num_dummy_evals(n_dummy);
-        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
+        let mut data = Data::new(&meta, vk, vk_mptr, proof_cptr);
         if n_dummy > 0 {
             data.set_dummy_eval_words(main_evals, n_dummy);
         }
 
         meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
+        (meta, data)
+    }
+
+    fn compact_quotient_program_for(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+    ) -> (QuotientProgramBuild, Vec<usize>) {
+        let evaluator = Evaluator::new(self.vk.cs(), meta, data);
+        let gate_items = evaluator.gate_computations_tagged();
+        let perm_items = evaluator.permutation_computations();
+        let lookup_items = evaluator.lookup_computations();
+        let trash_items = evaluator.trashcan_computations();
+
+        let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
+        sorted_simple.sort_unstable();
+        let quotient_program_build = self.build_quotient_program(
+            &gate_items,
+            &perm_items,
+            &lookup_items,
+            &trash_items,
+            &sorted_simple,
+        );
+        let _quotient_max_stack = quotient_program_build.max_stack;
+        (quotient_program_build, sorted_simple)
+    }
+
+    fn generate_verifier(
+        &self,
+        separate: bool,
+        trace: bool,
+        gas_checkpoints: bool,
+    ) -> Halo2Verifier {
+        let proof_cptr = Ptr::calldata(0x64);
+
+        let vk = self.generate_vk();
+        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
+
+        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
 
         let evaluator = Evaluator::new(self.vk.cs(), &meta, &data);
 
@@ -1056,14 +1135,38 @@ impl<'a> SolidityGenerator<'a> {
         let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
         let selector_acc_mptr = after_comms.next_multiple_of(0x20);
         let batch_invert_scratch_mptr = selector_acc_mptr;
+        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+        let quotient_const_words = vk.quotient_const_words;
+        let quotient_program_words = vk.quotient_program_words;
+        let quotient_const_offset_words = vk
+            .quotient_const_offset_words
+            .expect("VK must carry quotient constants");
+        let quotient_program_offset_words = vk
+            .quotient_program_offset_words
+            .expect("VK must carry quotient program");
+        assert_eq!(
+            quotient_program_build.consts.len(),
+            quotient_const_words,
+            "quotient const table changed after VK payload reservation"
+        );
+        assert_eq!(
+            quotient_program_chunks.len(),
+            quotient_program_words,
+            "quotient program length changed after VK payload reservation"
+        );
+        let expected_vk_codehash = separate.then(|| {
+            let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
+            U256::from_be_bytes(digest)
+        });
+        let vk_len = vk.len();
         let quotient_program = {
             let stack_mptr =
                 (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
-            let const_mptr = stack_mptr + quotient_program_build.max_stack.max(1) * 0x20;
-            let program_mptr = const_mptr + quotient_program_build.consts.len() * 0x20;
+            let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
+            let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
             Some(QuotientProgram {
                 consts: quotient_program_build.consts,
-                chunks: Self::program_chunks(&quotient_program_build.bytes),
+                chunks: quotient_program_chunks,
                 len: quotient_program_build.bytes.len(),
                 const_mptr,
                 stack_mptr,

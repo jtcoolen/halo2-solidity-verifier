@@ -504,7 +504,7 @@ impl Data {
         // stride between consecutive points is 4 instead of the BN254-era 2.
         let fixed_comm_mptr = vk_mptr + vk.constants.len();
         let permutation_comm_mptr = fixed_comm_mptr + 4 * vk.fixed_comms.len();
-        let challenge_mptr = permutation_comm_mptr + 4 * vk.permutation_comms.len();
+        let challenge_mptr = vk_mptr + vk.len() / 0x20;
         let theta_mptr = challenge_mptr + meta.challenge_indices.len();
 
         // ------------------------------------------------------------
