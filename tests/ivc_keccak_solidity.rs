@@ -1,20 +1,21 @@
-//! End-to-end on-chain verification of the IVC SHA-256 aggregation chain's
-//! final Keccak-transcript proof (the EVM twin of the off-circuit
-//! `IvcVerifier::verify_final` test in
-//! `midfall/aggregation/tests/single_aggregation_keccak_final.rs`).
+//! End-to-end on-chain verification of a Keccak-transcript decider proof for
+//! a two-leaf IVC SHA-256 aggregation tree.
 //!
 //! Pipeline:
 //!   1. Build the IVC circuit (k = 19, ProofAggregation transition).
-//!   2. Aggregate one SHA-256 preimage proof into the chain; the final
-//!      step uses `prove_final_step` so the outer Fiat-Shamir transcript
-//!      is Keccak-256 (matching the EVM verifier).
-//!   3. Render `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the
-//!      IVC VK with `truncated-challenges` + `fewer-point-sets` enabled.
-//!   4. Compile the Solidity, deploy on Prague-spec revm (EIP-2537
+//!   2. Produce two independent one-step IVC proofs under the Poseidon
+//!      transcript; these are the leaves of the tree.
+//!   3. Build a final decider circuit (k = 20) that verifies both IVC leaves,
+//!      accumulates their final proof accumulators, and fully collapses
+//!      the result over the fixed IVC VK bases.
+//!   4. Prove that decider circuit under Keccak-256, render
+//!      `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the decider
+//!      VK with `truncated-challenges` + `fewer-point-sets` enabled.
+//!   5. Compile the Solidity, deploy on Prague-spec revm (EIP-2537
 //!      precompiles routed through blst), repack the proof off-chain
 //!      via `SolidityGenerator::repack_compressed_proof`, encode
 //!      calldata, call `verifyProof`.
-//!   5. Assert success and dump gas.
+//!   6. Assert success and dump gas.
 //!
 //! Required features: `evm`, `truncated-challenges`, `fewer-point-sets`.
 //! Midnight crates are pulled from the published midfall `keccak` branch
@@ -230,6 +231,21 @@ fn constrain_fully_collapsed_accumulator(
     Ok(collapsed)
 }
 
+fn constrain_same_accumulator_public_input(
+    std_lib: &ZkStdLib,
+    layouter: &mut impl Layouter<F>,
+    lhs: &AssignedAccumulator<S>,
+    rhs: &AssignedAccumulator<S>,
+) -> Result<(), Error> {
+    let lhs = std_lib.verifier().as_public_input(layouter, lhs)?;
+    let rhs = std_lib.verifier().as_public_input(layouter, rhs)?;
+    assert_eq!(lhs.len(), rhs.len());
+    for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
+        std_lib.assert_equal(layouter, lhs, rhs)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct State {
     statements: Vec<<ShaPreimageCircuit as Relation>::Instance>,
@@ -442,7 +458,7 @@ impl IvcTransition for ProofAggregation {
                 .transpose_vec(SHA_NB_PUBLIC_INPUTS),
         )?;
 
-        let id_point = self
+        let id_point: <S as SelfEmulation>::AssignedPoint = self
             .std_lib
             .bls12_381_curve()
             .assign_fixed(layouter, C::identity())?;
@@ -480,6 +496,224 @@ impl IvcTransition for ProofAggregation {
 }
 
 // ---------------------------------------------------------------------------
+// Final two-leaf tree decider.
+// ---------------------------------------------------------------------------
+
+const TREE_LEAVES: usize = 2;
+
+#[derive(Clone, Debug)]
+struct TreeDeciderContext {
+    inner_ctx: InnerCircuitContext,
+    ivc_cs: ConstraintSystem<F>,
+    ivc_domain: EvaluationDomain<F>,
+    ivc_vk: MidnightVK,
+    ivc_params_verifier: ParamsVerifierKZG<E>,
+}
+
+impl TreeDeciderContext {
+    fn ivc_fixed_bases(&self) -> BTreeMap<String, C> {
+        verifier::fixed_bases::<S>("ivc_vk", self.ivc_vk.vk())
+    }
+
+    fn ivc_fixed_base_names(&self) -> Vec<String> {
+        self.ivc_fixed_bases().keys().cloned().collect()
+    }
+
+    fn one_step_outer_acc(&self) -> Accumulator<S> {
+        Accumulator::<S>::trivial(&self.ivc_fixed_base_names())
+    }
+
+    fn leaf_public_input(&self, state: &State) -> Vec<F> {
+        [
+            vec![self.ivc_vk.vk().transcript_repr()],
+            ProofAggregation::format_public_input(state),
+            AssignedAccumulator::<S>::as_public_input(&self.one_step_outer_acc()),
+        ]
+        .concat()
+    }
+
+    fn leaf_final_acc(&self, state: &State, proof: &[u8]) -> Accumulator<S> {
+        let leaf_pi = self.leaf_public_input(state);
+        let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
+        let dual_msm =
+            plonk::prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
+                self.ivc_vk.vk(),
+                &[&[C::identity()]],
+                &[&[&leaf_pi]],
+                &mut transcript,
+            )
+            .expect("off-circuit IVC leaf prepare should succeed");
+        transcript
+            .assert_empty()
+            .expect("IVC leaf transcript should be consumed");
+        assert!(
+            dual_msm.clone().check(&self.ivc_params_verifier),
+            "invalid IVC leaf proof"
+        );
+
+        let proof_acc = Accumulator::from_dual_msm(dual_msm, "ivc_vk", &self.ivc_fixed_bases());
+        Accumulator::accumulate(&[proof_acc, self.one_step_outer_acc()])
+    }
+
+    fn final_acc(&self, leaves: &[TreeLeafWitness; TREE_LEAVES]) -> Accumulator<S> {
+        let leaf_accs = leaves
+            .iter()
+            .map(|leaf| self.leaf_final_acc(&leaf.state, &leaf.proof))
+            .collect::<Vec<_>>();
+        let acc = Accumulator::accumulate(&leaf_accs);
+        fully_collapsed_accumulator(&acc, &self.ivc_fixed_bases())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TreeDeciderInstance {
+    leaf_statement_hashes: [F; TREE_LEAVES],
+    final_acc: Accumulator<S>,
+}
+
+#[derive(Clone, Debug)]
+struct TreeLeafWitness {
+    state: State,
+    proof: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct TreeDeciderWitness {
+    leaves: [TreeLeafWitness; TREE_LEAVES],
+}
+
+#[derive(Clone, Debug)]
+struct IvcTreeDeciderCircuit {
+    ctx: TreeDeciderContext,
+}
+
+impl IvcTreeDeciderCircuit {
+    fn new(ctx: TreeDeciderContext) -> Self {
+        Self { ctx }
+    }
+
+    fn arch() -> ZkStdLibArch {
+        ZkStdLibArch {
+            bls12_381: true,
+            poseidon: true,
+            nr_pow2range_cols: 4,
+            ..ZkStdLibArch::default()
+        }
+    }
+}
+
+impl Relation for IvcTreeDeciderCircuit {
+    type Instance = TreeDeciderInstance;
+    type Witness = TreeDeciderWitness;
+
+    fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
+        Ok([
+            instance.leaf_statement_hashes.to_vec(),
+            AssignedAccumulator::<S>::as_public_input(&instance.final_acc),
+        ]
+        .concat())
+    }
+
+    fn circuit(
+        &self,
+        std_lib: &ZkStdLib,
+        layouter: &mut impl Layouter<F>,
+        instance: Value<Self::Instance>,
+        witness: Value<Self::Witness>,
+    ) -> Result<(), Error> {
+        let verifier_gadget = std_lib.verifier();
+        let proof_aggregation = ProofAggregation::new(std_lib.clone(), &self.ctx.inner_ctx);
+
+        let mut public_leaf_hashes = Vec::with_capacity(TREE_LEAVES);
+        for i in 0..TREE_LEAVES {
+            public_leaf_hashes.push(
+                std_lib.assign(
+                    layouter,
+                    instance
+                        .as_ref()
+                        .map(|instance| instance.leaf_statement_hashes[i]),
+                )?,
+            );
+        }
+        for hash in &public_leaf_hashes {
+            std_lib.constrain_as_public_input(layouter, hash)?;
+        }
+
+        let public_final_acc = verifier_gadget.assign_collapsed_accumulator(
+            layouter,
+            &[],
+            instance.as_ref().map(|instance| instance.final_acc.clone()),
+        )?;
+        verifier_gadget.constrain_as_public_input(layouter, &public_final_acc)?;
+
+        let assigned_ivc_vk = verifier_gadget.assign_fixed_vk(
+            layouter,
+            "ivc_vk",
+            &self.ctx.ivc_domain,
+            &self.ctx.ivc_cs,
+            self.ctx.ivc_vk.vk().transcript_repr(),
+        )?;
+        let ivc_vk_pi = verifier_gadget.as_public_input(layouter, &assigned_ivc_vk)?;
+        let id_point: <S as SelfEmulation>::AssignedPoint = std_lib
+            .bls12_381_curve()
+            .assign_fixed(layouter, C::identity())?;
+        let outer_acc_value = Value::known(self.ctx.one_step_outer_acc());
+        let outer_acc = verifier_gadget.assign_collapsed_accumulator(
+            layouter,
+            &self.ctx.ivc_fixed_base_names(),
+            outer_acc_value,
+        )?;
+        let outer_acc_pi = verifier_gadget.as_public_input(layouter, &outer_acc)?;
+
+        let mut leaf_accs = Vec::with_capacity(TREE_LEAVES);
+        for (i, public_hash) in public_leaf_hashes.iter().enumerate() {
+            let leaf_state = proof_aggregation.assign(
+                layouter,
+                witness
+                    .as_ref()
+                    .map(|witness| witness.leaves[i].state.clone()),
+            )?;
+            let leaf_state_pi = proof_aggregation.as_public_input(layouter, &leaf_state)?;
+            std_lib.assert_equal(layouter, public_hash, &leaf_state_pi[0])?;
+
+            let leaf_pi = [ivc_vk_pi.clone(), leaf_state_pi, outer_acc_pi.clone()].concat();
+            let proof_acc = verifier_gadget.prepare(
+                layouter,
+                &assigned_ivc_vk,
+                &[id_point.clone()],
+                &[&leaf_pi],
+                witness
+                    .as_ref()
+                    .map(|witness| witness.leaves[i].proof.clone()),
+            )?;
+            let leaf_acc = verifier_gadget.accumulate(layouter, &[proof_acc, outer_acc.clone()])?;
+            leaf_accs.push(leaf_acc);
+        }
+
+        let final_acc = verifier_gadget.accumulate(layouter, &leaf_accs)?;
+        let final_acc = constrain_fully_collapsed_accumulator(
+            std_lib,
+            layouter,
+            final_acc,
+            &self.ctx.ivc_fixed_bases(),
+        )?;
+        constrain_same_accumulator_public_input(std_lib, layouter, &final_acc, &public_final_acc)
+    }
+
+    fn used_chips(&self) -> ZkStdLibArch {
+        Self::arch()
+    }
+
+    fn write_relation<W: std::io::Write>(&self, _writer: &mut W) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_relation<R: std::io::Read>(_reader: &mut R) -> std::io::Result<Self> {
+        unimplemented!()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // e2e test
 // ---------------------------------------------------------------------------
 
@@ -490,11 +724,44 @@ fn ivc_constraint_system(arch: ZkStdLibArch, k: u32) -> (ConstraintSystem<F>, Ev
     (cs, domain)
 }
 
+fn srs_dir() -> String {
+    std::env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".to_string())
+}
+
+fn has_required_srs_assets() -> bool {
+    let srs_dir = srs_dir();
+    let mut ok = true;
+
+    let filecoin_2p13 = format!("{srs_dir}/bls_filecoin_2p13");
+    let filecoin_2p19 = format!("{srs_dir}/bls_filecoin_2p19");
+    if !std::path::Path::new(&filecoin_2p13).is_file()
+        && !std::path::Path::new(&filecoin_2p19).is_file()
+    {
+        println!(
+            "[ivc-keccak-solidity] missing Filecoin SRS: need {filecoin_2p13} or {filecoin_2p19}"
+        );
+        ok = false;
+    }
+
+    for k in [19, 20] {
+        let path = format!("{srs_dir}/midnight-srs-2p{k}");
+        if !std::path::Path::new(&path).is_file() {
+            println!(
+                "[ivc-keccak-solidity] missing Midnight SRS: {path}\n\
+                 [ivc-keccak-solidity] download with: curl -L -o {path} https://srs.midnight.network/midnight-srs-2p{k}"
+            );
+            ok = false;
+        }
+    }
+
+    ok
+}
+
 #[test]
 #[ignore = "slow IVC proving + solc + revm; ~10 min total. Run with --ignored --nocapture"]
 fn ivc_final_keccak_solidity_e2e() {
     const IVC_K: u32 = 19;
-    const STEPS: usize = 1;
+    const DECIDER_K: u32 = 20;
     const SOLC_OPTIMIZE_RUNS: u32 = 1;
 
     // Bail out cleanly when solc isn't on PATH.
@@ -504,6 +771,10 @@ fn ivc_final_keccak_solidity_e2e() {
         .is_err()
     {
         println!("[ivc-keccak-solidity] solc not found on PATH; skipping");
+        return;
+    }
+    if !has_required_srs_assets() {
+        println!("[ivc-keccak-solidity] required SRS assets missing; skipping");
         return;
     }
 
@@ -525,20 +796,20 @@ fn ivc_final_keccak_solidity_e2e() {
     };
 
     let start = Instant::now();
-    let inner_statements_with_witnesses: [_; STEPS] =
+    let inner_statements_with_witnesses: [_; TREE_LEAVES] =
         std::array::from_fn(|_| sha_random_instance());
-    let inner_proofs: [_; STEPS] = std::array::from_fn(|i| {
+    let inner_proofs: [_; TREE_LEAVES] = std::array::from_fn(|i| {
         let (digest, preimage) = &inner_statements_with_witnesses[i];
         sha_prove(&inner_srs, &inner_pk, digest, *preimage)
     });
     let inner_statements = inner_statements_with_witnesses.map(|(x, _)| x);
     println!(
-        "[ivc-keccak-solidity] {STEPS} inner SHA proofs generated in {:.2?}",
+        "[ivc-keccak-solidity] {TREE_LEAVES} inner SHA proofs generated in {:.2?}",
         start.elapsed()
     );
 
     // ----------------------------------------------------------
-    // IVC chain (Midnight SRS at k = 19).
+    // Two independent one-step IVC leaves (Midnight SRS at k = 19).
     // ----------------------------------------------------------
     let ivc_srs = load_srs(
         SrsSource::Midnight,
@@ -546,18 +817,20 @@ fn ivc_final_keccak_solidity_e2e() {
         IvcCircuit::<ProofAggregation>::cs_degree(),
     );
     let start = Instant::now();
-    let (mut prover, verifier) =
+    let (leaf_prover, verifier) =
         ivc::setup::<ProofAggregation>(ivc_srs.clone(), IVC_K, inner_ctx.clone());
     println!(
         "[ivc-keccak-solidity] IVC setup completed in {:.2?}",
         start.elapsed()
     );
 
-    for i in 0..STEPS - 1 {
+    let mut leaf_witnesses = Vec::with_capacity(TREE_LEAVES);
+    for i in 0..TREE_LEAVES {
         let w = AggregationWitness {
             inner_statement: inner_statements[i],
             inner_proof: inner_proofs[i].clone(),
         };
+        let mut prover = leaf_prover.clone();
         let t0 = Instant::now();
         let p = prover.prove_step(w).unwrap();
         let dt = t0.elapsed();
@@ -565,56 +838,109 @@ fn ivc_final_keccak_solidity_e2e() {
         let t0 = Instant::now();
         verifier.verify(&inner_ctx, &inst, &p).unwrap();
         println!(
-            "[ivc-keccak-solidity] Step {i} (Poseidon): prove {dt:.2?}, verify {:.2?}",
+            "[ivc-keccak-solidity] Leaf {i} IVC (Poseidon): prove {dt:.2?}, verify {:.2?}",
             t0.elapsed()
         );
+        leaf_witnesses.push(TreeLeafWitness {
+            state: inst.state().clone(),
+            proof: p,
+        });
     }
 
-    let last = STEPS - 1;
-    let final_witness = AggregationWitness {
-        inner_statement: inner_statements[last],
-        inner_proof: inner_proofs[last].clone(),
+    let leaf_witnesses: [TreeLeafWitness; TREE_LEAVES] =
+        leaf_witnesses.try_into().expect("exactly two tree leaves");
+
+    // ----------------------------------------------------------
+    // Final tree decider proof under Keccak.
+    // ----------------------------------------------------------
+    let (ivc_cs, ivc_domain) = ivc_constraint_system(IvcCircuit::<ProofAggregation>::arch(), IVC_K);
+    let decider_ctx = TreeDeciderContext {
+        inner_ctx: inner_ctx.clone(),
+        ivc_cs,
+        ivc_domain,
+        ivc_vk: verifier.vk().clone(),
+        ivc_params_verifier: ivc_srs.verifier_params(),
     };
-    let t0 = Instant::now();
-    let final_proof = prover
-        .prove_final_step(final_witness)
-        .expect("prove_final_step should succeed");
+    let decider_relation = IvcTreeDeciderCircuit::new(decider_ctx.clone());
+    let decider_instance = TreeDeciderInstance {
+        leaf_statement_hashes: std::array::from_fn(|i| leaf_witnesses[i].state.statements_hash),
+        final_acc: decider_ctx.final_acc(&leaf_witnesses),
+    };
+    let no_fixed_bases = BTreeMap::new();
+    assert!(
+        decider_instance
+            .final_acc
+            .check(&ivc_srs.verifier_params(), &no_fixed_bases),
+        "fully-collapsed carried IVC accumulator must satisfy the pairing invariant"
+    );
+    println!("[ivc-keccak-solidity] collapsed carried IVC accumulator: OK");
+    let decider_witness = TreeDeciderWitness {
+        leaves: leaf_witnesses,
+    };
+
+    let decider_srs = load_srs(
+        SrsSource::Midnight,
+        DECIDER_K,
+        cs_degree(IvcTreeDeciderCircuit::arch()),
+    );
+    let start = Instant::now();
+    let decider_vk = midnight_zk_stdlib::setup_vk(&decider_srs, &decider_relation);
+    let decider_pk = midnight_zk_stdlib::setup_pk(&decider_relation, &decider_vk);
     println!(
-        "[ivc-keccak-solidity] Step {last} (Keccak):   prove {:.2?} ({} bytes compressed)",
+        "[ivc-keccak-solidity] tree decider setup completed in {:.2?}",
+        start.elapsed()
+    );
+
+    let t0 = Instant::now();
+    let final_proof = midnight_zk_stdlib::prove::<IvcTreeDeciderCircuit, sha3::Keccak256>(
+        &decider_srs,
+        &decider_pk,
+        &decider_relation,
+        &decider_instance,
+        decider_witness,
+        OsRng,
+    )
+    .expect("tree decider proof generation should succeed");
+    println!(
+        "[ivc-keccak-solidity] tree decider (Keccak): prove {:.2?} ({} bytes compressed)",
         t0.elapsed(),
         final_proof.len()
     );
-    let final_instance = prover.instance();
 
-    // Sanity: native verify_final must accept the proof.
+    // Sanity: native verifier must accept the final Keccak decider proof.
     let t0 = Instant::now();
-    verifier
-        .verify_final::<ProofAggregation>(&inner_ctx, &final_instance, &final_proof)
-        .expect("native verify_final must accept the prove_final_step output");
+    midnight_zk_stdlib::verify::<IvcTreeDeciderCircuit, sha3::Keccak256>(
+        &decider_srs.verifier_params(),
+        &decider_vk,
+        &decider_instance,
+        None,
+        &final_proof,
+    )
+    .expect("native decider verify must accept the Keccak proof");
     println!(
-        "[ivc-keccak-solidity] native verify_final: OK ({:.2?})",
+        "[ivc-keccak-solidity] native tree decider verify: OK ({:.2?})",
         t0.elapsed()
     );
 
     // ----------------------------------------------------------
     // Render Halo2Verifier.sol + Halo2VerifyingKey.sol.
     // ----------------------------------------------------------
-    // Public input vector exactly mirrors `IvcCircuit::format_instance`.
+    // Public input vector exactly mirrors `IvcTreeDeciderCircuit::format_instance`.
     let pi: Vec<F> =
-        IvcCircuit::<ProofAggregation>::format_instance(&final_instance).expect("format_instance");
+        IvcTreeDeciderCircuit::format_instance(&decider_instance).expect("format_instance");
 
     // ZkStdLib creates 2 instance columns (one committed, one
     // non-committed). num_instances counts the non-committed slots.
     //
-    // IvcCircuit::format_instance(instance) =
-    //   [self_vk_repr, transition_state_public_inputs..., outer_acc].
-    // The Solidity verifier must consume `outer_acc` for the final
-    // accumulator pairing check, so pass its starting instance offset.
+    // IvcTreeDeciderCircuit::format_instance(instance) =
+    //   [leaf_statement_hashes..., fully_collapsed_final_acc].
+    // The Solidity verifier consumes `fully_collapsed_final_acc` for the
+    // final accumulator pairing check, so pass its starting instance offset.
     let num_instances = pi.len();
-    let outer_acc_offset = 1 + ProofAggregation::format_public_input(final_instance.state()).len();
-    let generator = SolidityGenerator::new(&ivc_srs, verifier.vk().vk(), Gwc19, num_instances)
+    let final_acc_offset = TREE_LEAVES;
+    let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), Gwc19, num_instances)
         .set_num_committed_instances(1)
-        .set_acc_encoding(Some(AccumulatorEncoding::new(outer_acc_offset, 7, 56)));
+        .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();

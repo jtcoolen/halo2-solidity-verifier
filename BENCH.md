@@ -15,6 +15,8 @@ https://github.com/EYBlockchain/midfall.git#keccak
 
 The benchmark needs local SRS files. The helper script below downloads missing
 assets into `.srs/` by default; set `SRS_DIR` to reuse an existing directory.
+The current IVC Solidity bench needs Midnight `midnight-srs-2p19` for the leaf
+IVC proofs and `midnight-srs-2p20` for the final tree-decider proof.
 
 ## Running the Poseidon fixture bench
 
@@ -39,10 +41,12 @@ The 16 checkpoints sit at semantic section boundaries — see
 
 ## Running the IVC Keccak final bench
 
-The IVC bench proves one inner SHA-256 statement, emits the final IVC proof
-under a Keccak transcript, renders separate verifier/VK contracts, compiles
-them with solc, deploys them in Prague-spec revm, and verifies the final proof
-end to end. It is marked ignored because it is slow.
+The IVC bench proves two independent one-step IVC SHA-256 aggregation leaves,
+then proves a final Keccak-transcript tree decider that verifies both leaf
+proofs and fully collapses the carried IVC proof accumulator. It renders
+separate verifier/VK contracts for that decider proof, compiles them with
+solc, deploys them in Prague-spec revm, and verifies the final proof end to
+end. It is marked ignored because it is slow.
 
 Recommended runner:
 
@@ -98,6 +102,10 @@ ls -lh target/ivc-keccak-solidity-dump
 
 ### IVC Keccak final run, 2026-04-29
 
+This measurement is the previous one-step final-proof baseline. Re-run the
+bench after fetching `midnight-srs-2p20` to populate the new two-leaf tree
+decider numbers.
+
 Run shape:
 
 - 1 inner SHA proof: 0.59 s.
@@ -109,6 +117,9 @@ Run shape:
 - Calldata: 14,980 bytes, with 68 public-input field elements.
 
 Contract size summary with `SOLC_OPTIMIZE_RUNS = 1` and no CBOR metadata:
+
+> Historical inline-verifier baseline. Re-run `scripts/run_ivc_bench.sh` to
+> refresh the contract sizes for the current circuit/VK.
 
 ```
 Halo2Verifier.sol source bytes: 426,899

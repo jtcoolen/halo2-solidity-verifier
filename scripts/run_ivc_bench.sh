@@ -13,7 +13,8 @@ SRS_DIR="${SRS_DIR:-"$ROOT_DIR/.srs"}"
 MIDFALL_DIR="${MIDFALL_DIR:-"$ROOT_DIR/../midfall"}"
 
 FILECOIN_SRS_URL="https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19"
-MIDNIGHT_SRS_URL="https://srs.midnight.network/midnight-srs-2p19"
+MIDNIGHT_SRS_2P19_URL="https://srs.midnight.network/midnight-srs-2p19"
+MIDNIGHT_SRS_2P20_URL="https://srs.midnight.network/midnight-srs-2p20"
 
 usage() {
   cat <<'USAGE'
@@ -36,9 +37,10 @@ Options:
   -h, --help           Show this help.
 
 Default behavior:
-  1. Ensure SRS_DIR has Midnight's midnight-srs-2p19 and either Filecoin's
-     bls_filecoin_2p13 or bls_filecoin_2p19. If bls_filecoin_2p13 is absent,
-     Midfall's loader downsizes bls_filecoin_2p19 on the first full run.
+  1. Ensure SRS_DIR has Midnight's midnight-srs-2p19 and midnight-srs-2p20,
+     plus either Filecoin's bls_filecoin_2p13 or bls_filecoin_2p19. If
+     bls_filecoin_2p13 is absent, Midfall's loader downsizes bls_filecoin_2p19
+     on the first full run.
   2. Compile the ignored Solidity verifier bench.
   3. Run tests/ivc_keccak_solidity.rs::ivc_final_keccak_solidity_e2e with
      evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints.
@@ -139,7 +141,8 @@ ensure_srs_assets() {
     download_if_missing "$SRS_DIR/bls_filecoin_2p19" "$FILECOIN_SRS_URL"
   fi
 
-  download_if_missing "$SRS_DIR/midnight-srs-2p19" "$MIDNIGHT_SRS_URL"
+  download_if_missing "$SRS_DIR/midnight-srs-2p19" "$MIDNIGHT_SRS_2P19_URL"
+  download_if_missing "$SRS_DIR/midnight-srs-2p20" "$MIDNIGHT_SRS_2P20_URL"
 }
 
 cargo_features() {

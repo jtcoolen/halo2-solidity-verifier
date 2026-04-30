@@ -16,7 +16,9 @@ https://github.com/EYBlockchain/midfall.git#keccak
 
 The ignored proving benches need local SRS files. `scripts/run_ivc_bench.sh`
 downloads the IVC bench assets into `.srs/` by default, or you can point
-`SRS_DIR` at an existing Filecoin/Midnight SRS directory.
+`SRS_DIR` at an existing Filecoin/Midnight SRS directory. The IVC Solidity
+tree bench needs Midnight `midnight-srs-2p19` for the leaf IVC proofs and
+`midnight-srs-2p20` for the final decider proof.
 
 ```bash
 rustc --version    # should report 1.90.0
@@ -151,10 +153,12 @@ What each one covers:
 
 ### IVC Keccak Solidity bench
 
-This slow ignored test proves one inner SHA-256 statement, emits the final
-IVC proof under a Keccak transcript, renders the Solidity verifier/VK, deploys
-them in Prague-spec `revm`, verifies on-chain, reports contract sizes, and
-prints section-level gas checkpoints.
+This slow ignored test proves two independent one-step IVC SHA-256 aggregation
+leaves, proves a final Keccak-transcript tree decider that verifies both leaf
+proofs and fully collapses the carried IVC proof accumulator, renders the
+Solidity verifier/VK for that decider proof, deploys them in Prague-spec
+`revm`, verifies on-chain, reports contract sizes, and prints section-level gas
+checkpoints.
 
 Compile-only check:
 
