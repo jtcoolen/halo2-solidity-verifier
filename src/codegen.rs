@@ -186,10 +186,32 @@ const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 0;
 const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
+// The structured quotient path is the default: it emits VK-specialized Yul
+// loops/helpers without a bytecode VM or opcode interpreter. Set
+// HALO2_SOLIDITY_QUOTIENT_CSE=1 to force fully inline CSE for gas measurement,
+// or set both HALO2_SOLIDITY_QUOTIENT_CSE=0 and
+// HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=0 to opt back into the
+// bytecode-smaller VM path.
 const QUOTIENT_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_CSE";
 const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
 const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
 const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS";
+const LIMB7_YUL_COEFFS: [&str; 6] = [
+    "0x100000000000000",
+    "0x10000000000000000000000000000",
+    "0x400000000",
+    "0x40000000000000000000000",
+    "0x1000",
+    "0x100000000000000000",
+];
+const WIDE_LIMB7_YUL_COEFFS: [&str; 6] = [
+    "0x100000000000000",
+    "0x10000000000000000000000000000",
+    "0x1000000000000000000000000000000000000000000",
+    "0x100000000000000000000000000000000000000000000000000000000",
+    "0x6bc66e553973f396854f5626172ba135587d41e37a68209402355093fdcaaf6c",
+    "0x63f31e3f446953960c9d6964474300df43ab29179970f642a28e39d6c883c74b",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuotientProgramEncoding {
@@ -1205,7 +1227,7 @@ fn quotient_yul_helpers_enabled() -> bool {
 
 fn quotient_structured_loops_enabled() -> bool {
     let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_LOOPS_ENV) else {
-        return false;
+        return !quotient_inline_cse_enabled();
     };
 
     match value.trim().to_ascii_lowercase().as_str() {
@@ -1461,6 +1483,42 @@ fn mem_token(name: &str) -> Option<u8> {
         "INSTANCE_EVAL_MPTR" => Q_MEM_INSTANCE_EVAL,
         _ => return None,
     })
+}
+
+fn yul_let_assignment(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let line = line.strip_prefix("let ")?;
+    let (dst, expr) = line.split_once(" := ")?;
+    Some((dst.trim().to_string(), expr.trim().to_string()))
+}
+
+fn yul_const_value(value: &str, const_vars: &HashMap<String, String>) -> Option<String> {
+    let value = value.trim();
+    if is_literal(value) {
+        Some(u256_string(parse_u256(value)))
+    } else {
+        const_vars.get(value).cloned()
+    }
+}
+
+fn yul_mulmod_assignment(line: &str) -> Option<(String, String, String)> {
+    let (dst, expr) = yul_let_assignment(line)?;
+    let args = call_args(&expr, "mulmod")?;
+    if args.len() == 3 && args[2].trim() == "r" {
+        Some((dst, args[0].trim().to_string(), args[1].trim().to_string()))
+    } else {
+        None
+    }
+}
+
+fn yul_addmod_assignment(line: &str) -> Option<(String, String, String)> {
+    let (dst, expr) = yul_let_assignment(line)?;
+    let args = call_args(&expr, "addmod")?;
+    if args.len() == 3 && args[2].trim() == "r" {
+        Some((dst, args[0].trim().to_string(), args[1].trim().to_string()))
+    } else {
+        None
+    }
 }
 
 fn call_args(expr: &str, name: &str) -> Option<Vec<String>> {
@@ -2068,7 +2126,8 @@ impl<'a> SolidityGenerator<'a> {
     ) -> Vec<String> {
         let mut block = Vec::with_capacity(lines.len() + 6);
         block.push("{".to_string());
-        for line in lines {
+        let lines = Self::specialize_limb7_chains(lines);
+        for line in &lines {
             block.push(line.clone());
         }
         block.push(format!("mstore({eval_scratch_slot:#x}, {var})"));
@@ -2092,6 +2151,148 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
         block
+    }
+
+    fn specialize_limb7_chains(lines: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(lines.len());
+        let mut const_vars = HashMap::new();
+        let mut idx = 0usize;
+
+        while idx < lines.len() {
+            if let Some((consumed, replacement, updated_consts)) =
+                Self::try_limb7_chain(&lines[idx..], &const_vars, &LIMB7_YUL_COEFFS, "q_limb7")
+                    .or_else(|| {
+                        Self::try_limb7_chain(
+                            &lines[idx..],
+                            &const_vars,
+                            &WIDE_LIMB7_YUL_COEFFS,
+                            "q_limb7_wide",
+                        )
+                    })
+            {
+                const_vars = updated_consts;
+                out.extend(replacement);
+                idx += consumed;
+                continue;
+            }
+
+            Self::record_yul_const_assignment(&lines[idx], &mut const_vars);
+            out.push(lines[idx].clone());
+            idx += 1;
+        }
+
+        out
+    }
+
+    fn try_limb7_chain(
+        lines: &[String],
+        const_vars: &HashMap<String, String>,
+        coeffs: &[&str; 6],
+        helper_name: &str,
+    ) -> Option<(usize, Vec<String>, HashMap<String, String>)> {
+        let mut idx = 0usize;
+        let mut keep = Vec::new();
+        let mut args = Vec::with_capacity(7);
+        let mut previous_acc: Option<String> = None;
+        let mut local_consts = const_vars.clone();
+
+        for (step, coeff) in coeffs.iter().enumerate() {
+            let mut skipped = 0usize;
+            let (mul_dst, mul_arg) = loop {
+                if idx >= lines.len() || skipped > 4 {
+                    return None;
+                }
+
+                if let Some((dst, arg)) =
+                    Self::parse_limb7_mul_assignment(&lines[idx], coeff, &local_consts)
+                {
+                    break (dst, arg);
+                }
+
+                if yul_let_assignment(&lines[idx]).is_some() {
+                    Self::record_yul_const_assignment(&lines[idx], &mut local_consts);
+                    keep.push(lines[idx].clone());
+                    idx += 1;
+                    skipped += 1;
+                } else {
+                    return None;
+                }
+            };
+
+            let (add_dst, lhs, rhs) = yul_addmod_assignment(lines.get(idx + 1)?)?;
+            let addend = if lhs == mul_dst {
+                rhs
+            } else if rhs == mul_dst {
+                lhs
+            } else {
+                return None;
+            };
+
+            if step == 0 {
+                args.push(addend);
+            } else if Some(addend.as_str()) != previous_acc.as_deref() {
+                return None;
+            }
+            args.push(mul_arg);
+            previous_acc = Some(add_dst);
+            idx += 2;
+        }
+
+        let final_acc = previous_acc?;
+        keep.push(format!(
+            "let {final_acc} := {helper_name}({})",
+            args.join(", ")
+        ));
+        Some((idx, keep, local_consts))
+    }
+
+    fn parse_limb7_mul_assignment(
+        line: &str,
+        expected_coeff: &str,
+        const_vars: &HashMap<String, String>,
+    ) -> Option<(String, String)> {
+        let (dst, lhs, rhs) = yul_mulmod_assignment(line)?;
+        if Self::yul_coeff_matches(&lhs, expected_coeff, const_vars) {
+            Some((dst, rhs))
+        } else if Self::yul_coeff_matches(&rhs, expected_coeff, const_vars) {
+            Some((dst, lhs))
+        } else {
+            None
+        }
+    }
+
+    fn yul_coeff_matches(
+        value: &str,
+        expected_coeff: &str,
+        const_vars: &HashMap<String, String>,
+    ) -> bool {
+        yul_const_value(value, const_vars).as_deref() == Some(expected_coeff)
+    }
+
+    fn record_yul_const_assignment(line: &str, const_vars: &mut HashMap<String, String>) {
+        let Some((dst, rhs)) = yul_let_assignment(line) else {
+            return;
+        };
+        let Some(value) = yul_const_value(&rhs, const_vars) else {
+            return;
+        };
+        const_vars.insert(dst, value);
+    }
+
+    fn push_structured_main_fold(
+        block: &mut Vec<String>,
+        value: impl AsRef<str>,
+        sorted_simple: &[usize],
+    ) {
+        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+        if !sorted_simple.is_empty() {
+            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+        }
+        block.push(format!(
+            "quotient_eval_numer := addmod(quotient_eval_numer, {}, r)",
+            value.as_ref()
+        ));
     }
 
     fn structured_permutation_scratch_words(meta: &ConstraintSystemMeta) -> usize {
@@ -2263,6 +2464,235 @@ impl<'a> SolidityGenerator<'a> {
         Some(block)
     }
 
+    fn structured_lookup_loop_block(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        evaluator: &Evaluator<'_>,
+        sorted_simple: &[usize],
+        scratch_mptr: usize,
+    ) -> Option<Vec<String>> {
+        if meta.num_lookups == 0 {
+            return None;
+        }
+
+        let mut max_parallel = 1usize;
+        for lookup in self.vk.cs().lookups() {
+            let chunked = lookup.chunk_by_degree(self.vk.cs().degree());
+            for input_chunk in chunked.input_expression_chunks() {
+                max_parallel = max_parallel.max(input_chunk.len());
+            }
+        }
+
+        let f_plus_beta_mptr = scratch_mptr;
+        let prefix_mptr = f_plus_beta_mptr + max_parallel * 0x20;
+        let suffix_mptr = prefix_mptr + max_parallel * 0x20;
+
+        let mut block = Vec::new();
+        block.push("{".to_string());
+        block.push(format!("let q_lookup_f := {f_plus_beta_mptr:#x}"));
+        block.push(format!("let q_lookup_prefix := {prefix_mptr:#x}"));
+        block.push(format!("let q_lookup_suffix := {suffix_mptr:#x}"));
+        block.push("let q_lookup_l0 := mload(L_0_MPTR)".to_string());
+        block.push("let q_lookup_llast := mload(L_LAST_MPTR)".to_string());
+        block.push("let q_lookup_lblind := mload(L_BLIND_MPTR)".to_string());
+        block.push("let q_lookup_lsum := addmod(q_lookup_l0, q_lookup_llast, r)".to_string());
+        block.push(
+            "let q_lookup_active := addmod(1, sub(r, addmod(q_lookup_llast, q_lookup_lblind, r)), r)"
+                .to_string(),
+        );
+        block.push("let q_lookup_beta := mload(BETA_MPTR)".to_string());
+        block.push("let q_lookup_theta := mload(THETA_MPTR)".to_string());
+
+        for (lookup_idx, lookup) in self.vk.cs().lookups().iter().enumerate() {
+            let chunked = lookup.chunk_by_degree(self.vk.cs().degree());
+            let (m_eval, h_evals, z_eval, z_next_eval) = &data.lookup_evals[lookup_idx];
+
+            block.push("{".to_string());
+
+            // boundary = (l_0 + l_last) * Z_lookup(x)
+            block.push("{".to_string());
+            block.push(format!(
+                "let q_lookup_eval := mulmod(q_lookup_lsum, {}, r)",
+                z_eval
+            ));
+            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+            block.push("}".to_string());
+
+            for (input_chunk, h_eval) in
+                chunked.input_expression_chunks().iter().zip(h_evals.iter())
+            {
+                let k = input_chunk.len();
+                block.push("{".to_string());
+
+                if k == 0 {
+                    block.push("let q_lookup_eval := 0".to_string());
+                    Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+                    block.push("}".to_string());
+                    continue;
+                }
+
+                evaluator.reset_locals();
+                for (input_idx, parallel_input) in input_chunk.iter().enumerate() {
+                    let (mut compressed_lines, compressed_var) = evaluator
+                        .compress_expressions_with_challenge_var(parallel_input, "q_lookup_theta");
+                    block.append(&mut compressed_lines);
+                    block.push(format!(
+                        "mstore(add(q_lookup_f, {:#x}), addmod({compressed_var}, q_lookup_beta, r))",
+                        input_idx * 0x20
+                    ));
+                }
+
+                block.push("let q_lookup_product := 1".to_string());
+                block.push(format!(
+                    "for {{ let q_lookup_prod_i := 0 }} lt(q_lookup_prod_i, {k}) {{ q_lookup_prod_i := add(q_lookup_prod_i, 1) }} {{"
+                ));
+                block.push(
+                    "q_lookup_product := mulmod(q_lookup_product, mload(add(q_lookup_f, shl(5, q_lookup_prod_i))), r)"
+                        .to_string(),
+                );
+                block.push("}".to_string());
+
+                block.push("mstore(q_lookup_prefix, 1)".to_string());
+                if k > 1 {
+                    block.push(format!(
+                        "for {{ let q_lookup_pref_i := 1 }} lt(q_lookup_pref_i, {k}) {{ q_lookup_pref_i := add(q_lookup_pref_i, 1) }} {{"
+                    ));
+                    block.push("let q_lookup_pref_prev := sub(q_lookup_pref_i, 1)".to_string());
+                    block.push(
+                        "mstore(add(q_lookup_prefix, shl(5, q_lookup_pref_i)), mulmod(mload(add(q_lookup_prefix, shl(5, q_lookup_pref_prev))), mload(add(q_lookup_f, shl(5, q_lookup_pref_prev))), r))"
+                            .to_string(),
+                    );
+                    block.push("}".to_string());
+                }
+
+                block.push(format!(
+                    "mstore(add(q_lookup_suffix, {:#x}), 1)",
+                    (k - 1) * 0x20
+                ));
+                if k > 1 {
+                    block.push(format!(
+                        "for {{ let q_lookup_suf_i := sub({k}, 1) }} gt(q_lookup_suf_i, 0) {{ q_lookup_suf_i := sub(q_lookup_suf_i, 1) }} {{"
+                    ));
+                    block.push("let q_lookup_suf_prev := sub(q_lookup_suf_i, 1)".to_string());
+                    block.push(
+                        "mstore(add(q_lookup_suffix, shl(5, q_lookup_suf_prev)), mulmod(mload(add(q_lookup_suffix, shl(5, q_lookup_suf_i))), mload(add(q_lookup_f, shl(5, q_lookup_suf_i))), r))"
+                            .to_string(),
+                    );
+                    block.push("}".to_string());
+                }
+
+                block.push("let q_lookup_sum := 0".to_string());
+                block.push(format!(
+                    "for {{ let q_lookup_sum_i := 0 }} lt(q_lookup_sum_i, {k}) {{ q_lookup_sum_i := add(q_lookup_sum_i, 1) }} {{"
+                ));
+                block.push(
+                    "q_lookup_sum := addmod(q_lookup_sum, mulmod(mload(add(q_lookup_prefix, shl(5, q_lookup_sum_i))), mload(add(q_lookup_suffix, shl(5, q_lookup_sum_i))), r), r)"
+                        .to_string(),
+                );
+                block.push("}".to_string());
+                block.push(format!(
+                    "let q_lookup_eval := addmod(mulmod({}, q_lookup_product, r), sub(r, q_lookup_sum), r)",
+                    h_eval
+                ));
+                Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+                block.push("}".to_string());
+            }
+
+            // accumulator =
+            // active * ((Z_next - Z - selector * sum(h)) * (table + beta) + m)
+            block.push("{".to_string());
+            let sum_h_expr = if h_evals.is_empty() {
+                "0".to_string()
+            } else {
+                let sum_h = "q_lookup_sum_h";
+                block.push(format!("let {sum_h} := {}", h_evals[0]));
+                for h_eval in &h_evals[1..] {
+                    block.push(format!("{sum_h} := addmod({sum_h}, {}, r)", h_eval));
+                }
+                sum_h.to_string()
+            };
+
+            evaluator.reset_locals();
+            let (mut selector_lines, selector_var) =
+                evaluator.evaluate_expression(chunked.selector_expression());
+            block.append(&mut selector_lines);
+            let (mut table_lines, table_var) = evaluator.compress_expressions_with_challenge_var(
+                chunked.table_expressions(),
+                "q_lookup_theta",
+            );
+            block.append(&mut table_lines);
+            block.push(format!(
+                "let q_lookup_s_sum_h := mulmod({selector_var}, {sum_h_expr}, r)"
+            ));
+            block.push(format!(
+                "let q_lookup_diff := addmod({}, sub(r, addmod({}, q_lookup_s_sum_h, r)), r)",
+                z_next_eval, z_eval
+            ));
+            block.push(format!(
+                "let q_lookup_t_beta := addmod({table_var}, q_lookup_beta, r)"
+            ));
+            block.push(format!(
+                "let q_lookup_core := addmod(mulmod(q_lookup_diff, q_lookup_t_beta, r), {}, r)",
+                m_eval
+            ));
+            block
+                .push("let q_lookup_eval := mulmod(q_lookup_active, q_lookup_core, r)".to_string());
+            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+            block.push("}".to_string());
+
+            block.push("}".to_string());
+        }
+
+        block.push("}".to_string());
+        Some(block)
+    }
+
+    fn structured_trash_loop_block(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        evaluator: &Evaluator<'_>,
+        sorted_simple: &[usize],
+    ) -> Option<Vec<String>> {
+        if meta.num_trashcans == 0 {
+            return None;
+        }
+
+        let mut block = Vec::new();
+        block.push("{".to_string());
+        block.push("let q_trash_tau := mload(TRASH_CHALLENGE_MPTR)".to_string());
+
+        for (idx, argument) in self.vk.cs().trashcans().iter().enumerate() {
+            block.push("{".to_string());
+            evaluator.reset_locals();
+            let (mut compressed_lines, compressed_var) = evaluator
+                .compress_expressions_with_challenge_var(
+                    argument.constraint_expressions(),
+                    "q_trash_tau",
+                );
+            block.append(&mut compressed_lines);
+            let (mut selector_lines, selector_var) =
+                evaluator.evaluate_expression(argument.selector());
+            block.append(&mut selector_lines);
+            block.push(format!(
+                "let q_trash_one_minus_selector := addmod(1, sub(r, {selector_var}), r)"
+            ));
+            block.push(format!(
+                "let q_trash_scaled := mulmod(q_trash_one_minus_selector, {}, r)",
+                data.trashcan_evals[idx]
+            ));
+            block.push(format!(
+                "let q_trash_eval := addmod({compressed_var}, sub(r, q_trash_scaled), r)"
+            ));
+            Self::push_structured_main_fold(&mut block, "q_trash_eval", sorted_simple);
+            block.push("}".to_string());
+        }
+
+        block.push("}".to_string());
+        Some(block)
+    }
+
     fn structured_loop_quotient_computations(
         &self,
         meta: &ConstraintSystemMeta,
@@ -2270,12 +2700,10 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         scratch_mptr: usize,
     ) -> Vec<Vec<String>> {
-        let evaluator = Evaluator::new(self.vk.cs(), meta, data);
+        let evaluator = Evaluator::new(self.vk.cs(), meta, data).with_pow5_helper(true);
         let eval_scratch_slot =
             scratch_mptr + Self::structured_permutation_scratch_words(meta) * 0x20;
         let gate_items = evaluator.gate_computations_tagged();
-        let lookup_items = evaluator.lookup_computations();
-        let trash_items = evaluator.trashcan_computations();
 
         let mut init = vec!["let quotient_eval_numer := 0".to_string()];
         for idx in 0..sorted_simple.len() {
@@ -2335,24 +2763,19 @@ impl<'a> SolidityGenerator<'a> {
             computations.push(block);
         }
 
-        for (lines, var) in lookup_items {
-            computations.push(Self::direct_quotient_block(
-                &lines,
-                &var,
-                QuotientTarget::Main,
-                sorted_simple,
-                eval_scratch_slot,
-            ));
+        if let Some(block) = self.structured_lookup_loop_block(
+            meta,
+            data,
+            &evaluator,
+            sorted_simple,
+            eval_scratch_slot,
+        ) {
+            computations.push(block);
         }
 
-        for (lines, var) in trash_items {
-            computations.push(Self::direct_quotient_block(
-                &lines,
-                &var,
-                QuotientTarget::Main,
-                sorted_simple,
-                eval_scratch_slot,
-            ));
+        if let Some(block) = self.structured_trash_loop_block(meta, data, &evaluator, sorted_simple)
+        {
+            computations.push(block);
         }
 
         if !sorted_simple.is_empty() {
@@ -2587,6 +3010,22 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
 
+        let quotient_pow5_helper = quotient_eval_numer_computations
+            .iter()
+            .chain(quotient_inline_computations.iter())
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_pow5("));
+        let quotient_limb7_helper = quotient_eval_numer_computations
+            .iter()
+            .chain(quotient_inline_computations.iter())
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_limb7("));
+        let quotient_wide_limb7_helper = quotient_eval_numer_computations
+            .iter()
+            .chain(quotient_inline_computations.iter())
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_limb7_wide("));
+
         let pcs_computations =
             self.scheme
                 .computations(&meta, &data, cfg!(feature = "truncated-challenges"));
@@ -2666,6 +3105,9 @@ impl<'a> SolidityGenerator<'a> {
             trace,
             gas_checkpoints,
             quotient_yul_helpers,
+            quotient_pow5_helper,
+            quotient_limb7_helper,
+            quotient_wide_limb7_helper,
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,

@@ -101,6 +101,9 @@ pub(crate) struct Halo2Verifier {
     /// section boundaries. See SOLIDITY_GAS_CHECKPOINTS_ENABLED.
     pub(crate) gas_checkpoints: bool,
     pub(crate) quotient_yul_helpers: bool,
+    pub(crate) quotient_pow5_helper: bool,
+    pub(crate) quotient_limb7_helper: bool,
+    pub(crate) quotient_wide_limb7_helper: bool,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,

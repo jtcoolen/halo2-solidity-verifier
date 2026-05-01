@@ -47,6 +47,7 @@ pub(crate) struct Evaluator<'a> {
     cs: &'a ConstraintSystem<Fq>,
     meta: &'a ConstraintSystemMeta,
     data: &'a Data,
+    use_pow5_helper: bool,
     var_counter: RefCell<usize>,
     var_cache: RefCell<HashMap<String, String>>,
 }
@@ -61,9 +62,31 @@ impl<'a> Evaluator<'a> {
             cs,
             meta,
             data,
+            use_pow5_helper: false,
             var_counter: Default::default(),
             var_cache: Default::default(),
         }
+    }
+
+    pub(crate) fn with_pow5_helper(mut self, enabled: bool) -> Self {
+        self.use_pow5_helper = enabled;
+        self
+    }
+
+    pub(crate) fn reset_locals(&self) {
+        self.reset();
+    }
+
+    pub(crate) fn evaluate_expression(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
+        self.evaluate(expression)
+    }
+
+    pub(crate) fn compress_expressions_with_challenge_var(
+        &self,
+        expressions: &[Expression<Fq>],
+        challenge_var: &str,
+    ) -> (Vec<String>, String) {
+        self.compress_expressions(expressions, challenge_var)
     }
 
     // ----------------------------------------------------------------
@@ -621,6 +644,17 @@ impl<'a> Evaluator<'a> {
         let theta = self.fresh_var();
         lines.push(format!("let {theta} := mload(THETA_MPTR)"));
 
+        let (mut compressed_lines, final_var) = self.compress_expressions(expressions, &theta);
+        lines.append(&mut compressed_lines);
+        (lines, final_var)
+    }
+
+    fn compress_expressions(
+        &self,
+        expressions: &[Expression<Fq>],
+        challenge_var: &str,
+    ) -> (Vec<String>, String) {
+        let mut lines = Vec::new();
         let mut acc_var: Option<String> = None;
         for expr in expressions {
             let (mut e_lines, e_var) = self.evaluate(expr);
@@ -628,7 +662,7 @@ impl<'a> Evaluator<'a> {
             let next = self.fresh_var();
             let prev = acc_var.unwrap_or_else(|| "0".to_string());
             lines.push(format!(
-                "let {next} := addmod(mulmod({prev}, {theta}, r), {e_var}, r)"
+                "let {next} := addmod(mulmod({prev}, {challenge_var}, r), {e_var}, r)"
             ));
             acc_var = Some(next);
         }
@@ -638,6 +672,29 @@ impl<'a> Evaluator<'a> {
             zero
         });
         (lines, final_var)
+    }
+
+    fn pow5_base_expr<'b>(&self, expression: &'b Expression<Fq>) -> Option<&'b Expression<Fq>> {
+        if !self.use_pow5_helper {
+            return None;
+        }
+
+        let mut factors = Vec::new();
+        collect_product_factors(expression, &mut factors);
+        if factors.len() != 5 {
+            return None;
+        }
+
+        let first_key = format!("{:?}", factors[0]);
+        if factors
+            .iter()
+            .skip(1)
+            .all(|factor| format!("{factor:?}") == first_key)
+        {
+            Some(factors[0])
+        } else {
+            None
+        }
     }
 
     /// Resolve a `Column<Any>` evaluation at a rotation. Used by the
@@ -768,6 +825,23 @@ impl<'a> Evaluator<'a> {
     ) -> (Vec<String>, String) {
         let coeff_is_one = coeff == Fq::ONE;
 
+        if let Some(base) = self.pow5_base_expr(expression) {
+            let (mut lines, base_var) = self.evaluate_basic(base);
+            let (pow_lines, pow_var) = self.init_var(format!("q_pow5({base_var})"), None);
+            lines.extend(pow_lines);
+            if coeff_is_one {
+                return (lines, pow_var);
+            }
+
+            let (coeff_lines, coeff_var) =
+                self.init_var(u256_string(fe_to_u256::<Fq>(&coeff)), None);
+            lines.extend(coeff_lines);
+            let (scale_lines, out_var) =
+                self.init_var(format!("mulmod({pow_var}, {coeff_var}, r)"), None);
+            lines.extend(scale_lines);
+            return (lines, out_var);
+        }
+
         if let Expression::Product(lhs, rhs) = expression {
             let (mut lines, lhs_var) = self.evaluate_basic(lhs);
             let (mut rhs_lines, rhs_var) = self.evaluate_basic(rhs);
@@ -798,6 +872,13 @@ impl<'a> Evaluator<'a> {
     }
 
     fn evaluate_basic(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
+        if let Some(base) = self.pow5_base_expr(expression) {
+            let (mut lines, base_var) = self.evaluate_basic(base);
+            let (pow_lines, pow_var) = self.init_var(format!("q_pow5({base_var})"), None);
+            lines.extend(pow_lines);
+            return (lines, pow_var);
+        }
+
         // midnight-proofs `Expression<F>` carries the full frontend
         // variants: Constant / Selector / Fixed / Advice / Instance /
         // Challenge / Negated / Sum / Product / Scaled. We do not expect
@@ -922,5 +1003,17 @@ fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> 
         Ordering::Less => format!("{prefix}_{column_index}_prev_{}", rotation.abs()),
         Ordering::Equal => format!("{prefix}_{column_index}"),
         Ordering::Greater => format!("{prefix}_{column_index}_next_{rotation}"),
+    }
+}
+
+fn collect_product_factors<'a>(
+    expression: &'a Expression<Fq>,
+    factors: &mut Vec<&'a Expression<Fq>>,
+) {
+    if let Expression::Product(lhs, rhs) = expression {
+        collect_product_factors(lhs, factors);
+        collect_product_factors(rhs, factors);
+    } else {
+        factors.push(expression);
     }
 }
