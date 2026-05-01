@@ -1,5 +1,270 @@
 # CTF Vulnerability Analysis: Halo2 Solidity Verifier
 
+## 2026-05-01 audit pass: current split BLS12-381 verifier generator
+
+Scope: current Halo2/Midnight Solidity verifier generator, especially:
+
+- `templates/Halo2Verifier.sol`
+- `templates/Halo2QuotientEvaluator.sol`
+- `src/codegen.rs`
+- `src/codegen/pcs/gwc19.rs`
+- `src/transcript.rs`
+
+This pass focuses on verifier soundness, fail-closed behavior, transcript
+equivalence, deployment binding, and proof-input canonicality.
+
+### Findings overview
+
+| ID | Severity | Title |
+| --- | --- | --- |
+| C-1 | High | Verifier can be deployed with an arbitrary quotient evaluator |
+| C-2 | High | Missing precompile-existence and return-size checks can fail open on wrong chains |
+| C-3 | Medium | Not all proof G1 commitments are validated at parse time |
+| C-4 | Medium | Rust transcript reader/writer are asymmetric for G1 |
+| C-5 | Low/Medium | Denominator-zero cases silently compute inverse as zero |
+| C-6 | Informational | Add an end-of-proof cursor check |
+
+### C-1. Verifier can be deployed with an arbitrary quotient evaluator
+
+Severity: High.
+
+The verifier pins the VK by expected length and codehash, but the external
+quotient evaluator is only checked as non-empty code at construction time. The
+constructor then stores whatever `authorizedQuotient.codehash` was passed in and
+trusts that contract forever.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `AUTHORIZED_QUOTIENT`
+- `templates/Halo2Verifier.sol`: quotient constructor branches
+- `templates/Halo2Verifier.sol`: external quotient call in the batched identity
+  numerator reconstruction block
+- `templates/Halo2QuotientEvaluator.sol`: expected fallback return frame
+
+The quotient evaluator returns:
+
+```text
+word 0: magic/version
+word 1: linearization expected eval
+word 2..: simple-selector accumulators
+```
+
+The verifier checks only the magic word and then stores the returned
+linearization scalar and selector accumulators:
+
+```yul
+if iszero(staticcall(... quotientEvaluator ...)) { revert(0, 0) }
+if iszero(eq(mload(q_out), QUOTIENT_MAGIC)) { revert(0, 0) }
+mstore(QUOTIENT_EVAL_MPTR, mload(add(q_out, 0x20)))
+```
+
+Impact:
+
+- A malicious deployment can wire a quotient evaluator that returns
+  attacker-chosen linearization values.
+- That effectively removes or rewrites the algebraic constraint check enforced
+  by the quotient numerator block.
+- This is not caller-exploitable after an honest deployment, but it is a serious
+  deployment-integrity footgun for factories, registries, copied deployment
+  scripts, and third-party verifier addresses.
+
+Recommendation:
+
+- Generate and hard-code `EXPECTED_QUOTIENT_CODEHASH`, mirroring
+  `EXPECTED_VK_CODEHASH`.
+- Optionally also hard-code `EXPECTED_QUOTIENT_LENGTH`.
+- Include both VK and quotient evaluator hashes in deployment artifacts.
+- Add a deployment test that rejects a quotient evaluator with the same ABI but
+  different runtime bytecode.
+
+### C-2. Missing precompile-existence and return-size checks can fail open on wrong chains
+
+Severity: High.
+
+The verifier assumes the EIP-2537 BLS12-381 precompiles exist at:
+
+```text
+0x0b BLS12_G1ADD
+0x0c BLS12_G1MSM
+0x0f BLS12_PAIRING_CHECK
+```
+
+Most helper paths check only the `staticcall` success bit. A call to a
+non-existent address can succeed with empty returndata and leave the output
+memory unchanged. The code then consumes whatever was already in that memory
+slot.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `ec_add_acc`
+- `templates/Halo2Verifier.sol`: `ec_mul_acc`
+- `templates/Halo2Verifier.sol`: `ec_add_tmp`
+- `templates/Halo2Verifier.sol`: `ec_mul_tmp`
+- `templates/Halo2Verifier.sol`: `ec_pairing`
+- `src/codegen/pcs/gwc19.rs`: generated final MSM and pairing-input calls
+
+Impact:
+
+- On chains or local forks without EIP-2537 at those exact addresses, invalid
+  proofs may be accepted.
+- This is catastrophic for wrong-chain deployment and dangerous for test
+  environments that do not faithfully model the precompiles.
+
+Recommendation:
+
+- After every precompile call, require the exact expected `returndatasize()`:
+  - `0x80` for G1 point outputs,
+  - `0x20` for pairing/modexp scalar outputs.
+- Add a constructor or first-call self-test for G1ADD, G1MSM, and PAIRING.
+- Fail closed if any precompile behavior differs from the expected EIP-2537
+  semantics.
+
+### C-3. Not all proof G1 commitments are validated at parse time
+
+Severity: Medium.
+
+Proof G1 commitments are absorbed into the transcript and copied from calldata
+directly. They are validated only if they later participate in an EIP-2537
+precompile call.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `common_uncompressed_g1`
+- `templates/Halo2Verifier.sol`: proof commitment read loops
+- `src/codegen/pcs/gwc19.rs`: query construction and final MSM staging
+
+The query builder includes advice commitments only when they appear in the
+verifier query list. A circuit with a committed column that is transcript-
+absorbed but never queried could allow invalid G1 bytes to influence the
+Fiat-Shamir transcript without ever being rejected by a precompile.
+
+Impact:
+
+- Generated verifiers can accept transcripts the native verifier would reject.
+- For dead commitments this is mostly a challenge-grinding or verifier-
+  equivalence issue, but the invariant is fragile as circuits and query sets
+  change.
+
+Recommendation:
+
+- Validate every proof G1 as it is read, or prove/enforce at codegen time that
+  every absorbed G1 is later validated by a precompile.
+- Reject non-zero EIP-2537 padding bytes rather than only masking them before
+  hashing.
+- Add negative tests with unused malformed commitments for circuits that contain
+  unqueried committed columns.
+
+### C-4. Rust transcript reader/writer are asymmetric for G1
+
+Severity: Medium.
+
+The Rust helper transcript writes G1 points by absorbing the EIP-2537 padded
+128-byte uncompressed form:
+
+```rust
+pub fn write_g1(&mut self, point: &G1Projective) -> io::Result<()> {
+    self.common_g1(point)?;
+    let repr = point.to_bytes();
+    self.stream.write_all(repr.as_ref())
+}
+```
+
+But `read_g1` absorbs the raw compressed bytes before decompressing:
+
+```rust
+self.absorb_bytes(bytes.as_ref());
+G1Projective::from_bytes(&bytes)
+```
+
+Relevant code:
+
+- `src/transcript.rs`: `common_g1`
+- `src/transcript.rs`: `read_g1`
+- `src/transcript.rs`: `write_g1`
+
+Impact:
+
+- Rust-side proof generation and Rust-side verification can diverge when this
+  transcript is used for both.
+- Trace comparison or fixture tooling may certify a different Fiat-Shamir
+  transcript than the Solidity verifier.
+- This directly contradicts the file-level transcript spec, which says G1
+  input is the 128-byte EIP-2537 padded uncompressed form.
+
+Recommendation:
+
+- In `read_g1`, read and decompress the compressed point first, then call
+  `common_g1(&point)`.
+- Add a round-trip test that `write_g1` and `read_g1` produce the same
+  transcript state for a non-identity point and for the identity point.
+
+### C-5. Denominator-zero cases silently compute inverse as zero
+
+Severity: Low/Medium.
+
+Several verifier paths call `scalar_inv` on values that are expected to be
+non-zero by Fiat-Shamir. If the denominator is zero, the modexp-based inverse
+returns zero and the verifier continues with bogus arithmetic.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: `scalar_inv`
+- `templates/Halo2Verifier.sol`: Lagrange batch inversion around
+  `x_n_minus_1`
+- `src/codegen/pcs/gwc19.rs`: PCS interpolation at `x3`
+
+Examples:
+
+- `x^n - 1 = 0` in the Lagrange/instance evaluation block.
+- `x3 = rotation_point` in PCS interpolation.
+
+Impact:
+
+- The event is Fiat-Shamir-negligible, but with truncated challenges the bound
+  is closer to 2^-128 for `x3` collisions.
+- Continuing after a zero denominator makes the soundness error implicit and
+  harder to reason about.
+
+Recommendation:
+
+- Explicitly reject zero denominators before inversion.
+- Treat this as defensive hardening with tiny gas cost compared to the proof.
+
+### C-6. Add an end-of-proof cursor check
+
+Severity: Informational.
+
+The ABI length checks make this likely redundant today, but the verifier should
+assert the transcript parser consumed exactly the expected proof bytes.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: proof length check
+- `templates/Halo2Verifier.sol`: transcript proof cursor after `pi`
+
+Recommendation:
+
+- After reading `pi`, assert:
+
+```yul
+success := and(success, eq(proof_cptr, NUM_INSTANCE_CPTR))
+```
+
+This catches future proof-layout drift cheaply and makes the raw calldata parser
+less brittle.
+
+### Recommended fix priority
+
+1. Pin the quotient evaluator by generated codehash and length.
+2. Add `returndatasize()` checks and precompile self-tests.
+3. Fix `read_g1` transcript absorption to match `write_g1` and Solidity.
+4. Validate every absorbed proof G1 or enforce that every absorbed G1 is later
+   precompile-validated.
+5. Reject zero inversion denominators.
+6. Add the end-of-proof cursor check.
+
+---
+
 ## 2026-04-30 audit addendum: current Halo2 BLS12-381 Solidity/Yul verifier
 
 Scope: `templates/Halo2Verifier.sol`, `src/codegen.rs`, and the compact quotient
