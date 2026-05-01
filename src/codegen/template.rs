@@ -165,9 +165,13 @@ pub(crate) struct Halo2Verifier {
     /// spill its temporary prefix products immediately above X_N_MPTR
     /// where they would overlap the permanent eval/commitment regions.
     pub(crate) batch_invert_scratch_mptr: usize,
+    pub(crate) quotient_external: Option<QuotientExternal>,
     pub(crate) quotient_inline_computations: Vec<Vec<String>>,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,
+    pub(crate) quotient_native_permutation_computation: Vec<String>,
+    pub(crate) quotient_native_identity_computations: Vec<Vec<String>>,
+    pub(crate) quotient_native_trash_computation: Vec<String>,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
     /// Sorted simple-selector fixed-column indices. Each is rendered
@@ -208,6 +212,36 @@ pub(crate) struct Halo2Verifier {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct QuotientExternal {
+    pub(crate) frame_base: usize,
+    pub(crate) frame_len: usize,
+    pub(crate) output_len: usize,
+    pub(crate) magic: u64,
+}
+
+#[derive(Template)]
+#[template(path = "Halo2QuotientEvaluator.sol")]
+pub(crate) struct Halo2QuotientEvaluator {
+    pub(crate) quotient_pow5_helper: bool,
+    pub(crate) quotient_limb7_helper: bool,
+    pub(crate) quotient_wide_limb7_helper: bool,
+    pub(crate) vk_mptr: Ptr,
+    pub(crate) challenge_mptr: Ptr,
+    pub(crate) theta_mptr: Ptr,
+    pub(crate) reversed_evals_mptr: Ptr,
+    pub(crate) selector_acc_mptr: usize,
+    pub(crate) quotient_external: QuotientExternal,
+    pub(crate) quotient_inline_computations: Vec<Vec<String>>,
+    pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
+    pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,
+    pub(crate) quotient_native_permutation_computation: Vec<String>,
+    pub(crate) quotient_native_identity_computations: Vec<Vec<String>>,
+    pub(crate) quotient_native_trash_computation: Vec<String>,
+    pub(crate) quotient_program: Option<QuotientProgram>,
+    pub(crate) simple_selector_cols: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct QuotientProgram {
     pub(crate) consts: Vec<U256>,
     pub(crate) chunks: Vec<U256>,
@@ -230,6 +264,15 @@ impl Halo2VerifyingKey {
 }
 
 impl Halo2Verifier {
+    pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
+        self.render_into(writer).map_err(|err| match err {
+            Error::Fmt(err) => err,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl Halo2QuotientEvaluator {
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
             Error::Fmt(err) => err,

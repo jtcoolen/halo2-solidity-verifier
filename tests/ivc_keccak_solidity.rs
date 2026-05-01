@@ -999,13 +999,14 @@ fn ivc_final_keccak_solidity_e2e() {
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
-    let (verifier_solidity, vk_solidity) = generator
-        .render_separately()
-        .expect("render_separately should succeed");
+    let (verifier_solidity, vk_solidity, quotient_solidity) = generator
+        .render_separately_with_quotient()
+        .expect("render_separately_with_quotient should succeed");
     println!(
-        "[ivc-keccak-solidity] rendered Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes (took {:.2?})",
+        "[ivc-keccak-solidity] rendered Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes, Halo2QuotientEvaluator.sol = {} bytes (took {:.2?})",
         verifier_solidity.len(),
         vk_solidity.len(),
+        quotient_solidity.len(),
         t0.elapsed()
     );
 
@@ -1017,6 +1018,11 @@ fn ivc_final_keccak_solidity_e2e() {
     std::fs::create_dir_all(&dump_dir).ok();
     std::fs::write(format!("{dump_dir}/Halo2Verifier.sol"), &verifier_solidity).ok();
     std::fs::write(format!("{dump_dir}/Halo2VerifyingKey.sol"), &vk_solidity).ok();
+    std::fs::write(
+        format!("{dump_dir}/Halo2QuotientEvaluator.sol"),
+        &quotient_solidity,
+    )
+    .ok();
     std::fs::write(format!("{dump_dir}/proof.bin"), &final_proof).ok();
     std::fs::write(
         format!("{dump_dir}/proof-evaluation-counts.txt"),
@@ -1035,8 +1041,10 @@ fn ivc_final_keccak_solidity_e2e() {
     // ----------------------------------------------------------
     let t0 = Instant::now();
     let vk_creation_code = compile_solidity_with_runs(&vk_solidity, SOLC_OPTIMIZE_RUNS);
+    let quotient_creation_code = compile_solidity_with_runs(&quotient_solidity, SOLC_OPTIMIZE_RUNS);
     let verifier_creation_code = compile_solidity_with_runs(&verifier_solidity, SOLC_OPTIMIZE_RUNS);
     let vk_creation_size = vk_creation_code.len();
+    let quotient_creation_size = quotient_creation_code.len();
     let verifier_creation_size = verifier_creation_code.len();
     std::fs::write(
         format!("{dump_dir}/Halo2Verifier.creation.bin"),
@@ -1048,31 +1056,44 @@ fn ivc_final_keccak_solidity_e2e() {
         &vk_creation_code,
     )
     .ok();
+    std::fs::write(
+        format!("{dump_dir}/Halo2QuotientEvaluator.creation.bin"),
+        &quotient_creation_code,
+    )
+    .ok();
     println!(
-        "[ivc-keccak-solidity] solc compile completed in {:.2?} (optimize-runs = {SOLC_OPTIMIZE_RUNS}, no CBOR; verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes)",
+        "[ivc-keccak-solidity] solc compile completed in {:.2?} (optimize-runs = {SOLC_OPTIMIZE_RUNS}, no CBOR; verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes, quotient creation bytecode = {} bytes)",
         t0.elapsed(),
         verifier_creation_size,
-        vk_creation_size
+        vk_creation_size,
+        quotient_creation_size
     );
 
     let mut evm = Evm::default();
     let vk_address = evm.create(vk_creation_code);
-    let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
+    let quotient_address = evm.create(quotient_creation_code);
+    let verifier_address =
+        evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
     let vk_runtime_size = evm.code_size(vk_address);
+    let quotient_runtime_size = evm.code_size(quotient_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
     let contract_size_summary = format!(
         "solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
          solc CBOR metadata: omitted\n\
          Halo2Verifier.sol source bytes: {}\n\
          Halo2VerifyingKey.sol source bytes: {}\n\
+         Halo2QuotientEvaluator.sol source bytes: {}\n\
          Halo2Verifier creation bytecode bytes: {verifier_creation_size}\n\
          Halo2VerifyingKey creation bytecode bytes: {vk_creation_size}\n\
+         Halo2QuotientEvaluator creation bytecode bytes: {quotient_creation_size}\n\
          Halo2Verifier deployed runtime bytes: {verifier_runtime_size}\n\
          Halo2VerifyingKey deployed runtime bytes: {vk_runtime_size}\n\
+         Halo2QuotientEvaluator deployed runtime bytes: {quotient_runtime_size}\n\
          total deployed runtime bytes: {}\n",
         verifier_solidity.len(),
         vk_solidity.len(),
-        verifier_runtime_size + vk_runtime_size
+        quotient_solidity.len(),
+        verifier_runtime_size + vk_runtime_size + quotient_runtime_size
     );
     std::fs::write(
         format!("{dump_dir}/contract-sizes.txt"),
@@ -1080,11 +1101,11 @@ fn ivc_final_keccak_solidity_e2e() {
     )
     .ok();
     println!(
-        "[ivc-keccak-solidity] deployed (vk = {vk_address:?}, verifier = {verifier_address:?})"
+        "[ivc-keccak-solidity] deployed (vk = {vk_address:?}, quotient = {quotient_address:?}, verifier = {verifier_address:?})"
     );
     println!(
-        "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, total runtime = {} bytes",
-        verifier_runtime_size + vk_runtime_size
+        "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, quotient runtime = {quotient_runtime_size} bytes, total runtime = {} bytes",
+        verifier_runtime_size + vk_runtime_size + quotient_runtime_size
     );
 
     // ----------------------------------------------------------

@@ -232,6 +232,24 @@ pub(crate) mod test {
             self.create(bytecode)
         }
 
+        /// Apply create transaction with two address constructor arguments
+        /// appended to creation bytecode and return created `address`.
+        pub fn create_with_two_address_args(
+            &mut self,
+            mut bytecode: Vec<u8>,
+            first_address_arg: Address,
+            second_address_arg: Address,
+        ) -> Address {
+            for address in [first_address_arg, second_address_arg] {
+                bytecode.extend_from_slice(
+                    &U256::try_from_be_slice(address.as_slice())
+                        .unwrap()
+                        .to_be_bytes::<0x20>(),
+                );
+            }
+            self.create(bytecode)
+        }
+
         /// Apply call transaction to given `address` with `calldata`.
         /// Returns `gas_used` and `return_data`.
         ///

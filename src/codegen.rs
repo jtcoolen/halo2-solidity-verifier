@@ -1,6 +1,9 @@
 use crate::codegen::{
     evaluator::Evaluator,
-    template::{Halo2Verifier, Halo2VerifyingKey, QuotientProgram, UserPhase},
+    template::{
+        Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
+        QuotientProgram, UserPhase,
+    },
     util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
 };
 // midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
@@ -204,15 +207,35 @@ enum QuotientStructuredTailMode {
     Trash,
 }
 
-// Spend a bounded slice of the verifier bytecode headroom recovered by moving
-// the quotient payload into the VK. The first N identities are emitted as
-// specialized straight-line Yul, while the suffix remains interpreted by the
-// compact VM. Tune with HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N.
-// The default keeps the IVC verifier comfortably below EIP-170 while shaving a
-// measurable chunk from the quotient VM checkpoint.
+#[derive(Clone, Debug)]
+enum QuotientProgramItem {
+    Identity(QuotientIdentity),
+    NativePermutation,
+    NativeIdentity(usize),
+}
+
+#[derive(Clone, Debug)]
+struct QuotientProgramPlan {
+    inline_identities: Vec<QuotientIdentity>,
+    items: Vec<QuotientProgramItem>,
+    native_identities: Vec<QuotientIdentity>,
+    sorted_simple: Vec<usize>,
+    has_native_permutation: bool,
+}
+
+// Keep a small direct prefix as the correctness anchor for the hybrid VM path:
+// it is the most-tested shape and avoids running the entire numerator through
+// the interpreter. Tune with HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N.
 const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 4;
 const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
+
+// Spend a bounded slice of verifier bytecode headroom on native VM callbacks.
+// After the direct prefix, the heaviest N remaining gate identities are emitted
+// as VM opcodes that call generated Yul blocks; everything else stays in the
+// compact interpreter. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
+const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 4;
+const QUOTIENT_NATIVE_GATES_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES";
 const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 // The compact quotient VM path is the default size-oriented emitter: it stores
 // identity arithmetic as data in the VK and interprets it from one small Yul
@@ -227,6 +250,8 @@ const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
 const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
 const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS";
 const QUOTIENT_STRUCTURED_TAIL_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL";
+const QUOTIENT_NATIVE_PERMUTATION_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_PERMUTATION";
+const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
 const LIMB7_YUL_COEFFS: [&str; 6] = [
     "0x100000000000000",
     "0x10000000000000000000000000000",
@@ -274,6 +299,8 @@ const Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8: u8 = 0x15;
 const Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16: u8 = 0x16;
 const Q_OP_PUSH_TEMP: u8 = 0x17;
 const Q_OP_STORE_TEMP: u8 = 0x18;
+const Q_OP_NATIVE_PERMUTATION: u8 = 0x19;
+const Q_OP_NATIVE_IDENTITY: u8 = 0x1b;
 
 const Q_MEM_L0: u8 = 0x01;
 const Q_MEM_L_LAST: u8 = 0x02;
@@ -580,6 +607,23 @@ impl QuotientProgramBuilder {
         }
 
         assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
+    }
+
+    fn native_permutation(&mut self) {
+        assert_eq!(
+            self.stack_depth, 0,
+            "native permutation expects empty VM stack"
+        );
+        self.bytes.push(Q_OP_NATIVE_PERMUTATION);
+    }
+
+    fn native_identity(&mut self, native_idx: usize) {
+        assert_eq!(
+            self.stack_depth, 0,
+            "native identity expects empty VM stack"
+        );
+        self.bytes.push(Q_OP_NATIVE_IDENTITY);
+        self.u16(native_idx);
     }
 
     fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
@@ -1111,7 +1155,7 @@ fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
         match op {
             Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
             | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
-            | Q_OP_STORE_TEMP => {
+            | Q_OP_STORE_TEMP | Q_OP_NATIVE_IDENTITY => {
                 push_packed_quotient_op(&mut out, op, read_u16(bytes, idx + 1) as u32);
                 idx += 3;
             }
@@ -1142,7 +1186,7 @@ fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
                 push_packed_quotient_op(&mut out, op, bytes[idx + 1] as u32);
                 idx += 2;
             }
-            Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN => {
+            Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN | Q_OP_NATIVE_PERMUTATION => {
                 push_packed_quotient_op(&mut out, op, 0);
                 idx += 1;
             }
@@ -1206,6 +1250,14 @@ fn hybrid_quotient_inline_count(identities: &[QuotientIdentity]) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES);
     identities.len().min(requested)
+}
+
+fn quotient_native_gate_count(gates: &[QuotientIdentity]) -> usize {
+    let requested = std::env::var(QUOTIENT_NATIVE_GATES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_QUOTIENT_NATIVE_GATES);
+    gates.len().min(requested)
 }
 
 fn quotient_program_encoding() -> QuotientProgramEncoding {
@@ -1277,6 +1329,18 @@ fn quotient_structured_tail_mode() -> QuotientStructuredTailMode {
         "" | "0" | "false" | "off" | "no" => QuotientStructuredTailMode::Off,
         "1" | "true" | "on" | "yes" | "tail" | "trash" => QuotientStructuredTailMode::Trash,
         other => panic!("unsupported {QUOTIENT_STRUCTURED_TAIL_ENV}={other}; use off or trash"),
+    }
+}
+
+fn quotient_native_permutation_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_NATIVE_PERMUTATION_ENV) else {
+        return true;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "native" => true,
+        other => panic!("unsupported {QUOTIENT_NATIVE_PERMUTATION_ENV}={other}; use 0/1"),
     }
 }
 
@@ -1425,12 +1489,12 @@ fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
     match bytes[idx] {
         Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
         | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
-        | Q_OP_STORE_TEMP => 3,
+        | Q_OP_STORE_TEMP | Q_OP_NATIVE_IDENTITY => 3,
         Q_OP_PUSH_MEM_LITERAL => 5,
         Q_OP_PUSH_MEM_TOKEN => 2,
         Q_OP_PUSH_MEM_TOKEN_OFFSET => 6,
         Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => 2,
-        Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN => 1,
+        Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN | Q_OP_NATIVE_PERMUTATION => 1,
         Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => 6,
         Q_OP_ADD_MUL_CONST_U8_MEM_U16 => 4,
         Q_OP_ADD_MUL_MEM_MEM => 5,
@@ -1741,6 +1805,7 @@ impl<'a> SolidityGenerator<'a> {
             false,
             crate::SOLIDITY_TRACE_ENABLED,
             crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            false,
         )
         .render(verifier_writer)
     }
@@ -1757,7 +1822,7 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED)
+        self.generate_verifier(false, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED, false)
             .render(verifier_writer)
     }
 
@@ -1776,7 +1841,7 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED, true)
+        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED, true, false)
             .render(verifier_writer)
     }
 
@@ -1803,6 +1868,7 @@ impl<'a> SolidityGenerator<'a> {
             true,
             crate::SOLIDITY_TRACE_ENABLED,
             crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            false,
         )
         .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
@@ -1817,13 +1883,49 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output))
     }
 
+    /// Render `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`, and a linked
+    /// `Halo2QuotientEvaluator.sol`. The verifier passes a fixed memory
+    /// frame to the quotient evaluator via `staticcall`, keeping the bulky
+    /// native quotient code out of the verifier runtime.
+    pub fn render_separately_with_quotient_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+        quotient_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(
+            true,
+            crate::SOLIDITY_TRACE_ENABLED,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            true,
+        )
+        .render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        self.generate_quotient_evaluator().render(quotient_writer)?;
+        Ok(())
+    }
+
+    /// Render `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`, and
+    /// `Halo2QuotientEvaluator.sol` and return them as `String`s.
+    pub fn render_separately_with_quotient(&self) -> Result<(String, String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        let mut quotient_output = String::new();
+        self.render_separately_with_quotient_into(
+            &mut verifier_output,
+            &mut vk_output,
+            &mut quotient_output,
+        )?;
+        Ok((verifier_output, vk_output, quotient_output))
+    }
+
     /// Render a trace-enabled `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
     pub fn render_trace_separately_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED)
+        self.generate_verifier(true, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED, false)
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
@@ -1847,7 +1949,7 @@ impl<'a> SolidityGenerator<'a> {
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED, true)
+        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED, true, false)
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
@@ -2065,28 +2167,124 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> (QuotientProgramBuild, Vec<usize>) {
-        let parts = self.quotient_identity_parts(meta, data);
-        let sorted_simple = parts.sorted_simple.clone();
-        let tail_mode = quotient_structured_tail_mode();
-        let quotient_program_build = if tail_mode == QuotientStructuredTailMode::Off {
-            let identities = parts.all_identities();
-            let inline_count = hybrid_quotient_inline_count(&identities);
-            self.build_quotient_program(&identities[inline_count..])
-        } else {
-            let inline_count = hybrid_quotient_inline_count(&parts.gates);
-            let mut vm_identities = Vec::new();
-            vm_identities.extend_from_slice(&parts.gates[inline_count..]);
-            match tail_mode {
-                QuotientStructuredTailMode::Off => unreachable!(),
-                QuotientStructuredTailMode::Trash => {
-                    vm_identities.extend_from_slice(&parts.permutation);
-                    vm_identities.extend_from_slice(&parts.lookup);
-                }
-            }
-            self.build_quotient_program(&vm_identities)
-        };
+        let plan = self.quotient_program_plan(meta, data);
+        let sorted_simple = plan.sorted_simple.clone();
+        let quotient_program_build = self.build_quotient_program_items(&plan.items);
         let _quotient_max_stack = quotient_program_build.max_stack;
         (quotient_program_build, sorted_simple)
+    }
+
+    fn quotient_program_plan(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+    ) -> QuotientProgramPlan {
+        let parts = self.quotient_identity_parts(meta, data);
+        let inline_count = hybrid_quotient_inline_count(&parts.gates);
+        let inline_identities = parts.gates[..inline_count].to_vec();
+        let remaining_gates = &parts.gates[inline_count..];
+        let native_gate_indices = Self::native_gate_indices(remaining_gates);
+        let native_permutation =
+            quotient_native_permutation_enabled() && meta.num_permutation_zs > 0;
+        let structured_trash_tail = quotient_structured_tail_mode()
+            == QuotientStructuredTailMode::Trash
+            && meta.num_trashcans > 0;
+
+        let mut items = Vec::with_capacity(
+            remaining_gates.len()
+                + parts.permutation.len()
+                + parts.lookup.len()
+                + parts.trash.len()
+                + usize::from(native_permutation),
+        );
+        let mut native_identities = Vec::with_capacity(native_gate_indices.len());
+        for (gate_idx, identity) in remaining_gates.iter().enumerate() {
+            if native_gate_indices.contains(&gate_idx) {
+                let native_idx = native_identities.len();
+                native_identities.push(identity.clone());
+                items.push(QuotientProgramItem::NativeIdentity(native_idx));
+            } else {
+                items.push(QuotientProgramItem::Identity(identity.clone()));
+            }
+        }
+
+        if native_permutation {
+            items.push(QuotientProgramItem::NativePermutation);
+        } else {
+            items.extend(
+                parts
+                    .permutation
+                    .iter()
+                    .cloned()
+                    .map(QuotientProgramItem::Identity),
+            );
+        }
+        items.extend(
+            parts
+                .lookup
+                .iter()
+                .cloned()
+                .map(QuotientProgramItem::Identity),
+        );
+        if !structured_trash_tail {
+            items.extend(
+                parts
+                    .trash
+                    .iter()
+                    .cloned()
+                    .map(QuotientProgramItem::Identity),
+            );
+        }
+
+        QuotientProgramPlan {
+            inline_identities,
+            items,
+            native_identities,
+            sorted_simple: parts.sorted_simple,
+            has_native_permutation: native_permutation,
+        }
+    }
+
+    fn native_gate_indices(gates: &[QuotientIdentity]) -> HashSet<usize> {
+        let count = quotient_native_gate_count(gates);
+        if count == 0 {
+            return HashSet::new();
+        }
+
+        let mut costs = gates
+            .iter()
+            .enumerate()
+            .map(|(idx, identity)| (Self::quotient_identity_program_cost(identity), idx))
+            .collect::<Vec<_>>();
+        costs.sort_by(|(lhs_cost, lhs_idx), (rhs_cost, rhs_idx)| {
+            rhs_cost.cmp(lhs_cost).then_with(|| lhs_idx.cmp(rhs_idx))
+        });
+        costs.into_iter().take(count).map(|(_, idx)| idx).collect()
+    }
+
+    fn quotient_external_frame(
+        vk_mptr: Ptr,
+        vk_len: usize,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        simple_selector_count: usize,
+    ) -> QuotientExternal {
+        let frame_base = vk_mptr.value().as_usize();
+        let vk_end = frame_base + vk_len;
+        let evals_end = data.reversed_evals_mptr.value().as_usize() + meta.num_evals * 0x20;
+        let frame_end = vk_end.max(evals_end);
+        QuotientExternal {
+            frame_base,
+            frame_len: frame_end - frame_base,
+            output_len: 0x40 + simple_selector_count * 0x20,
+            magic: QUOTIENT_EXTERNAL_MAGIC,
+        }
+    }
+
+    fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
+        let mut builder = QuotientProgramBuilder::default();
+        builder.identity(&identity.lines, &identity.var, identity.target, None);
+        builder.bytes.len()
     }
 
     fn quotient_identity_parts(
@@ -2685,8 +2883,9 @@ impl<'a> SolidityGenerator<'a> {
         let num_cols = meta.permutation_columns.len();
         let num_sets = meta.num_permutation_zs;
         // permutation values, permutation sigma values, z_cur, z_next,
-        // z_last for every non-final set.
-        (2 * num_cols) + (2 * num_sets) + num_sets.saturating_sub(1)
+        // z_last for every non-final set, and one spill slot for the
+        // running delta base used by the native permutation callback.
+        (2 * num_cols) + (2 * num_sets) + num_sets.saturating_sub(1) + 1
     }
 
     fn structured_permutation_loop_block(
@@ -2708,6 +2907,7 @@ impl<'a> SolidityGenerator<'a> {
         let z_cur_mptr = sigmas_mptr + num_cols * 0x20;
         let z_next_mptr = z_cur_mptr + num_sets * 0x20;
         let z_last_mptr = z_next_mptr + num_sets * 0x20;
+        let delta_base_mptr = z_last_mptr + num_sets.saturating_sub(1) * 0x20;
         let delta_chunk = Fq::DELTA.pow_vartime([chunk_len as u64]);
         let delta_chunk = u256_string(fe_to_u256::<Fq>(&delta_chunk));
 
@@ -2722,6 +2922,7 @@ impl<'a> SolidityGenerator<'a> {
         block.push(format!("let q_perm_z_cur := {z_cur_mptr:#x}"));
         block.push(format!("let q_perm_z_next := {z_next_mptr:#x}"));
         block.push(format!("let q_perm_z_last := {z_last_mptr:#x}"));
+        block.push(format!("let q_perm_delta_base_ptr := {delta_base_mptr:#x}"));
         block.push(format!("let q_perm_num_cols := {num_cols}"));
         block.push(format!("let q_perm_num_sets := {num_sets}"));
         block.push(format!("let q_perm_chunk_len := {chunk_len}"));
@@ -2839,7 +3040,7 @@ impl<'a> SolidityGenerator<'a> {
             block.push("}".to_string());
         }
 
-        block.push("let q_perm_delta_base := q_perm_xbeta".to_string());
+        block.push("mstore(q_perm_delta_base_ptr, q_perm_xbeta)".to_string());
         block.push(format!(
             "for {{ let q_perm_set := 0 }} lt(q_perm_set, {num_sets}) {{ q_perm_set := add(q_perm_set, 1) }} {{"
         ));
@@ -2850,7 +3051,7 @@ impl<'a> SolidityGenerator<'a> {
         );
         block.push("let q_perm_left := mload(add(q_perm_z_next, shl(5, q_perm_set)))".to_string());
         block.push("let q_perm_right := mload(add(q_perm_z_cur, shl(5, q_perm_set)))".to_string());
-        block.push("let q_perm_delta_pow := q_perm_delta_base".to_string());
+        block.push("let q_perm_delta_pow := mload(q_perm_delta_base_ptr)".to_string());
         block.push("for { let q_perm_j := q_perm_start } lt(q_perm_j, q_perm_end) { q_perm_j := add(q_perm_j, 1) } {".to_string());
         block.push("let q_perm_off := shl(5, q_perm_j)".to_string());
         block.push("let q_perm_v := mload(add(q_perm_vals, q_perm_off))".to_string());
@@ -2871,7 +3072,7 @@ impl<'a> SolidityGenerator<'a> {
         );
         fold_eval(&mut block);
         block.push(
-            "q_perm_delta_base := mulmod(q_perm_delta_base, q_perm_delta_chunk, r)".to_string(),
+            "mstore(q_perm_delta_base_ptr, mulmod(mload(q_perm_delta_base_ptr), q_perm_delta_chunk, r))".to_string(),
         );
         block.push("}".to_string());
 
@@ -3259,11 +3460,180 @@ impl<'a> SolidityGenerator<'a> {
         computations
     }
 
+    fn generate_quotient_evaluator(&self) -> Halo2QuotientEvaluator {
+        let proof_cptr = Ptr::calldata(0x64);
+
+        let vk = self.generate_vk();
+        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
+        let vk_len = vk.len();
+        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let quotient_plan = self.quotient_program_plan(&meta, &data);
+        let sorted_simple = quotient_plan.sorted_simple.clone();
+
+        assert!(
+            !(quotient_inline_cse_enabled() && quotient_structured_loops_enabled()),
+            "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
+        );
+        assert!(
+            !(quotient_inline_cse_enabled() || quotient_structured_loops_enabled()),
+            "external quotient evaluator is only implemented for the compact VM quotient path"
+        );
+
+        let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
+        let total_advices: usize = meta.num_user_advices.iter().sum();
+        let comm_g1_count = total_advices
+            + meta.num_lookups
+            + meta.num_permutation_zs
+            + lookup_helper_chunks_total
+            + meta.num_lookups
+            + meta.num_trashcans
+            + meta.num_quotients;
+        let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
+        let selector_acc_mptr = after_comms.next_multiple_of(0x20);
+        let quotient_tmp_mptr =
+            (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+
+        let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
+        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+        let quotient_const_words = vk.quotient_const_words;
+        let quotient_program_words = vk.quotient_program_words;
+        let quotient_const_offset_words = vk
+            .quotient_const_offset_words
+            .expect("VK must carry quotient constants");
+        let quotient_program_offset_words = vk
+            .quotient_program_offset_words
+            .expect("VK must carry quotient program");
+        assert_eq!(
+            quotient_program_build.consts.len(),
+            quotient_const_words,
+            "quotient const table changed after VK payload reservation"
+        );
+        assert_eq!(
+            quotient_program_chunks.len(),
+            quotient_program_words,
+            "quotient program length changed after VK payload reservation"
+        );
+        let quotient_stack_mptr = quotient_tmp_mptr + quotient_program_build.cse_temps * 0x20;
+        let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
+        let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
+        let quotient_program = Some(QuotientProgram {
+            consts: quotient_program_build.consts,
+            chunks: quotient_program_chunks,
+            len: quotient_program_build.bytes.len(),
+            packed32: quotient_program_build.packed32,
+            cse_temps: quotient_program_build.cse_temps,
+            const_mptr,
+            tmp_mptr: quotient_tmp_mptr,
+            stack_mptr: quotient_stack_mptr,
+            program_mptr,
+        });
+
+        let mut quotient_inline_computations = Vec::new();
+        let quotient_eval_numer_computations = Vec::new();
+        let mut quotient_post_vm_computations = Vec::new();
+        let mut quotient_native_permutation_computation = Vec::new();
+        let mut quotient_native_identity_computations = Vec::new();
+        let quotient_native_trash_computation = Vec::new();
+
+        let eval_scratch_slot = quotient_stack_mptr;
+        let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
+        for identity in &quotient_plan.inline_identities {
+            quotient_inline_computations.push(Self::direct_quotient_block(
+                &identity.lines,
+                &identity.var,
+                identity.target,
+                &sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+        if quotient_plan.has_native_permutation {
+            if let Some(block) = Self::structured_permutation_loop_block(
+                &meta,
+                &data,
+                &evaluator,
+                &sorted_simple,
+                quotient_stack_mptr,
+            ) {
+                quotient_native_permutation_computation = block;
+            }
+        }
+        for identity in &quotient_plan.native_identities {
+            quotient_native_identity_computations.push(Self::direct_quotient_block(
+                &identity.lines,
+                &identity.var,
+                identity.target,
+                &sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+        if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
+            && meta.num_trashcans > 0
+        {
+            if let Some(block) =
+                self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple)
+            {
+                quotient_post_vm_computations.push(block);
+            }
+        }
+
+        let quotient_pow5_helper = quotient_inline_computations
+            .iter()
+            .chain(quotient_post_vm_computations.iter())
+            .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(quotient_native_identity_computations.iter())
+            .chain(std::iter::once(&quotient_native_trash_computation))
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_pow5("));
+        let quotient_limb7_helper = quotient_inline_computations
+            .iter()
+            .chain(quotient_post_vm_computations.iter())
+            .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(quotient_native_identity_computations.iter())
+            .chain(std::iter::once(&quotient_native_trash_computation))
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_limb7("));
+        let quotient_wide_limb7_helper = quotient_inline_computations
+            .iter()
+            .chain(quotient_post_vm_computations.iter())
+            .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(quotient_native_identity_computations.iter())
+            .chain(std::iter::once(&quotient_native_trash_computation))
+            .flat_map(|block| block.iter())
+            .any(|line| line.contains("q_limb7_wide("));
+
+        Halo2QuotientEvaluator {
+            quotient_pow5_helper,
+            quotient_limb7_helper,
+            quotient_wide_limb7_helper,
+            vk_mptr,
+            challenge_mptr: data.challenge_mptr,
+            theta_mptr: data.theta_mptr,
+            reversed_evals_mptr: data.reversed_evals_mptr,
+            selector_acc_mptr,
+            quotient_external: Self::quotient_external_frame(
+                vk_mptr,
+                vk_len,
+                &meta,
+                &data,
+                sorted_simple.len(),
+            ),
+            quotient_inline_computations,
+            quotient_eval_numer_computations,
+            quotient_post_vm_computations,
+            quotient_native_permutation_computation,
+            quotient_native_identity_computations,
+            quotient_native_trash_computation,
+            quotient_program,
+            simple_selector_cols: sorted_simple,
+        }
+    }
+
     fn generate_verifier(
         &self,
         separate: bool,
         trace: bool,
         gas_checkpoints: bool,
+        external_quotient: bool,
     ) -> Halo2Verifier {
         let proof_cptr = Ptr::calldata(0x64);
 
@@ -3272,51 +3642,18 @@ impl<'a> SolidityGenerator<'a> {
 
         let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
 
-        let quotient_parts = self.quotient_identity_parts(&meta, &data);
-        let identities = quotient_parts.all_identities();
-        let sorted_simple = quotient_parts.sorted_simple.clone();
+        let quotient_plan = self.quotient_program_plan(&meta, &data);
+        let identities = self.quotient_identity_parts(&meta, &data).all_identities();
+        let sorted_simple = quotient_plan.sorted_simple.clone();
         let use_inline_cse = quotient_inline_cse_enabled();
         let use_structured_loops = quotient_structured_loops_enabled();
-        let structured_tail_mode = if use_inline_cse || use_structured_loops {
-            QuotientStructuredTailMode::Off
-        } else {
-            quotient_structured_tail_mode()
-        };
         assert!(
             !(use_inline_cse && use_structured_loops),
             "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
         );
         let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
-        let inline_count = if use_inline_cse || use_structured_loops {
-            0
-        } else if structured_tail_mode != QuotientStructuredTailMode::Off {
-            hybrid_quotient_inline_count(&quotient_parts.gates)
-        } else {
-            hybrid_quotient_inline_count(&identities)
-        };
-        let inline_identities = if structured_tail_mode != QuotientStructuredTailMode::Off {
-            &quotient_parts.gates[..inline_count]
-        } else {
-            &identities[..inline_count]
-        };
-        let vm_identities_storage;
-        let vm_identities = if structured_tail_mode == QuotientStructuredTailMode::Off {
-            &identities[inline_count..]
-        } else {
-            let mut identities = Vec::new();
-            identities.extend_from_slice(&quotient_parts.gates[inline_count..]);
-            match structured_tail_mode {
-                QuotientStructuredTailMode::Off => unreachable!(),
-                QuotientStructuredTailMode::Trash => {
-                    identities.extend_from_slice(&quotient_parts.permutation);
-                    identities.extend_from_slice(&quotient_parts.lookup);
-                }
-            }
-            vm_identities_storage = identities;
-            &vm_identities_storage
-        };
         let quotient_program_build = (!(use_inline_cse || use_structured_loops))
-            .then(|| self.build_quotient_program(vm_identities));
+            .then(|| self.build_quotient_program_items(&quotient_plan.items));
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -3337,6 +3674,9 @@ impl<'a> SolidityGenerator<'a> {
         let vk_len = vk.len();
         let quotient_tmp_mptr =
             (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+        let quotient_external = external_quotient.then(|| {
+            Self::quotient_external_frame(vk_mptr, vk_len, &meta, &data, sorted_simple.len())
+        });
         let (quotient_program, quotient_stack_mptr) = if let Some(quotient_program_build) =
             quotient_program_build
         {
@@ -3383,8 +3723,15 @@ impl<'a> SolidityGenerator<'a> {
         let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_post_vm_computations: Vec<Vec<String>> = Vec::new();
+        let mut quotient_native_permutation_computation: Vec<String> = Vec::new();
+        let mut quotient_native_identity_computations: Vec<Vec<String>> = Vec::new();
+        let quotient_native_trash_computation: Vec<String> = Vec::new();
 
-        if use_structured_loops {
+        if external_quotient {
+            // The external quotient evaluator renders and runs these blocks.
+            // Keep the main verifier source free of the bulky native quotient
+            // code; it only performs the staticcall and copies the output.
+        } else if use_structured_loops {
             quotient_eval_numer_computations = self.structured_loop_quotient_computations(
                 &meta,
                 &data,
@@ -3400,8 +3747,9 @@ impl<'a> SolidityGenerator<'a> {
             );
         } else {
             let eval_scratch_slot = quotient_stack_mptr;
+            let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
 
-            for identity in inline_identities {
+            for identity in &quotient_plan.inline_identities {
                 quotient_inline_computations.push(Self::direct_quotient_block(
                     &identity.lines,
                     &identity.var,
@@ -3411,8 +3759,31 @@ impl<'a> SolidityGenerator<'a> {
                 ));
             }
 
-            if structured_tail_mode == QuotientStructuredTailMode::Trash {
-                let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
+            if quotient_plan.has_native_permutation {
+                if let Some(block) = Self::structured_permutation_loop_block(
+                    &meta,
+                    &data,
+                    &evaluator,
+                    &sorted_simple,
+                    quotient_stack_mptr,
+                ) {
+                    quotient_native_permutation_computation = block;
+                }
+            }
+
+            for identity in &quotient_plan.native_identities {
+                quotient_native_identity_computations.push(Self::direct_quotient_block(
+                    &identity.lines,
+                    &identity.var,
+                    identity.target,
+                    &sorted_simple,
+                    eval_scratch_slot,
+                ));
+            }
+
+            if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
+                && meta.num_trashcans > 0
+            {
                 if let Some(block) =
                     self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple)
                 {
@@ -3421,24 +3792,36 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
 
-        let quotient_pow5_helper = quotient_eval_numer_computations
-            .iter()
-            .chain(quotient_inline_computations.iter())
-            .chain(quotient_post_vm_computations.iter())
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_pow5("));
-        let quotient_limb7_helper = quotient_eval_numer_computations
-            .iter()
-            .chain(quotient_inline_computations.iter())
-            .chain(quotient_post_vm_computations.iter())
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_limb7("));
-        let quotient_wide_limb7_helper = quotient_eval_numer_computations
-            .iter()
-            .chain(quotient_inline_computations.iter())
-            .chain(quotient_post_vm_computations.iter())
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_limb7_wide("));
+        let quotient_pow5_helper = !external_quotient
+            && quotient_eval_numer_computations
+                .iter()
+                .chain(quotient_inline_computations.iter())
+                .chain(quotient_post_vm_computations.iter())
+                .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(quotient_native_identity_computations.iter())
+                .chain(std::iter::once(&quotient_native_trash_computation))
+                .flat_map(|block| block.iter())
+                .any(|line| line.contains("q_pow5("));
+        let quotient_limb7_helper = !external_quotient
+            && quotient_eval_numer_computations
+                .iter()
+                .chain(quotient_inline_computations.iter())
+                .chain(quotient_post_vm_computations.iter())
+                .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(quotient_native_identity_computations.iter())
+                .chain(std::iter::once(&quotient_native_trash_computation))
+                .flat_map(|block| block.iter())
+                .any(|line| line.contains("q_limb7("));
+        let quotient_wide_limb7_helper = !external_quotient
+            && quotient_eval_numer_computations
+                .iter()
+                .chain(quotient_inline_computations.iter())
+                .chain(quotient_post_vm_computations.iter())
+                .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(quotient_native_identity_computations.iter())
+                .chain(std::iter::once(&quotient_native_trash_computation))
+                .flat_map(|block| block.iter())
+                .any(|line| line.contains("q_limb7_wide("));
 
         let pcs_computations =
             self.scheme
@@ -3543,6 +3926,7 @@ impl<'a> SolidityGenerator<'a> {
             reversed_evals_mptr: data.reversed_evals_mptr,
             selector_acc_mptr,
             batch_invert_scratch_mptr,
+            quotient_external,
             proof_cptr,
             num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
             instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + 0x20,
@@ -3553,7 +3937,14 @@ impl<'a> SolidityGenerator<'a> {
             quotient_inline_computations,
             quotient_eval_numer_computations,
             quotient_post_vm_computations,
-            quotient_program,
+            quotient_native_permutation_computation,
+            quotient_native_identity_computations,
+            quotient_native_trash_computation,
+            quotient_program: if external_quotient {
+                None
+            } else {
+                quotient_program
+            },
             pcs_computations,
             simple_selector_cols: sorted_simple.clone(),
             fixed_comm_mptr: fixed_comm_mptr_byte,
@@ -3565,26 +3956,40 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn build_quotient_program(&self, identities: &[QuotientIdentity]) -> QuotientProgramBuild {
+    fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::default();
         // Mirror snark-verifier's loader cache shape: when VM CSE is enabled,
         // choose repeated expression temps across the whole quotient program,
         // not just within one identity.
         let mut cse = quotient_vm_cse_enabled().then(|| {
-            let exprs = identities
+            let exprs = items
                 .iter()
-                .map(Self::quotient_identity_expr)
+                .filter_map(|item| match item {
+                    QuotientProgramItem::Identity(identity) => {
+                        Some(Self::quotient_identity_expr(identity))
+                    }
+                    QuotientProgramItem::NativePermutation
+                    | QuotientProgramItem::NativeIdentity(_) => None,
+                })
                 .collect::<Vec<_>>();
             QuotientCseState::from_exprs(&exprs)
         });
 
-        for identity in identities {
-            builder.identity(
-                &identity.lines,
-                &identity.var,
-                identity.target,
-                cse.as_mut(),
-            );
+        for item in items {
+            match item {
+                QuotientProgramItem::Identity(identity) => {
+                    builder.identity(
+                        &identity.lines,
+                        &identity.var,
+                        identity.target,
+                        cse.as_mut(),
+                    );
+                }
+                QuotientProgramItem::NativePermutation => builder.native_permutation(),
+                QuotientProgramItem::NativeIdentity(native_idx) => {
+                    builder.native_identity(*native_idx);
+                }
+            }
         }
 
         builder.finish(quotient_program_encoding())
