@@ -40,7 +40,7 @@ use midnight_curves::Fq;
 use midnight_proofs::plonk::{Any, Column, ConstraintSystem, Expression};
 use ruint::aliases::U256;
 
-use crate::codegen::util::{fe_to_u256, ConstraintSystemMeta, Data, Word};
+use crate::codegen::util::{fe_to_u256, ConstraintSystemMeta, Data, Location, Value, Word};
 
 #[derive(Debug)]
 pub(crate) struct Evaluator<'a> {
@@ -87,6 +87,66 @@ impl<'a> Evaluator<'a> {
         challenge_var: &str,
     ) -> (Vec<String>, String) {
         self.compress_expressions(expressions, challenge_var)
+    }
+
+    pub(crate) fn lookup_shared_prefix_f_plus_beta(
+        &self,
+        input_chunk: &[Vec<Expression<Fq>>],
+        challenge_var: &str,
+        beta_var: &str,
+        f_plus_beta_mptr: &str,
+    ) -> Option<Vec<String>> {
+        if input_chunk.len() < 3 {
+            return None;
+        }
+
+        let first = input_chunk.first()?;
+        if first.is_empty() {
+            return None;
+        }
+        let prefix_len = first.len().checked_sub(1)?;
+        if prefix_len == 0 {
+            return None;
+        }
+
+        if input_chunk
+            .iter()
+            .any(|exprs| exprs.len() != first.len() || exprs[..prefix_len] != first[..prefix_len])
+        {
+            return None;
+        }
+
+        let base_ptr = self.expression_memory_ptr(first.last()?)?;
+        for (idx, exprs) in input_chunk.iter().enumerate() {
+            if self.expression_memory_ptr(exprs.last()?)? != base_ptr + idx * 0x20 {
+                return None;
+            }
+        }
+
+        let mut lines = Vec::new();
+        let (mut prefix_lines, prefix_var) =
+            self.compress_expressions(&first[..prefix_len], challenge_var);
+        lines.append(&mut prefix_lines);
+        let prefix_scaled = self.fresh_var();
+        lines.push(format!(
+            "let {prefix_scaled} := mulmod({prefix_var}, {challenge_var}, r)"
+        ));
+        lines.push(format!(
+            "for {{ let q_lookup_shared_i := 0 }} lt(q_lookup_shared_i, {}) {{ q_lookup_shared_i := add(q_lookup_shared_i, 1) }} {{",
+            input_chunk.len()
+        ));
+        lines.push("let q_lookup_shared_off := shl(5, q_lookup_shared_i)".to_string());
+        lines.push(format!(
+            "let q_lookup_shared_tail := mload(add({base_ptr:#x}, q_lookup_shared_off))"
+        ));
+        lines.push(format!(
+            "let q_lookup_shared_compressed := addmod({prefix_scaled}, q_lookup_shared_tail, r)"
+        ));
+        lines.push(format!(
+            "mstore(add({f_plus_beta_mptr}, q_lookup_shared_off), addmod(q_lookup_shared_compressed, {beta_var}, r))"
+        ));
+        lines.push("}".to_string());
+        Some(lines)
     }
 
     // ----------------------------------------------------------------
@@ -656,7 +716,34 @@ impl<'a> Evaluator<'a> {
     ) -> (Vec<String>, String) {
         let mut lines = Vec::new();
         let mut acc_var: Option<String> = None;
-        for expr in expressions {
+        let mut idx = 0usize;
+        while idx < expressions.len() {
+            if let Some((count, base_ptr)) =
+                self.contiguous_expression_memory_run(&expressions[idx..])
+            {
+                let acc = self.fresh_var();
+                let prev = acc_var.unwrap_or_else(|| "0".to_string());
+                lines.push(format!("let {acc} := {prev}"));
+                let loop_var = self.fresh_var();
+                let off_var = self.fresh_var();
+                let value_var = self.fresh_var();
+                lines.push(format!(
+                    "for {{ let {loop_var} := 0 }} lt({loop_var}, {count}) {{ {loop_var} := add({loop_var}, 1) }} {{"
+                ));
+                lines.push(format!("let {off_var} := shl(5, {loop_var})"));
+                lines.push(format!(
+                    "let {value_var} := mload(add({base_ptr:#x}, {off_var}))"
+                ));
+                lines.push(format!(
+                    "{acc} := addmod(mulmod({acc}, {challenge_var}, r), {value_var}, r)"
+                ));
+                lines.push("}".to_string());
+                acc_var = Some(acc);
+                idx += count;
+                continue;
+            }
+
+            let expr = &expressions[idx];
             let (mut e_lines, e_var) = self.evaluate(expr);
             lines.append(&mut e_lines);
             let next = self.fresh_var();
@@ -665,6 +752,7 @@ impl<'a> Evaluator<'a> {
                 "let {next} := addmod(mulmod({prev}, {challenge_var}, r), {e_var}, r)"
             ));
             acc_var = Some(next);
+            idx += 1;
         }
         let final_var = acc_var.unwrap_or_else(|| {
             let zero = self.fresh_var();
@@ -672,6 +760,63 @@ impl<'a> Evaluator<'a> {
             zero
         });
         (lines, final_var)
+    }
+
+    fn contiguous_expression_memory_run(
+        &self,
+        expressions: &[Expression<Fq>],
+    ) -> Option<(usize, usize)> {
+        let base_ptr = self.expression_memory_ptr(expressions.first()?)?;
+        let mut count = 1usize;
+        while let Some(expr) = expressions.get(count) {
+            if self.expression_memory_ptr(expr)? != base_ptr + count * 0x20 {
+                break;
+            }
+            count += 1;
+        }
+
+        (count >= 3).then_some((count, base_ptr))
+    }
+
+    fn expression_memory_ptr(&self, expression: &Expression<Fq>) -> Option<usize> {
+        let word = match expression {
+            Expression::Advice(query) => self
+                .data
+                .advice_evals
+                .get(&(query.column_index(), query.rotation().0))
+                .copied()?,
+            Expression::Fixed(query) => {
+                let column_index = query.column_index();
+                if self.meta.simple_selector_cols.contains(&column_index) {
+                    return None;
+                }
+                self.data
+                    .fixed_evals
+                    .get(&(column_index, query.rotation().0))
+                    .copied()?
+            }
+            Expression::Instance(query) => {
+                let column_index = query.column_index();
+                if column_index < self.meta.num_committed_instances {
+                    self.data
+                        .committed_instance_evals
+                        .get(&(column_index, query.rotation().0))
+                        .copied()?
+                } else {
+                    self.data.instance_eval
+                }
+            }
+            _ => return None,
+        };
+
+        if word.loc() != Location::Memory {
+            return None;
+        }
+
+        match word.ptr().value() {
+            Value::Integer(offset) if offset >= 0 => Some(offset as usize),
+            _ => None,
+        }
     }
 
     fn pow5_base_expr<'b>(&self, expression: &'b Expression<Fq>) -> Option<&'b Expression<Fq>> {

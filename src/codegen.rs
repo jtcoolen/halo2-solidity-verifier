@@ -1470,6 +1470,14 @@ fn parse_u32_literal(value: &str) -> Option<u32> {
     parsed.try_into().ok()
 }
 
+fn parse_usize_literal(value: &str) -> Option<usize> {
+    if !is_literal(value) {
+        return None;
+    }
+    let parsed = parse_u256(value);
+    parsed.try_into().ok()
+}
+
 fn mem_token(name: &str) -> Option<u8> {
     Some(match name {
         "L_0_MPTR" => Q_MEM_L0,
@@ -1516,6 +1524,30 @@ fn yul_addmod_assignment(line: &str) -> Option<(String, String, String)> {
     let args = call_args(&expr, "addmod")?;
     if args.len() == 3 && args[2].trim() == "r" {
         Some((dst, args[0].trim().to_string(), args[1].trim().to_string()))
+    } else {
+        None
+    }
+}
+
+fn yul_mload_literal_assignment(line: &str) -> Option<(String, usize)> {
+    let (dst, expr) = yul_let_assignment(line)?;
+    Some((dst, yul_mload_literal_expr(&expr)?))
+}
+
+fn yul_mload_literal_expr(expr: &str) -> Option<usize> {
+    let args = call_args(expr.trim(), "mload")?;
+    if args.len() == 1 {
+        parse_usize_literal(args[0].trim())
+    } else {
+        None
+    }
+}
+
+fn yul_sub_r_assignment(line: &str) -> Option<(String, String)> {
+    let (dst, expr) = yul_let_assignment(line)?;
+    let args = call_args(&expr, "sub")?;
+    if args.len() == 2 && args[0].trim() == "r" {
+        Some((dst, args[1].trim().to_string()))
     } else {
         None
     }
@@ -2153,6 +2185,289 @@ impl<'a> SolidityGenerator<'a> {
         block
     }
 
+    fn push_structured_fold_advance(
+        block: &mut Vec<String>,
+        count: usize,
+        sorted_simple: &[usize],
+        loop_var: &str,
+    ) {
+        if count == 1 {
+            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+            if !sorted_simple.is_empty() {
+                block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+                block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+            }
+            return;
+        }
+
+        block.push(format!(
+            "for {{ let {loop_var} := 0 }} lt({loop_var}, {count}) {{ {loop_var} := add({loop_var}, 1) }} {{"
+        ));
+        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+        if !sorted_simple.is_empty() {
+            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+        }
+        block.push("}".to_string());
+    }
+
+    fn push_mstore_mload_literal_runs(
+        block: &mut Vec<String>,
+        dst: &str,
+        entries: &[(usize, String)],
+        loop_prefix: &str,
+    ) {
+        let mut idx = 0usize;
+        while idx < entries.len() {
+            let (dst_base, expr) = &entries[idx];
+            let Some(src_base) = yul_mload_literal_expr(expr) else {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            };
+            let Some((next_dst, next_expr)) = entries.get(idx + 1) else {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            };
+            if *next_dst != *dst_base + 0x20 {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            }
+            let Some(next_src) = yul_mload_literal_expr(next_expr) else {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            };
+            let Some(src_stride) = next_src.checked_sub(src_base) else {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            };
+            if src_stride == 0 {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            }
+
+            let mut count = 2usize;
+            while let Some((candidate_dst, candidate_expr)) = entries.get(idx + count) {
+                let Some(candidate_src) = yul_mload_literal_expr(candidate_expr) else {
+                    break;
+                };
+                if *candidate_dst != *dst_base + count * 0x20
+                    || candidate_src != src_base + count * src_stride
+                {
+                    break;
+                }
+                count += 1;
+            }
+
+            if count < 3 {
+                block.push(format!("mstore(add({dst}, {dst_base:#x}), {expr})"));
+                idx += 1;
+                continue;
+            }
+
+            block.push("{".to_string());
+            block.push(format!(
+                "for {{ let {loop_prefix}_i := 0 }} lt({loop_prefix}_i, {count}) {{ {loop_prefix}_i := add({loop_prefix}_i, 1) }} {{"
+            ));
+            block.push(format!(
+                "let {loop_prefix}_dst_off := shl(5, {loop_prefix}_i)"
+            ));
+            if src_stride == 0x20 {
+                block.push(format!(
+                    "let {loop_prefix}_src_off := {loop_prefix}_dst_off"
+                ));
+            } else {
+                block.push(format!(
+                    "let {loop_prefix}_src_off := mul({loop_prefix}_i, {src_stride:#x})"
+                ));
+            }
+            block.push(format!(
+                "mstore(add(add({dst}, {dst_base:#x}), {loop_prefix}_dst_off), mload(add({src_base:#x}, {loop_prefix}_src_off)))"
+            ));
+            block.push("}".to_string());
+            block.push("}".to_string());
+            idx += count;
+        }
+    }
+
+    fn yul_pair_matches(lhs: &str, rhs: &str, a: &str, b: &str) -> bool {
+        (lhs == a && rhs == b) || (lhs == b && rhs == a)
+    }
+
+    fn parse_selector_linear_next_identity(
+        lines: &[String],
+        final_var: &str,
+    ) -> Option<(usize, usize, usize)> {
+        if lines.len() != 8 {
+            return None;
+        }
+
+        let (one_var, one) = yul_let_assignment(&lines[0])?;
+        if parse_u256(one.trim()) != U256::from(1u8) {
+            return None;
+        }
+
+        let (a_var, a_addr) = yul_mload_literal_assignment(&lines[1])?;
+        let (f_var, f_addr) = yul_mload_literal_assignment(&lines[2])?;
+        let (sum_var, lhs, rhs) = yul_addmod_assignment(&lines[3])?;
+        if !Self::yul_pair_matches(&lhs, &rhs, &a_var, &f_var) {
+            return None;
+        }
+
+        let (next_var, next_addr) = yul_mload_literal_assignment(&lines[4])?;
+        let (neg_var, neg_arg) = yul_sub_r_assignment(&lines[5])?;
+        if neg_arg != next_var {
+            return None;
+        }
+
+        let (eval_var, lhs, rhs) = yul_addmod_assignment(&lines[6])?;
+        if !Self::yul_pair_matches(&lhs, &rhs, &sum_var, &neg_var) {
+            return None;
+        }
+
+        let (scaled_var, lhs, rhs) = yul_mulmod_assignment(&lines[7])?;
+        if scaled_var != final_var || !Self::yul_pair_matches(&lhs, &rhs, &one_var, &eval_var) {
+            return None;
+        }
+
+        Some((a_addr, f_addr, next_addr))
+    }
+
+    fn selector_linear_next_loop_block(
+        run: &[(Vec<String>, String)],
+    ) -> Option<(usize, Vec<String>)> {
+        let (a_base, f_base, next_base) =
+            Self::parse_selector_linear_next_identity(&run.first()?.0, &run.first()?.1)?;
+        let mut count = 1usize;
+        while let Some((lines, var)) = run.get(count) {
+            let Some((a_addr, f_addr, next_addr)) =
+                Self::parse_selector_linear_next_identity(lines, var)
+            else {
+                break;
+            };
+            let off = count * 0x20;
+            if a_addr != a_base + off || f_addr != f_base + off || next_addr != next_base + off {
+                break;
+            }
+            count += 1;
+        }
+
+        if count < 3 {
+            return None;
+        }
+
+        let mut block = Vec::with_capacity(10);
+        block.push("{".to_string());
+        block.push(format!(
+            "for {{ let q_gate_lin_i := 0 }} lt(q_gate_lin_i, {count}) {{ q_gate_lin_i := add(q_gate_lin_i, 1) }} {{"
+        ));
+        block.push("let q_gate_lin_off := shl(5, q_gate_lin_i)".to_string());
+        block.push(format!(
+            "let q_gate_lin_a := mload(add({a_base:#x}, q_gate_lin_off))"
+        ));
+        block.push(format!(
+            "let q_gate_lin_f := mload(add({f_base:#x}, q_gate_lin_off))"
+        ));
+        block.push(format!(
+            "let q_gate_lin_next := mload(add({next_base:#x}, q_gate_lin_off))"
+        ));
+        block.push(
+            "let q_gate_lin_eval := addmod(addmod(q_gate_lin_a, q_gate_lin_f, r), sub(r, q_gate_lin_next), r)"
+                .to_string(),
+        );
+        block
+            .push("q_gate_run := addmod(mulmod(q_gate_run, y, r), q_gate_lin_eval, r)".to_string());
+        block.push("}".to_string());
+        block.push("}".to_string());
+        Some((count, block))
+    }
+
+    fn push_selector_run_identity(
+        block: &mut Vec<String>,
+        lines: &[String],
+        var: &str,
+        eval_scratch_slot: usize,
+    ) {
+        block.push("{".to_string());
+        let lines = Self::specialize_limb7_chains(lines);
+        for line in &lines {
+            block.push(line.clone());
+        }
+        block.push(format!("mstore({eval_scratch_slot:#x}, {var})"));
+        block.push("}".to_string());
+        block.push(format!(
+            "q_gate_run := addmod(mulmod(q_gate_run, y, r), mload({eval_scratch_slot:#x}), r)"
+        ));
+    }
+
+    fn selector_run_quotient_block(
+        run: &[(Vec<String>, String)],
+        selector_idx: usize,
+        sorted_simple: &[usize],
+        eval_scratch_slot: usize,
+    ) -> Vec<String> {
+        let capacity = run.iter().map(|(lines, _)| lines.len() + 5).sum::<usize>() + 10;
+        let mut block = Vec::with_capacity(capacity);
+        let offset = selector_idx * 0x20;
+
+        block.push("{".to_string());
+        block.push("let q_gate_run := 0".to_string());
+        let mut idx = 0usize;
+        while idx < run.len() {
+            if let Some((consumed, mut loop_block)) =
+                Self::selector_linear_next_loop_block(&run[idx..])
+            {
+                block.append(&mut loop_block);
+                idx += consumed;
+                continue;
+            }
+            let (lines, var) = &run[idx];
+            Self::push_selector_run_identity(&mut block, lines, var, eval_scratch_slot);
+            idx += 1;
+        }
+        Self::push_structured_fold_advance(&mut block, run.len(), sorted_simple, "q_gate_run_i");
+        block.push(format!(
+            "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(q_gate_run, q_sel_inv_scale, r), r))"
+        ));
+        block.push("}".to_string());
+        block
+    }
+
+    fn flush_structured_selector_run(
+        computations: &mut Vec<Vec<String>>,
+        pending_selector: &mut Option<usize>,
+        pending_run: &mut Vec<(Vec<String>, String)>,
+        sorted_simple: &[usize],
+        eval_scratch_slot: usize,
+    ) {
+        let Some(selector_idx) = pending_selector.take() else {
+            return;
+        };
+        let run = std::mem::take(pending_run);
+        if run.len() == 1 {
+            let (lines, var) = run.into_iter().next().expect("selector run item");
+            computations.push(Self::direct_quotient_block(
+                &lines,
+                &var,
+                QuotientTarget::Selector(selector_idx),
+                sorted_simple,
+                eval_scratch_slot,
+            ));
+        } else if !run.is_empty() {
+            computations.push(Self::selector_run_quotient_block(
+                &run,
+                selector_idx,
+                sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+    }
+
     fn specialize_limb7_chains(lines: &[String]) -> Vec<String> {
         let mut out = Vec::with_capacity(lines.len());
         let mut const_vars = HashMap::new();
@@ -2284,11 +2599,7 @@ impl<'a> SolidityGenerator<'a> {
         value: impl AsRef<str>,
         sorted_simple: &[usize],
     ) {
-        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-        if !sorted_simple.is_empty() {
-            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
-        }
+        Self::push_structured_fold_advance(block, 1, sorted_simple, "q_main_fold_i");
         block.push(format!(
             "quotient_eval_numer := addmod(quotient_eval_numer, {}, r)",
             value.as_ref()
@@ -2341,6 +2652,8 @@ impl<'a> SolidityGenerator<'a> {
         block.push(format!("let q_perm_chunk_len := {chunk_len}"));
         block.push(format!("let q_perm_delta_chunk := {delta_chunk}"));
 
+        let mut value_entries = Vec::with_capacity(num_cols);
+        let mut sigma_entries = Vec::with_capacity(num_cols);
         for (idx, column) in meta.permutation_columns.iter().enumerate() {
             let offset = idx * 0x20;
             let value = evaluator.eval_at(column, 0);
@@ -2349,24 +2662,51 @@ impl<'a> SolidityGenerator<'a> {
                 .get(column)
                 .expect("permutation sigma eval present")
                 .to_string();
-            block.push(format!("mstore(add(q_perm_vals, {offset:#x}), {value})"));
-            block.push(format!("mstore(add(q_perm_sigmas, {offset:#x}), {sigma})"));
+            value_entries.push((offset, value));
+            sigma_entries.push((offset, sigma));
         }
+        Self::push_mstore_mload_literal_runs(
+            &mut block,
+            "q_perm_vals",
+            &value_entries,
+            "q_perm_val_load",
+        );
+        Self::push_mstore_mload_literal_runs(
+            &mut block,
+            "q_perm_sigmas",
+            &sigma_entries,
+            "q_perm_sigma_load",
+        );
 
+        let mut z_cur_entries = Vec::with_capacity(data.permutation_z_evals.len());
+        let mut z_next_entries = Vec::with_capacity(data.permutation_z_evals.len());
+        let mut z_last_entries = Vec::with_capacity(data.permutation_z_evals.len());
         for (idx, (z_cur, z_next, z_last)) in data.permutation_z_evals.iter().enumerate() {
             let offset = idx * 0x20;
-            block.push(format!("mstore(add(q_perm_z_cur, {offset:#x}), {})", z_cur));
-            block.push(format!(
-                "mstore(add(q_perm_z_next, {offset:#x}), {})",
-                z_next
-            ));
+            z_cur_entries.push((offset, z_cur.to_string()));
+            z_next_entries.push((offset, z_next.to_string()));
             if let Some(z_last) = z_last {
-                block.push(format!(
-                    "mstore(add(q_perm_z_last, {offset:#x}), {})",
-                    z_last
-                ));
+                z_last_entries.push((offset, z_last.to_string()));
             }
         }
+        Self::push_mstore_mload_literal_runs(
+            &mut block,
+            "q_perm_z_cur",
+            &z_cur_entries,
+            "q_perm_z_cur_load",
+        );
+        Self::push_mstore_mload_literal_runs(
+            &mut block,
+            "q_perm_z_next",
+            &z_next_entries,
+            "q_perm_z_next_load",
+        );
+        Self::push_mstore_mload_literal_runs(
+            &mut block,
+            "q_perm_z_last",
+            &z_last_entries,
+            "q_perm_z_last_load",
+        );
 
         let fold_eval = |block: &mut Vec<String>| {
             block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
@@ -2533,14 +2873,26 @@ impl<'a> SolidityGenerator<'a> {
                 }
 
                 evaluator.reset_locals();
-                for (input_idx, parallel_input) in input_chunk.iter().enumerate() {
-                    let (mut compressed_lines, compressed_var) = evaluator
-                        .compress_expressions_with_challenge_var(parallel_input, "q_lookup_theta");
-                    block.append(&mut compressed_lines);
-                    block.push(format!(
-                        "mstore(add(q_lookup_f, {:#x}), addmod({compressed_var}, q_lookup_beta, r))",
-                        input_idx * 0x20
-                    ));
+                if let Some(mut shared_prefix_lines) = evaluator.lookup_shared_prefix_f_plus_beta(
+                    input_chunk,
+                    "q_lookup_theta",
+                    "q_lookup_beta",
+                    "q_lookup_f",
+                ) {
+                    block.append(&mut shared_prefix_lines);
+                } else {
+                    for (input_idx, parallel_input) in input_chunk.iter().enumerate() {
+                        let (mut compressed_lines, compressed_var) = evaluator
+                            .compress_expressions_with_challenge_var(
+                                parallel_input,
+                                "q_lookup_theta",
+                            );
+                        block.append(&mut compressed_lines);
+                        block.push(format!(
+                            "mstore(add(q_lookup_f, {:#x}), addmod({compressed_var}, q_lookup_beta, r))",
+                            input_idx * 0x20
+                        ));
+                    }
                 }
 
                 block.push("let q_lookup_product := 1".to_string());
@@ -2706,11 +3058,13 @@ impl<'a> SolidityGenerator<'a> {
         let gate_items = evaluator.gate_computations_tagged();
 
         let mut init = vec!["let quotient_eval_numer := 0".to_string()];
-        for idx in 0..sorted_simple.len() {
+        if !sorted_simple.is_empty() {
             init.push(format!(
-                "mstore(add(SELECTOR_ACC_MPTR, {:#x}), 0)",
-                idx * 0x20
+                "for {{ let q_sel_zero_off := 0 }} lt(q_sel_zero_off, {:#x}) {{ q_sel_zero_off := add(q_sel_zero_off, 0x20) }} {{",
+                sorted_simple.len() * 0x20
             ));
+            init.push("mstore(add(SELECTOR_ACC_MPTR, q_sel_zero_off), 0)".to_string());
+            init.push("}".to_string());
         }
         if !sorted_simple.is_empty() {
             init.push("let q_sel_scale := 1".to_string());
@@ -2733,6 +3087,8 @@ impl<'a> SolidityGenerator<'a> {
         }
         let mut computations = vec![init];
 
+        let mut pending_selector = None;
+        let mut pending_selector_run: Vec<(Vec<String>, String)> = Vec::new();
         for (lines, var, target) in gate_items {
             let target = match target {
                 Some(col) => {
@@ -2744,14 +3100,47 @@ impl<'a> SolidityGenerator<'a> {
                 }
                 None => QuotientTarget::Main,
             };
-            computations.push(Self::direct_quotient_block(
-                &lines,
-                &var,
-                target,
-                sorted_simple,
-                eval_scratch_slot,
-            ));
+            match target {
+                QuotientTarget::Selector(idx) => {
+                    if pending_selector == Some(idx) {
+                        pending_selector_run.push((lines, var));
+                    } else {
+                        Self::flush_structured_selector_run(
+                            &mut computations,
+                            &mut pending_selector,
+                            &mut pending_selector_run,
+                            sorted_simple,
+                            eval_scratch_slot,
+                        );
+                        pending_selector = Some(idx);
+                        pending_selector_run.push((lines, var));
+                    }
+                }
+                QuotientTarget::Main => {
+                    Self::flush_structured_selector_run(
+                        &mut computations,
+                        &mut pending_selector,
+                        &mut pending_selector_run,
+                        sorted_simple,
+                        eval_scratch_slot,
+                    );
+                    computations.push(Self::direct_quotient_block(
+                        &lines,
+                        &var,
+                        target,
+                        sorted_simple,
+                        eval_scratch_slot,
+                    ));
+                }
+            }
         }
+        Self::flush_structured_selector_run(
+            &mut computations,
+            &mut pending_selector,
+            &mut pending_selector_run,
+            sorted_simple,
+            eval_scratch_slot,
+        );
 
         if let Some(block) = Self::structured_permutation_loop_block(
             meta,
@@ -2780,13 +3169,15 @@ impl<'a> SolidityGenerator<'a> {
 
         if !sorted_simple.is_empty() {
             let mut tail = Vec::new();
-            for i in 0..sorted_simple.len() {
-                tail.push(format!(
-                    "mstore(add(SELECTOR_ACC_MPTR, {:#x}), mulmod(mload(add(SELECTOR_ACC_MPTR, {:#x})), q_sel_scale, r))",
-                    i * 0x20,
-                    i * 0x20
-                ));
-            }
+            tail.push(format!(
+                "for {{ let q_sel_tail_off := 0 }} lt(q_sel_tail_off, {:#x}) {{ q_sel_tail_off := add(q_sel_tail_off, 0x20) }} {{",
+                sorted_simple.len() * 0x20
+            ));
+            tail.push(
+                "mstore(add(SELECTOR_ACC_MPTR, q_sel_tail_off), mulmod(mload(add(SELECTOR_ACC_MPTR, q_sel_tail_off)), q_sel_scale, r))"
+                    .to_string(),
+            );
+            tail.push("}".to_string());
             computations.push(tail);
         }
 
