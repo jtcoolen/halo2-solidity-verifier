@@ -960,6 +960,12 @@ contract Halo2Verifier {
             calldatacopy(PI_MPTR, proof_cptr, 0x80)
             proof_cptr := add(proof_cptr, 0x80)
 
+            // The hand-rolled proof parser must consume exactly the ABI
+            // `proof` bytes before the `instances` length word. This is
+            // redundant with the generated proof length today, but makes
+            // future proof-layout drift fail closed.
+            success := and(success, eq(proof_cptr, NUM_INSTANCE_CPTR))
+
             if iszero(success) { revert(0, 0) }
 
             {%- if self.gas_checkpoints %}
