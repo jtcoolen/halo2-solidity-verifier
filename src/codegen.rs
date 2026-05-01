@@ -177,25 +177,56 @@ struct QuotientIdentity {
     target: QuotientTarget,
 }
 
-// Optional experiment: spend part of the verifier bytecode headroom recovered
-// by moving the quotient payload into the VK. The first N identities are
-// emitted as straight-line Yul, while the suffix remains interpreted by the
-// compact VM. Keep the default at zero; benchmark with
-// HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N.
-const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 0;
+#[derive(Clone, Debug)]
+struct QuotientIdentityParts {
+    gates: Vec<QuotientIdentity>,
+    permutation: Vec<QuotientIdentity>,
+    lookup: Vec<QuotientIdentity>,
+    trash: Vec<QuotientIdentity>,
+    sorted_simple: Vec<usize>,
+}
+
+impl QuotientIdentityParts {
+    fn all_identities(&self) -> Vec<QuotientIdentity> {
+        self.gates
+            .iter()
+            .chain(self.permutation.iter())
+            .chain(self.lookup.iter())
+            .chain(self.trash.iter())
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotientStructuredTailMode {
+    Off,
+    Trash,
+}
+
+// Spend a bounded slice of the verifier bytecode headroom recovered by moving
+// the quotient payload into the VK. The first N identities are emitted as
+// specialized straight-line Yul, while the suffix remains interpreted by the
+// compact VM. Tune with HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N.
+// The default keeps the IVC verifier comfortably below EIP-170 while shaving a
+// measurable chunk from the quotient VM checkpoint.
+const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 4;
 const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
-// The structured quotient path is the default: it emits VK-specialized Yul
-// loops/helpers without a bytecode VM or opcode interpreter. Set
-// HALO2_SOLIDITY_QUOTIENT_CSE=1 to force fully inline CSE for gas measurement,
-// or set both HALO2_SOLIDITY_QUOTIENT_CSE=0 and
-// HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=0 to opt back into the
-// bytecode-smaller VM path.
+// The compact quotient VM path is the default size-oriented emitter: it stores
+// identity arithmetic as data in the VK and interprets it from one small Yul
+// loop. By default only the final trash suffix is emitted as structured Yul,
+// which saves dispatch gas while preserving the IVC size budget. Set
+// HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off to disable this,
+// HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1 for the larger fully structured
+// experiment, or HALO2_SOLIDITY_QUOTIENT_CSE=1 for fully inline CSE gas
+// measurement.
 const QUOTIENT_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_CSE";
 const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
 const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
 const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS";
+const QUOTIENT_STRUCTURED_TAIL_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL";
 const LIMB7_YUL_COEFFS: [&str; 6] = [
     "0x100000000000000",
     "0x10000000000000000000000000000",
@@ -1203,7 +1234,7 @@ fn quotient_inline_cse_enabled() -> bool {
 
 fn quotient_vm_cse_enabled() -> bool {
     let Ok(value) = std::env::var(QUOTIENT_VM_CSE_ENV) else {
-        return false;
+        return true;
     };
 
     match value.trim().to_ascii_lowercase().as_str() {
@@ -1227,13 +1258,25 @@ fn quotient_yul_helpers_enabled() -> bool {
 
 fn quotient_structured_loops_enabled() -> bool {
     let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_LOOPS_ENV) else {
-        return !quotient_inline_cse_enabled();
+        return false;
     };
 
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "0" | "false" | "off" | "no" => false,
         "1" | "true" | "on" | "yes" | "loops" => true,
         other => panic!("unsupported {QUOTIENT_STRUCTURED_LOOPS_ENV}={other}; use 0/1"),
+    }
+}
+
+fn quotient_structured_tail_mode() -> QuotientStructuredTailMode {
+    let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_TAIL_ENV) else {
+        return QuotientStructuredTailMode::Trash;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => QuotientStructuredTailMode::Off,
+        "1" | "true" | "on" | "yes" | "tail" | "trash" => QuotientStructuredTailMode::Trash,
+        other => panic!("unsupported {QUOTIENT_STRUCTURED_TAIL_ENV}={other}; use off or trash"),
     }
 }
 
@@ -1439,6 +1482,7 @@ fn parse_mem(ptr: &str) -> QuotientMem {
 }
 
 fn is_literal(value: &str) -> bool {
+    let value = value.trim();
     value.starts_with("0x")
         || value
             .as_bytes()
@@ -1447,10 +1491,13 @@ fn is_literal(value: &str) -> bool {
 }
 
 fn parse_u256(value: &str) -> U256 {
+    let value = value.trim();
     if let Some(hex) = value.strip_prefix("0x") {
-        U256::from_str_radix(hex, 16).expect("valid hex U256")
+        U256::from_str_radix(hex, 16)
+            .unwrap_or_else(|err| panic!("valid hex U256 `{value}`: {err:?}"))
     } else {
-        U256::from_str_radix(value, 10).expect("valid decimal U256")
+        U256::from_str_radix(value, 10)
+            .unwrap_or_else(|err| panic!("valid decimal U256 `{value}`: {err:?}"))
     }
 }
 
@@ -2018,18 +2065,35 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> (QuotientProgramBuild, Vec<usize>) {
-        let (identities, sorted_simple) = self.quotient_identities(meta, data);
-        let inline_count = hybrid_quotient_inline_count(&identities);
-        let quotient_program_build = self.build_quotient_program(&identities[inline_count..]);
+        let parts = self.quotient_identity_parts(meta, data);
+        let sorted_simple = parts.sorted_simple.clone();
+        let tail_mode = quotient_structured_tail_mode();
+        let quotient_program_build = if tail_mode == QuotientStructuredTailMode::Off {
+            let identities = parts.all_identities();
+            let inline_count = hybrid_quotient_inline_count(&identities);
+            self.build_quotient_program(&identities[inline_count..])
+        } else {
+            let inline_count = hybrid_quotient_inline_count(&parts.gates);
+            let mut vm_identities = Vec::new();
+            vm_identities.extend_from_slice(&parts.gates[inline_count..]);
+            match tail_mode {
+                QuotientStructuredTailMode::Off => unreachable!(),
+                QuotientStructuredTailMode::Trash => {
+                    vm_identities.extend_from_slice(&parts.permutation);
+                    vm_identities.extend_from_slice(&parts.lookup);
+                }
+            }
+            self.build_quotient_program(&vm_identities)
+        };
         let _quotient_max_stack = quotient_program_build.max_stack;
         (quotient_program_build, sorted_simple)
     }
 
-    fn quotient_identities(
+    fn quotient_identity_parts(
         &self,
         meta: &ConstraintSystemMeta,
         data: &Data,
-    ) -> (Vec<QuotientIdentity>, Vec<usize>) {
+    ) -> QuotientIdentityParts {
         let evaluator = Evaluator::new(self.vk.cs(), meta, data);
         let gate_items = evaluator.gate_computations_tagged();
         let perm_items = evaluator.permutation_computations();
@@ -2039,9 +2103,7 @@ impl<'a> SolidityGenerator<'a> {
         let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         sorted_simple.sort_unstable();
 
-        let mut identities = Vec::with_capacity(
-            gate_items.len() + perm_items.len() + lookup_items.len() + trash_items.len(),
-        );
+        let mut gates = Vec::with_capacity(gate_items.len());
         for (lines, var, sel_idx) in gate_items {
             let target = match sel_idx {
                 Some(col) => {
@@ -2053,31 +2115,40 @@ impl<'a> SolidityGenerator<'a> {
                 }
                 None => QuotientTarget::Main,
             };
-            identities.push(QuotientIdentity { lines, var, target });
+            gates.push(QuotientIdentity { lines, var, target });
         }
+        let mut permutation = Vec::with_capacity(perm_items.len());
         for (lines, var) in perm_items {
-            identities.push(QuotientIdentity {
+            permutation.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
             });
         }
+        let mut lookup = Vec::with_capacity(lookup_items.len());
         for (lines, var) in lookup_items {
-            identities.push(QuotientIdentity {
+            lookup.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
             });
         }
+        let mut trash = Vec::with_capacity(trash_items.len());
         for (lines, var) in trash_items {
-            identities.push(QuotientIdentity {
+            trash.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
             });
         }
 
-        (identities, sorted_simple)
+        QuotientIdentityParts {
+            gates,
+            permutation,
+            lookup,
+            trash,
+            sorted_simple,
+        }
     }
 
     fn quotient_identity_expr(identity: &QuotientIdentity) -> QuotientExpr {
@@ -2642,6 +2713,10 @@ impl<'a> SolidityGenerator<'a> {
 
         let mut block = Vec::new();
         block.push("{".to_string());
+        block.push(
+            "let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999"
+                .to_string(),
+        );
         block.push(format!("let q_perm_vals := {vals_mptr:#x}"));
         block.push(format!("let q_perm_sigmas := {sigmas_mptr:#x}"));
         block.push(format!("let q_perm_z_cur := {z_cur_mptr:#x}"));
@@ -3197,9 +3272,16 @@ impl<'a> SolidityGenerator<'a> {
 
         let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
 
-        let (identities, sorted_simple) = self.quotient_identities(&meta, &data);
+        let quotient_parts = self.quotient_identity_parts(&meta, &data);
+        let identities = quotient_parts.all_identities();
+        let sorted_simple = quotient_parts.sorted_simple.clone();
         let use_inline_cse = quotient_inline_cse_enabled();
         let use_structured_loops = quotient_structured_loops_enabled();
+        let structured_tail_mode = if use_inline_cse || use_structured_loops {
+            QuotientStructuredTailMode::Off
+        } else {
+            quotient_structured_tail_mode()
+        };
         assert!(
             !(use_inline_cse && use_structured_loops),
             "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
@@ -3207,11 +3289,32 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
         let inline_count = if use_inline_cse || use_structured_loops {
             0
+        } else if structured_tail_mode != QuotientStructuredTailMode::Off {
+            hybrid_quotient_inline_count(&quotient_parts.gates)
         } else {
             hybrid_quotient_inline_count(&identities)
         };
-        let (inline_identities, vm_identities) = identities.split_at(inline_count);
-        let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
+        let inline_identities = if structured_tail_mode != QuotientStructuredTailMode::Off {
+            &quotient_parts.gates[..inline_count]
+        } else {
+            &identities[..inline_count]
+        };
+        let vm_identities_storage;
+        let vm_identities = if structured_tail_mode == QuotientStructuredTailMode::Off {
+            &identities[inline_count..]
+        } else {
+            let mut identities = Vec::new();
+            identities.extend_from_slice(&quotient_parts.gates[inline_count..]);
+            match structured_tail_mode {
+                QuotientStructuredTailMode::Off => unreachable!(),
+                QuotientStructuredTailMode::Trash => {
+                    identities.extend_from_slice(&quotient_parts.permutation);
+                    identities.extend_from_slice(&quotient_parts.lookup);
+                }
+            }
+            vm_identities_storage = identities;
+            &vm_identities_storage
+        };
         let quotient_program_build = (!(use_inline_cse || use_structured_loops))
             .then(|| self.build_quotient_program(vm_identities));
 
@@ -3279,6 +3382,7 @@ impl<'a> SolidityGenerator<'a> {
 
         let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
+        let mut quotient_post_vm_computations: Vec<Vec<String>> = Vec::new();
 
         if use_structured_loops {
             quotient_eval_numer_computations = self.structured_loop_quotient_computations(
@@ -3295,125 +3399,44 @@ impl<'a> SolidityGenerator<'a> {
                 quotient_yul_helpers,
             );
         } else {
-            // Step 0: declare and zero-init all accumulators.
-            {
-                let mut init_lines = Vec::new();
-                init_lines.push("let quotient_eval_numer := 0".to_string());
-                for idx in 0..sorted_simple.len() {
-                    init_lines.push(format!("let {} := 0", sel_var(idx)));
-                }
-                quotient_eval_numer_computations.push(init_lines);
-            }
-
-            // Helper that emits a self-contained Horner-fold step for one
-            // identity. The eval is computed inside its own `{}` scope
-            // (so per-block `v0..vN` locals don't collide with siblings)
-            // and exported via a small per-step shim. We compute the
-            // eval inside the block, store its value at scratch, and then
-            // perform the Horner update at the outer scope. Using
-            // mstore/mload here is wasteful but lets us keep the existing
-            // `evaluate` contract untouched.
-            // Scratch slot for piping each identity's eval out of its
-            // inner `{}` block back to the outer Horner accumulator. Must
-            // not overlap the generated verifier's VK, challenge, proof
-            // commitment, simple-selector, or scalar-inversion regions.
             let eval_scratch_slot = quotient_stack_mptr;
-            let make_block = |identity: &QuotientIdentity| -> Vec<String> {
-                let mut block = Vec::with_capacity(identity.lines.len() + 6);
-                // Inner block: compute the eval and stash it in a scratch slot.
-                block.push("{".to_string());
-                for l in &identity.lines {
-                    block.push(l.clone());
-                }
-                block.push(format!("mstore({eval_scratch_slot:#x}, {})", identity.var));
-                block.push("}".to_string());
-                // Outer Horner update (re-loads from the scratch slot).
-                block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-                for idx in 0..sorted_simple.len() {
-                    block.push(format!(
-                        "{name} := mulmod({name}, y, r)",
-                        name = sel_var(idx)
-                    ));
-                }
-                let target = match identity.target {
-                    QuotientTarget::Selector(idx) => sel_var(idx),
-                    QuotientTarget::Main => "quotient_eval_numer".to_string(),
-                };
-                block.push(format!(
-                    "{target} := addmod({target}, mload({eval_scratch_slot:#x}), r)"
-                ));
-                block
-            };
-
-            let make_inline_block = |identity: &QuotientIdentity| -> Vec<String> {
-                let mut block = Vec::with_capacity(identity.lines.len() + 8 + sorted_simple.len());
-                block.push("{".to_string());
-                for l in &identity.lines {
-                    block.push(l.clone());
-                }
-                block.push(format!("mstore({eval_scratch_slot:#x}, {})", identity.var));
-                block.push("}".to_string());
-                block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-                if !sorted_simple.is_empty() {
-                    block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-                    block
-                        .push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
-                }
-                match identity.target {
-                    QuotientTarget::Main => {
-                        block.push(format!(
-                        "quotient_eval_numer := addmod(quotient_eval_numer, mload({eval_scratch_slot:#x}), r)"
-                    ));
-                    }
-                    QuotientTarget::Selector(idx) => {
-                        block.push(format!(
-                        "mstore(add(SELECTOR_ACC_MPTR, {:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {:#x})), mulmod(mload({eval_scratch_slot:#x}), q_sel_inv_scale, r), r))",
-                        idx * 0x20,
-                        idx * 0x20
-                    ));
-                    }
-                }
-                block
-            };
 
             for identity in inline_identities {
-                quotient_inline_computations.push(make_inline_block(identity));
-            }
-            for identity in &identities {
-                quotient_eval_numer_computations.push(make_block(identity));
+                quotient_inline_computations.push(Self::direct_quotient_block(
+                    &identity.lines,
+                    &identity.var,
+                    identity.target,
+                    &sorted_simple,
+                    eval_scratch_slot,
+                ));
             }
 
-            // Tail block: store each simple-selector accumulator at a
-            // dedicated scratch slot so the linearization-MSM emitter can
-            // pick them up. The base is placed after the decompressed proof
-            // commitments; later PCS scratch tables may reuse it after the
-            // linearization MSM has consumed these values.
-            if !sorted_simple.is_empty() {
-                let mut tail = Vec::new();
-                for i in 0..sorted_simple.len() {
-                    tail.push(format!(
-                        "mstore(add(SELECTOR_ACC_MPTR, {:#x}), {})",
-                        i * 0x20,
-                        sel_var(i)
-                    ));
+            if structured_tail_mode == QuotientStructuredTailMode::Trash {
+                let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
+                if let Some(block) =
+                    self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple)
+                {
+                    quotient_post_vm_computations.push(block);
                 }
-                quotient_eval_numer_computations.push(tail);
             }
         }
 
         let quotient_pow5_helper = quotient_eval_numer_computations
             .iter()
             .chain(quotient_inline_computations.iter())
+            .chain(quotient_post_vm_computations.iter())
             .flat_map(|block| block.iter())
             .any(|line| line.contains("q_pow5("));
         let quotient_limb7_helper = quotient_eval_numer_computations
             .iter()
             .chain(quotient_inline_computations.iter())
+            .chain(quotient_post_vm_computations.iter())
             .flat_map(|block| block.iter())
             .any(|line| line.contains("q_limb7("));
         let quotient_wide_limb7_helper = quotient_eval_numer_computations
             .iter()
             .chain(quotient_inline_computations.iter())
+            .chain(quotient_post_vm_computations.iter())
             .flat_map(|block| block.iter())
             .any(|line| line.contains("q_limb7_wide("));
 
@@ -3529,6 +3552,7 @@ impl<'a> SolidityGenerator<'a> {
             theta_mptr: data.theta_mptr,
             quotient_inline_computations,
             quotient_eval_numer_computations,
+            quotient_post_vm_computations,
             quotient_program,
             pcs_computations,
             simple_selector_cols: sorted_simple.clone(),

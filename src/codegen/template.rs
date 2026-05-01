@@ -167,6 +167,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) batch_invert_scratch_mptr: usize,
     pub(crate) quotient_inline_computations: Vec<Vec<String>>,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
+    pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
     /// Sorted simple-selector fixed-column indices. Each is rendered

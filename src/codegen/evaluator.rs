@@ -153,21 +153,8 @@ impl<'a> Evaluator<'a> {
     // Gate emitter: one constraint per gate-polynomial.
     // ----------------------------------------------------------------
 
-    pub fn gate_computations(&self) -> Vec<(Vec<String>, String)> {
-        self.cs
-            .gates()
-            .iter()
-            .flat_map(|gate| {
-                gate.polynomials()
-                    .iter()
-                    .map(|poly| self.evaluate_and_reset(poly))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Like [`gate_computations`], but additionally tags each gate
-    /// polynomial with its simple-selector fixed-column index (if any).
+    /// Emit each gate polynomial and tag it with its simple-selector
+    /// fixed-column index (if any).
     /// Mirrors `partially_evaluate_identities` in
     /// `midfall/proofs/src/plonk/mod.rs`: for each gate, the simple
     /// selector index is `gate.queried_selectors().filter(|s|
@@ -716,34 +703,7 @@ impl<'a> Evaluator<'a> {
     ) -> (Vec<String>, String) {
         let mut lines = Vec::new();
         let mut acc_var: Option<String> = None;
-        let mut idx = 0usize;
-        while idx < expressions.len() {
-            if let Some((count, base_ptr)) =
-                self.contiguous_expression_memory_run(&expressions[idx..])
-            {
-                let acc = self.fresh_var();
-                let prev = acc_var.unwrap_or_else(|| "0".to_string());
-                lines.push(format!("let {acc} := {prev}"));
-                let loop_var = self.fresh_var();
-                let off_var = self.fresh_var();
-                let value_var = self.fresh_var();
-                lines.push(format!(
-                    "for {{ let {loop_var} := 0 }} lt({loop_var}, {count}) {{ {loop_var} := add({loop_var}, 1) }} {{"
-                ));
-                lines.push(format!("let {off_var} := shl(5, {loop_var})"));
-                lines.push(format!(
-                    "let {value_var} := mload(add({base_ptr:#x}, {off_var}))"
-                ));
-                lines.push(format!(
-                    "{acc} := addmod(mulmod({acc}, {challenge_var}, r), {value_var}, r)"
-                ));
-                lines.push("}".to_string());
-                acc_var = Some(acc);
-                idx += count;
-                continue;
-            }
-
-            let expr = &expressions[idx];
+        for expr in expressions {
             let (mut e_lines, e_var) = self.evaluate(expr);
             lines.append(&mut e_lines);
             let next = self.fresh_var();
@@ -752,7 +712,6 @@ impl<'a> Evaluator<'a> {
                 "let {next} := addmod(mulmod({prev}, {challenge_var}, r), {e_var}, r)"
             ));
             acc_var = Some(next);
-            idx += 1;
         }
         let final_var = acc_var.unwrap_or_else(|| {
             let zero = self.fresh_var();
@@ -760,22 +719,6 @@ impl<'a> Evaluator<'a> {
             zero
         });
         (lines, final_var)
-    }
-
-    fn contiguous_expression_memory_run(
-        &self,
-        expressions: &[Expression<Fq>],
-    ) -> Option<(usize, usize)> {
-        let base_ptr = self.expression_memory_ptr(expressions.first()?)?;
-        let mut count = 1usize;
-        while let Some(expr) = expressions.get(count) {
-            if self.expression_memory_ptr(expr)? != base_ptr + count * 0x20 {
-                break;
-            }
-            count += 1;
-        }
-
-        (count >= 3).then_some((count, base_ptr))
     }
 
     fn expression_memory_ptr(&self, expression: &Expression<Fq>) -> Option<usize> {

@@ -1077,10 +1077,10 @@ contract Halo2Verifier {
                 {%- endif %}
 
                 let quotient_eval_numer := 0
-                {%- for col in simple_selector_cols %}
-                mstore(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }}), 0)
-                {%- endfor %}
                 {%- if simple_selector_cols.len() > 0 %}
+                for { let q_sel_zero_off := 0 } lt(q_sel_zero_off, {{ (simple_selector_cols.len() * 0x20)|hex() }}) { q_sel_zero_off := add(q_sel_zero_off, 0x20) } {
+                    mstore(add(SELECTOR_ACC_MPTR, q_sel_zero_off), 0)
+                }
                 let q_sel_scale := 1
                 let q_sel_inv_scale := 1
                 let q_y_inv := 0
@@ -1540,6 +1540,12 @@ contract Halo2Verifier {
                     }
                 }
                 {%- endif %}
+
+                {%- for code_block in quotient_post_vm_computations %}
+                {%- for line in code_block %}
+                {{ line }}
+                {%- endfor %}
+                {%- endfor %}
 
                 {%- if simple_selector_cols.len() > 0 %}
                 for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
