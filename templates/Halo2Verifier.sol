@@ -1122,30 +1122,20 @@ contract Halo2Verifier {
             {%- endif %}
 
             // ===============================================================
-            // Compute the linearization commitment as a single
-            // multi-pair G1MSM (optimisation #1, OPTIMISATION.md).
+            // Prepare linearization scalars for the final PCS MSM.
             //
-            // Native math (from `compute_linearization_commitment`):
-            //   LINEARIZATION_COM =
-            //       (1 - x^n) * Σ_i x_split^i * Q_i
-            //     + Σ_j sel_acc_j * S_j_com
-            // where x_split = x^(n-1) is the splitting factor and Q_i are
-            // the quotient limbs at QUOTIENT_LIMB_COMMS_MPTR_BASE.
+            // The linearized commitment is
+            //   (1 - x^n) * Σ_i x_split^i * Q_i
+            // + Σ_j sel_acc_j * S_j_com,
+            // where x_split = x^(n-1). Instead of materializing that point
+            // with a standalone G1MSM here, PCS block 5 expands the
+            // linearized commitment into its quotient-limb and selector
+            // pairs inside the already-fused final MSM.
             //
-            // The naive emitter does
-            //   k × ec_mul_acc + k × ec_add_acc  (Horner fold)
-            //   + 1 × ec_mul_acc                 ((1-x^n) scale)
-            //   + n_sel × (ec_mul_tmp + ec_add_acc)
-            // = (k + 1 + n_sel) single-pair G1MSMs.
-            //
-            // EIP-2537 G1MSM gas is concave in pair count, so we
-            // pre-compute the Fr scalars
-            //   [(1-x^n)·1, (1-x^n)·x_split, …, (1-x^n)·x_split^{k-1},
-            //    sel_acc_0, sel_acc_1, …, sel_acc_{n_sel-1}]
-            // stage all (point, scalar) pairs contiguously at
-            // 0x100, and dispatch one staticcall(0x0c). The pair
-            // layout (160 bytes per pair) is the EIP-2537 BLS12_G1MSM
-            // input format: 4 words point || 1 word scalar.
+            // QUOTIENT_MPTR is no longer a G1 point in this path. Its first
+            // two words carry:
+            //   word 0: x_split
+            //   word 1: one_minus_x_n
             // ===============================================================
             {
                 let x := mload(X_MPTR)
@@ -1163,57 +1153,12 @@ contract Halo2Verifier {
                 let x_split := x_pow_2i_minus1
                 let one_minus_x_n := addmod(1, sub(r, x_pow_2i), r)
 
-                // MSM input staging at 0x100 (free during this block —
-                // the per-pair ec_mul_acc / ec_add_acc temporaries that
-                // used 0x100..0x300 are gone). Each pair = 0xa0 bytes.
-                let p := 0x100
-                let cur_scalar := one_minus_x_n
-                let q := QUOTIENT_LIMB_COMMS_MPTR_BASE
-
-                // Quotient-limb pairs: (Q_i, (1-x^n) · x_split^i).
-                // Use Cancun MCOPY to copy each 4-word point in one
-                // op (~18 gas) instead of the 4-mstore chain which
-                // solc-via-ir compiles to ~60-100 gas.
-                for { let i := 0 } lt(i, {{ num_quotients }}) { i := add(i, 1) } {
-                    mcopy(p, q, 0x80)
-                    mstore(add(p, 0x80), cur_scalar)
-                    cur_scalar := mulmod(cur_scalar, x_split, r)
-                    p := add(p, 0xa0)
-                    q := add(q, 0x80)
-                }
-
-                {%- if simple_selector_cols.len() > 0 %}
-                // Simple-selector pairs: (S_j_com, sel_acc_j). Mirrors
-                // the `Some(col_idx)` branch of
-                // `compute_linearization_commitment`. MCOPY each 4-word
-                // point in one op.
-                {%- for col in simple_selector_cols %}
-                mcopy(p, {{ (fixed_comm_mptr + col * 0x80)|hex() }}, 0x80)
-                mstore(add(p, 0x80), mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }})))
-                p := add(p, 0xa0)
-                {%- endfor %}
-                {%- endif %}
-
-                // One multi-pair MSM. Result = LINEARIZATION_COM
-                // (4 words at 0x100).
-                success := and(
-                    success,
-                    staticcall(
-                        gas(),
-                        0x0c,
-                        0x100,
-                        {{ (0xa0 * (num_quotients + simple_selector_cols.len()))|hex() }},
-                        0x100,
-                        0x80
-                    )
-                )
-
-                // MCOPY the 4-word MSM result back to QUOTIENT_MPTR.
-                mcopy(QUOTIENT_MPTR, 0x100, 0x80)
+                mstore(QUOTIENT_MPTR, x_split)
+                mstore(add(QUOTIENT_MPTR, 0x20), one_minus_x_n)
             }
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(13) // after linearization-commitment MSM
+            gas_checkpoint(13) // after linearization scalar prep
             {%- endif %}
 
             // ===============================================================
@@ -1236,11 +1181,19 @@ contract Halo2Verifier {
             gas_checkpoint(14) // after PCS computation block (= sub-block 6)
             {%- endif %}
 
-            // Rebuild the public IVC accumulator from `instances` and
-            // verify its pairing equation separately. Midnight's native
-            // accumulator batching challenge is Poseidon-based; using a
-            // second pairing here is simpler and avoids changing the
-            // verifier's transcript surface.
+            // Rebuild the public IVC accumulator from `instances` and batch
+            // its pairing equation into the final KZG pairing.
+            //
+            // We do not simply multiply the two pairing equations together:
+            // two bad equations could cancel. Instead, after all four G1
+            // pairing inputs are fixed, derive a verifier-local randomizer
+            // alpha and check:
+            //
+            //   e(kzg_rhs + alpha * acc_rhs, G2_BASE)
+            // * e(kzg_lhs + alpha * acc_lhs, NEG_S_G2_BASE) == 1
+            //
+            // If either original equation is bad, this combined equation
+            // holds for at most one alpha in Fr.
             if mload(HAS_ACCUMULATOR_MPTR) {
                 let bits := mload(NUM_ACC_LIMB_BITS_MPTR)
                 let n := mload(NUM_ACC_LIMBS_MPTR)
@@ -1261,12 +1214,25 @@ contract Halo2Verifier {
                 success := and(success, lhs_ok)
                 let acc_scratch := {{ acc_msm_scratch|hex() }}
                 if iszero(lhs_is_id) {
-                    mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
-                    mstore(add(acc_scratch, 0x80), calldataload(lhs_scalar_ptr))
-                    success := and(
-                        success,
-                        staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
-                    )
+                    let lhs_scalar := calldataload(lhs_scalar_ptr)
+                    switch lhs_scalar
+                    case 0 {
+                        mstore(ACC_LHS_MPTR, 0)
+                        mstore(add(ACC_LHS_MPTR, 0x20), 0)
+                        mstore(add(ACC_LHS_MPTR, 0x40), 0)
+                        mstore(add(ACC_LHS_MPTR, 0x60), 0)
+                    }
+                    case 1 {
+                        // ACC_LHS_MPTR already holds 1 * point.
+                    }
+                    default {
+                        mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
+                        mstore(add(acc_scratch, 0x80), lhs_scalar)
+                        success := and(
+                            success,
+                            staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
+                        )
+                    }
                 }
 
                 // RHS layout: point limbs (x,y), scalar, then fixed-base
@@ -1277,10 +1243,29 @@ contract Halo2Verifier {
                 let rhs_ok, rhs_is_id := load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
                 success := and(success, rhs_ok)
                 let acc_pair_ptr := acc_scratch
+                let rhs_kept_direct := 0
                 if iszero(rhs_is_id) {
-                    mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
-                    mstore(add(acc_pair_ptr, 0x80), calldataload(rhs_scalar_ptr))
-                    acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                    let rhs_scalar := calldataload(rhs_scalar_ptr)
+                    switch rhs_scalar
+                    case 0 {
+                        // No variable-base RHS contribution.
+                    }
+                    case 1 {
+                        {%- if acc_fixed_bases.len() == 0 %}
+                        // With no fixed-base tail, ACC_RHS_MPTR already
+                        // holds the complete 1 * point result.
+                        rhs_kept_direct := 1
+                        {%- else %}
+                        mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
+                        mstore(add(acc_pair_ptr, 0x80), 1)
+                        acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                        {%- endif %}
+                    }
+                    default {
+                        mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
+                        mstore(add(acc_pair_ptr, 0x80), rhs_scalar)
+                        acc_pair_ptr := add(acc_pair_ptr, 0xa0)
+                    }
                 }
                 let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
                 {%- for (base_mptr, negate_scalar) in acc_fixed_bases %}
@@ -1309,18 +1294,43 @@ contract Halo2Verifier {
                         )
                     )
                 }
-                if iszero(acc_msm_len) {
+                if and(iszero(acc_msm_len), iszero(rhs_kept_direct)) {
                     mstore(ACC_RHS_MPTR, 0)
                     mstore(add(ACC_RHS_MPTR, 0x20), 0)
                     mstore(add(ACC_RHS_MPTR, 0x40), 0)
                     mstore(add(ACC_RHS_MPTR, 0x60), 0)
                 }
 
-                success := ec_pairing(success, ACC_RHS_MPTR, ACC_LHS_MPTR)
+                {
+                    let batch_ptr := 0x100
+
+                    // Domain || KZG rhs/lhs || accumulator rhs/lhs.
+                    mstore(batch_ptr, 0x70616972696e672d62617463682d6163632d6b7a670000000000000000)
+                    mcopy(add(batch_ptr, 0x20),  PAIRING_RHS_MPTR, 0x80)
+                    mcopy(add(batch_ptr, 0xa0),  PAIRING_LHS_MPTR, 0x80)
+                    mcopy(add(batch_ptr, 0x120), ACC_RHS_MPTR,     0x80)
+                    mcopy(add(batch_ptr, 0x1a0), ACC_LHS_MPTR,     0x80)
+                    let acc_pair_alpha := mod(keccak256(batch_ptr, 0x220), r)
+                    if iszero(acc_pair_alpha) { acc_pair_alpha := 1 }
+
+                    // PAIRING_RHS_MPTR += alpha * ACC_RHS_MPTR.
+                    mcopy(batch_ptr, ACC_RHS_MPTR, 0x80)
+                    mstore(add(batch_ptr, 0x80), acc_pair_alpha)
+                    success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    mcopy(add(batch_ptr, 0x80), PAIRING_RHS_MPTR, 0x80)
+                    success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_RHS_MPTR, 0x80))
+
+                    // PAIRING_LHS_MPTR += alpha * ACC_LHS_MPTR.
+                    mcopy(batch_ptr, ACC_LHS_MPTR, 0x80)
+                    mstore(add(batch_ptr, 0x80), acc_pair_alpha)
+                    success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    mcopy(add(batch_ptr, 0x80), PAIRING_LHS_MPTR, 0x80)
+                    success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_LHS_MPTR, 0x80))
+                }
             }
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(15) // after public accumulator pairing check (no-op when HAS_ACCUMULATOR_MPTR == 0)
+            gas_checkpoint(15) // after public accumulator pairing batch prep (no-op when HAS_ACCUMULATOR_MPTR == 0)
             {%- endif %}
 
             // The Yul `ec_pairing` helper checks

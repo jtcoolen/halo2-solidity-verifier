@@ -346,9 +346,9 @@ fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log],
             10 => "evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi",
             11 => "Lagrange + instance evaluation",
             12 => "batched identity numerator reconstruction",
-            13 => "linearization-commitment MSM",
+            13 => "linearization scalar prep",
             14 => "PCS block 6 (pairing inputs LHS/RHS)",
-            15 => "accumulator random-combine",
+            15 => "public accumulator pairing batch prep",
             16 => "final ec_pairing",
             // Poseidon-specific PCS sub-block layout (3 point sets):
             //   set 0: m=33 commits, 1 rotation

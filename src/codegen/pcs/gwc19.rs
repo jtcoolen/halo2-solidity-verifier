@@ -488,7 +488,13 @@ pub(super) fn computations(
             + meta.num_lookups
             + meta.num_trashcans
             + meta.num_quotients);
-    let pcs_scratch_mptr: usize = comms_top_words * 0x20;
+    // The PCS scratch starts immediately after decompressed commitments.
+    // That address also backs SELECTOR_ACC_MPTR in the Solidity template.
+    // After linearization expansion moved into Block 5, the final MSM still
+    // needs selector accumulators, while earlier PCS blocks use this scratch
+    // as transient tables. Keep the selector accumulator words live by
+    // starting PCS scratch just after them.
+    let pcs_scratch_mptr: usize = comms_top_words * 0x20 + meta.num_simple_selectors * 0x20;
 
     let mut blocks: Vec<Vec<String>> = Vec::new();
 
@@ -1029,16 +1035,28 @@ pub(super) fn computations(
     {
         let mut lines: Vec<String> = Vec::new();
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
-        let final_msm_terms = by_set
+        let linearization_comm = data.computed_quotient_comm;
+        let simple_selector_cols: Vec<usize> =
+            meta.simple_selector_cols.iter().copied().collect();
+        let final_msm_terms: usize = by_set
             .iter()
             .flat_map(|commitments| commitments.iter())
             .filter(|entry| entry.comm != g1_identity)
-            .count()
+            .map(|entry| {
+                if entry.comm == linearization_comm {
+                    meta.num_quotients + simple_selector_cols.len()
+                } else {
+                    1
+                }
+            })
+            .sum::<usize>()
             + 1; // f_com
         let final_msm_scratch = pcs_scratch_mptr;
 
         lines.push("// build final_com and v (KZG single-opening proof, fused MSM)".to_string());
         lines.push("let x4 := mload(X4_MPTR)".to_string());
+        lines.push("let lin_x_split := mload(QUOTIENT_MPTR)".to_string());
+        lines.push("let lin_one_minus_x_n := mload(add(QUOTIENT_MPTR, 0x20))".to_string());
         // Resolve the calldata pointer to the q_evals block once.
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
@@ -1095,14 +1113,57 @@ pub(super) fn computations(
                 if c.comm == g1_identity {
                     continue;
                 }
-                let pair_base = final_msm_scratch + pair_idx * 0xa0;
-                lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
-                lines.push(format!(
-                    "mstore({:#x}, {})",
-                    pair_base + 0x80,
-                    scalar_expr(set_idx, commitment_idx)
-                ));
-                pair_idx += 1;
+
+                let scalar = scalar_expr(set_idx, commitment_idx);
+                if c.comm == linearization_comm {
+                    let lin_query_var = format!("lin_query_scalar_{pair_idx}");
+                    let lin_cur_var = format!("lin_cur_scalar_{pair_idx}");
+                    lines.push(format!(
+                        "let {lin_query_var} := {scalar}"
+                    ));
+                    lines.push(format!(
+                        "let {lin_cur_var} := mulmod({lin_query_var}, lin_one_minus_x_n, r)"
+                    ));
+
+                    for q_idx in 0..meta.num_quotients {
+                        let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                        lines.push(format!(
+                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), 0x80)",
+                            q_idx * 0x80
+                        ));
+                        lines.push(format!(
+                            "mstore({:#x}, {lin_cur_var})",
+                            pair_base + 0x80,
+                        ));
+                        pair_idx += 1;
+                        if q_idx + 1 != meta.num_quotients {
+                            lines.push(format!(
+                                "{lin_cur_var} := mulmod({lin_cur_var}, lin_x_split, r)"
+                            ));
+                        }
+                    }
+
+                    for (sel_idx, col) in simple_selector_cols.iter().copied().enumerate() {
+                        let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                        let selector_scalar =
+                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * 0x20);
+                        lines.push(format!(
+                            "mcopy({pair_base:#x}, {}, 0x80)",
+                            data.fixed_comms[col].ptr()
+                        ));
+                        lines.push(format!(
+                            "mstore({:#x}, mulmod({lin_query_var}, {}, r))",
+                            pair_base + 0x80,
+                            selector_scalar
+                        ));
+                        pair_idx += 1;
+                    }
+                } else {
+                    let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                    lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
+                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + 0x80));
+                    pair_idx += 1;
+                }
             }
         }
 
