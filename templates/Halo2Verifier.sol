@@ -308,12 +308,13 @@ contract Halo2Verifier {
                 }
             }
 
-            // Inverse of a Fr scalar via modexp(x, r-2, r). Uses memory
-            // [0x6000..0x60e0] as temporary scratch; callers invoke this
-            // only after the regions it may overlap have already been
-            // consumed.
+            // Inverse of a Fr scalar via modexp(x, r-2, r). The verifier
+            // calls this only after transcript absorption is complete, so it
+            // reuses the dead transcript buffer just below VK_MPTR instead of
+            // a fixed post-VK address that can collide with live PCS scratch
+            // when the VK payload becomes smaller.
             function scalar_inv(x) -> inv {
-                let p := 0x6000
+                let p := sub(VK_MPTR, 0x100)
                 mstore(p,            0x20)        // base len
                 mstore(add(p, 0x20), 0x20)        // exp len
                 mstore(add(p, 0x40), 0x20)        // mod len

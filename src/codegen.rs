@@ -234,7 +234,7 @@ const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
 // After the direct prefix, the heaviest N remaining gate identities are emitted
 // as VM opcodes that call generated Yul blocks; everything else stays in the
 // compact interpreter. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
-const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 4;
+const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 5;
 const QUOTIENT_NATIVE_GATES_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES";
 const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 // The compact quotient VM path is the default size-oriented emitter: it stores
