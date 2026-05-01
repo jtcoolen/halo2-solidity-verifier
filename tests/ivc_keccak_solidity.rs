@@ -77,7 +77,7 @@ use sha2::Digest;
 
 use halo2_solidity_verifier::{
     compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding,
-    BatchOpenScheme::Gwc19, CallOutcome, Evm, SolidityGenerator,
+    BatchOpenScheme::Gwc19, CallOutcome, Evm, ProofEvaluationCounts, SolidityGenerator,
 };
 
 type S = BlstrsEmulation;
@@ -757,6 +757,43 @@ fn has_required_srs_assets() -> bool {
     ok
 }
 
+fn proof_evaluation_count_summary(counts: &ProofEvaluationCounts) -> String {
+    format!(
+        "proof eval scalars total: {} (main: {}, dummy PCS: {})\n\
+         instances: {} proof evals from committed instance queries, {} public-input evals computed locally ({} total identity inputs)\n\
+         advice evals: {}\n\
+         fixed evals: {} proof evals ({} simple-selector fixed columns omitted from proof)\n\
+         permutation evals: {} total ({} common/sigma, {} product/Z across {} sets)\n\
+         lookup evals: {} total ({} multiplicity, {} helper, {} accumulator z/z_next)\n\
+         trash evals: {}\n",
+        counts.proof_total(),
+        counts.proof_main_total(),
+        counts.dummy,
+        counts.committed_instance,
+        counts.computed_instance,
+        counts.instance_total_for_identities(),
+        counts.advice,
+        counts.fixed,
+        counts.simple_selector_fixed,
+        counts.permutation_total(),
+        counts.permutation_common,
+        counts.permutation_product,
+        counts.permutation_sets,
+        counts.lookup_total(),
+        counts.lookup_multiplicity,
+        counts.lookup_helper,
+        counts.lookup_accumulator,
+        counts.trash
+    )
+}
+
+fn print_proof_evaluation_counts(counts: &ProofEvaluationCounts) {
+    println!("\n=== IVC Keccak Solidity proof evaluation counts ===");
+    for line in proof_evaluation_count_summary(counts).lines() {
+        println!("[ivc-keccak-solidity][evals] {line}");
+    }
+}
+
 #[test]
 #[ignore = "slow IVC proving + solc + revm; ~10 min total. Run with --ignored --nocapture"]
 fn ivc_final_keccak_solidity_e2e() {
@@ -941,6 +978,8 @@ fn ivc_final_keccak_solidity_e2e() {
     let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), Gwc19, num_instances)
         .set_num_committed_instances(1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
+    let proof_evaluation_counts = generator.proof_evaluation_counts();
+    print_proof_evaluation_counts(&proof_evaluation_counts);
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
@@ -963,6 +1002,11 @@ fn ivc_final_keccak_solidity_e2e() {
     std::fs::write(format!("{dump_dir}/Halo2Verifier.sol"), &verifier_solidity).ok();
     std::fs::write(format!("{dump_dir}/Halo2VerifyingKey.sol"), &vk_solidity).ok();
     std::fs::write(format!("{dump_dir}/proof.bin"), &final_proof).ok();
+    std::fs::write(
+        format!("{dump_dir}/proof-evaluation-counts.txt"),
+        proof_evaluation_count_summary(&proof_evaluation_counts),
+    )
+    .ok();
     let pi_bytes: Vec<u8> = pi
         .iter()
         .flat_map(|f| <F as ff::PrimeField>::to_repr(f).as_ref().to_vec())

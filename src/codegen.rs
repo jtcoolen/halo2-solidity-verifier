@@ -81,6 +81,77 @@ impl AccumulatorEncoding {
     }
 }
 
+/// Field-evaluation counts for the proof layout consumed by the generated
+/// Solidity verifier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProofEvaluationCounts {
+    /// Committed instance-query evaluations read from the proof.
+    pub committed_instance: usize,
+    /// Non-committed instance-query evaluations reconstructed from calldata
+    /// public inputs, not read from the proof.
+    pub computed_instance: usize,
+    /// Advice-query evaluations read from the proof.
+    pub advice: usize,
+    /// Non-simple fixed-column evaluations read from the proof.
+    pub fixed: usize,
+    /// Simple selector fixed columns synthesized/handled via selector
+    /// commitments instead of proof eval scalars.
+    pub simple_selector_fixed: usize,
+    /// Permutation common/sigma evaluations read from the proof.
+    pub permutation_common: usize,
+    /// Permutation product evaluations (`z_cur`, `z_next`, and non-final
+    /// `z_last`) read from the proof.
+    pub permutation_product: usize,
+    /// Number of permutation product sets.
+    pub permutation_sets: usize,
+    /// Lookup multiplicity evaluations read from the proof.
+    pub lookup_multiplicity: usize,
+    /// Lookup helper evaluations read from the proof.
+    pub lookup_helper: usize,
+    /// Lookup accumulator evaluations (`z`, `z_next`) read from the proof.
+    pub lookup_accumulator: usize,
+    /// Trash argument evaluations read from the proof.
+    pub trash: usize,
+    /// Dummy eval scalars appended for the `fewer-point-sets` PCS layout.
+    pub dummy: usize,
+}
+
+impl ProofEvaluationCounts {
+    /// Main proof eval scalars, excluding dummy PCS evals.
+    pub fn proof_main_total(&self) -> usize {
+        self.committed_instance
+            + self.advice
+            + self.fixed
+            + self.permutation_common
+            + self.permutation_product
+            + self.lookup_multiplicity
+            + self.lookup_helper
+            + self.lookup_accumulator
+            + self.trash
+    }
+
+    /// All proof eval scalars consumed by the generated Solidity verifier.
+    pub fn proof_total(&self) -> usize {
+        self.proof_main_total() + self.dummy
+    }
+
+    /// Instance evals available to identity reconstruction, including those
+    /// computed locally from public inputs.
+    pub fn instance_total_for_identities(&self) -> usize {
+        self.committed_instance + self.computed_instance
+    }
+
+    /// Total permutation eval scalars read from the proof.
+    pub fn permutation_total(&self) -> usize {
+        self.permutation_common + self.permutation_product
+    }
+
+    /// Total lookup eval scalars read from the proof.
+    pub fn lookup_total(&self) -> usize {
+        self.lookup_multiplicity + self.lookup_helper + self.lookup_accumulator
+    }
+}
+
 // Compact quotient-identity bytecode interpreted by the generated Yul verifier.
 // The identities are still derived from the same evaluator output; this only
 // changes how the arithmetic is represented in deployed bytecode.
@@ -1473,6 +1544,51 @@ impl<'a> SolidityGenerator<'a> {
         self.num_committed_instances = n;
         self.meta = ConstraintSystemMeta::new(self.vk.cs(), n);
         self
+    }
+
+    /// Return the exact field-evaluation counts for the proof layout consumed
+    /// by the generated Solidity verifier.
+    pub fn proof_evaluation_counts(&self) -> ProofEvaluationCounts {
+        let proof_cptr = Ptr::calldata(0x64);
+        let vk = self.generate_vk();
+        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
+        let (meta, _) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+
+        let committed_instance = meta
+            .instance_queries
+            .iter()
+            .filter(|(col, _)| *col < meta.num_committed_instances)
+            .count();
+        let computed_instance = meta.instance_queries.len() - committed_instance;
+        let permutation_product = if meta.num_permutation_zs == 0 {
+            0
+        } else {
+            3 * meta.num_permutation_zs - 1
+        };
+        let lookup_helper = meta.lookup_chunks.iter().sum();
+
+        let counts = ProofEvaluationCounts {
+            committed_instance,
+            computed_instance,
+            advice: meta.advice_queries.len(),
+            fixed: meta.num_fixeds - meta.num_simple_selectors,
+            simple_selector_fixed: meta.num_simple_selectors,
+            permutation_common: meta.permutation_columns.len(),
+            permutation_product,
+            permutation_sets: meta.num_permutation_zs,
+            lookup_multiplicity: meta.num_lookups,
+            lookup_helper,
+            lookup_accumulator: 2 * meta.num_lookups,
+            trash: meta.num_trashcans,
+            dummy: meta.num_dummy_evals,
+        };
+
+        assert_eq!(
+            counts.proof_total(),
+            meta.num_evals,
+            "proof evaluation count accounting must match verifier proof layout"
+        );
+        counts
     }
 }
 
