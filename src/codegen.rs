@@ -230,7 +230,7 @@ const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 4;
 const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 
-// Spend a bounded slice of verifier bytecode headroom on native VM callbacks.
+// Spend a bounded slice of quotient-evaluator bytecode headroom on native VM callbacks.
 // After the direct prefix, the heaviest N remaining gate identities are emitted
 // as VM opcodes that call generated Yul blocks; everything else stays in the
 // compact interpreter. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.

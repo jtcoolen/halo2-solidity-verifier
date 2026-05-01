@@ -1298,7 +1298,7 @@ fn checkpoint_name(id: u8, pcs_set_count: Option<u8>) -> String {
             if let Some(n) = pcs_set_count {
                 let idx = id - 19;
                 if idx < n {
-                    return format!("PCS block 3 set {idx} (q_com/q_eval fold)");
+                    return format!("PCS block 3 set {idx} (q_eval fold)");
                 }
                 if idx == n {
                     return "PCS block 4 (f_eval Lagrange interpolation)".to_string();

@@ -36,7 +36,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::codegen::util::{ConstraintSystemMeta, Data, EcPoint, Word};
+use crate::codegen::util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word};
 
 // ---------------------------------------------------------------------------
 // Verifier query list.
@@ -456,12 +456,16 @@ pub(super) fn computations(
         return Vec::new();
     }
 
+    // Per-set commitment list. Reused by the q_eval fold block and the
+    // fused final commitment MSM.
+    let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
+    for c in &sets.commitments {
+        by_set[c.set_index].push(c);
+    }
+
     // The number of x1 powers is bounded by the largest commitments-per-set
     // count (one power per commitment within a set).
-    let nb_x1_powers: usize = (0..n_sets)
-        .map(|s| sets.commitments.iter().filter(|c| c.set_index == s).count())
-        .max()
-        .unwrap_or(0);
+    let nb_x1_powers: usize = by_set.iter().map(Vec::len).max().unwrap_or(0);
 
     // Distinct rotations encountered, sorted; emit code that stores
     // `x * omega^rot` at a known scratch slot per rotation.
@@ -472,6 +476,19 @@ pub(super) fn computations(
         .collect();
     distinct_rotations.sort_unstable();
     distinct_rotations.dedup();
+
+    // Scratch above every decompressed commitment slot. Block 3 uses it as
+    // a compact eval-address table; Block 5 reuses the same region as the
+    // fused final MSM input buffer.
+    let comms_top_words = data.comms_mptr_base.value().as_usize() / 0x20
+        + 4 * (meta.num_user_advices.iter().sum::<usize>()
+            + meta.num_lookups
+            + meta.num_permutation_zs
+            + meta.lookup_chunks.iter().sum::<usize>()
+            + meta.num_lookups
+            + meta.num_trashcans
+            + meta.num_quotients);
+    let pcs_scratch_mptr: usize = comms_top_words * 0x20;
 
     let mut blocks: Vec<Vec<String>> = Vec::new();
 
@@ -596,10 +613,9 @@ pub(super) fn computations(
     }
 
     // ------------------------------------------------------------------
-    // Block 3: per-set q_com / q_eval_set computation.
+    // Block 3: per-set q_eval_set computation.
     //
     // For each set s:
-    //   q_com[s]      = sum_{i, c in commitments of s} x1[i] * c.point
     //   q_eval_set[s] = sum_{i, c in commitments of s} x1[i] * c.eval[?]
     //
     // The commitment ordering inside a set follows the order in which
@@ -608,84 +624,32 @@ pub(super) fn computations(
     // for_each iteration order).
     //
     // Storage:
-    //   Q_COM_MPTR  + 0x80 * s : q_com[s] (4 words, EIP-2537 padded)
     //   Q_EVAL_SET_MPTR + 0x20 * s : q_eval_set[s] (1 Fq word)
     // ------------------------------------------------------------------
     {
-        // Per-set commitment list.
-        let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
-        for c in &sets.commitments {
-            by_set[c.set_index].push(c);
-        }
-
         // ------------------------------------------------------------------
-        // Memory layout for Block 3 (Phase 2 / Opt I+J — rolled q_eval/q_com).
+        // Memory layout for Block 3 (rolled q_eval).
         //
-        // For "wide" sets (m >= ROLL_THRESHOLD), the previously-unrolled
-        // `m * n_rot` straight-line addmod block + `m` mcopy/mstore staging
-        // pair block is collapsed into a single Yul `for` loop. The loop
-        // body indexes two pre-staged scratch tables that hold the source
-        // addresses (point base + per-rotation eval addr) of each commit.
+        // For "wide" sets (m >= ROLL_THRESHOLD), the `m * n_rot`
+        // straight-line addmod block is collapsed into a single Yul `for`
+        // loop. The loop body indexes a pre-staged scratch table holding
+        // per-rotation eval addresses for each commitment.
         //
         // Per-set scratch layout:
-        //   POINT_SRC_TABLE_MPTR     m * 0x20 bytes  (one address per commit)
         //   EVAL_SRC_TABLE_MPTR      m * n_rot * 0x20 bytes (eval addrs)
-        //   MSM_SCRATCH              m * 0xa0 bytes  (point+scalar pairs)
         //
-        // The tables are placed ABOVE the previous MSM_SCRATCH=0x6100, sized
-        // for the worst-case m across all sets so that the same constants
-        // can be reused per-set without collision. The +~3 KB memory
-        // expansion costs ~3 kg, dwarfed by the >100 kg saving on wide
-        // sets (cf. OPTIMISATION.md cp19/H2 −48 kg from rolling the
-        // 32-step x1-powers loop alone).
+        // The table is placed above every commitment slot. Block 5 reuses
+        // the same scratch region for the fused final MSM after the q_eval
+        // folds have been persisted to Q_EVAL_SET_MPTR.
         //
         // Sets with m < ROLL_THRESHOLD keep the unrolled emission (faster
         // for tiny m where loop overhead dominates).
         // ------------------------------------------------------------------
         const ROLL_THRESHOLD: usize = 4;
-        let max_m = by_set.iter().map(|c| c.len()).max().unwrap_or(0);
-        let max_n_rot = by_set
-            .iter()
-            .filter(|c| !c.is_empty())
-            .map(|c| c[0].evals.len())
-            .max()
-            .unwrap_or(0);
-        // Phase-2.1 staging tables must live ABOVE every commitment slot
-        // — `comms_mptr_base` starts the advice-comm region, then
-        // lookup_m, perm_z, lookup_helpers, lookup_z, trashcan,
-        // quotient-limb (all 4-word EIP-2537 padded points). The codegen
-        // uses the same arithmetic as the template's
-        // `QUOTIENT_LIMB_COMMS_MPTR_BASE` constant, plus 4 words for each
-        // quotient limb. Hardcoded `0x6100` (the previous Poseidon-only
-        // MSM_SCRATCH) silently overlapped ADVICE_COMMS_MPTR_BASE for the
-        // IVC fixture (110 instances, ~250 advice columns) and fed the
-        // staticcall garbage point coords, costing ~5B gas on the
-        // BLS12_G1MSM precompile path.
-        let comms_top_words = data.comms_mptr_base.value().as_usize() / 0x20
-            + 4 * (meta.num_user_advices.iter().sum::<usize>()
-                + meta.num_lookups
-                + meta.num_permutation_zs
-                + meta.lookup_chunks.iter().sum::<usize>()
-                + meta.num_lookups
-                + meta.num_trashcans
-                + meta.num_quotients);
-        // Round up to 0x20 alignment (it already is since words are 32-byte aligned).
-        let needs_rolled_path = max_m >= ROLL_THRESHOLD;
-        let point_src_table_mptr: usize = comms_top_words * 0x20;
-        let eval_src_table_mptr: usize = if needs_rolled_path {
-            point_src_table_mptr + max_m * 0x20
-        } else {
-            point_src_table_mptr
-        };
-        let msm_scratch: usize = if needs_rolled_path {
-            eval_src_table_mptr + max_m * max_n_rot * 0x20
-        } else {
-            point_src_table_mptr
-        };
+        let eval_src_table_mptr: usize = pcs_scratch_mptr;
 
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let mut lines: Vec<String> = Vec::new();
-            let q_com_base = format!("add(Q_COM_MPTR, {:#x})", set_idx * 0x80);
             let q_eval_base = format!("add(Q_EVAL_SET_MPTR, {:#x})", set_idx * 0x20);
             let m = commitments_in_set.len();
 
@@ -710,21 +674,10 @@ pub(super) fn computations(
             if m >= ROLL_THRESHOLD {
                 // -------- Rolled path (Opt I + Opt J merged) ----------
                 lines.push(format!(
-                    "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, rolled, m>={ROLL_THRESHOLD})"
+                    "// q_eval_set[{set_idx}]: {m} commitment(s) (rolled, m>={ROLL_THRESHOLD})"
                 ));
 
-                // 1. Pre-stage source-point addresses at POINT_SRC_TABLE_MPTR.
-                //    Each entry is the base address of c[i].comm (4-word point).
-                lines.push("// stage commit-point source addresses".to_string());
-                for (i, c) in commitments_in_set.iter().enumerate() {
-                    lines.push(format!(
-                        "mstore({:#x}, {})",
-                        point_src_table_mptr + i * 0x20,
-                        c.comm.ptr()
-                    ));
-                }
-
-                // 2. Pre-stage source-eval addresses at EVAL_SRC_TABLE_MPTR.
+                // 1. Pre-stage source-eval addresses at EVAL_SRC_TABLE_MPTR.
                 //    Layout: row-major i over commits, k over rotations.
                 //    Stride between commit rows = n_rot * 0x20.
                 lines.push("// stage per-(commit, rotation) eval source addresses".to_string());
@@ -749,46 +702,30 @@ pub(super) fn computations(
                     }
                 }
 
-                // 3. Seed q_eval_set_k stack locals from c[0].evals[k]
+                // 2. Seed q_eval_set_k stack locals from c[0].evals[k]
                 //    (x1^0 = 1, so no scaling needed).
                 for (k, ev) in first.evals.iter().enumerate() {
                     lines.push(format!("let q_eval_set_{k} := {ev}"));
                 }
 
-                // 4. Stage commit 0 at MSM_SCRATCH (point + scalar=1).
-                lines.push(format!(
-                    "mcopy({:#x}, {}, 0x80)",
-                    msm_scratch,
-                    first.comm.ptr()
-                ));
-                lines.push(format!("mstore({:#x}, 1)", msm_scratch + 0x80));
-
-                // 5. Single Yul `for` loop: stage commits 1..m-1 +
-                //    accumulate evals using a single x1 power load per
+                // 3. Single Yul `for` loop: accumulate evals using a single x1 power load per
                 //    iteration (vs n_rot loads in the unrolled form).
                 //
                 //    Loop variables:
                 //      pow_p : ptr into X1_POWERS_MPTR (i*0x20)
                 //      eval_p: ptr into EVAL_SRC_TABLE_MPTR (i*n_rot*0x20)
-                //      pt_p  : ptr into POINT_SRC_TABLE_MPTR (i*0x20)
-                //      dst   : ptr into MSM_SCRATCH (i*0xa0)
                 //
                 //    Per iter: 1 mload(pow), n_rot * (mload + mulmod +
-                //    addmod) for the evals, 1 mcopy + 1 mstore for the
-                //    staging, 4 ptr-bump adds. Compared to the unrolled
-                //    block this halves the total mload count and gives
-                //    solc-via-ir a single basic block to schedule.
+                //    addmod) for the evals, and 2 ptr-bump adds. Compared
+                //    to the unrolled block this halves the total mload
+                //    count and gives solc-via-ir a single basic block to
+                //    schedule.
                 let n_rot_stride = n_rot * 0x20;
                 lines.push(format!("let pow_p := add(X1_POWERS_MPTR, 0x20)"));
                 lines.push(format!(
                     "let eval_p := add({:#x}, {:#x})",
                     eval_src_table_mptr, n_rot_stride
                 ));
-                lines.push(format!(
-                    "let pt_p := add({:#x}, 0x20)",
-                    point_src_table_mptr
-                ));
-                lines.push(format!("let dst := add({:#x}, 0xa0)", msm_scratch));
                 lines.push(format!(
                     "for {{ let i := 1 }} lt(i, {:#x}) {{ i := add(i, 1) }} {{",
                     m
@@ -807,24 +744,11 @@ pub(super) fn computations(
                         ));
                     }
                 }
-                lines.push("    mcopy(dst, mload(pt_p), 0x80)".to_string());
-                lines.push("    mstore(add(dst, 0x80), pow)".to_string());
                 lines.push("    pow_p := add(pow_p, 0x20)".to_string());
                 lines.push(format!("    eval_p := add(eval_p, {:#x})", n_rot_stride));
-                lines.push("    pt_p := add(pt_p, 0x20)".to_string());
-                lines.push("    dst := add(dst, 0xa0)".to_string());
                 lines.push("}".to_string());
 
-                // 6. MSM call + writeback.
-                lines.push(format!(
-                    "success := and(success, staticcall(gas(), 0x0c, {:#x}, {:#x}, {:#x}, 0x80))",
-                    msm_scratch,
-                    m * 0xa0,
-                    msm_scratch
-                ));
-                lines.push(format!("mcopy({}, {:#x}, 0x80)", q_com_base, msm_scratch));
-
-                // 7. Persist q_eval_set[s][k].
+                // 4. Persist q_eval_set[s][k].
                 for k in 0..n_rot {
                     lines.push(format!(
                         "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
@@ -833,11 +757,9 @@ pub(super) fn computations(
                 }
             } else {
                 // -------- Unrolled path (preserved for m < ROLL_THRESHOLD) --
-                lines.push(format!(
-                    "// q_com[{set_idx}] / q_eval_set[{set_idx}]: {m} commitment(s) (batched MSM, optimisation #1)"
-                ));
+                lines.push(format!("// q_eval_set[{set_idx}]: {m} commitment(s)"));
 
-                // Phase 1: Fr-only eval accumulation in stack locals.
+                // Fr-only eval accumulation in stack locals.
                 for (k, ev) in first.evals.iter().enumerate() {
                     lines.push(format!("let q_eval_set_{k} := {ev}"));
                 }
@@ -848,33 +770,6 @@ pub(super) fn computations(
                             "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
                         ));
                     }
-                }
-
-                // Phase 2: G1 commitment fold via one m-pair MSM (or mcopy
-                // for m=1).
-                if m == 1 {
-                    lines.push(format!("mcopy({}, {}, 0x80)", q_com_base, first.comm.ptr()));
-                } else {
-                    for (i, c) in commitments_in_set.iter().enumerate() {
-                        let pair_base = msm_scratch + i * 0xa0;
-                        lines.push(format!("mcopy({:#x}, {}, 0x80)", pair_base, c.comm.ptr()));
-                        if i == 0 {
-                            lines.push(format!("mstore({:#x}, 1)", pair_base + 0x80));
-                        } else {
-                            lines.push(format!(
-                                "mstore({:#x}, mload(add(X1_POWERS_MPTR, {:#x})))",
-                                pair_base + 0x80,
-                                i * 0x20
-                            ));
-                        }
-                    }
-                    lines.push(format!(
-                        "success := and(success, staticcall(gas(), 0x0c, {:#x}, {:#x}, {:#x}, 0x80))",
-                        msm_scratch,
-                        m * 0xa0,
-                        msm_scratch
-                    ));
-                    lines.push(format!("mcopy({}, {:#x}, 0x80)", q_com_base, msm_scratch));
                 }
 
                 // Persist q_eval_set[s][k].
@@ -1116,107 +1011,114 @@ pub(super) fn computations(
     }
 
     // ------------------------------------------------------------------
-    // Block 5: final commitment via msm_inner_product with x4 powers,
-    // plus f_com at the highest power.
+    // Block 5: fused final commitment MSM with x4 powers.
     //
-    //   x4_powers = [1, x4, x4^2, ..., x4^n_sets]  (n_sets + 1 entries)
-    //   final_com = sum_s x4_powers[s] * q_com[s] + x4_powers[n_sets] * f_com
-    //   v         = sum_s x4_powers[s] * q_evals_at_x3[s] + x4_powers[n_sets] * f_eval
+    // Instead of materialising every q_com[s] and then combining those
+    // points with x4 powers, use linearity:
     //
-    // Accumulator at 0x00..0x80; operand at 0x80..0x100.
+    //   q_com[s]   = sum_i x1^i * C[s][i]
+    //   final_com  = sum_s x4^s * q_com[s] + x4^n_sets * f_com
+    //              = sum_{s,i} (x4^s * x1^i) * C[s][i]
+    //                + x4^n_sets * f_com
     //
-    // Note: tried batching this into one (n_sets+1)-pair MSM, but for
-    // n_sets <= 3 (typical) the 4-pair MSM (~33k) is more expensive
-    // than the equivalent 3 × G1MSM-1 + 3 × G1ADD chain (~37.5k base,
-    // but the existing structure folds q_com[0] in for free as the
-    // accumulator seed, leaving 2 × G1MSM-1 + 2 × G1ADD + 1 final
-    // (f_com) MSM-1 + 1 final ADD = ~25k); the staging mstore overhead
-    // (24 stores × 9 = ~216 gas) erases the small precompile saving.
-    // The win for batched MSM only kicks in once n_sets >= 5 or so.
+    // The q_eval_set scalar folds from Block 3 are still needed by Block 4,
+    // but q_com points are not needed anywhere else. This also lets us skip
+    // G1 identity commitments in the MSM input while preserving their eval
+    // contribution in q_eval_set.
     // ------------------------------------------------------------------
     {
         let mut lines: Vec<String> = Vec::new();
-        lines.push("// build final_com and v (KZG single-opening proof)".to_string());
+        let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
+        let final_msm_terms = by_set
+            .iter()
+            .flat_map(|commitments| commitments.iter())
+            .filter(|entry| entry.comm != g1_identity)
+            .count()
+            + 1; // f_com
+        let final_msm_scratch = pcs_scratch_mptr;
+
+        lines.push("// build final_com and v (KZG single-opening proof, fused MSM)".to_string());
         lines.push("let x4 := mload(X4_MPTR)".to_string());
         // Resolve the calldata pointer to the q_evals block once.
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
-        // Seed acc with q_com[0] (x4^0 = 1).
-        // 4-word point copy via Cancun MCOPY: ~15 gas vs ~60 for the
-        // mstore/mload chain. Same for every other 4-word copy below.
-        lines.push("mcopy(0x0, Q_COM_MPTR, 0x80)".to_string());
-        // v = q_evals[0] (calldata, midnight-proofs Fr::to_repr() is LE -> byte-reverse)
-        lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
         // truncated-challenges: midnight-proofs uses
         //   truncated_powers(x4)[i] = truncate(x4^i)
         // i.e. the internal accumulator stays full precision while
-        // each emitted power is truncated to 128 bits. We mirror that
-        // by maintaining `x4_pow_full` (the full-precision Fr running
-        // product, advanced by `mulmod(_, x4, r)`) separately from
-        // `x4_pow` (the truncated value used as the MSM scalar / Fr
-        // coefficient in `v`).
-        //
-        // When the feature is OFF the two collapse into one variable
-        // and the emitted code is byte-identical to the pre-Phase-3
-        // path.
+        // each emitted power is truncated to 128 bits.
         if truncated_challenges {
             lines.push("let x4_pow_full := 1".to_string());
-            lines.push("let x4_pow := 1".to_string());
-        } else {
-            lines.push("let x4_pow := 1".to_string());
         }
-
-        // Helper closure: emit the lines that advance `x4_pow` to the
-        // next power. Renders to one mulmod when the feature is off,
-        // or to one mulmod + one and(_, mask) when it is on.
-        let advance_x4_pow = |lines: &mut Vec<String>| {
+        lines.push("let x4_pow_0 := 1".to_string());
+        for s in 1..=n_sets {
             if truncated_challenges {
                 lines.push("x4_pow_full := mulmod(x4_pow_full, x4, r)".to_string());
-                lines.push(format!("x4_pow := and(x4_pow_full, {TRUNC_MASK_128})"));
+                lines.push(format!(
+                    "let x4_pow_{s} := and(x4_pow_full, {TRUNC_MASK_128})"
+                ));
             } else {
-                lines.push("x4_pow := mulmod(x4_pow, x4, r)".to_string());
+                lines.push(format!("let x4_pow_{s} := mulmod(x4_pow_{}, x4, r)", s - 1));
             }
-        };
+        }
 
+        // v = sum_s x4^s * q_evals[s] + x4^n_sets * f_eval.
+        lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
         for s in 1..n_sets {
-            advance_x4_pow(&mut lines);
-            // Load q_com[s] into operand slot.
             lines.push(format!(
-                "mcopy(0x80, add(Q_COM_MPTR, {:#x}), 0x80)",
-                s * 0x80
-            ));
-            // Scale operand by x4_pow.
-            lines.push("mstore(0x100, x4_pow)".to_string());
-            lines.push(
-                "success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))"
-                    .to_string(),
-            );
-            // Add into accumulator.
-            lines.push(
-                "success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))"
-                    .to_string(),
-            );
-            // v += x4_pow * q_evals[s]
-            lines.push(format!(
-                "v := addmod(v, mulmod(byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x}))), x4_pow, r), r)",
+                "v := addmod(v, mulmod(byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x}))), x4_pow_{s}, r), r)",
                 s * 0x20
             ));
         }
+        lines.push(format!(
+            "v := addmod(v, mulmod(mload(F_EVAL_MPTR), x4_pow_{n_sets}, r), r)"
+        ));
 
-        // Final f_com term: x4^n_sets.
-        advance_x4_pow(&mut lines);
-        lines.push("mcopy(0x80, F_COM_MPTR, 0x80)".to_string());
-        lines.push("mstore(0x100, x4_pow)".to_string());
-        lines.push(
-            "success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))".to_string(),
-        );
-        lines.push(
-            "success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))".to_string(),
-        );
-        lines.push("v := addmod(v, mulmod(mload(F_EVAL_MPTR), x4_pow, r), r)".to_string());
+        // final_com = sum_{s,i} (x4^s * x1^i) * C[s][i]
+        //             + x4^n_sets * f_com.
+        let mut pair_idx = 0usize;
+        let scalar_expr = |set_idx: usize, commitment_idx: usize| -> String {
+            let x1_pow = if commitment_idx == 0 {
+                "1".to_string()
+            } else {
+                format!("mload(add(X1_POWERS_MPTR, {:#x}))", commitment_idx * 0x20)
+            };
 
-        // Persist final_com to FINAL_COM_MPTR.
-        lines.push("mcopy(FINAL_COM_MPTR, 0x0, 0x80)".to_string());
+            match (set_idx, commitment_idx) {
+                (0, _) => x1_pow,
+                (_, 0) => format!("x4_pow_{set_idx}"),
+                _ => format!("mulmod({x1_pow}, x4_pow_{set_idx}, r)"),
+            }
+        };
+
+        for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
+            for (commitment_idx, c) in commitments_in_set.iter().enumerate() {
+                if c.comm == g1_identity {
+                    continue;
+                }
+                let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
+                lines.push(format!(
+                    "mstore({:#x}, {})",
+                    pair_base + 0x80,
+                    scalar_expr(set_idx, commitment_idx)
+                ));
+                pair_idx += 1;
+            }
+        }
+
+        let pair_base = final_msm_scratch + pair_idx * 0xa0;
+        lines.push(format!("mcopy({pair_base:#x}, F_COM_MPTR, 0x80)"));
+        lines.push(format!("mstore({:#x}, x4_pow_{n_sets})", pair_base + 0x80));
+        pair_idx += 1;
+        debug_assert_eq!(pair_idx, final_msm_terms);
+
+        lines.push(format!(
+            "success := and(success, staticcall(gas(), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80))",
+            final_msm_terms * 0xa0
+        ));
+        lines.push(format!(
+            "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, 0x80)"
+        ));
         lines.push("mstore(V_MPTR, v)".to_string());
 
         blocks.push(lines);

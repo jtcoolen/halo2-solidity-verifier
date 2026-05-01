@@ -44,30 +44,33 @@ contract Halo2QuotientEvaluator {
 
             {%- if self.quotient_pow5_helper %}
             function q_pow5(x) -> z {
-                let x2 := mulmod(x, x, FR_MODULUS)
-                z := mulmod(x, mulmod(x2, x2, FR_MODULUS), FR_MODULUS)
+                let q_r := FR_MODULUS
+                let x2 := mulmod(x, x, q_r)
+                z := mulmod(x, mulmod(x2, x2, q_r), q_r)
             }
             {%- endif %}
 
             {%- if self.quotient_limb7_helper %}
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
-                z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x400000000, x3, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x40000000000000000000000, x4, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x1000, x5, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x100000000000000000, x6, FR_MODULUS), FR_MODULUS)
+                let q_r := FR_MODULUS
+                z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
+                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, q_r), q_r)
+                z := addmod(z, mulmod(0x400000000, x3, q_r), q_r)
+                z := addmod(z, mulmod(0x40000000000000000000000, x4, q_r), q_r)
+                z := addmod(z, mulmod(0x1000, x5, q_r), q_r)
+                z := addmod(z, mulmod(0x100000000000000000, x6, q_r), q_r)
             }
             {%- endif %}
 
             {%- if self.quotient_wide_limb7_helper %}
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
-                z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x1000000000000000000000000000000000000000000, x3, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x100000000000000000000000000000000000000000000000000000000, x4, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x6bc66e553973f396854f5626172ba135587d41e37a68209402355093fdcaaf6c, x5, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x63f31e3f446953960c9d6964474300df43ab29179970f642a28e39d6c883c74b, x6, FR_MODULUS), FR_MODULUS)
+                let q_r := FR_MODULUS
+                z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
+                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, q_r), q_r)
+                z := addmod(z, mulmod(0x1000000000000000000000000000000000000000000, x3, q_r), q_r)
+                z := addmod(z, mulmod(0x100000000000000000000000000000000000000000000000000000000, x4, q_r), q_r)
+                z := addmod(z, mulmod(0x6bc66e553973f396854f5626172ba135587d41e37a68209402355093fdcaaf6c, x5, q_r), q_r)
+                z := addmod(z, mulmod(0x63f31e3f446953960c9d6964474300df43ab29179970f642a28e39d6c883c74b, x6, q_r), q_r)
             }
             {%- endif %}
 
