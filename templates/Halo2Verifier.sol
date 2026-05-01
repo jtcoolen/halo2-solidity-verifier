@@ -302,6 +302,7 @@ contract Halo2Verifier {
             // a fixed post-VK address that can collide with live PCS scratch
             // when the VK payload becomes smaller.
             function scalar_inv(x) -> inv {
+                if iszero(x) { revert(0, 0) }
                 let p := sub(VK_MPTR, 0x100)
                 mstore(p,            0x20)        // base len
                 mstore(add(p, 0x20), 0x20)        // exp len
@@ -470,6 +471,10 @@ contract Halo2Verifier {
                     gp_mptr := add(gp_mptr, 0x20)
                 }
                 gp := mulmod(gp, mload(mptr), r)
+                if iszero(gp) {
+                    ret := 0
+                    leave
+                }
 
                 mstore(gp_mptr, 0x20)
                 mstore(add(gp_mptr, 0x20), 0x20)

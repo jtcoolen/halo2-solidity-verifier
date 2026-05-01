@@ -37,6 +37,7 @@
                     // Keep this inversion away from scalar_inv's fixed 0x6000
                     // scratch: large separated VKs occupy that range.
                     let q_inv_scratch := {{ program.stack_mptr|hex() }}
+                    if iszero(y) { revert(0, 0) }
                     mstore(q_inv_scratch,            0x20)
                     mstore(add(q_inv_scratch, 0x20), 0x20)
                     mstore(add(q_inv_scratch, 0x40), 0x20)
@@ -610,4 +611,3 @@
                 mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 {%- endmatch %}
             }
-

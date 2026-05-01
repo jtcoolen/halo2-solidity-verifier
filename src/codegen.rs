@@ -3348,6 +3348,7 @@ impl<'a> SolidityGenerator<'a> {
             init.push("let q_y_inv := 0".to_string());
             init.push("{".to_string());
             init.push(format!("let q_inv_scratch := {eval_scratch_slot:#x}"));
+            init.push("if iszero(y) { revert(0, 0) }".to_string());
             init.push("mstore(q_inv_scratch, 0x20)".to_string());
             init.push("mstore(add(q_inv_scratch, 0x20), 0x20)".to_string());
             init.push("mstore(add(q_inv_scratch, 0x40), 0x20)".to_string());
