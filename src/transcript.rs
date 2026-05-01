@@ -138,19 +138,20 @@ impl<R: Read> Keccak256Transcript<R> {
         Ok(scalar)
     }
 
-    /// Read a 48-byte compressed G1 point from the stream, absorb the
-    /// raw compressed bytes, and decompress to
-    /// `G1Projective`.
+    /// Read a 48-byte compressed G1 point from the stream, decompress it,
+    /// and absorb its canonical EIP-2537 padded uncompressed transcript
+    /// representation.
     pub fn read_g1(&mut self) -> io::Result<G1Projective> {
         let mut bytes = <G1Projective as GroupEncoding>::Repr::default();
         self.stream.read_exact(bytes.as_mut())?;
-        self.absorb_bytes(bytes.as_ref());
-        Option::from(G1Projective::from_bytes(&bytes)).ok_or_else(|| {
+        let point = Option::from(G1Projective::from_bytes(&bytes)).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid compressed BLS12-381 G1 point",
             )
-        })
+        })?;
+        self.common_g1(&point)?;
+        Ok(point)
     }
 }
 
@@ -169,8 +170,8 @@ impl<W: Write> Keccak256Transcript<W> {
         self.stream.write_all(scalar.to_repr().as_ref())
     }
 
-    /// Append a G1 point (compressed) to the proof stream and absorb
-    /// the compressed bytes into the transcript.
+    /// Append a G1 point in compressed proof encoding and absorb its
+    /// canonical EIP-2537 padded uncompressed transcript representation.
     pub fn write_g1(&mut self, point: &G1Projective) -> io::Result<()> {
         self.common_g1(point)?;
         let repr = <G1Projective as GroupEncoding>::to_bytes(point);
@@ -241,5 +242,27 @@ mod tests {
         };
 
         assert_eq!(our_c, theirs);
+    }
+
+    #[test]
+    fn read_g1_matches_write_g1_transcript_state() {
+        use group::Group;
+
+        for point in [
+            G1Projective::identity(),
+            G1Projective::generator() * Fq::from(7u64),
+        ] {
+            let mut writer = Keccak256Transcript::new(Cursor::new(Vec::<u8>::new()));
+            writer.write_g1(&point).unwrap();
+            let expected_challenge = writer.squeeze_challenge();
+            let proof_bytes = writer.finalize().into_inner();
+
+            let mut reader = Keccak256Transcript::new(Cursor::new(proof_bytes));
+            let decoded = reader.read_g1().unwrap();
+            let actual_challenge = reader.squeeze_challenge();
+
+            assert_eq!(decoded, point);
+            assert_eq!(actual_challenge, expected_challenge);
+        }
     }
 }
