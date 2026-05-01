@@ -411,31 +411,34 @@ contract Halo2Verifier {
             // the fly; switching to the uncompressed form drops that
             // ladder entirely.
             //
-            // Malleability: an attacker could submit non-zero bytes
-            // in the top 16 bytes of each `_hi` calldata word (the
-            // EIP-2537 precompile would reject those later, but only
-            // after they had been hashed). We mask those padding
-            // bytes to zero before the keccak absorb so the
-            // transcript only ever commits to the canonical form.
+            // Canonicality: reject non-zero bytes in the top 16 bytes
+            // of each `_hi` calldata word and reject coordinates
+            // outside Fp. Normalizing those bytes before hashing would
+            // make multiple calldata encodings share one transcript.
             //
             // The point's uncompressed form remains in calldata; the
             // call site is responsible for `calldatacopy`-ing it into
             // memory afterwards if it needs the on-curve coordinates.
             function common_uncompressed_g1(buf_len, cptr) -> ret {
+                let x_hi_word := calldataload(cptr)
+                let x_lo := calldataload(add(cptr, 0x20))
+                let y_hi_word := calldataload(add(cptr, 0x40))
+                let y_lo := calldataload(add(cptr, 0x60))
+                if shr(128, x_hi_word) { revert(0, 0) }
+                if shr(128, y_hi_word) { revert(0, 0) }
+
+                let x_hi := and(x_hi_word, 0xffffffffffffffffffffffffffffffff)
+                let y_hi := and(y_hi_word, 0xffffffffffffffffffffffffffffffff)
+                if iszero(or(lt(x_hi, BLS_P_HI), and(eq(x_hi, BLS_P_HI), iszero(gt(x_lo, BLS_P_MINUS_ONE_LO))))) {
+                    revert(0, 0)
+                }
+                if iszero(or(lt(y_hi, BLS_P_HI), and(eq(y_hi, BLS_P_HI), iszero(gt(y_lo, BLS_P_MINUS_ONE_LO))))) {
+                    revert(0, 0)
+                }
+
                 // Memcpy the 4 calldata words (128 bytes) verbatim
                 // into the keccak buffer.
                 calldatacopy(buf_len, cptr, 0x80)
-                // Mask the top 16 bytes of x_hi and y_hi to zero so
-                // that an attacker cannot grind the transcript by
-                // submitting non-canonical padding bytes. EIP-2537
-                // requires the top 16 bytes of each `_hi` word to be
-                // zero; we enforce it here at the hash boundary
-                // rather than at the precompile boundary so that the
-                // hash commits to canonical bytes only.
-                let x_hi_off := buf_len
-                let y_hi_off := add(buf_len, 0x40)
-                mstore(x_hi_off, and(mload(x_hi_off), 0xffffffffffffffffffffffffffffffff))
-                mstore(y_hi_off, and(mload(y_hi_off), 0xffffffffffffffffffffffffffffffff))
                 ret := add(buf_len, 0x80)
             }
 
