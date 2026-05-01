@@ -230,6 +230,49 @@ A forced no-inline variant using one-trip loops in each helper reduced generated
 source size further, but made `solc --via-ir` compile for roughly 25 minutes
 without finishing on this verifier. That shape is not practical.
 
+### Hardcoded Structured-Loop Experiment
+
+A verifier-specific structured-loop mode was added behind:
+
+```sh
+HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1
+```
+
+This is not a generic verifier path. It still emits a verifier tied to the
+current VK, but it uses the VK metadata to hardcode the permutation quotient
+family as loops over known memory tables:
+
+- permutation column evaluations,
+- permutation sigma evaluations,
+- `z_cur`, `z_next`, and non-final `z_last` evaluations,
+- fixed `num_sets`, `num_cols`, and `chunk_len`.
+
+The remaining gate, lookup, and trash identities stay as direct generated Yul.
+Simple-selector quotient targets use the same scaled memory accumulator scheme
+as the quotient VM path: `q_sel_scale`, `q_sel_inv_scale`, and one final scaling
+pass over `SELECTOR_ACC_MPTR`.
+
+Command used:
+
+```sh
+HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1 \
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+scripts/run_ivc_bench.sh --skip-srs-download
+```
+
+Result:
+
+| Mode | Verifier source | Verifier runtime | VK runtime | Total runtime | Quotient checkpoint | Total tx gas |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hardcoded structured loops | 383,306 bytes | 51,955 bytes | 6,752 bytes | 58,707 bytes | 117,694 gas | 1,566,405 gas |
+
+The experiment verifies end to end, but it is only a small bytecode win because
+the permutation quotient family is not the dominant source of deployed bytecode
+for this VK. The more important takeaway is architectural: hardcoded loops are
+viable for regular quotient families, but we need to loop or table-drive the
+large gate and lookup identities before this can materially reduce the verifier
+below the current straight-line size.
+
 ### Packed 32-bit Instruction Encoding Benchmark
 
 An experimental packed-32 mode was added behind:

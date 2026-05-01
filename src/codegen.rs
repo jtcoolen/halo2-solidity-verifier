@@ -10,7 +10,7 @@ use crate::codegen::{
 // form as halo2 v0.4 (bare G1/G2 fields), but the public accessors only
 // expose `g_lagrange()`, `g2()`, `s_g2()`. The G1 generator is read from
 // `G1Affine::generator()` directly.
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
 use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, G2Affine};
@@ -118,6 +118,7 @@ const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 const QUOTIENT_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_CSE";
 const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
 const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
+const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuotientProgramEncoding {
@@ -1131,6 +1132,18 @@ fn quotient_yul_helpers_enabled() -> bool {
     }
 }
 
+fn quotient_structured_loops_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_LOOPS_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "loops" => true,
+        other => panic!("unsupported {QUOTIENT_STRUCTURED_LOOPS_ENV}={other}; use 0/1"),
+    }
+}
+
 fn count_quotient_exprs(
     expr: &QuotientExpr,
     counts: &mut HashMap<String, usize>,
@@ -1706,7 +1719,7 @@ impl<'a> SolidityGenerator<'a> {
     fn generate_vk(&self) -> Halo2VerifyingKey {
         let proof_cptr = Ptr::calldata(0x64);
         let mut vk = self.generate_base_vk();
-        if quotient_inline_cse_enabled() {
+        if quotient_inline_cse_enabled() || quotient_structured_loops_enabled() {
             return vk;
         }
 
@@ -1930,6 +1943,317 @@ impl<'a> SolidityGenerator<'a> {
         computations
     }
 
+    fn direct_quotient_block(
+        lines: &[String],
+        var: &str,
+        target: QuotientTarget,
+        sorted_simple: &[usize],
+        eval_scratch_slot: usize,
+    ) -> Vec<String> {
+        let mut block = Vec::with_capacity(lines.len() + 6);
+        block.push("{".to_string());
+        for line in lines {
+            block.push(line.clone());
+        }
+        block.push(format!("mstore({eval_scratch_slot:#x}, {var})"));
+        block.push("}".to_string());
+        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+        if !sorted_simple.is_empty() {
+            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+        }
+        match target {
+            QuotientTarget::Main => {
+                block.push(format!(
+                    "quotient_eval_numer := addmod(quotient_eval_numer, mload({eval_scratch_slot:#x}), r)"
+                ));
+            }
+            QuotientTarget::Selector(idx) => {
+                let offset = idx * 0x20;
+                block.push(format!(
+                    "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(mload({eval_scratch_slot:#x}), q_sel_inv_scale, r), r))"
+                ));
+            }
+        }
+        block
+    }
+
+    fn structured_permutation_scratch_words(meta: &ConstraintSystemMeta) -> usize {
+        if meta.num_permutation_zs == 0 {
+            return 0;
+        }
+
+        let num_cols = meta.permutation_columns.len();
+        let num_sets = meta.num_permutation_zs;
+        // permutation values, permutation sigma values, z_cur, z_next,
+        // z_last for every non-final set.
+        (2 * num_cols) + (2 * num_sets) + num_sets.saturating_sub(1)
+    }
+
+    fn structured_permutation_loop_block(
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        evaluator: &Evaluator<'_>,
+        sorted_simple: &[usize],
+        scratch_mptr: usize,
+    ) -> Option<Vec<String>> {
+        if meta.num_permutation_zs == 0 {
+            return None;
+        }
+
+        let num_cols = meta.permutation_columns.len();
+        let num_sets = meta.num_permutation_zs;
+        let chunk_len = meta.permutation_chunk_len;
+        let vals_mptr = scratch_mptr;
+        let sigmas_mptr = vals_mptr + num_cols * 0x20;
+        let z_cur_mptr = sigmas_mptr + num_cols * 0x20;
+        let z_next_mptr = z_cur_mptr + num_sets * 0x20;
+        let z_last_mptr = z_next_mptr + num_sets * 0x20;
+        let delta_chunk = Fq::DELTA.pow_vartime([chunk_len as u64]);
+        let delta_chunk = u256_string(fe_to_u256::<Fq>(&delta_chunk));
+
+        let mut block = Vec::new();
+        block.push("{".to_string());
+        block.push(format!("let q_perm_vals := {vals_mptr:#x}"));
+        block.push(format!("let q_perm_sigmas := {sigmas_mptr:#x}"));
+        block.push(format!("let q_perm_z_cur := {z_cur_mptr:#x}"));
+        block.push(format!("let q_perm_z_next := {z_next_mptr:#x}"));
+        block.push(format!("let q_perm_z_last := {z_last_mptr:#x}"));
+        block.push(format!("let q_perm_num_cols := {num_cols}"));
+        block.push(format!("let q_perm_num_sets := {num_sets}"));
+        block.push(format!("let q_perm_chunk_len := {chunk_len}"));
+        block.push(format!("let q_perm_delta_chunk := {delta_chunk}"));
+
+        for (idx, column) in meta.permutation_columns.iter().enumerate() {
+            let offset = idx * 0x20;
+            let value = evaluator.eval_at(column, 0);
+            let sigma = data
+                .permutation_evals
+                .get(column)
+                .expect("permutation sigma eval present")
+                .to_string();
+            block.push(format!("mstore(add(q_perm_vals, {offset:#x}), {value})"));
+            block.push(format!("mstore(add(q_perm_sigmas, {offset:#x}), {sigma})"));
+        }
+
+        for (idx, (z_cur, z_next, z_last)) in data.permutation_z_evals.iter().enumerate() {
+            let offset = idx * 0x20;
+            block.push(format!("mstore(add(q_perm_z_cur, {offset:#x}), {})", z_cur));
+            block.push(format!(
+                "mstore(add(q_perm_z_next, {offset:#x}), {})",
+                z_next
+            ));
+            if let Some(z_last) = z_last {
+                block.push(format!(
+                    "mstore(add(q_perm_z_last, {offset:#x}), {})",
+                    z_last
+                ));
+            }
+        }
+
+        let fold_eval = |block: &mut Vec<String>| {
+            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+            if !sorted_simple.is_empty() {
+                block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+                block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+            }
+            block.push(
+                "quotient_eval_numer := addmod(quotient_eval_numer, q_perm_eval, r)".to_string(),
+            );
+        };
+
+        block.push("let q_perm_l0 := mload(L_0_MPTR)".to_string());
+        block.push("let q_perm_llast := mload(L_LAST_MPTR)".to_string());
+        block.push("let q_perm_lblind := mload(L_BLIND_MPTR)".to_string());
+        block.push("let q_perm_beta := mload(BETA_MPTR)".to_string());
+        block.push("let q_perm_gamma := mload(GAMMA_MPTR)".to_string());
+        block.push(
+            "let q_perm_active := addmod(1, sub(r, addmod(q_perm_llast, q_perm_lblind, r)), r)"
+                .to_string(),
+        );
+        block.push("let q_perm_xbeta := mulmod(q_perm_beta, mload(X_MPTR), r)".to_string());
+        block.push("let q_perm_eval := 0".to_string());
+
+        block.push(
+            "q_perm_eval := mulmod(q_perm_l0, addmod(1, sub(r, mload(q_perm_z_cur)), r), r)"
+                .to_string(),
+        );
+        fold_eval(&mut block);
+
+        let final_z_offset = (num_sets - 1) * 0x20;
+        block.push(format!(
+            "let q_perm_zn := mload(add(q_perm_z_cur, {final_z_offset:#x}))"
+        ));
+        block.push(
+            "q_perm_eval := mulmod(q_perm_llast, addmod(mulmod(q_perm_zn, q_perm_zn, r), sub(r, q_perm_zn), r), r)"
+                .to_string(),
+        );
+        fold_eval(&mut block);
+
+        if num_sets > 1 {
+            block.push(format!(
+                "for {{ let q_perm_i := 1 }} lt(q_perm_i, {num_sets}) {{ q_perm_i := add(q_perm_i, 1) }} {{"
+            ));
+            block.push("let q_perm_cur := mload(add(q_perm_z_cur, shl(5, q_perm_i)))".to_string());
+            block.push(
+                "let q_perm_prev := mload(add(q_perm_z_last, shl(5, sub(q_perm_i, 1))))"
+                    .to_string(),
+            );
+            block.push(
+                "q_perm_eval := mulmod(q_perm_l0, addmod(q_perm_cur, sub(r, q_perm_prev), r), r)"
+                    .to_string(),
+            );
+            fold_eval(&mut block);
+            block.push("}".to_string());
+        }
+
+        block.push("let q_perm_delta_base := q_perm_xbeta".to_string());
+        block.push(format!(
+            "for {{ let q_perm_set := 0 }} lt(q_perm_set, {num_sets}) {{ q_perm_set := add(q_perm_set, 1) }} {{"
+        ));
+        block.push("let q_perm_start := mul(q_perm_set, q_perm_chunk_len)".to_string());
+        block.push("let q_perm_end := add(q_perm_start, q_perm_chunk_len)".to_string());
+        block.push(
+            "if gt(q_perm_end, q_perm_num_cols) { q_perm_end := q_perm_num_cols }".to_string(),
+        );
+        block.push("let q_perm_left := mload(add(q_perm_z_next, shl(5, q_perm_set)))".to_string());
+        block.push("let q_perm_right := mload(add(q_perm_z_cur, shl(5, q_perm_set)))".to_string());
+        block.push("let q_perm_delta_pow := q_perm_delta_base".to_string());
+        block.push("for { let q_perm_j := q_perm_start } lt(q_perm_j, q_perm_end) { q_perm_j := add(q_perm_j, 1) } {".to_string());
+        block.push("let q_perm_off := shl(5, q_perm_j)".to_string());
+        block.push("let q_perm_v := mload(add(q_perm_vals, q_perm_off))".to_string());
+        block.push("let q_perm_s := mload(add(q_perm_sigmas, q_perm_off))".to_string());
+        block.push(
+            "q_perm_left := mulmod(q_perm_left, addmod(addmod(q_perm_v, mulmod(q_perm_beta, q_perm_s, r), r), q_perm_gamma, r), r)"
+                .to_string(),
+        );
+        block.push(
+            "q_perm_right := mulmod(q_perm_right, addmod(addmod(q_perm_v, q_perm_delta_pow, r), q_perm_gamma, r), r)"
+                .to_string(),
+        );
+        block.push("q_perm_delta_pow := mulmod(q_perm_delta_pow, delta, r)".to_string());
+        block.push("}".to_string());
+        block.push(
+            "q_perm_eval := mulmod(q_perm_active, addmod(q_perm_left, sub(r, q_perm_right), r), r)"
+                .to_string(),
+        );
+        fold_eval(&mut block);
+        block.push(
+            "q_perm_delta_base := mulmod(q_perm_delta_base, q_perm_delta_chunk, r)".to_string(),
+        );
+        block.push("}".to_string());
+
+        block.push("}".to_string());
+        Some(block)
+    }
+
+    fn structured_loop_quotient_computations(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        sorted_simple: &[usize],
+        scratch_mptr: usize,
+    ) -> Vec<Vec<String>> {
+        let evaluator = Evaluator::new(self.vk.cs(), meta, data);
+        let eval_scratch_slot =
+            scratch_mptr + Self::structured_permutation_scratch_words(meta) * 0x20;
+        let gate_items = evaluator.gate_computations_tagged();
+        let lookup_items = evaluator.lookup_computations();
+        let trash_items = evaluator.trashcan_computations();
+
+        let mut init = vec!["let quotient_eval_numer := 0".to_string()];
+        for idx in 0..sorted_simple.len() {
+            init.push(format!(
+                "mstore(add(SELECTOR_ACC_MPTR, {:#x}), 0)",
+                idx * 0x20
+            ));
+        }
+        if !sorted_simple.is_empty() {
+            init.push("let q_sel_scale := 1".to_string());
+            init.push("let q_sel_inv_scale := 1".to_string());
+            init.push("let q_y_inv := 0".to_string());
+            init.push("{".to_string());
+            init.push(format!("let q_inv_scratch := {eval_scratch_slot:#x}"));
+            init.push("mstore(q_inv_scratch, 0x20)".to_string());
+            init.push("mstore(add(q_inv_scratch, 0x20), 0x20)".to_string());
+            init.push("mstore(add(q_inv_scratch, 0x40), 0x20)".to_string());
+            init.push("mstore(add(q_inv_scratch, 0x60), y)".to_string());
+            init.push("mstore(add(q_inv_scratch, 0x80), sub(FR_MODULUS, 2))".to_string());
+            init.push("mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)".to_string());
+            init.push(
+                "if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }"
+                    .to_string(),
+            );
+            init.push("q_y_inv := mload(q_inv_scratch)".to_string());
+            init.push("}".to_string());
+        }
+        let mut computations = vec![init];
+
+        for (lines, var, target) in gate_items {
+            let target = match target {
+                Some(col) => {
+                    let idx = sorted_simple
+                        .iter()
+                        .position(|simple| *simple == col)
+                        .expect("selector column present");
+                    QuotientTarget::Selector(idx)
+                }
+                None => QuotientTarget::Main,
+            };
+            computations.push(Self::direct_quotient_block(
+                &lines,
+                &var,
+                target,
+                sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+
+        if let Some(block) = Self::structured_permutation_loop_block(
+            meta,
+            data,
+            &evaluator,
+            sorted_simple,
+            scratch_mptr,
+        ) {
+            computations.push(block);
+        }
+
+        for (lines, var) in lookup_items {
+            computations.push(Self::direct_quotient_block(
+                &lines,
+                &var,
+                QuotientTarget::Main,
+                sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+
+        for (lines, var) in trash_items {
+            computations.push(Self::direct_quotient_block(
+                &lines,
+                &var,
+                QuotientTarget::Main,
+                sorted_simple,
+                eval_scratch_slot,
+            ));
+        }
+
+        if !sorted_simple.is_empty() {
+            let mut tail = Vec::new();
+            for i in 0..sorted_simple.len() {
+                tail.push(format!(
+                    "mstore(add(SELECTOR_ACC_MPTR, {:#x}), mulmod(mload(add(SELECTOR_ACC_MPTR, {:#x})), q_sel_scale, r))",
+                    i * 0x20,
+                    i * 0x20
+                ));
+            }
+            computations.push(tail);
+        }
+
+        computations
+    }
+
     fn generate_verifier(
         &self,
         separate: bool,
@@ -1945,16 +2269,21 @@ impl<'a> SolidityGenerator<'a> {
 
         let (identities, sorted_simple) = self.quotient_identities(&meta, &data);
         let use_inline_cse = quotient_inline_cse_enabled();
+        let use_structured_loops = quotient_structured_loops_enabled();
+        assert!(
+            !(use_inline_cse && use_structured_loops),
+            "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
+        );
         let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
-        let inline_count = if use_inline_cse {
+        let inline_count = if use_inline_cse || use_structured_loops {
             0
         } else {
             hybrid_quotient_inline_count(&identities)
         };
         let (inline_identities, vm_identities) = identities.split_at(inline_count);
         let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
-        let quotient_program_build =
-            (!use_inline_cse).then(|| self.build_quotient_program(vm_identities));
+        let quotient_program_build = (!(use_inline_cse || use_structured_loops))
+            .then(|| self.build_quotient_program(vm_identities));
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -2021,7 +2350,14 @@ impl<'a> SolidityGenerator<'a> {
         let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
 
-        if use_inline_cse {
+        if use_structured_loops {
+            quotient_eval_numer_computations = self.structured_loop_quotient_computations(
+                &meta,
+                &data,
+                &sorted_simple,
+                quotient_tmp_mptr,
+            );
+        } else if use_inline_cse {
             quotient_eval_numer_computations = Self::inline_cse_quotient_computations(
                 &identities,
                 &sorted_simple,

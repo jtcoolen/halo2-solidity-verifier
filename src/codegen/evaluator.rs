@@ -637,7 +637,7 @@ impl<'a> Evaluator<'a> {
     /// Resolve a `Column<Any>` evaluation at a rotation. Used by the
     /// permutation emitter (which works in `Column<Any>` form rather
     /// than `Expression<F>`).
-    fn eval_at(&self, column: &Column<Any>, rotation: i32) -> String {
+    pub(crate) fn eval_at(&self, column: &Column<Any>, rotation: i32) -> String {
         let col_idx = column.index();
         match column.column_type() {
             Any::Advice(_) => self
