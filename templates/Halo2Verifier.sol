@@ -311,6 +311,7 @@ contract Halo2Verifier {
                 mstore(add(p, 0x80), sub(FR_MODULUS, 2))
                 mstore(add(p, 0xa0), FR_MODULUS)
                 if iszero(staticcall(gas(), 0x05, p, 0xc0, p, 0x20)) { revert(0, 0) }
+                if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }
                 inv := mload(p)
             }
 
@@ -483,6 +484,7 @@ contract Halo2Verifier {
                 mstore(add(gp_mptr, 0x80), sub(r, 2))
                 mstore(add(gp_mptr, 0xa0), r)
                 ret := and(success, staticcall(gas(), 0x05, gp_mptr, 0xc0, gp_mptr, 0x20))
+                ret := and(ret, eq(returndatasize(), 0x20))
                 let all_inv := mload(gp_mptr)
 
                 let first_mptr := mptr_start
@@ -503,17 +505,21 @@ contract Halo2Verifier {
 
             function ec_add_acc(success) -> ret {
                 ret := and(success, staticcall(gas(), 0x0b, 0x100, 0x100, 0x100, 0x80))
+                ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_mul_acc(success, scalar) -> ret {
                 mstore(0x180, scalar)
                 ret := and(success, staticcall(gas(), 0x0c, 0x100, 0xa0, 0x100, 0x80))
+                ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_add_tmp(success) -> ret {
                 ret := and(success, staticcall(gas(), 0x0b, 0x180, 0x100, 0x180, 0x80))
+                ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_mul_tmp(success, scalar) -> ret {
                 mstore(0x200, scalar)
                 ret := and(success, staticcall(gas(), 0x0c, 0x180, 0xa0, 0x180, 0x80))
+                ret := and(ret, eq(returndatasize(), 0x80))
             }
 
             function ec_pairing(success, lhs_mptr, rhs_mptr) -> ret {
@@ -529,6 +535,7 @@ contract Halo2Verifier {
                 mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
                 mcopy(add(scratch, 0x200),  NEG_S_G2_BASE_MPTR,       0x100)
                 ret := and(success, staticcall(gas(), 0x0f, scratch, 0x300, scratch, 0x20))
+                ret := and(ret, eq(returndatasize(), 0x20))
                 ret := and(ret, mload(scratch))
             }
 
@@ -1064,6 +1071,7 @@ contract Halo2Verifier {
             {
                 let q_out := SELECTOR_ACC_MPTR
                 if iszero(staticcall(gas(), quotientEvaluator, {{ qext.frame_base|hex() }}, {{ qext.frame_len|hex() }}, q_out, {{ qext.output_len|hex() }})) { revert(0, 0) }
+                if iszero(eq(returndatasize(), {{ qext.output_len|hex() }})) { revert(0, 0) }
                 if iszero(eq(mload(q_out), {{ qext.magic|hex_padded(64) }})) { revert(0, 0) }
                 mstore(QUOTIENT_EVAL_MPTR, mload(add(q_out, 0x20)))
                 {%- if simple_selector_cols.len() > 0 %}
@@ -1191,6 +1199,7 @@ contract Halo2Verifier {
                             success,
                             staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
                         )
+                        success := and(success, eq(returndatasize(), 0x80))
                     }
                 }
 
@@ -1252,6 +1261,7 @@ contract Halo2Verifier {
                             0x80
                         )
                     )
+                    success := and(success, eq(returndatasize(), 0x80))
                 }
                 if and(iszero(acc_msm_len), iszero(rhs_kept_direct)) {
                     mstore(ACC_RHS_MPTR, 0)
@@ -1276,15 +1286,19 @@ contract Halo2Verifier {
                     mcopy(batch_ptr, ACC_RHS_MPTR, 0x80)
                     mstore(add(batch_ptr, 0x80), acc_pair_alpha)
                     success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    success := and(success, eq(returndatasize(), 0x80))
                     mcopy(add(batch_ptr, 0x80), PAIRING_RHS_MPTR, 0x80)
                     success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_RHS_MPTR, 0x80))
+                    success := and(success, eq(returndatasize(), 0x80))
 
                     // PAIRING_LHS_MPTR += alpha * ACC_LHS_MPTR.
                     mcopy(batch_ptr, ACC_LHS_MPTR, 0x80)
                     mstore(add(batch_ptr, 0x80), acc_pair_alpha)
                     success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    success := and(success, eq(returndatasize(), 0x80))
                     mcopy(add(batch_ptr, 0x80), PAIRING_LHS_MPTR, 0x80)
                     success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_LHS_MPTR, 0x80))
+                    success := and(success, eq(returndatasize(), 0x80))
                 }
             }
 

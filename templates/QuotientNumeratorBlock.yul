@@ -45,6 +45,7 @@
                     mstore(add(q_inv_scratch, 0x80), sub(FR_MODULUS, 2))
                     mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)
                     if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }
+                    if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }
                     q_y_inv := mload(q_inv_scratch)
                 }
                 {%- endif %}

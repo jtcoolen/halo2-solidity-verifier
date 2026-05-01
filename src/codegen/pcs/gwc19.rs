@@ -1176,6 +1176,7 @@ pub(super) fn computations(
             "success := and(success, staticcall(gas(), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80))",
             final_msm_terms * 0xa0
         ));
+        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
         lines.push(format!(
             "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, 0x80)"
         ));
@@ -1213,12 +1214,14 @@ pub(super) fn computations(
         lines.push(
             "success := and(success, staticcall(gas(), 0x0c, 0x00, 0xa0, 0x00, 0x80))".to_string(),
         );
+        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
 
         // tmp += final_com.
         lines.push("mcopy(0x80, FINAL_COM_MPTR, 0x80)".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))".to_string(),
         );
+        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
 
         // tmp += x3 * pi.
         lines.push("mcopy(0x80, PI_MPTR, 0x80)".to_string());
@@ -1226,9 +1229,11 @@ pub(super) fn computations(
         lines.push(
             "success := and(success, staticcall(gas(), 0x0c, 0x80, 0xa0, 0x80, 0x80))".to_string(),
         );
+        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
         lines.push(
             "success := and(success, staticcall(gas(), 0x0b, 0x00, 0x100, 0x00, 0x80))".to_string(),
         );
+        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
 
         // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
         lines.push("mcopy(PAIRING_RHS_MPTR, 0x0, 0x80)".to_string());

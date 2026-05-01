@@ -3359,6 +3359,7 @@ impl<'a> SolidityGenerator<'a> {
                 "if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }"
                     .to_string(),
             );
+            init.push("if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }".to_string());
             init.push("q_y_inv := mload(q_inv_scratch)".to_string());
             init.push("}".to_string());
         }
