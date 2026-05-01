@@ -20,8 +20,7 @@
 //!     `midnight-proofs` and lets the EVM verifier hash the calldata
 //!     uncompressed bytes verbatim instead of running a 384-bit
 //!     sign-bit ladder to derive the 48-byte compressed encoding.
-//!     For Fq scalars, `input` is the canonical little-endian 32-byte
-//!     repr (`Fq::to_repr()`).
+//!     For Fq scalars, `input` is the canonical big-endian 32-byte repr.
 //!   * `squeeze`: produces one 32-byte Keccak digest over the current
 //!     transcript data, then resets the transcript data to that digest.
 //!   * `sample::<Fq>(out32)`: copy the 32-byte digest into the low half
@@ -87,9 +86,10 @@ impl<S> Keccak256Transcript<S> {
         Fq::from_uniform_bytes(&bytes)
     }
 
-    /// Absorb a Fq scalar in its canonical 32-byte LE repr.
+    /// Absorb a Fq scalar in its canonical 32-byte BE transcript repr.
     pub fn common_scalar(&mut self, scalar: &Fq) -> io::Result<()> {
-        let repr = scalar.to_repr();
+        let mut repr = scalar.to_repr();
+        repr.as_mut().reverse();
         self.absorb_bytes(repr.as_ref());
         Ok(())
     }
@@ -125,16 +125,17 @@ fn g1_to_uncompressed_eip2537(point: &G1Projective) -> [u8; 128] {
 }
 
 impl<R: Read> Keccak256Transcript<R> {
-    /// Read 32 bytes from the stream, absorb them, and
-    /// decode the canonical-LE Fq scalar.
+    /// Read a canonical-LE Fq scalar from the stream, absorb its
+    /// canonical-BE transcript representation, and decode it.
     pub fn read_scalar(&mut self) -> io::Result<Fq> {
         let mut bytes = [0u8; 32];
         self.stream.read_exact(&mut bytes)?;
-        self.absorb_bytes(&bytes);
         let mut repr = <Fq as PrimeField>::Repr::default();
         repr.as_mut().copy_from_slice(&bytes);
-        Option::from(Fq::from_repr(repr))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Fq scalar"))
+        let scalar = Option::from(Fq::from_repr(repr))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Fq scalar"))?;
+        self.common_scalar(&scalar)?;
+        Ok(scalar)
     }
 
     /// Read a 48-byte compressed G1 point from the stream, absorb the

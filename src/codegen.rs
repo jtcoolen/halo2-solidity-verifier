@@ -4006,8 +4006,10 @@ impl<'a> SolidityGenerator<'a> {
 
     /// Repack a midnight-proofs proof from the on-the-wire compressed
     /// form (each G1 = 48 bytes ZCash compressed) into the EIP-2537
-    /// padded form (each G1 = 4 × 32-byte BE words) the rendered
-    /// Solidity verifier reads from calldata.
+    /// padded form (each G1 = 4 × 32-byte BE words) and rewrites scalar
+    /// proof elements from midnight-proofs' canonical LE bytes into
+    /// canonical BE calldata words. This is the Solidity-facing proof
+    /// shim; the native proof bytes remain unchanged.
     ///
     /// This is the off-chain repack step the verifier expects: the
     /// EVM does **not** run the modexp-based BLS12-381 decompression
@@ -4130,19 +4132,29 @@ impl<'a> SolidityGenerator<'a> {
             out.extend_from_slice(&y_be[0..16]);
             out.extend_from_slice(&y_be[16..48]);
         };
+        let push_scalar_be = |cursor: &mut usize, out: &mut Vec<u8>| {
+            let mut scalar = [0u8; 32];
+            scalar.copy_from_slice(&compressed[*cursor..*cursor + 32]);
+            scalar.reverse();
+            out.extend_from_slice(&scalar);
+            *cursor += 32;
+        };
         for &n in &g1_groups {
             for _ in 0..n {
                 push_g1(&mut cursor, &mut out);
             }
         }
-        // evals (Fr 32-byte LE) - pass through (incl. dummy slots).
-        out.extend_from_slice(&compressed[cursor..cursor + total_evals * 32]);
-        cursor += total_evals * 32;
+        // evals (Fr 32-byte LE in native proof) -> BE calldata words
+        // (incl. dummy slots).
+        for _ in 0..total_evals {
+            push_scalar_be(&mut cursor, &mut out);
+        }
         // f_com
         push_g1(&mut cursor, &mut out);
-        // q_evals
-        out.extend_from_slice(&compressed[cursor..cursor + n_point_sets * 32]);
-        cursor += n_point_sets * 32;
+        // q_evals (Fr 32-byte LE in native proof) -> BE calldata words.
+        for _ in 0..n_point_sets {
+            push_scalar_be(&mut cursor, &mut out);
+        }
         // pi
         push_g1(&mut cursor, &mut out);
         assert_eq!(
@@ -4249,11 +4261,10 @@ impl<'a> SolidityGenerator<'a> {
 ///
 /// In the midnight-proofs schema each G1 commitment in the proof byte
 /// stream is the **48-byte compressed** BLS12-381 form. The Solidity
-/// verifier decompresses internally and feeds EIP-2537 the padded
-/// uncompressed form, so the calldata stays a flat byte concatenation
-/// of `(compressed-G1 | scalars | compressed-G1 | scalars | ...)` with
-/// the exact layout `parse_trace` consumes. This helper just wraps
-/// `encode_calldata` so callers don't have to import `evm`.
+/// verifier expects G1s already expanded to EIP-2537 padded uncompressed
+/// form and scalar proof elements already rewritten to canonical BE words by
+/// `repack_compressed_proof`. This helper just wraps `encode_calldata` so
+/// callers don't have to import `evm`.
 pub fn encode_calldata_bls_padded(
     _generator: &SolidityGenerator<'_>,
     proof: &[u8],

@@ -842,11 +842,10 @@ pub(super) fn computations(
         for set_idx in (0..n_sets).rev() {
             let points = &sets.point_sets[set_idx];
             let m = points.len();
-            // proof_eval is the s-th q_eval scalar in calldata.
-            let proof_eval = format!(
-                "byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x})))",
-                set_idx * 0x20
-            );
+            // proof_eval is the s-th q_eval scalar in calldata. The
+            // Solidity proof shim rewrites q_evals to canonical BE words, so
+            // calldataload gives the field element directly.
+            let proof_eval = format!("calldataload(add(Q_EVAL_CPTR, {:#x}))", set_idx * 0x20);
             // Reference to q_eval_set[set_idx][k]:
             let set_eval_offset_words: usize = sets.point_sets[..set_idx]
                 .iter()
@@ -1080,10 +1079,10 @@ pub(super) fn computations(
         }
 
         // v = sum_s x4^s * q_evals[s] + x4^n_sets * f_eval.
-        lines.push("let v := byte_reverse_32(calldataload(Q_EVAL_CPTR))".to_string());
+        lines.push("let v := calldataload(Q_EVAL_CPTR)".to_string());
         for s in 1..n_sets {
             lines.push(format!(
-                "v := addmod(v, mulmod(byte_reverse_32(calldataload(add(Q_EVAL_CPTR, {:#x}))), x4_pow_{s}, r), r)",
+                "v := addmod(v, mulmod(calldataload(add(Q_EVAL_CPTR, {:#x})), x4_pow_{s}, r), r)",
                 s * 0x20
             ));
         }

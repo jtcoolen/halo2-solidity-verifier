@@ -478,12 +478,10 @@ pub(crate) struct Data {
     /// Calldata pointer to the first compressed quotient G1 in the proof
     /// stream. Used by the quotient-fold loop in the template.
     pub(crate) quotient_limb_cptr: Ptr,
-    /// Memory base of the pre-reversed-evals buffer (Optimisation H3).
-    /// The transcript-side `evaluations` loop spills the byte-reversed
-    /// `eval_le` value to `REVERSED_EVALS_MPTR + i * 0x20` so that
-    /// every later eval reference can `mload` instead of paying the
-    /// per-call `byte_reverse_32(calldataload(N))` cost (~145 gas → 3
-    /// gas).
+    /// Memory base of the decoded-evals buffer (Optimisation H3). The
+    /// transcript-side `evaluations` loop spills the decoded scalar value to
+    /// `REVERSED_EVALS_MPTR + i * 0x20` so that every later eval reference can
+    /// `mload` instead of rereading calldata.
     pub(crate) reversed_evals_mptr: Ptr,
     /// Eval Words for the dummy queries appended by the
     /// fewer-point-sets path. Empty when the feature is disabled. The
@@ -561,25 +559,17 @@ impl Data {
             _ => unreachable!("theta_mptr is always an integer offset"),
         };
         // ------------------------------------------------------------
-        // Optimisation H3: pre-reverse polynomial evaluations.
+        // Optimisation H3: pre-decode polynomial evaluations.
         //
-        // Each polynomial evaluation in the proof is referenced
-        // multiple times across the gate evaluator (cp12) and the PCS
-        // q_eval Horner accumulators (cp14). Each reference renders as
-        // `byte_reverse_32(calldataload(N))` (~145 gas) since calldata
-        // bytes are LE-encoded `Fq::to_repr` form but Yul interprets
-        // them as BE. For the Poseidon fixture this expands to 174
-        // byte_reverse_32 calls hitting only 48 distinct calldata
-        // addresses (3.6× reuse).
+        // Each polynomial evaluation in the proof is referenced multiple
+        // times across the gate evaluator (cp12) and the PCS q_eval Horner
+        // accumulators (cp14). The Solidity proof shim rewrites scalar proof
+        // bytes into canonical BE calldata words, so the transcript-side
+        // evaluations loop can range-check and spill the decoded value once.
         //
-        // The transcript-side `evaluations` loop in the template
-        // already computes `byte_reverse_32(calldataload(...))` once
-        // per eval (to range-check `eval_le < r`) and discards the
-        // reversed value. We hijack that by adding a single `mstore`
-        // per iter — ~5 gas amortised — to spill the reversed value
-        // into a contiguous memory buffer at REVERSED_EVALS_MPTR.
-        // Every later eval reference then becomes `mload(N)` (3 gas)
-        // instead of `byte_reverse_32(calldataload(N))` (~145 gas).
+        // We add a single `mstore` per iter to spill the decoded value into a
+        // contiguous memory buffer at REVERSED_EVALS_MPTR. Every later eval
+        // reference then becomes `mload(N)` instead of a calldata read.
         //
         // To make this transparent to the codegen, we construct
         // `eval_cptr` as a *Memory* Ptr pointing at REVERSED_EVALS_MPTR
@@ -992,13 +982,11 @@ impl Word {
 
 impl Display for Word {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // For Calldata-located Words (proof evals), the bytes in calldata
-        // are stored LE (midnight-proofs `Fq::to_repr` convention), so
-        // reading via `calldataload` (which interprets bytes as BE) gives
-        // the byte-reversed integer. Wrap in `byte_reverse_32(...)` so
-        // the consumer always sees the correct field-element value.
+        // For Calldata-located Words (proof evals/q_evals), the Solidity
+        // proof shim stores scalars as canonical BE words, so calldataload
+        // gives the field-element value directly.
         match self.0.loc {
-            Location::Calldata => write!(f, "byte_reverse_32(calldataload({}))", self.0.value),
+            Location::Calldata => write!(f, "calldataload({})", self.0.value),
             Location::Memory => write!(f, "mload({})", self.0.value),
         }
     }

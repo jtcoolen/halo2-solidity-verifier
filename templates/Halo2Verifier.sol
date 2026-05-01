@@ -133,15 +133,12 @@ contract Halo2Verifier {
     // ec_add / ec_mul precompiles accept.
     uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 208 }};
 
-    // Pre-reversed polynomial-eval buffer (Optimisation H3). Each Fq
-    // evaluation in the proof byte stream is LE-encoded (`Fq::to_repr`)
-    // but Yul's `calldataload` reads BE, so every reference would
-    // normally pay ~145 gas of `byte_reverse_32(calldataload(...))`.
-    // The transcript-side `evaluations` loop already computes the
-    // byte-reversed value once (for range-checking `eval_le < r`); we
-    // spill it to this buffer so the 174 downstream eval references
-    // (in the gate evaluator + PCS q_eval Horner) become 3-gas
-    // `mload(...)` instead.
+    // Decoded polynomial-eval buffer (Optimisation H3). The off-chain
+    // Solidity proof shim rewrites proof scalars into canonical BE words,
+    // so `calldataload` gives the field element directly. The transcript-
+    // side `evaluations` loop range-checks and spills that value here so
+    // downstream eval references (gate evaluator + PCS q_eval Horner)
+    // become 3-gas `mload(...)` instead of calldata reads.
     uint256 internal constant     REVERSED_EVALS_MPTR = {{ reversed_evals_mptr }};
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ selector_acc_mptr|hex() }};
     uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ batch_invert_scratch_mptr|hex() }};
@@ -721,10 +718,9 @@ contract Halo2Verifier {
             // ===============================================================
             let buf_len := transcript_init()
             // VK_DIGEST_MPTR holds the digest as a BE 32-byte word (the
-            // VK contract stores it via `mstore`, which is BE). Native
-            // midnight-proofs hashes `Fq::to_repr()` (LE bytes), so we
-            // byte-reverse before absorbing.
-            buf_len := common_word(buf_len, byte_reverse_32(mload(VK_DIGEST_MPTR)))
+            // VK contract stores it via `mstore`, which matches the
+            // Keccak Fq transcript input).
+            buf_len := common_word(buf_len, mload(VK_DIGEST_MPTR))
 
             // Absorb committed_pi = G1Affine::identity() when the
             // `committed-instances` feature is on in midnight-proofs.
@@ -746,11 +742,9 @@ contract Halo2Verifier {
 
             {
                 let num_instances := mload(NUM_INSTANCES_MPTR)
-                // common(num_instances as Fq scalar in LE-32). The number is
-                // small so its LE int = its value; the BE-int form (what
-                // mstore would write) needs to be byte-reversed before
-                // hashing.
-                buf_len := common_word(buf_len, byte_reverse_32(num_instances))
+                // Native verifier absorbs a length scalar before instance
+                // values; Keccak Fq transcript input is canonical BE.
+                buf_len := common_word(buf_len, num_instances)
 
                 let instance_cptr := INSTANCE_CPTR
                 for { let instance_cptr_end := add(instance_cptr, mul(0x20, num_instances)) }
@@ -758,9 +752,9 @@ contract Halo2Verifier {
                     { instance_cptr := add(instance_cptr, 0x20) } {
                     let inst_be := calldataload(instance_cptr)
                     success := and(success, lt(inst_be, r))
-                    // Instances are passed BE in calldata (uint256[]); convert
-                    // to LE to match midnight-proofs Fq::to_repr().
-                    buf_len := common_word(buf_len, byte_reverse_32(inst_be))
+                    // Instances are passed BE in calldata, matching the
+                    // Keccak Fq transcript input.
+                    buf_len := common_word(buf_len, inst_be)
                 }
             }
 
@@ -909,23 +903,20 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, X_MPTR)
 
             // ---- evaluations ----
-            // Optimisation H3: spill the byte-reversed eval_le into the
-            // REVERSED_EVALS_MPTR buffer in the same iteration we
-            // already compute it for range-checking. ~5 gas amortised
-            // per iter; replaces ~145 gas of byte_reverse_32 per
-            // downstream reference (174 references in the verifier,
-            // ~25 kg total saving).
+            // Optimisation H3: the off-chain Solidity proof shim rewrites
+            // proof scalars into BE calldata words. Spill each decoded eval
+            // into REVERSED_EVALS_MPTR in the same iteration we range-check
+            // it, so downstream references can use cheap mload.
             {
                 let eval_buf := REVERSED_EVALS_MPTR
                 for { let end := add(proof_cptr, {{ (num_evals * 32)|hex() }}) }
                     lt(proof_cptr, end)
                     {} {
-                    let eval_be := calldataload(proof_cptr)
-                    let eval_le := byte_reverse_32(eval_be)
-                    success := and(success, lt(eval_le, r))
-                    mstore(eval_buf, eval_le)
+                    let eval := calldataload(proof_cptr)
+                    success := and(success, lt(eval, r))
+                    mstore(eval_buf, eval)
                     eval_buf := add(eval_buf, 0x20)
-                    buf_len := common_word(buf_len, eval_be)
+                    buf_len := common_word(buf_len, eval)
                     proof_cptr := add(proof_cptr, 0x20)
                 }
             }
@@ -955,10 +946,9 @@ contract Halo2Verifier {
             for { let end := add(proof_cptr, {{ (num_point_sets * 32)|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
-                let eval_be := calldataload(proof_cptr)
-                let eval_le := byte_reverse_32(eval_be)
-                success := and(success, lt(eval_le, r))
-                buf_len := common_word(buf_len, eval_be)
+                let eval := calldataload(proof_cptr)
+                success := and(success, lt(eval, r))
+                buf_len := common_word(buf_len, eval)
                 proof_cptr := add(proof_cptr, 0x20)
             }
 
