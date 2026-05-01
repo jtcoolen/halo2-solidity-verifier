@@ -16,13 +16,11 @@ pragma solidity ^0.8.0;
 //     form into the transcript verbatim (matches the patched
 //     `Hashable<Keccak256> for G1Projective::to_input` in
 //     midnight-proofs); see `common_uncompressed_g1`.
-//   * Transcript is a streaming Keccak256 with domain separator
-//     "Domain separator for transcript" + PREFIX_COMMON (0x01) before
-//     each absorbed value + PREFIX_CHALLENGE (0x00) before each squeeze.
-//     Squeeze is a two-fork: clone state || 0x00 then clone state ||
-//     0x01, finalize each, concat to 64 bytes, reseed.
-//   * Fq sampling: from_uniform_bytes(64) = a0 + a1 * 2^256 (mod r),
-//     where a0 = LE int of bytes[0..32], a1 = LE int of bytes[32..64].
+//   * Transcript accumulates raw absorbed inputs in order. Squeeze
+//     computes one Keccak digest of the accumulated bytes, resets the
+//     transcript buffer to that 32-byte digest, then samples by
+//     zero-padding the digest to 64 bytes.
+//   * Fq sampling: from_uniform_bytes(32-byte digest || 32 zero bytes).
 //   * Scalar inversion uses modexp(scalar, r-2, r).
 //   * Precompiles:
 //       0x05 modexp (used for Fr inversion)
@@ -171,9 +169,8 @@ contract Halo2Verifier {
     uint256 internal constant     TRASHCAN_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups }};
     uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups + 4 * num_trashcans }};
 
-    // Fr modulus and Montgomery constant 2^256 mod r used by from_uniform_bytes.
+    // Fr modulus.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
-    uint256 internal constant FR_R_2POW256_MOD  = 0x1824b159acc5056f998c4fefecbc4ff55884b7fa0003480200000001fffffffe;
 
     // BLS12-381 Fp modulus minus one, split like an EIP-2537 coordinate:
     // high word = 16 zero bytes || top 16 coordinate bytes, low word =
@@ -183,12 +180,6 @@ contract Halo2Verifier {
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_0 = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa;
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_0_WITH_ID_FLAG = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffbafeffffffffaaaa;
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_1 = 0x0000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd764774b84;
-
-    // Prefix bytes for the Keccak256 transcript (matches the `Domain
-    // separator for transcript` literal in midnight-proofs). The string
-    // is 31 bytes; the bottom byte of this bytes32 is zero padding and
-    // is overwritten by the first absorb in `transcript_init`.
-    bytes32 internal constant DOMAIN_SEPARATOR = "Domain separator for transcript";
 
     {%- match self.expected_vk_codehash %}
     {%- when Some with (_) %}
@@ -389,27 +380,20 @@ contract Halo2Verifier {
             // ---------- Streaming Keccak256 transcript helpers ----------
             //
             // The transcript buffer lives at memory[0x00..buf_len). On
-            // verifier entry we seed it with the 30-byte domain separator;
-            // every common(input) prepends a single PREFIX_COMMON byte and
-            // then writes the input bytes. squeeze_*(buf_len) computes the
-            // 64-byte two-fork keccak output, reseeds the buffer, and
-            // samples a Fq element via from_uniform_bytes.
+            // verifier entry it starts empty. Each common(input) appends
+            // raw bytes. squeeze_*(buf_len) computes one Keccak digest,
+            // reseeds the buffer with that 32-byte digest, and samples a
+            // Fq element via zero-padded from_uniform_bytes.
 
             function transcript_init() -> buf_len {
-                // Write the 31-byte domain separator. The literal is
-                // stored left-aligned in DOMAIN_SEPARATOR; the trailing
-                // byte (zero) is overwritten by the first PREFIX_COMMON
-                // absorb.
-                mstore(0x00, DOMAIN_SEPARATOR)
-                buf_len := 31
+                buf_len := 0
             }
 
-            // Append PREFIX_COMMON || word[0..32] at the current end of the
-            // transcript buffer.
+            // Append word[0..32] at the current end of the transcript
+            // buffer.
             function common_word(buf_len, word) -> ret {
-                mstore8(buf_len, 0x01)
-                mstore(add(buf_len, 1), word)
-                ret := add(buf_len, 33)
+                mstore(buf_len, word)
+                ret := add(buf_len, 32)
             }
 
             // Absorb a BLS12-381 G1 point in EIP-2537 padded
@@ -439,11 +423,9 @@ contract Halo2Verifier {
             // call site is responsible for `calldatacopy`-ing it into
             // memory afterwards if it needs the on-curve coordinates.
             function common_uncompressed_g1(buf_len, cptr) -> ret {
-                // Append PREFIX_COMMON.
-                mstore8(buf_len, 0x01)
                 // Memcpy the 4 calldata words (128 bytes) verbatim
-                // into the keccak buffer right after PREFIX_COMMON.
-                calldatacopy(add(buf_len, 1), cptr, 0x80)
+                // into the keccak buffer.
+                calldatacopy(buf_len, cptr, 0x80)
                 // Mask the top 16 bytes of x_hi and y_hi to zero so
                 // that an attacker cannot grind the transcript by
                 // submitting non-canonical padding bytes. EIP-2537
@@ -451,49 +433,26 @@ contract Halo2Verifier {
                 // zero; we enforce it here at the hash boundary
                 // rather than at the precompile boundary so that the
                 // hash commits to canonical bytes only.
-                let x_hi_off := add(buf_len, 1)
-                let y_hi_off := add(buf_len, 0x41)
+                let x_hi_off := buf_len
+                let y_hi_off := add(buf_len, 0x40)
                 mstore(x_hi_off, and(mload(x_hi_off), 0xffffffffffffffffffffffffffffffff))
                 mstore(y_hi_off, and(mload(y_hi_off), 0xffffffffffffffffffffffffffffffff))
-                ret := add(buf_len, 0x81)
+                ret := add(buf_len, 0x80)
             }
 
-            // PREFIX_CHALLENGE + two-fork keccak + reseed. Returns the new
-            // buffer length (= 64) and stores the squeezed Fq at `mptr`.
+            // One Keccak finalization + reseed. Returns the new buffer
+            // length (= 32) and stores the squeezed Fq at `mptr`.
             function squeeze_to(buf_len, mptr) -> ret {
-                // Append PREFIX_CHALLENGE (0x00) at buf_len. midnight-proofs
-                // (`midfall/proofs/src/transcript/mod.rs:15`) defines
-                // `KECCAK256_PREFIX_CHALLENGE: u8 = 0`. Earlier verifier
-                // generations targeting the upstream halo2 BN254 transcript
-                // hard-coded `0x02` here, which silently rerouted the
-                // challenge stream onto a different domain and produced
-                // garbage scalars; we keep the byte writable so the next
-                // line can overlay the per-fork tag (0x00 / 0x01) without
-                // moving the cursor.
-                mstore8(buf_len, 0x00)
-                // Append 0x00; first fork.
-                mstore8(add(buf_len, 1), 0x00)
-                let h0 := keccak256(0x00, add(buf_len, 2))
-                // Append 0x01 (overwrites the previous 0x00); second fork.
-                mstore8(add(buf_len, 1), 0x01)
-                let h1 := keccak256(0x00, add(buf_len, 2))
-                // Reseed: write 64 bytes at start of buffer.
+                let h0 := keccak256(0x00, buf_len)
+                // Reseed: write the 32-byte digest at start of buffer.
                 mstore(0x00, h0)
-                mstore(0x20, h1)
-                // Sample Fq via from_uniform_bytes(64 bytes LE).
+                // Sample Fq via from_uniform_bytes(digest || zero[32]).
                 // h0 is the BE-loaded 32-byte int of bytes [0..32];
-                // we need its LE int interpretation. Same for h1.
+                // we need its LE int interpretation.
                 let a0 := byte_reverse_32(h0)
-                let a1 := byte_reverse_32(h1)
                 let r := FR_MODULUS
-                mstore(mptr,
-                    addmod(
-                        mod(a0, r),
-                        mulmod(mod(a1, r), FR_R_2POW256_MOD, r),
-                        r
-                    )
-                )
-                ret := 64
+                mstore(mptr, mod(a0, r))
+                ret := 32
             }
 
             // ---------- EC primitives (EIP-2537 wrappers) ----------
@@ -758,7 +717,7 @@ contract Halo2Verifier {
             {%- endif %}
 
             // ===============================================================
-            // Transcript: domain sep + VK digest + instances + proof.
+            // Transcript: VK digest + instances + proof.
             // ===============================================================
             let buf_len := transcript_init()
             // VK_DIGEST_MPTR holds the digest as a BE 32-byte word (the
@@ -776,15 +735,13 @@ contract Halo2Verifier {
             // 0xc0||47*0x00 that the previous emitter produced.
             // Native verifier absorbs this BEFORE the instance count.
             {
-                // PREFIX_COMMON (0x01) at buf_len.
-                mstore8(buf_len, 0x01)
                 // 128 zero bytes: zero out 4 consecutive 32-byte words
-                // at buf_len+1.
-                mstore(add(buf_len, 1),    0)
-                mstore(add(buf_len, 0x21), 0)
-                mstore(add(buf_len, 0x41), 0)
-                mstore(add(buf_len, 0x61), 0)
-                buf_len := add(buf_len, 0x81)
+                // at buf_len.
+                mstore(buf_len, 0)
+                mstore(add(buf_len, 0x20), 0)
+                mstore(add(buf_len, 0x40), 0)
+                mstore(add(buf_len, 0x60), 0)
+                buf_len := add(buf_len, 0x80)
             }
 
             {

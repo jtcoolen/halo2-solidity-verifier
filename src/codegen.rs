@@ -4162,7 +4162,7 @@ impl<'a> SolidityGenerator<'a> {
 
         // The Step 6 transcript model is a streaming Keccak256 buffer at
         // memory `[0..buf_len)`. The buffer monotonically grows between
-        // two challenge squeezes and is reset to 64 bytes after each
+        // two challenge squeezes and is reset to 32 bytes after each
         // squeeze, so the *peak* buf_len equals the longest absorb run
         // between two consecutive squeezes. For midnight-proofs verifiers
         // the dominating run is whichever of the following is largest:
@@ -4173,37 +4173,37 @@ impl<'a> SolidityGenerator<'a> {
         //       after the `y` squeeze and before the next squeeze.
         //
         // We compute a per-run conservative upper bound for each and
-        // take the max, then add the 64-byte post-squeeze seed cushion.
+        // take the max, then add the 32-byte post-squeeze seed cushion.
         //
         // Per-absorb costs in the patched (uncompressed-G1) emitter:
-        //   - PREFIX_COMMON || word        = 33 bytes  (`common_word`)
-        //   - PREFIX_COMMON || 128 bytes   = 129 bytes (`common_uncompressed_g1`)
-        //   - PREFIX_CHALLENGE || forks    = 64 bytes  (post-squeeze seed)
+        //   - word                         = 32 bytes  (`common_word`)
+        //   - uncompressed G1              = 128 bytes (`common_uncompressed_g1`)
+        //   - squeeze output               = 32 bytes  (post-squeeze seed)
         // The earlier (compressed-G1) emitter used 49 bytes per G1; the
         // 49 used here is wrong now that the verifier hashes the 128-byte
-        // EIP-2537 padded form, so we use 129. Mismatching the bound
+        // EIP-2537 padded form, so we use 128. Mismatching the bound
         // causes the keccak buffer to overrun `VK_MPTR` mid-verify and
         // silently corrupt `K_MPTR`, `OMEGA_MPTR`, etc., producing a
         // multi-billion-gas spin in the Lagrange block.
         let transcript_words: usize = {
-            // (a) initial run: vk_digest (33) + committed_pi (129)
-            //     + num_instances scalar (33) + num_instances * 33
-            //     + phase_1_advices * 129 + 64 cushion.
+            // (a) initial run: vk_digest (32) + committed_pi (128)
+            //     + num_instances scalar (32) + num_instances * 32
+            //     + phase_1_advices * 128 + 32 cushion.
             let phase_1_advices = self.meta.num_user_advices.first().copied().unwrap_or(0);
-            let initial_run = 33                      // vk_digest
-                + 129                                 // committed_pi
-                + 33                                  // num_instances scalar
-                + self.num_instances * 33             // committed instances
-                + phase_1_advices * 129               // phase-1 advices
-                + 64; // post-squeeze seed cushion
+            let initial_run = 32                      // vk_digest
+                + 128                                 // committed_pi
+                + 32                                  // num_instances scalar
+                + self.num_instances * 32             // committed instances
+                + phase_1_advices * 128               // phase-1 advices
+                + 32; // post-squeeze seed cushion
 
             // (b) eval-block run: quotient_limbs (Keccak common_uncompressed
             //     of each quotient G1) + num_evals scalars + num_point_sets
-            //     scalars + 64 cushion.
-            let eval_run = self.meta.num_quotients * 129
-                + self.meta.num_evals * 33
-                + self.meta.num_point_sets * 33
-                + 64;
+            //     scalars + 32 cushion.
+            let eval_run = self.meta.num_quotients * 128
+                + self.meta.num_evals * 32
+                + self.meta.num_point_sets * 32
+                + 32;
 
             // Catch-all: any other phase. We bound it by every G1 + every
             // scalar absorbed across the whole transcript; this is a
@@ -4217,7 +4217,7 @@ impl<'a> SolidityGenerator<'a> {
                 + self.meta.num_quotients
                 + 2; // f_com + pi
             let total_scalar = self.meta.num_evals + self.meta.num_point_sets + 32;
-            let total_run = 64 + total_g1 * 129 + total_scalar * 33 + 64;
+            let total_run = 32 + total_g1 * 128 + total_scalar * 32 + 32;
 
             let peak = initial_run.max(eval_run).max(total_run);
             peak.div_ceil(0x20)

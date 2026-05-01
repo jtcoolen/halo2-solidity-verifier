@@ -10,8 +10,8 @@
 //!
 //! Behaviour summary:
 //!
-//!   * `init`: hasher = `Keccak256::new().update("Domain separator for transcript")`.
-//!   * `common(input)`: hasher.update([1u8 PREFIX_COMMON]); hasher.update(input).
+//!   * `init`: transcript data starts empty.
+//!   * `common(input)`: append `input` to the transcript data.
 //!     For G1, `input` is the **EIP-2537 padded 128-byte uncompressed
 //!     form** (`x_hi || x_lo || y_hi || y_lo`, 64 bytes per coord = 16
 //!     zero pad bytes + 48 BE bytes of the BLS12-381 base-field
@@ -22,11 +22,10 @@
 //!     sign-bit ladder to derive the 48-byte compressed encoding.
 //!     For Fq scalars, `input` is the canonical little-endian 32-byte
 //!     repr (`Fq::to_repr()`).
-//!   * `squeeze`: produces 64 bytes via two domain-separated finalisations
-//!     (`state || PREFIX_CHALLENGE=0 || 0x00` and `... || 0x01`), then
-//!     re-seeds the hasher with `Keccak256::new().update(out64)`.
-//!   * `sample::<Fq>(out64)`: `Fq::from_uniform_bytes(&out64)` =
-//!     `LE(out64[0..32]) + LE(out64[32..64]) * 2^256 (mod r)`.
+//!   * `squeeze`: produces one 32-byte Keccak digest over the current
+//!     transcript data, then resets the transcript data to that digest.
+//!   * `sample::<Fq>(out32)`: copy the 32-byte digest into the low half
+//!     of a zeroed 64-byte buffer and call `Fq::from_uniform_bytes`.
 //!
 //! The Solidity verifier (`templates/Halo2Verifier.sol`) ports this exactly:
 //! see Step 6 in MIGRATION.md for the planned Yul translation.
@@ -38,15 +37,10 @@ use group::{prime::PrimeCurveAffine, GroupEncoding, UncompressedEncoding};
 use midnight_curves::{Fq, G1Affine, G1Projective};
 use sha3::{Digest, Keccak256};
 
-/// Prefix matching `midnight_proofs::transcript::KECCAK256_PREFIX_CHALLENGE`.
-pub(crate) const KECCAK256_PREFIX_CHALLENGE: u8 = 0;
-/// Prefix matching `midnight_proofs::transcript::KECCAK256_PREFIX_COMMON`.
-pub(crate) const KECCAK256_PREFIX_COMMON: u8 = 1;
-
 /// In-memory Keccak256 transcript matching `CircuitTranscript<Keccak256>`.
 #[derive(Clone, Debug)]
 pub struct Keccak256Transcript<S> {
-    state: Keccak256,
+    transcript_data: Vec<u8>,
     stream: S,
 }
 
@@ -57,46 +51,30 @@ impl<S: Default> Default for Keccak256Transcript<S> {
 }
 
 impl<S> Keccak256Transcript<S> {
-    /// Construct a new transcript wrapping `stream` with the midnight-
-    /// proofs domain separator already absorbed.
+    /// Construct a new transcript wrapping `stream` with empty transcript
+    /// data.
     pub fn new(stream: S) -> Self {
-        let mut state = Keccak256::new();
-        state.update(b"Domain separator for transcript");
-        Self { state, stream }
+        Self {
+            transcript_data: Vec::new(),
+            stream,
+        }
     }
 
-    /// Absorb a `PREFIX_COMMON || input` block into the running hasher.
+    /// Absorb input bytes into the running transcript data.
     fn absorb_bytes(&mut self, input: &[u8]) {
-        self.state.update([KECCAK256_PREFIX_COMMON]);
-        self.state.update(input);
+        self.transcript_data.extend_from_slice(input);
     }
 
-    /// Squeeze 64 bytes via the midnight-proofs two-fork pattern, then
-    /// re-seed `self.state` with the squeezed bytes.
+    /// Squeeze one 32-byte digest, zero-pad it to the 64-byte
+    /// `from_uniform_bytes` input, then reset the transcript data to the
+    /// squeezed digest.
     fn squeeze_bytes(&mut self) -> [u8; 64] {
-        // Append PREFIX_CHALLENGE inside the per-fork tag the same way
-        // midnight-proofs' impl does (it absorbs PREFIX_CHALLENGE before
-        // the fork tag).
-        self.state.update([KECCAK256_PREFIX_CHALLENGE]);
-
-        let mut h0 = self.state.clone();
-        h0.update([0u8]);
-        let out0 = h0.finalize();
-
-        let mut h1 = self.state.clone();
-        h1.update([1u8]);
-        let out1 = h1.finalize();
+        let out0 = Keccak256::digest(&self.transcript_data);
 
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&out0);
-        out[32..].copy_from_slice(&out1);
 
-        // Re-seed the state with the squeezed 64 bytes (matches Rust:
-        // `state = Keccak256::new(); state.update(out)` -- importantly,
-        // *no* domain separator is re-applied on reseed).
-        let mut new_state = Keccak256::new();
-        new_state.update(out);
-        self.state = new_state;
+        self.transcript_data = out0.to_vec();
 
         out
     }
@@ -104,8 +82,8 @@ impl<S> Keccak256Transcript<S> {
     /// Squeeze a Fq challenge using `from_uniform_bytes` semantics.
     pub fn squeeze_challenge(&mut self) -> Fq {
         let bytes = self.squeeze_bytes();
-        // Fq::from_uniform_bytes reduces 64 bytes (interpreted as a
-        // 512-bit little-endian integer) modulo r.
+        // Fq::from_uniform_bytes reduces the zero-padded 64-byte little-
+        // endian integer modulo r.
         Fq::from_uniform_bytes(&bytes)
     }
 
@@ -147,7 +125,7 @@ fn g1_to_uncompressed_eip2537(point: &G1Projective) -> [u8; 128] {
 }
 
 impl<R: Read> Keccak256Transcript<R> {
-    /// Read 32 bytes from the stream, absorb them via PREFIX_COMMON, and
+    /// Read 32 bytes from the stream, absorb them, and
     /// decode the canonical-LE Fq scalar.
     pub fn read_scalar(&mut self) -> io::Result<Fq> {
         let mut bytes = [0u8; 32];
@@ -160,7 +138,7 @@ impl<R: Read> Keccak256Transcript<R> {
     }
 
     /// Read a 48-byte compressed G1 point from the stream, absorb the
-    /// raw compressed bytes via PREFIX_COMMON, and decompress to
+    /// raw compressed bytes, and decompress to
     /// `G1Projective`.
     pub fn read_g1(&mut self) -> io::Result<G1Projective> {
         let mut bytes = <G1Projective as GroupEncoding>::Repr::default();
