@@ -10,14 +10,18 @@
 //!      the result over the fixed IVC VK bases.
 //!   4. Prove that decider circuit under Keccak-256, render
 //!      `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the decider
-//!      VK with `truncated-challenges` + `fewer-point-sets` enabled.
+//!      VK with `truncated-challenges` enabled. The recursive verifier uses
+//!      fewer point sets for the leaf proofs, while the final Solidity-facing
+//!      proof omits the dummy-query layout unless `outer-fewer-point-sets`
+//!      is explicitly enabled.
 //!   5. Compile the Solidity, deploy on Prague-spec revm (EIP-2537
 //!      precompiles routed through blst), repack the proof off-chain
 //!      via `SolidityGenerator::repack_compressed_proof`, encode
 //!      calldata, call `verifyProof`.
 //!   6. Assert success and dump gas.
 //!
-//! Required features: `evm`, `truncated-challenges`, `fewer-point-sets`.
+//! Required features: `evm`, `truncated-challenges`,
+//! `in-circuit-fewer-point-sets`.
 //! Midnight crates are pulled from the published midfall `keccak` branch
 //! configured in `Cargo.toml`; `SRS_DIR` still needs to point at local SRS
 //! assets.
@@ -26,7 +30,7 @@
 //! ```text
 //! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,fewer-point-sets \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets \
 //!     --test ivc_keccak_solidity \
 //!     -- --ignored --nocapture
 //! ```
@@ -36,7 +40,7 @@
 //! ```text
 //! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,solidity-gas-checkpoints \
 //!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
 //!     -- --ignored --nocapture
 //! ```
@@ -44,7 +48,7 @@
 #![cfg(all(
     feature = "evm",
     feature = "truncated-challenges",
-    feature = "fewer-point-sets",
+    feature = "in-circuit-fewer-point-sets",
 ))]
 
 use std::{collections::BTreeMap, time::Instant};
@@ -927,6 +931,18 @@ fn ivc_final_keccak_solidity_e2e() {
         "[ivc-keccak-solidity] tree decider setup completed in {:.2?}",
         start.elapsed()
     );
+
+    let _outer_fewer_point_sets_guard = if cfg!(feature = "outer-fewer-point-sets") {
+        println!(
+            "[ivc-keccak-solidity] outer proof fewer-point-sets: enabled (dummy query evals expected)"
+        );
+        None
+    } else {
+        println!(
+            "[ivc-keccak-solidity] outer proof fewer-point-sets: disabled (recursive leaf proofs still use it)"
+        );
+        Some(midnight_proofs::poly::kzg::scoped_fewer_point_sets(false))
+    };
 
     let t0 = Instant::now();
     let final_proof = midnight_zk_stdlib::prove::<IvcTreeDeciderCircuit, sha3::Keccak256>(

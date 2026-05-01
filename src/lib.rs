@@ -38,6 +38,15 @@ pub const SOLIDITY_TRACE_ENABLED: bool = cfg!(feature = "solidity-trace");
 /// emission regardless of this flag.
 pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool = cfg!(feature = "solidity-gas-checkpoints");
 
+/// Whether the generated Solidity verifier expects the outer proof to use
+/// the fewer-point-sets dummy-query PCS layout.
+///
+/// This is intentionally separate from recursive/in-circuit verifier proofs:
+/// the IVC benchmark can keep fewer point sets for proofs checked inside the
+/// decider circuit while emitting the final Solidity-facing proof without the
+/// extra dummy eval scalars.
+pub const OUTER_FEWER_POINT_SETS_ENABLED: bool = cfg!(feature = "outer-fewer-point-sets");
+
 #[cfg(feature = "evm")]
 pub use evm::test::{
     compile_solidity, compile_solidity_with_runs, revm, CallOutcome, Evm, DEFAULT_OPTIMIZE_RUNS,

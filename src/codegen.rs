@@ -1889,7 +1889,7 @@ impl<'a> SolidityGenerator<'a> {
         proof_cptr: Ptr,
     ) -> (ConstraintSystemMeta, Data) {
         // ------------------------------------------------------------------
-        // Phase 3 / fewer-point-sets two-pass `Data` construction.
+        // Phase 3 / outer-fewer-point-sets two-pass `Data` construction.
         //
         // Pass 1: build `Data` against the *raw* meta (no dummy evals).
         //   This gives us the raw query list whose commitment identity
@@ -1900,14 +1900,14 @@ impl<'a> SolidityGenerator<'a> {
         //   comms_mptr_base - grows to fit the dummies), rebuild Data,
         //   and populate the dummy eval Words.
         //
-        // When the `fewer-point-sets` Cargo feature is OFF, the dummy
+        // When the `outer-fewer-point-sets` Cargo feature is OFF, the dummy
         // count is forced to zero; pass 2 collapses to "rebuild Data
         // against unchanged meta", and the result is byte-identical
         // to the pre-Phase-3 single-pass path.
         // ------------------------------------------------------------------
         let raw_data = Data::new(&self.meta, vk, vk_mptr, proof_cptr);
         let mut meta = self.meta.clone();
-        let n_dummy = if cfg!(feature = "fewer-point-sets") {
+        let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
             BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
         } else {
             0
@@ -2701,7 +2701,7 @@ impl<'a> SolidityGenerator<'a> {
             simple_selector_cols: sorted_simple.clone(),
             fixed_comm_mptr: fixed_comm_mptr_byte,
             truncated_challenges: cfg!(feature = "truncated-challenges"),
-            fewer_point_sets: cfg!(feature = "fewer-point-sets"),
+            fewer_point_sets: cfg!(feature = "outer-fewer-point-sets"),
             num_dummy_evals: meta.num_dummy_evals,
             acc_fixed_bases,
             acc_msm_scratch,
@@ -2757,7 +2757,7 @@ impl<'a> SolidityGenerator<'a> {
     /// shapes the codegen produces: per-phase advices, lookup
     /// multiplicities + chunked helpers + accumulators, perm Z
     /// products, trashcans, quotient limbs, eval block, dummy evals
-    /// from `fewer-point-sets`, f_com, q_evals per point set, pi).
+    /// from `outer-fewer-point-sets`, f_com, q_evals per point set, pi).
     ///
     /// # Panics
     /// - Panics if any G1 in the input fails to decompress (off-curve
@@ -2778,7 +2778,7 @@ impl<'a> SolidityGenerator<'a> {
 
         let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
         let mut meta = self.meta.clone();
-        let n_dummy = if cfg!(feature = "fewer-point-sets") {
+        let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
             BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
         } else {
             0

@@ -180,11 +180,11 @@ pub(crate) struct Halo2Verifier {
     /// Driven by `cfg!(feature = "truncated-challenges")` in
     /// `SolidityGenerator::generate_verifier`.
     pub(crate) truncated_challenges: bool,
-    /// When true, mirrors midnight-proofs/fewer-point-sets: the
+    /// When true, mirrors the outer proof's fewer-point-sets layout: the
     /// transcript reads `num_dummy_evals` extra Fr scalars after the
     /// main eval block, and the codegen-side query list is augmented
     /// with the corresponding dummy queries before construct_intermediate_sets.
-    /// Driven by `cfg!(feature = "fewer-point-sets")`.
+    /// Driven by `cfg!(feature = "outer-fewer-point-sets")`.
     pub(crate) fewer_point_sets: bool,
     /// Number of dummy evals appended to the proof's eval block when
     /// `fewer_point_sets` is enabled. Zero otherwise.
