@@ -100,6 +100,7 @@ pub(crate) struct Halo2Verifier {
     /// When true, the rendered verifier emits LOG1 gas() checkpoints at
     /// section boundaries. See SOLIDITY_GAS_CHECKPOINTS_ENABLED.
     pub(crate) gas_checkpoints: bool,
+    pub(crate) quotient_yul_helpers: bool,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
@@ -161,6 +162,7 @@ pub(crate) struct Halo2Verifier {
     /// spill its temporary prefix products immediately above X_N_MPTR
     /// where they would overlap the permanent eval/commitment regions.
     pub(crate) batch_invert_scratch_mptr: usize,
+    pub(crate) quotient_inline_computations: Vec<Vec<String>>,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) pcs_computations: Vec<Vec<String>>,
@@ -206,7 +208,10 @@ pub(crate) struct QuotientProgram {
     pub(crate) consts: Vec<U256>,
     pub(crate) chunks: Vec<U256>,
     pub(crate) len: usize,
+    pub(crate) packed32: bool,
+    pub(crate) cse_temps: usize,
     pub(crate) const_mptr: usize,
+    pub(crate) tmp_mptr: usize,
     pub(crate) stack_mptr: usize,
     pub(crate) program_mptr: usize,
 }

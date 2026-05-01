@@ -676,6 +676,122 @@ impl<'a> Evaluator<'a> {
     }
 
     fn evaluate(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
+        if let Some(result) = self.evaluate_sum_with_coeff_and_const(expression) {
+            return result;
+        }
+
+        self.evaluate_basic(expression)
+    }
+
+    fn evaluate_sum_with_coeff_and_const(
+        &self,
+        expression: &Expression<Fq>,
+    ) -> Option<(Vec<String>, String)> {
+        let mut terms = Vec::new();
+        let mut constant = Fq::ZERO;
+        self.collect_sum_terms(expression, Fq::ONE, &mut constant, &mut terms);
+
+        terms.retain(|(coeff, _)| !bool::from(coeff.is_zero_vartime()));
+        let has_constant = !bool::from(constant.is_zero_vartime());
+        let should_fuse = has_constant
+            || terms.len() > 1
+            || terms.first().is_some_and(|(coeff, _)| *coeff != Fq::ONE);
+        if !should_fuse {
+            return None;
+        }
+
+        let mut lines = Vec::new();
+        let mut acc = if has_constant {
+            let (const_lines, const_var) =
+                self.init_var(u256_string(fe_to_u256::<Fq>(&constant)), None);
+            lines.extend(const_lines);
+            Some(const_var)
+        } else {
+            None
+        };
+
+        for (coeff, term) in terms {
+            let (mut term_lines, term_var) = self.evaluate_scaled_term(term, coeff);
+            lines.append(&mut term_lines);
+            acc = Some(match acc {
+                Some(acc_var) => {
+                    let (add_lines, add_var) =
+                        self.init_var(format!("addmod({acc_var}, {term_var}, r)"), None);
+                    lines.extend(add_lines);
+                    add_var
+                }
+                None => term_var,
+            });
+        }
+
+        Some(match acc {
+            Some(var) => (lines, var),
+            None => self.init_var("0x0", None),
+        })
+    }
+
+    fn collect_sum_terms<'b>(
+        &self,
+        expression: &'b Expression<Fq>,
+        coeff: Fq,
+        constant: &mut Fq,
+        terms: &mut Vec<(Fq, &'b Expression<Fq>)>,
+    ) {
+        match expression {
+            Expression::Constant(value) => {
+                *constant += coeff * value;
+            }
+            Expression::Negated(inner) => {
+                self.collect_sum_terms(inner, -coeff, constant, terms);
+            }
+            Expression::Sum(lhs, rhs) => {
+                self.collect_sum_terms(lhs, coeff, constant, terms);
+                self.collect_sum_terms(rhs, coeff, constant, terms);
+            }
+            Expression::Scaled(inner, scale) => {
+                self.collect_sum_terms(inner, coeff * scale, constant, terms);
+            }
+            _ => terms.push((coeff, expression)),
+        }
+    }
+
+    fn evaluate_scaled_term(
+        &self,
+        expression: &Expression<Fq>,
+        coeff: Fq,
+    ) -> (Vec<String>, String) {
+        let coeff_is_one = coeff == Fq::ONE;
+
+        if let Expression::Product(lhs, rhs) = expression {
+            let (mut lines, lhs_var) = self.evaluate_basic(lhs);
+            let (mut rhs_lines, rhs_var) = self.evaluate_basic(rhs);
+            lines.append(&mut rhs_lines);
+            let expr = if coeff_is_one {
+                format!("mulmod({lhs_var}, {rhs_var}, r)")
+            } else {
+                let (coeff_lines, coeff_var) =
+                    self.init_var(u256_string(fe_to_u256::<Fq>(&coeff)), None);
+                lines.extend(coeff_lines);
+                format!("mulmod(mulmod({lhs_var}, {rhs_var}, r), {coeff_var}, r)")
+            };
+            let (out_lines, out_var) = self.init_var(expr, None);
+            lines.extend(out_lines);
+            return (lines, out_var);
+        }
+
+        let (mut lines, var) = self.evaluate_basic(expression);
+        if coeff_is_one {
+            return (lines, var);
+        }
+
+        let (coeff_lines, coeff_var) = self.init_var(u256_string(fe_to_u256::<Fq>(&coeff)), None);
+        lines.extend(coeff_lines);
+        let (scale_lines, out_var) = self.init_var(format!("mulmod({var}, {coeff_var}, r)"), None);
+        lines.extend(scale_lines);
+        (lines, out_var)
+    }
+
+    fn evaluate_basic(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         // midnight-proofs `Expression<F>` carries the full frontend
         // variants: Constant / Selector / Fixed / Advice / Instance /
         // Challenge / Negated / Sum / Product / Scaled. We do not expect

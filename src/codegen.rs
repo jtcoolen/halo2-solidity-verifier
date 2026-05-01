@@ -24,7 +24,7 @@ use midnight_proofs::{
 use ruint::aliases::U256;
 use sha3::{Digest, Keccak256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug},
 };
 
@@ -95,6 +95,34 @@ struct QuotientProgramBuild {
     bytes: Vec<u8>,
     consts: Vec<U256>,
     max_stack: usize,
+    packed32: bool,
+    cse_temps: usize,
+}
+
+#[derive(Clone, Debug)]
+struct QuotientIdentity {
+    lines: Vec<String>,
+    var: String,
+    target: QuotientTarget,
+}
+
+// Optional experiment: spend part of the verifier bytecode headroom recovered
+// by moving the quotient payload into the VK. The first N identities are
+// emitted as straight-line Yul, while the suffix remains interpreted by the
+// compact VM. Keep the default at zero; benchmark with
+// HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N.
+const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 0;
+const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
+    "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
+const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
+const QUOTIENT_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_CSE";
+const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
+const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotientProgramEncoding {
+    Bytes,
+    Packed32,
 }
 
 const Q_OP_PUSH_CONST: u8 = 0x01;
@@ -119,6 +147,8 @@ const Q_OP_ADD_MUL_CONST_U8_MEM_U16: u8 = 0x13;
 const Q_OP_ADD_MUL_MEM_MEM: u8 = 0x14;
 const Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8: u8 = 0x15;
 const Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16: u8 = 0x16;
+const Q_OP_PUSH_TEMP: u8 = 0x17;
+const Q_OP_STORE_TEMP: u8 = 0x18;
 
 const Q_MEM_L0: u8 = 0x01;
 const Q_MEM_L_LAST: u8 = 0x02;
@@ -139,11 +169,239 @@ enum QuotientExpr {
     Neg(Box<QuotientExpr>),
 }
 
+#[derive(Debug, Default)]
+struct QuotientCseState {
+    slots: HashMap<String, u16>,
+    emitted: HashMap<String, u16>,
+}
+
+impl QuotientCseState {
+    fn from_exprs(exprs: &[QuotientExpr]) -> Self {
+        let mut counts = HashMap::new();
+        let mut costs = HashMap::new();
+        for expr in exprs {
+            count_quotient_exprs(expr, &mut counts, &mut costs);
+        }
+
+        let mut keyed_counts = counts
+            .iter()
+            .filter_map(|(key, &count)| {
+                let cost = costs.get(key).copied().unwrap_or_default();
+                if quotient_cse_candidate(count, cost) {
+                    Some((key.clone(), count, cost))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        keyed_counts.sort_by(|(lhs, lhs_count, lhs_cost), (rhs, rhs_count, rhs_cost)| {
+            quotient_cse_sort_key(lhs, *lhs_count, *lhs_cost)
+                .cmp(&quotient_cse_sort_key(rhs, *rhs_count, *rhs_cost))
+        });
+
+        let mut slots = HashMap::new();
+        for (key, _, _) in keyed_counts {
+            let slot = slots.len();
+            assert!(slot <= u16::MAX as usize, "too many quotient CSE temps");
+            slots.insert(key, slot as u16);
+        }
+
+        Self {
+            slots,
+            emitted: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum QuotientMem {
     Literal(u32),
     Token(u8),
     TokenOffset(u8, u32),
+}
+
+#[derive(Debug)]
+struct QuotientInlineCsePlan {
+    slots: HashMap<String, u16>,
+    exprs: HashMap<String, QuotientExpr>,
+}
+
+impl QuotientInlineCsePlan {
+    fn new(exprs: &[QuotientExpr]) -> Self {
+        let mut counts = HashMap::new();
+        let mut costs = HashMap::new();
+        let mut keyed_exprs = HashMap::new();
+        for expr in exprs {
+            collect_quotient_expr_stats(expr, &mut counts, &mut costs, &mut keyed_exprs);
+        }
+
+        let mut keyed_counts = counts
+            .iter()
+            .filter_map(|(key, &count)| {
+                let cost = costs.get(key).copied().unwrap_or_default();
+                if quotient_inline_cse_candidate(count, cost) {
+                    Some((key.clone(), count, cost))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        keyed_counts.sort_by(|(lhs, lhs_count, lhs_cost), (rhs, rhs_count, rhs_cost)| {
+            quotient_cse_sort_key(lhs, *lhs_count, *lhs_cost)
+                .cmp(&quotient_cse_sort_key(rhs, *rhs_count, *rhs_cost))
+        });
+
+        let mut slots = HashMap::new();
+        let mut exprs = HashMap::new();
+        for (key, _, _) in keyed_counts {
+            let slot = slots.len();
+            assert!(
+                slot <= u16::MAX as usize,
+                "too many quotient inline CSE temps"
+            );
+            let expr = keyed_exprs
+                .get(&key)
+                .cloned()
+                .expect("CSE expression present");
+            slots.insert(key.clone(), slot as u16);
+            exprs.insert(key, expr);
+        }
+
+        Self { slots, exprs }
+    }
+}
+
+struct QuotientInlineCseEmitter<'a> {
+    plan: &'a QuotientInlineCsePlan,
+    cse_mptr: usize,
+    helpers: bool,
+    emitted: HashSet<String>,
+    emitting: HashSet<String>,
+    next_var: usize,
+}
+
+impl<'a> QuotientInlineCseEmitter<'a> {
+    fn new(plan: &'a QuotientInlineCsePlan, cse_mptr: usize, helpers: bool) -> Self {
+        Self {
+            plan,
+            cse_mptr,
+            helpers,
+            emitted: HashSet::new(),
+            emitting: HashSet::new(),
+            next_var: 0,
+        }
+    }
+
+    fn emit_identity(&mut self, expr: &QuotientExpr, out: &mut Vec<String>) -> String {
+        self.emit_expr(expr, out, None)
+    }
+
+    fn emit_expr(
+        &mut self,
+        expr: &QuotientExpr,
+        out: &mut Vec<String>,
+        current_cse_key: Option<&str>,
+    ) -> String {
+        let key = quotient_expr_key(expr);
+        if Some(key.as_str()) != current_cse_key && self.plan.slots.contains_key(&key) {
+            self.ensure_cse(&key, out);
+            return self.cse_load(&key);
+        }
+
+        match expr {
+            QuotientExpr::Const(value) => u256_string(*value),
+            QuotientExpr::Mem(mem) => quotient_mem_load_expr(*mem),
+            QuotientExpr::Add(lhs, rhs) => {
+                if self.helpers {
+                    if let QuotientExpr::Mul(mul_lhs, mul_rhs) = lhs.as_ref() {
+                        let a = self.emit_expr(mul_lhs, out, current_cse_key);
+                        let b = self.emit_expr(mul_rhs, out, current_cse_key);
+                        let c = self.emit_expr(rhs, out, current_cse_key);
+                        let var = self.fresh_var();
+                        out.push(format!("let {var} := q_madd({a}, {b}, {c})"));
+                        return var;
+                    }
+                    if let QuotientExpr::Mul(mul_lhs, mul_rhs) = rhs.as_ref() {
+                        let a = self.emit_expr(lhs, out, current_cse_key);
+                        let b = self.emit_expr(mul_lhs, out, current_cse_key);
+                        let c = self.emit_expr(mul_rhs, out, current_cse_key);
+                        let var = self.fresh_var();
+                        out.push(format!("let {var} := q_addmul({a}, {b}, {c})"));
+                        return var;
+                    }
+                }
+                let lhs = self.emit_expr(lhs, out, current_cse_key);
+                let rhs = self.emit_expr(rhs, out, current_cse_key);
+                let var = self.fresh_var();
+                if self.helpers {
+                    out.push(format!("let {var} := q_add({lhs}, {rhs})"));
+                } else {
+                    out.push(format!("let {var} := addmod({lhs}, {rhs}, r)"));
+                }
+                var
+            }
+            QuotientExpr::Mul(lhs, rhs) => {
+                let lhs = self.emit_expr(lhs, out, current_cse_key);
+                let rhs = self.emit_expr(rhs, out, current_cse_key);
+                let var = self.fresh_var();
+                if self.helpers {
+                    out.push(format!("let {var} := q_mul({lhs}, {rhs})"));
+                } else {
+                    out.push(format!("let {var} := mulmod({lhs}, {rhs}, r)"));
+                }
+                var
+            }
+            QuotientExpr::Neg(inner) => {
+                let inner = self.emit_expr(inner, out, current_cse_key);
+                let var = self.fresh_var();
+                if self.helpers {
+                    out.push(format!("let {var} := q_neg({inner})"));
+                } else {
+                    out.push(format!("let {var} := sub(r, {inner})"));
+                }
+                var
+            }
+        }
+    }
+
+    fn ensure_cse(&mut self, key: &str, out: &mut Vec<String>) {
+        if self.emitted.contains(key) {
+            return;
+        }
+        assert!(
+            self.emitting.insert(key.to_string()),
+            "cyclic quotient CSE expression"
+        );
+        let expr = self
+            .plan
+            .exprs
+            .get(key)
+            .cloned()
+            .expect("CSE expression present");
+
+        out.push("{".to_string());
+        let value = self.emit_expr(&expr, out, Some(key));
+        out.push(format!("mstore({}, {value})", self.cse_ptr(key)));
+        out.push("}".to_string());
+
+        self.emitting.remove(key);
+        self.emitted.insert(key.to_string());
+    }
+
+    fn cse_load(&self, key: &str) -> String {
+        format!("mload({})", self.cse_ptr(key))
+    }
+
+    fn cse_ptr(&self, key: &str) -> String {
+        let slot = self.plan.slots[key] as usize;
+        format!("{:#x}", self.cse_mptr + slot * 0x20)
+    }
+
+    fn fresh_var(&mut self) -> String {
+        let var = format!("q_cse_var_{}", self.next_var);
+        self.next_var += 1;
+        var
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -170,14 +428,20 @@ struct QuotientProgramBuilder {
 }
 
 impl QuotientProgramBuilder {
-    fn identity(&mut self, lines: &[String], final_var: &str, target: QuotientTarget) {
+    fn identity(
+        &mut self,
+        lines: &[String],
+        final_var: &str,
+        target: QuotientTarget,
+        cse: Option<&mut QuotientCseState>,
+    ) {
         self.vars.clear();
         self.stack_depth = 0;
 
         for line in lines {
             self.assignment(line);
         }
-        self.expr(final_var);
+        self.expr(final_var, cse);
         match target {
             QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
             QuotientTarget::Selector(idx) => {
@@ -193,11 +457,18 @@ impl QuotientProgramBuilder {
         assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
     }
 
-    fn finish(self) -> QuotientProgramBuild {
+    fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
+        let cse_temps = self.cse_temps();
+        let bytes = match encoding {
+            QuotientProgramEncoding::Bytes => compact_quotient_runs(&self.bytes),
+            QuotientProgramEncoding::Packed32 => pack_quotient_u32_program(&self.bytes),
+        };
         QuotientProgramBuild {
-            bytes: compact_quotient_runs(&self.bytes),
+            bytes,
             consts: self.consts,
             max_stack: self.max_stack,
+            packed32: encoding == QuotientProgramEncoding::Packed32,
+            cse_temps,
         }
     }
 
@@ -211,9 +482,13 @@ impl QuotientProgramBuilder {
         self.vars.insert(dst.trim().to_string(), expr);
     }
 
-    fn expr(&mut self, expr: &str) {
+    fn expr(&mut self, expr: &str, cse: Option<&mut QuotientCseState>) {
         let expr = self.parse_expr(expr);
-        self.emit_expr(&expr);
+        if let Some(cse) = cse {
+            self.emit_expr_cse(&expr, cse);
+        } else {
+            self.emit_expr(&expr);
+        }
     }
 
     fn parse_expr(&self, expr: &str) -> QuotientExpr {
@@ -299,6 +574,80 @@ impl QuotientProgramBuilder {
         }
     }
 
+    fn emit_expr_cse(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
+        let key = quotient_expr_key(expr);
+        if let Some(slot) = cse.slots.get(&key).copied() {
+            if cse.emitted.contains_key(&key) {
+                self.bytes.push(Q_OP_PUSH_TEMP);
+                self.u16(slot as usize);
+                self.push_stack();
+                return;
+            }
+
+            cse.emitted.insert(key, slot);
+            self.emit_expr_cse_inner(expr, cse);
+            self.bytes.push(Q_OP_STORE_TEMP);
+            self.u16(slot as usize);
+            return;
+        }
+
+        self.emit_expr_cse_inner(expr, cse);
+    }
+
+    fn emit_expr_cse_inner(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
+        match expr {
+            QuotientExpr::Const(value) => {
+                self.emit_const(*value);
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+                self.emit_mem_literal(*ptr);
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::Token(token)) => {
+                self.bytes.push(Q_OP_PUSH_MEM_TOKEN);
+                self.bytes.push(*token);
+                self.push_stack();
+            }
+            QuotientExpr::Mem(QuotientMem::TokenOffset(token, offset)) => {
+                self.bytes.push(Q_OP_PUSH_MEM_TOKEN_OFFSET);
+                self.bytes.push(*token);
+                self.u32(*offset);
+                self.push_stack();
+            }
+            QuotientExpr::Add(lhs, rhs) => {
+                if !self.try_emit_add_product_cse(lhs, rhs, cse)
+                    && !self.try_emit_add_product_cse(rhs, lhs, cse)
+                {
+                    self.emit_binary_expr_cse(
+                        lhs,
+                        rhs,
+                        Q_OP_ADD,
+                        Q_OP_ADD_CONST_U8,
+                        Q_OP_ADD_CONST,
+                        Q_OP_ADD_MEM_U16,
+                        cse,
+                    );
+                }
+            }
+            QuotientExpr::Mul(lhs, rhs) => {
+                self.emit_binary_expr_cse(
+                    lhs,
+                    rhs,
+                    Q_OP_MUL,
+                    Q_OP_MUL_CONST_U8,
+                    Q_OP_MUL_CONST,
+                    Q_OP_MUL_MEM_U16,
+                    cse,
+                );
+            }
+            QuotientExpr::Neg(expr) => {
+                self.emit_expr_cse(expr, cse);
+                self.op0(Q_OP_NEG);
+            }
+        }
+    }
+
     fn emit_const(&mut self, value: U256) {
         let slot = self.const_slot(value);
         if let Ok(slot) = u8::try_from(slot) {
@@ -330,6 +679,25 @@ impl QuotientProgramBuilder {
         };
 
         self.emit_expr(base);
+        self.emit_product_add(product);
+        true
+    }
+
+    fn try_emit_add_product_cse(
+        &mut self,
+        base: &QuotientExpr,
+        product: &QuotientExpr,
+        cse: &mut QuotientCseState,
+    ) -> bool {
+        let mut leaves = Vec::new();
+        if !collect_product_leaves(product, &mut leaves) {
+            return false;
+        }
+        let Some(product) = self.product_add_macro(&leaves) else {
+            return false;
+        };
+
+        self.emit_expr_cse(base, cse);
         self.emit_product_add(product);
         true
     }
@@ -429,6 +797,40 @@ impl QuotientProgramBuilder {
         self.op_binary(stack_op);
     }
 
+    fn emit_binary_expr_cse(
+        &mut self,
+        lhs: &QuotientExpr,
+        rhs: &QuotientExpr,
+        stack_op: u8,
+        const_u8_op: u8,
+        const_op: u8,
+        mem_u16_op: u8,
+        cse: &mut QuotientCseState,
+    ) {
+        if let Some(leaf) = quotient_leaf(rhs) {
+            self.emit_expr_cse(lhs, cse);
+            if self.emit_acc_leaf(leaf, const_u8_op, const_op, mem_u16_op) {
+                return;
+            }
+            self.emit_expr_cse(rhs, cse);
+            self.op_binary(stack_op);
+            return;
+        }
+        if let Some(leaf) = quotient_leaf(lhs) {
+            self.emit_expr_cse(rhs, cse);
+            if self.emit_acc_leaf(leaf, const_u8_op, const_op, mem_u16_op) {
+                return;
+            }
+            self.emit_expr_cse(lhs, cse);
+            self.op_binary(stack_op);
+            return;
+        }
+
+        self.emit_expr_cse(lhs, cse);
+        self.emit_expr_cse(rhs, cse);
+        self.op_binary(stack_op);
+    }
+
     fn emit_acc_leaf(
         &mut self,
         leaf: QuotientLeaf,
@@ -510,6 +912,27 @@ impl QuotientProgramBuilder {
             .is_some_and(|slot| u8::try_from(*slot).is_ok())
             || (!self.const_slots.contains_key(&value) && self.consts.len() <= u8::MAX as usize)
     }
+
+    fn cse_temps(&self) -> usize {
+        if !quotient_vm_cse_enabled() {
+            return 0;
+        }
+        // Temp slots are encoded directly in the bytecode, so recover the high
+        // watermark from STORE/PUSH_TEMP operands after all identities have
+        // been emitted.
+        let mut idx = 0usize;
+        let mut temps = 0usize;
+        while idx < self.bytes.len() {
+            match self.bytes[idx] {
+                Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP => {
+                    temps = temps.max(read_u16(&self.bytes, idx + 1) as usize + 1);
+                    idx += 3;
+                }
+                _ => idx += quotient_op_len(&self.bytes, idx),
+            }
+        }
+        temps
+    }
 }
 
 fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
@@ -555,10 +978,305 @@ fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len().next_multiple_of(4));
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let op = bytes[idx];
+        match op {
+            Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
+            | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
+            | Q_OP_STORE_TEMP => {
+                push_packed_quotient_op(&mut out, op, read_u16(bytes, idx + 1) as u32);
+                idx += 3;
+            }
+            Q_OP_PUSH_MEM_LITERAL => {
+                let ptr = read_u32(bytes, idx + 1);
+                assert!(
+                    ptr <= 0x00ff_ffff,
+                    "packed quotient VM literal pointer exceeds 24-bit operand"
+                );
+                push_packed_quotient_op(&mut out, op, ptr);
+                idx += 5;
+            }
+            Q_OP_PUSH_MEM_TOKEN => {
+                push_packed_quotient_op(&mut out, op, bytes[idx + 1] as u32);
+                idx += 2;
+            }
+            Q_OP_PUSH_MEM_TOKEN_OFFSET => {
+                let token = bytes[idx + 1] as u32;
+                let offset = read_u32(bytes, idx + 2);
+                assert!(
+                    offset <= u16::MAX as u32,
+                    "packed quotient VM token offset exceeds 16-bit operand"
+                );
+                push_packed_quotient_op(&mut out, op, (token << 16) | offset);
+                idx += 6;
+            }
+            Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => {
+                push_packed_quotient_op(&mut out, op, bytes[idx + 1] as u32);
+                idx += 2;
+            }
+            Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN => {
+                push_packed_quotient_op(&mut out, op, 0);
+                idx += 1;
+            }
+            Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => {
+                let lhs = read_u16(bytes, idx + 1) as u32;
+                let rhs = read_u16(bytes, idx + 3) as u32;
+                let scalar = bytes[idx + 5] as u32;
+                push_packed_quotient_op(&mut out, op, scalar);
+                out.extend_from_slice(&((lhs << 16) | rhs).to_be_bytes());
+                idx += 6;
+            }
+            Q_OP_ADD_MUL_CONST_U8_MEM_U16 => {
+                let ptr = read_u16(bytes, idx + 1) as u32;
+                let scalar = bytes[idx + 3] as u32;
+                push_packed_quotient_op(&mut out, op, (scalar << 16) | ptr);
+                idx += 4;
+            }
+            Q_OP_ADD_MUL_MEM_MEM => {
+                let lhs = read_u16(bytes, idx + 1) as u32;
+                let rhs = read_u16(bytes, idx + 3) as u32;
+                push_packed_quotient_op(&mut out, op, 0);
+                out.extend_from_slice(&((lhs << 16) | rhs).to_be_bytes());
+                idx += 5;
+            }
+            Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 | Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+                panic!("packed quotient VM expects un-compacted quotient op stream")
+            }
+            op => panic!("unknown quotient op {op:#x} at byte {idx}"),
+        }
+    }
+    out
+}
+
+fn push_packed_quotient_op(out: &mut Vec<u8>, op: u8, arg: u32) {
+    assert!(
+        arg <= 0x00ff_ffff,
+        "packed quotient VM operand exceeds 24 bits"
+    );
+    out.extend_from_slice(&(((op as u32) << 24) | arg).to_be_bytes());
+}
+
+fn read_u16(bytes: &[u8], idx: usize) -> u16 {
+    u16::from_be_bytes(
+        bytes[idx..idx + 2]
+            .try_into()
+            .expect("u16 quotient operand"),
+    )
+}
+
+fn read_u32(bytes: &[u8], idx: usize) -> u32 {
+    u32::from_be_bytes(
+        bytes[idx..idx + 4]
+            .try_into()
+            .expect("u32 quotient operand"),
+    )
+}
+
+fn hybrid_quotient_inline_count(identities: &[QuotientIdentity]) -> usize {
+    let requested = std::env::var(HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES);
+    identities.len().min(requested)
+}
+
+fn quotient_program_encoding() -> QuotientProgramEncoding {
+    let Ok(value) = std::env::var(QUOTIENT_ENCODING_ENV) else {
+        return QuotientProgramEncoding::Bytes;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "bytes" | "byte" | "varbytes" | "compact" => QuotientProgramEncoding::Bytes,
+        "3" | "option3" | "packed32" | "packed-32" | "u32" => QuotientProgramEncoding::Packed32,
+        other => panic!("unsupported {QUOTIENT_ENCODING_ENV}={other}; use bytes or packed32"),
+    }
+}
+
+fn quotient_inline_cse_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_CSE_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "cse" => true,
+        other => panic!("unsupported {QUOTIENT_CSE_ENV}={other}; use 0/1"),
+    }
+}
+
+fn quotient_vm_cse_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_VM_CSE_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "cse" => true,
+        other => panic!("unsupported {QUOTIENT_VM_CSE_ENV}={other}; use 0/1"),
+    }
+}
+
+fn quotient_yul_helpers_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_YUL_HELPERS_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "helpers" => true,
+        other => panic!("unsupported {QUOTIENT_YUL_HELPERS_ENV}={other}; use 0/1"),
+    }
+}
+
+fn count_quotient_exprs(
+    expr: &QuotientExpr,
+    counts: &mut HashMap<String, usize>,
+    costs: &mut HashMap<String, usize>,
+) -> usize {
+    let key = quotient_expr_key(expr);
+    *counts.entry(key.clone()).or_default() += 1;
+
+    let cost = match expr {
+        QuotientExpr::Const(_) => 2,
+        QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+            if u16::try_from(*ptr).is_ok() {
+                3
+            } else {
+                5
+            }
+        }
+        QuotientExpr::Mem(QuotientMem::Token(_)) => 2,
+        QuotientExpr::Mem(QuotientMem::TokenOffset(_, _)) => 6,
+        QuotientExpr::Add(lhs, rhs) | QuotientExpr::Mul(lhs, rhs) => {
+            count_quotient_exprs(lhs, counts, costs) + count_quotient_exprs(rhs, counts, costs) + 1
+        }
+        QuotientExpr::Neg(inner) => count_quotient_exprs(inner, counts, costs) + 1,
+    };
+    costs.entry(key).or_insert(cost);
+    cost
+}
+
+fn collect_quotient_expr_stats(
+    expr: &QuotientExpr,
+    counts: &mut HashMap<String, usize>,
+    costs: &mut HashMap<String, usize>,
+    exprs: &mut HashMap<String, QuotientExpr>,
+) -> usize {
+    let key = quotient_expr_key(expr);
+    *counts.entry(key.clone()).or_default() += 1;
+    exprs.entry(key.clone()).or_insert_with(|| expr.clone());
+
+    let cost = match expr {
+        QuotientExpr::Const(_) => 2,
+        QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+            if u16::try_from(*ptr).is_ok() {
+                3
+            } else {
+                5
+            }
+        }
+        QuotientExpr::Mem(QuotientMem::Token(_)) => 2,
+        QuotientExpr::Mem(QuotientMem::TokenOffset(_, _)) => 6,
+        QuotientExpr::Add(lhs, rhs) | QuotientExpr::Mul(lhs, rhs) => {
+            collect_quotient_expr_stats(lhs, counts, costs, exprs)
+                + collect_quotient_expr_stats(rhs, counts, costs, exprs)
+                + 1
+        }
+        QuotientExpr::Neg(inner) => collect_quotient_expr_stats(inner, counts, costs, exprs) + 1,
+    };
+    costs.entry(key).or_insert(cost);
+    cost
+}
+
+fn quotient_cse_candidate(count: usize, cost: usize) -> bool {
+    if count <= 1 || cost <= 3 {
+        return false;
+    }
+    // First use pays the original expression plus STORE_TEMP; each later use
+    // becomes PUSH_TEMP. Keep only cases with an estimated bytecode win.
+    (count - 1) * (cost - 3) > 3
+}
+
+fn quotient_inline_cse_candidate(count: usize, cost: usize) -> bool {
+    if count <= 1 || cost <= 6 {
+        return false;
+    }
+    // Straight-line CSE stores the first evaluation in memory and replaces
+    // every use with an mload. Keep only expressions with enough estimated
+    // duplicated arithmetic to pay for the mstore/mload bytecode.
+    (count - 1) * cost > 12
+}
+
+fn quotient_cse_sort_key(key: &str, count: usize, cost: usize) -> (usize, usize, &str) {
+    let score = count.saturating_sub(1).saturating_mul(cost);
+    (
+        usize::MAX.saturating_sub(score),
+        usize::MAX.saturating_sub(cost),
+        key,
+    )
+}
+
+fn quotient_expr_key(expr: &QuotientExpr) -> String {
+    match expr {
+        QuotientExpr::Const(value) => format!("c:{value:x}"),
+        QuotientExpr::Mem(QuotientMem::Literal(ptr)) => format!("m:{ptr:x}"),
+        QuotientExpr::Mem(QuotientMem::Token(token)) => format!("t:{token:x}"),
+        QuotientExpr::Mem(QuotientMem::TokenOffset(token, offset)) => {
+            format!("to:{token:x}:{offset:x}")
+        }
+        QuotientExpr::Add(lhs, rhs) => quotient_commutative_expr_key("a", lhs, rhs),
+        QuotientExpr::Mul(lhs, rhs) => quotient_commutative_expr_key("u", lhs, rhs),
+        QuotientExpr::Neg(inner) => format!("n:{}", quotient_expr_key(inner)),
+    }
+}
+
+fn quotient_mem_load_expr(mem: QuotientMem) -> String {
+    format!("mload({})", quotient_mem_ptr_expr(mem))
+}
+
+fn quotient_mem_ptr_expr(mem: QuotientMem) -> String {
+    match mem {
+        QuotientMem::Literal(ptr) => format!("{ptr:#x}"),
+        QuotientMem::Token(token) => quotient_mem_token_name(token).to_string(),
+        QuotientMem::TokenOffset(token, offset) => {
+            format!("add({}, {offset:#x})", quotient_mem_token_name(token))
+        }
+    }
+}
+
+fn quotient_mem_token_name(token: u8) -> &'static str {
+    match token {
+        Q_MEM_L0 => "L_0_MPTR",
+        Q_MEM_L_LAST => "L_LAST_MPTR",
+        Q_MEM_L_BLIND => "L_BLIND_MPTR",
+        Q_MEM_BETA => "BETA_MPTR",
+        Q_MEM_GAMMA => "GAMMA_MPTR",
+        Q_MEM_X => "X_MPTR",
+        Q_MEM_THETA => "THETA_MPTR",
+        Q_MEM_TRASH_CHALLENGE => "TRASH_CHALLENGE_MPTR",
+        Q_MEM_INSTANCE_EVAL => "INSTANCE_EVAL_MPTR",
+        _ => panic!("unknown quotient memory token {token:#x}"),
+    }
+}
+
+fn quotient_commutative_expr_key(op: &str, lhs: &QuotientExpr, rhs: &QuotientExpr) -> String {
+    let lhs = quotient_expr_key(lhs);
+    let rhs = quotient_expr_key(rhs);
+    if lhs <= rhs {
+        format!("{op}:{lhs}:{rhs}")
+    } else {
+        format!("{op}:{rhs}:{lhs}")
+    }
+}
+
 fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
     match bytes[idx] {
         Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
-        | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 => 3,
+        | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
+        | Q_OP_STORE_TEMP => 3,
         Q_OP_PUSH_MEM_LITERAL => 5,
         Q_OP_PUSH_MEM_TOKEN => 2,
         Q_OP_PUSH_MEM_TOKEN_OFFSET => 6,
@@ -627,6 +1345,14 @@ fn parse_u256(value: &str) -> U256 {
         U256::from_str_radix(hex, 16).expect("valid hex U256")
     } else {
         U256::from_str_radix(value, 10).expect("valid decimal U256")
+    }
+}
+
+fn u256_string(value: U256) -> String {
+    if value.bit_len() < 64 {
+        format!("0x{:x}", value.as_limbs()[0])
+    } else {
+        format!("0x{value:x}")
     }
 }
 
@@ -980,6 +1706,10 @@ impl<'a> SolidityGenerator<'a> {
     fn generate_vk(&self) -> Halo2VerifyingKey {
         let proof_cptr = Ptr::calldata(0x64);
         let mut vk = self.generate_base_vk();
+        if quotient_inline_cse_enabled() {
+            return vk;
+        }
+
         let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
 
         let (pre_meta, pre_data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
@@ -1069,6 +1799,18 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> (QuotientProgramBuild, Vec<usize>) {
+        let (identities, sorted_simple) = self.quotient_identities(meta, data);
+        let inline_count = hybrid_quotient_inline_count(&identities);
+        let quotient_program_build = self.build_quotient_program(&identities[inline_count..]);
+        let _quotient_max_stack = quotient_program_build.max_stack;
+        (quotient_program_build, sorted_simple)
+    }
+
+    fn quotient_identities(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+    ) -> (Vec<QuotientIdentity>, Vec<usize>) {
         let evaluator = Evaluator::new(self.vk.cs(), meta, data);
         let gate_items = evaluator.gate_computations_tagged();
         let perm_items = evaluator.permutation_computations();
@@ -1077,15 +1819,115 @@ impl<'a> SolidityGenerator<'a> {
 
         let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         sorted_simple.sort_unstable();
-        let quotient_program_build = self.build_quotient_program(
-            &gate_items,
-            &perm_items,
-            &lookup_items,
-            &trash_items,
-            &sorted_simple,
+
+        let mut identities = Vec::with_capacity(
+            gate_items.len() + perm_items.len() + lookup_items.len() + trash_items.len(),
         );
-        let _quotient_max_stack = quotient_program_build.max_stack;
-        (quotient_program_build, sorted_simple)
+        for (lines, var, sel_idx) in gate_items {
+            let target = match sel_idx {
+                Some(col) => {
+                    let idx = sorted_simple
+                        .iter()
+                        .position(|simple| *simple == col)
+                        .expect("selector column present");
+                    QuotientTarget::Selector(idx)
+                }
+                None => QuotientTarget::Main,
+            };
+            identities.push(QuotientIdentity { lines, var, target });
+        }
+        for (lines, var) in perm_items {
+            identities.push(QuotientIdentity {
+                lines,
+                var,
+                target: QuotientTarget::Main,
+            });
+        }
+        for (lines, var) in lookup_items {
+            identities.push(QuotientIdentity {
+                lines,
+                var,
+                target: QuotientTarget::Main,
+            });
+        }
+        for (lines, var) in trash_items {
+            identities.push(QuotientIdentity {
+                lines,
+                var,
+                target: QuotientTarget::Main,
+            });
+        }
+
+        (identities, sorted_simple)
+    }
+
+    fn quotient_identity_expr(identity: &QuotientIdentity) -> QuotientExpr {
+        let mut parser = QuotientProgramBuilder::default();
+        for line in &identity.lines {
+            parser.assignment(line);
+        }
+        parser.parse_expr(&identity.var)
+    }
+
+    fn inline_cse_quotient_computations(
+        identities: &[QuotientIdentity],
+        sorted_simple: &[usize],
+        cse_mptr: usize,
+        helpers: bool,
+    ) -> Vec<Vec<String>> {
+        let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
+        let exprs = identities
+            .iter()
+            .map(Self::quotient_identity_expr)
+            .collect::<Vec<_>>();
+        let plan = QuotientInlineCsePlan::new(&exprs);
+        let eval_scratch_slot = cse_mptr + plan.slots.len() * 0x20;
+        let mut emitter = QuotientInlineCseEmitter::new(&plan, cse_mptr, helpers);
+        let mut computations = Vec::new();
+
+        let mut init_lines = Vec::new();
+        init_lines.push("let quotient_eval_numer := 0".to_string());
+        for idx in 0..sorted_simple.len() {
+            init_lines.push(format!("let {} := 0", sel_var(idx)));
+        }
+        computations.push(init_lines);
+
+        for (identity, expr) in identities.iter().zip(exprs.iter()) {
+            let mut block = Vec::with_capacity(identity.lines.len() + 8 + sorted_simple.len());
+            block.push("{".to_string());
+            let value = emitter.emit_identity(expr, &mut block);
+            block.push(format!("mstore({eval_scratch_slot:#x}, {value})"));
+            block.push("}".to_string());
+            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+            for idx in 0..sorted_simple.len() {
+                block.push(format!(
+                    "{name} := mulmod({name}, y, r)",
+                    name = sel_var(idx)
+                ));
+            }
+            let target = match identity.target {
+                QuotientTarget::Selector(idx) => sel_var(idx),
+                QuotientTarget::Main => "quotient_eval_numer".to_string(),
+            };
+            block.push(format!(
+                "{target} := addmod({target}, mload({eval_scratch_slot:#x}), r)"
+            ));
+            computations.push(block);
+        }
+
+        if !sorted_simple.is_empty() {
+            let mut tail = Vec::new();
+            for i in 0..sorted_simple.len() {
+                tail.push(format!(
+                    "mstore(add(SELECTOR_ACC_MPTR, {:#x}), {})",
+                    i * 0x20,
+                    sel_var(i)
+                ));
+            }
+            computations.push(tail);
+        }
+
+        computations
     }
 
     fn generate_verifier(
@@ -1101,27 +1943,18 @@ impl<'a> SolidityGenerator<'a> {
 
         let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
 
-        let evaluator = Evaluator::new(self.vk.cs(), &meta, &data);
-
-        // Build the merged identity list, tagging each item with its
-        // simple-selector fixed column (if any) so we can route gate
-        // contributions to the correct accumulator. Permutation,
-        // lookup, and trash identities are always `None`-bucket.
-        let gate_items = evaluator.gate_computations_tagged();
-        let perm_items = evaluator.permutation_computations();
-        let lookup_items = evaluator.lookup_computations();
-        let trash_items = evaluator.trashcan_computations();
-
-        let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
-        sorted_simple.sort_unstable();
-        let sel_var = |col: usize| format!("sel_acc_{col}");
-        let quotient_program_build = self.build_quotient_program(
-            &gate_items,
-            &perm_items,
-            &lookup_items,
-            &trash_items,
-            &sorted_simple,
-        );
+        let (identities, sorted_simple) = self.quotient_identities(&meta, &data);
+        let use_inline_cse = quotient_inline_cse_enabled();
+        let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
+        let inline_count = if use_inline_cse {
+            0
+        } else {
+            hybrid_quotient_inline_count(&identities)
+        };
+        let (inline_identities, vm_identities) = identities.split_at(inline_count);
+        let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
+        let quotient_program_build =
+            (!use_inline_cse).then(|| self.build_quotient_program(vm_identities));
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -1135,125 +1968,171 @@ impl<'a> SolidityGenerator<'a> {
         let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
         let selector_acc_mptr = after_comms.next_multiple_of(0x20);
         let batch_invert_scratch_mptr = selector_acc_mptr;
-        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
-        let quotient_const_words = vk.quotient_const_words;
-        let quotient_program_words = vk.quotient_program_words;
-        let quotient_const_offset_words = vk
-            .quotient_const_offset_words
-            .expect("VK must carry quotient constants");
-        let quotient_program_offset_words = vk
-            .quotient_program_offset_words
-            .expect("VK must carry quotient program");
-        assert_eq!(
-            quotient_program_build.consts.len(),
-            quotient_const_words,
-            "quotient const table changed after VK payload reservation"
-        );
-        assert_eq!(
-            quotient_program_chunks.len(),
-            quotient_program_words,
-            "quotient program length changed after VK payload reservation"
-        );
         let expected_vk_codehash = separate.then(|| {
             let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
             U256::from_be_bytes(digest)
         });
         let vk_len = vk.len();
-        let quotient_program = {
-            let stack_mptr =
-                (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+        let quotient_tmp_mptr =
+            (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+        let (quotient_program, quotient_stack_mptr) = if let Some(quotient_program_build) =
+            quotient_program_build
+        {
+            let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+            let quotient_const_words = vk.quotient_const_words;
+            let quotient_program_words = vk.quotient_program_words;
+            let quotient_const_offset_words = vk
+                .quotient_const_offset_words
+                .expect("VK must carry quotient constants");
+            let quotient_program_offset_words = vk
+                .quotient_program_offset_words
+                .expect("VK must carry quotient program");
+            assert_eq!(
+                quotient_program_build.consts.len(),
+                quotient_const_words,
+                "quotient const table changed after VK payload reservation"
+            );
+            assert_eq!(
+                quotient_program_chunks.len(),
+                quotient_program_words,
+                "quotient program length changed after VK payload reservation"
+            );
+            let quotient_stack_mptr = quotient_tmp_mptr + quotient_program_build.cse_temps * 0x20;
             let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
             let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
-            Some(QuotientProgram {
-                consts: quotient_program_build.consts,
-                chunks: quotient_program_chunks,
-                len: quotient_program_build.bytes.len(),
-                const_mptr,
-                stack_mptr,
-                program_mptr,
-            })
+            (
+                Some(QuotientProgram {
+                    consts: quotient_program_build.consts,
+                    chunks: quotient_program_chunks,
+                    len: quotient_program_build.bytes.len(),
+                    packed32: quotient_program_build.packed32,
+                    cse_temps: quotient_program_build.cse_temps,
+                    const_mptr,
+                    tmp_mptr: quotient_tmp_mptr,
+                    stack_mptr: quotient_stack_mptr,
+                    program_mptr,
+                }),
+                quotient_stack_mptr,
+            )
+        } else {
+            (None, quotient_tmp_mptr)
         };
 
+        let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
 
-        // Step 0: declare and zero-init all accumulators.
-        {
-            let mut init_lines = Vec::new();
-            init_lines.push("let quotient_eval_numer := 0".to_string());
-            for &col in &sorted_simple {
-                init_lines.push(format!("let {} := 0", sel_var(col)));
+        if use_inline_cse {
+            quotient_eval_numer_computations = Self::inline_cse_quotient_computations(
+                &identities,
+                &sorted_simple,
+                quotient_tmp_mptr,
+                quotient_yul_helpers,
+            );
+        } else {
+            // Step 0: declare and zero-init all accumulators.
+            {
+                let mut init_lines = Vec::new();
+                init_lines.push("let quotient_eval_numer := 0".to_string());
+                for idx in 0..sorted_simple.len() {
+                    init_lines.push(format!("let {} := 0", sel_var(idx)));
+                }
+                quotient_eval_numer_computations.push(init_lines);
             }
-            quotient_eval_numer_computations.push(init_lines);
-        }
 
-        // Helper that emits a self-contained Horner-fold step for one
-        // identity. The eval is computed inside its own `{}` scope
-        // (so per-block `v0..vN` locals don't collide with siblings)
-        // and exported via a small per-step shim. We compute the
-        // eval inside the block, store its value at scratch, and then
-        // perform the Horner update at the outer scope. Using
-        // mstore/mload here is wasteful but lets us keep the existing
-        // `evaluate` contract untouched.
-        // Scratch slot for piping each identity's eval out of its
-        // inner `{}` block back to the outer Horner accumulator. Must
-        // not overlap the generated verifier's VK, challenge, proof
-        // commitment, simple-selector, or scalar-inversion regions.
-        const EVAL_SCRATCH_SLOT: usize = 0x9000;
-        let make_block = |lines: Vec<String>, var: String, sel_idx: Option<usize>| -> Vec<String> {
-            let mut block = Vec::with_capacity(lines.len() + 6);
-            // Inner block: compute the eval and stash it in a scratch slot.
-            block.push("{".to_string());
-            for l in lines {
-                block.push(l);
-            }
-            block.push(format!("mstore({EVAL_SCRATCH_SLOT:#x}, {var})"));
-            block.push("}".to_string());
-            // Outer Horner update (re-loads from the scratch slot).
-            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-            for &col in &sorted_simple {
+            // Helper that emits a self-contained Horner-fold step for one
+            // identity. The eval is computed inside its own `{}` scope
+            // (so per-block `v0..vN` locals don't collide with siblings)
+            // and exported via a small per-step shim. We compute the
+            // eval inside the block, store its value at scratch, and then
+            // perform the Horner update at the outer scope. Using
+            // mstore/mload here is wasteful but lets us keep the existing
+            // `evaluate` contract untouched.
+            // Scratch slot for piping each identity's eval out of its
+            // inner `{}` block back to the outer Horner accumulator. Must
+            // not overlap the generated verifier's VK, challenge, proof
+            // commitment, simple-selector, or scalar-inversion regions.
+            let eval_scratch_slot = quotient_stack_mptr;
+            let make_block = |identity: &QuotientIdentity| -> Vec<String> {
+                let mut block = Vec::with_capacity(identity.lines.len() + 6);
+                // Inner block: compute the eval and stash it in a scratch slot.
+                block.push("{".to_string());
+                for l in &identity.lines {
+                    block.push(l.clone());
+                }
+                block.push(format!("mstore({eval_scratch_slot:#x}, {})", identity.var));
+                block.push("}".to_string());
+                // Outer Horner update (re-loads from the scratch slot).
+                block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+                for idx in 0..sorted_simple.len() {
+                    block.push(format!(
+                        "{name} := mulmod({name}, y, r)",
+                        name = sel_var(idx)
+                    ));
+                }
+                let target = match identity.target {
+                    QuotientTarget::Selector(idx) => sel_var(idx),
+                    QuotientTarget::Main => "quotient_eval_numer".to_string(),
+                };
                 block.push(format!(
-                    "{name} := mulmod({name}, y, r)",
-                    name = sel_var(col)
+                    "{target} := addmod({target}, mload({eval_scratch_slot:#x}), r)"
                 ));
-            }
-            let target = match sel_idx {
-                Some(col) => sel_var(col),
-                None => "quotient_eval_numer".to_string(),
+                block
             };
-            block.push(format!(
-                "{target} := addmod({target}, mload({EVAL_SCRATCH_SLOT:#x}), r)"
-            ));
-            block
-        };
 
-        for (lines, var, sel_idx) in gate_items {
-            quotient_eval_numer_computations.push(make_block(lines, var, sel_idx));
-        }
-        for (lines, var) in perm_items {
-            quotient_eval_numer_computations.push(make_block(lines, var, None));
-        }
-        for (lines, var) in lookup_items {
-            quotient_eval_numer_computations.push(make_block(lines, var, None));
-        }
-        for (lines, var) in trash_items {
-            quotient_eval_numer_computations.push(make_block(lines, var, None));
-        }
+            let make_inline_block = |identity: &QuotientIdentity| -> Vec<String> {
+                let mut block = Vec::with_capacity(identity.lines.len() + 8 + sorted_simple.len());
+                block.push("{".to_string());
+                for l in &identity.lines {
+                    block.push(l.clone());
+                }
+                block.push(format!("mstore({eval_scratch_slot:#x}, {})", identity.var));
+                block.push("}".to_string());
+                block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+                if !sorted_simple.is_empty() {
+                    block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+                    block
+                        .push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+                }
+                match identity.target {
+                    QuotientTarget::Main => {
+                        block.push(format!(
+                        "quotient_eval_numer := addmod(quotient_eval_numer, mload({eval_scratch_slot:#x}), r)"
+                    ));
+                    }
+                    QuotientTarget::Selector(idx) => {
+                        block.push(format!(
+                        "mstore(add(SELECTOR_ACC_MPTR, {:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {:#x})), mulmod(mload({eval_scratch_slot:#x}), q_sel_inv_scale, r), r))",
+                        idx * 0x20,
+                        idx * 0x20
+                    ));
+                    }
+                }
+                block
+            };
 
-        // Tail block: store each simple-selector accumulator at a
-        // dedicated scratch slot so the linearization-MSM emitter can
-        // pick them up. The base is placed after the decompressed proof
-        // commitments; later PCS scratch tables may reuse it after the
-        // linearization MSM has consumed these values.
-        if !sorted_simple.is_empty() {
-            let mut tail = Vec::new();
-            for (i, &col) in sorted_simple.iter().enumerate() {
-                tail.push(format!(
-                    "mstore(add(SELECTOR_ACC_MPTR, {:#x}), {})",
-                    i * 0x20,
-                    sel_var(col)
-                ));
+            for identity in inline_identities {
+                quotient_inline_computations.push(make_inline_block(identity));
             }
-            quotient_eval_numer_computations.push(tail);
+            for identity in &identities {
+                quotient_eval_numer_computations.push(make_block(identity));
+            }
+
+            // Tail block: store each simple-selector accumulator at a
+            // dedicated scratch slot so the linearization-MSM emitter can
+            // pick them up. The base is placed after the decompressed proof
+            // commitments; later PCS scratch tables may reuse it after the
+            // linearization MSM has consumed these values.
+            if !sorted_simple.is_empty() {
+                let mut tail = Vec::new();
+                for i in 0..sorted_simple.len() {
+                    tail.push(format!(
+                        "mstore(add(SELECTOR_ACC_MPTR, {:#x}), {})",
+                        i * 0x20,
+                        sel_var(i)
+                    ));
+                }
+                quotient_eval_numer_computations.push(tail);
+            }
         }
 
         let pcs_computations =
@@ -1334,6 +2213,7 @@ impl<'a> SolidityGenerator<'a> {
             scheme: self.scheme,
             trace,
             gas_checkpoints,
+            quotient_yul_helpers,
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,
@@ -1362,6 +2242,7 @@ impl<'a> SolidityGenerator<'a> {
             proof_len: meta.proof_len(self.scheme),
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
+            quotient_inline_computations,
             quotient_eval_numer_computations,
             quotient_program,
             pcs_computations,
@@ -1375,40 +2256,29 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn build_quotient_program(
-        &self,
-        gate_items: &[(Vec<String>, String, Option<usize>)],
-        perm_items: &[(Vec<String>, String)],
-        lookup_items: &[(Vec<String>, String)],
-        trash_items: &[(Vec<String>, String)],
-        sorted_simple: &[usize],
-    ) -> QuotientProgramBuild {
+    fn build_quotient_program(&self, identities: &[QuotientIdentity]) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::default();
+        // Mirror snark-verifier's loader cache shape: when VM CSE is enabled,
+        // choose repeated expression temps across the whole quotient program,
+        // not just within one identity.
+        let mut cse = quotient_vm_cse_enabled().then(|| {
+            let exprs = identities
+                .iter()
+                .map(Self::quotient_identity_expr)
+                .collect::<Vec<_>>();
+            QuotientCseState::from_exprs(&exprs)
+        });
 
-        for (lines, var, sel_idx) in gate_items {
-            let target = match sel_idx {
-                Some(col) => {
-                    let idx = sorted_simple
-                        .iter()
-                        .position(|simple| simple == col)
-                        .expect("selector column present");
-                    QuotientTarget::Selector(idx)
-                }
-                None => QuotientTarget::Main,
-            };
-            builder.identity(lines, var, target);
-        }
-        for (lines, var) in perm_items {
-            builder.identity(lines, var, QuotientTarget::Main);
-        }
-        for (lines, var) in lookup_items {
-            builder.identity(lines, var, QuotientTarget::Main);
-        }
-        for (lines, var) in trash_items {
-            builder.identity(lines, var, QuotientTarget::Main);
+        for identity in identities {
+            builder.identity(
+                &identity.lines,
+                &identity.var,
+                identity.target,
+                cse.as_mut(),
+            );
         }
 
-        builder.finish()
+        builder.finish(quotient_program_encoding())
     }
 
     fn program_chunks(bytes: &[u8]) -> Vec<U256> {
