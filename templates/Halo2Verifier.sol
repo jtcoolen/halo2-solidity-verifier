@@ -93,13 +93,16 @@ contract Halo2Verifier {
     uint256 internal constant          ACC_LHS_MPTR = {{ theta_mptr + 18 }};
     uint256 internal constant          ACC_RHS_MPTR = {{ theta_mptr + 22 }};
 
-    // Lagrange / quotient scratch.
+    // Lagrange / linearization scratch.
     uint256 internal constant              X_N_MPTR = {{ theta_mptr + 26 }};
     uint256 internal constant  X_N_MINUS_1_INV_MPTR = {{ theta_mptr + 27 }};
     uint256 internal constant           L_LAST_MPTR = {{ theta_mptr + 28 }};
     uint256 internal constant          L_BLIND_MPTR = {{ theta_mptr + 29 }};
     uint256 internal constant              L_0_MPTR = {{ theta_mptr + 30 }};
     uint256 internal constant     INSTANCE_EVAL_MPTR = {{ theta_mptr + 31 }};
+    // Legacy name: this is not h(x). It stores the expected opening
+    // scalar for the linearized commitment, i.e. the negated y-batched
+    // identity numerator reconstructed from the alleged evals at x.
     uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ theta_mptr + 32 }};
     uint256 internal constant         QUOTIENT_MPTR = {{ theta_mptr + 33 }};   // 4 words
     uint256 internal constant        G1_SCALAR_MPTR = {{ theta_mptr + 37 }};
@@ -1008,7 +1011,21 @@ contract Halo2Verifier {
             {%- endif %}
 
             // ===============================================================
-            // Quotient evaluation. Pure Fr arithmetic.
+            // Batched identity numerator / linearization target.
+            //
+            // This block does not evaluate the quotient polynomial h(x), and
+            // the proof does not provide an h(x) scalar to trust. Instead it:
+            //
+            //   1. Reconstructs the y-batched constraint numerator nu_y(x)
+            //      from the alleged polynomial evaluations read after the
+            //      transcript sampled x.
+            //   2. Stores -nu_y(x) as the expected opening scalar for the
+            //      linearized commitment.
+            //
+            // The commitment side is built in the next block from the quotient
+            // limb commitments as (1 - x^n) * Σ_i x_split^i * Q_i, plus any
+            // simple-selector commitments. The PCS check later binds that
+            // linearized commitment to this expected scalar at x.
             // ===============================================================
             {
                 {%- match quotient_program %}
@@ -1492,8 +1509,8 @@ contract Halo2Verifier {
                 }
                 {%- endif %}
 
-                let quotient_eval := sub(r, quotient_eval_numer)
-                mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
+                let linearization_expected_eval := sub(r, quotient_eval_numer)
+                mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 pop(y)
                 {%- when None %}
                 let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999 // BLS12-381 Fr::DELTA
@@ -1509,26 +1526,24 @@ contract Halo2Verifier {
                 pop(y)
                 pop(delta)
 
-                // The linearization-poly target eval at x is the (negated)
-                // sum of fully-evaluated identities — see
+                // Store the expected opening scalar for the linearized
+                // commitment at x: the negated sum of fully-evaluated
+                // identities. See
                 // `compute_linearization_commitment` in
                 // midfall/proofs/src/plonk/linearization/verifier.rs:
                 //
                 //   expected_eval -= eval     (for col_idx == None)
                 //
-                // For our setting (num_simple_selectors == 0) every
-                // identity is fully evaluated, so the target eval is
-                // -quotient_eval_numer. The point is paired with a
-                // commitment that already includes the (1 - x^n)
-                // factor (see splitting_pow init below), so we do
-                // NOT divide by (x^n - 1) here.
-                let quotient_eval := sub(r, quotient_eval_numer)
-                mstore(QUOTIENT_EVAL_MPTR, quotient_eval)
+                // The commitment side already includes the quotient-limb
+                // factor (1 - x^n), so this scalar is -nu_y(x), not
+                // h(x) = nu_y(x) / (x^n - 1).
+                let linearization_expected_eval := sub(r, quotient_eval_numer)
+                mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 {%- endmatch %}
             }
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(12) // after quotient evaluation (Fr arithmetic)
+            gas_checkpoint(12) // after batched identity numerator reconstruction
             {%- endif %}
 
             // ===============================================================
@@ -1536,8 +1551,9 @@ contract Halo2Verifier {
             // multi-pair G1MSM (optimisation #1, OPTIMISATION.md).
             //
             // Native math (from `compute_linearization_commitment`):
-            //   QUOTIENT = (1 - x^n) * Σ_i x_split^i * Q_i
-            //            + Σ_j sel_acc_j * S_j_com
+            //   LINEARIZATION_COM =
+            //       (1 - x^n) * Σ_i x_split^i * Q_i
+            //     + Σ_j sel_acc_j * S_j_com
             // where x_split = x^(n-1) is the splitting factor and Q_i are
             // the quotient limbs at QUOTIENT_LIMB_COMMS_MPTR_BASE.
             //
@@ -1603,7 +1619,8 @@ contract Halo2Verifier {
                 {%- endfor %}
                 {%- endif %}
 
-                // One multi-pair MSM. Result = QUOTIENT (4 words at 0x100).
+                // One multi-pair MSM. Result = LINEARIZATION_COM
+                // (4 words at 0x100).
                 success := and(
                     success,
                     staticcall(

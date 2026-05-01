@@ -466,6 +466,9 @@ pub(crate) struct Data {
     pub(crate) trashcan_evals: Vec<Word>,
 
     pub(crate) computed_quotient_comm: EcPoint,
+    /// Historical name mirroring `QUOTIENT_EVAL_MPTR`. This is the
+    /// expected opening scalar for the linearized commitment (`-nu_y(x)`),
+    /// not an alleged quotient-polynomial evaluation `h(x)`.
     pub(crate) computed_quotient_eval: Word,
 
     /// Word offset (in the verifier's static memory map) of the start of

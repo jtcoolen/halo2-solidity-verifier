@@ -1,11 +1,17 @@
 #![allow(clippy::useless_format)]
 
-//! Quotient-numerator emitter.
+//! Batched identity numerator emitter.
 //!
 //! This module walks the gates / permutation / lookup / trash arguments
 //! stored in a `midnight_proofs::plonk::ConstraintSystem` and emits the
 //! Yul lines that compute their per-row contributions to
 //! `quotient_eval_numer` at the evaluation challenge `x`.
+//!
+//! The name is historical: this is not an evaluator for the quotient
+//! polynomial `h(x)`. It reconstructs the batched identity numerator
+//! `nu_y(x)`. The generated verifier later stores `-nu_y(x)` as the
+//! expected opening scalar for the linearized commitment; the commitment
+//! side already includes the quotient-limb factor `(1 - x^n)`.
 //!
 //! ## Step 4 status (2026-04-26)
 //!

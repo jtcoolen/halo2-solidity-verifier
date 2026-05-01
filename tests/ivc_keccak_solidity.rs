@@ -1206,7 +1206,7 @@ fn checkpoint_name(id: u8, pcs_set_count: Option<u8>) -> String {
         9 => "y squeeze + quotient-limb reads".to_string(),
         10 => "evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi".to_string(),
         11 => "Lagrange + instance evaluation".to_string(),
-        12 => "quotient evaluation (Fr arithmetic)".to_string(),
+        12 => "batched identity numerator reconstruction".to_string(),
         13 => "linearization-commitment MSM".to_string(),
         14 => "PCS block 6 (pairing inputs LHS/RHS)".to_string(),
         15 => "public accumulator pairing check".to_string(),

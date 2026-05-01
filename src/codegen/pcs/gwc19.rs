@@ -20,12 +20,12 @@
 //!
 //! Notes:
 //!
-//!   * The current emission targets the simplified case
-//!     `num_simple_selectors() == 0`. In that regime the linearization
-//!     commitment is just the combined quotient commitment with eval
-//!     `quotient_eval_numer / (x^n - 1)`, both already produced by the
-//!     evaluator/prologue. Step 6/7 will extend the emitter to handle
-//!     the linearized commitment as a `Linear` MSM.
+//!   * The query list includes the linearized commitment built from the
+//!     quotient-limb commitments and any simple-selector commitments. Its
+//!     expected opening scalar is not `h(x)`; the verifier reconstructs
+//!     the batched identity numerator `nu_y(x)` and stores `-nu_y(x)`.
+//!     The commitment side already carries the `(1 - x^n)` quotient-limb
+//!     factor.
 //!
 //!   * For point-set inversion we emit one `modexp` precompile call per
 //!     set (`x3 - p_j`), then locally compose. This is gas-suboptimal
@@ -151,11 +151,13 @@ pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
         out.push(Query::new(comm, 0, eval));
     }
 
-    // 7. Linearization query at rotation 0. With num_simple_selectors == 0
-    //    this collapses to (computed_quotient_comm, computed_quotient_eval).
-    //    The evaluator emits `quotient_eval` already as
-    //    `quotient_eval_numer / (x^n - 1)`, which matches the
-    //    linearization eval target.
+    // 7. Linearization query at rotation 0. Despite the historical
+    //    `computed_quotient_*` names, this is the PCS query for the
+    //    linearized commitment. Its eval is the expected opening scalar
+    //    `-nu_y(x)`, reconstructed from the alleged component evals. The
+    //    commitment side includes `(1 - x^n) * Σ_i x_split^i * Q_i`, so
+    //    the verifier does not divide by `(x^n - 1)` or accept an
+    //    alleged `h(x)` scalar.
     out.push(Query::new(
         data.computed_quotient_comm,
         0,

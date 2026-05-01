@@ -2,10 +2,14 @@
 
 ## Context
 
-The generated Solidity verifier currently emits the quotient polynomial evaluation as
-straight-line Yul/Solidity arithmetic. For large Halo2/Midnight-ZK circuits this can
-produce thousands of arithmetic statements. The runtime cost is pure `Fr`
-arithmetic, but the generated code occupies a large amount of verifier bytecode.
+The generated Solidity verifier currently emits the batched identity numerator
+reconstruction as straight-line Yul/Solidity arithmetic. Historically we called
+this "quotient evaluation", but the verifier is not directly evaluating
+`h(x)`. It reconstructs `nu_y(x)` from alleged polynomial evaluations and stores
+`-nu_y(x)` as the expected opening scalar for the linearized commitment. For
+large Halo2/Midnight-ZK circuits this can produce thousands of arithmetic
+statements. The runtime cost is pure `Fr` arithmetic, but the generated code
+occupies a large amount of verifier bytecode.
 
 This matters because the main verifier contract must stay under the EIP-170
 runtime bytecode limit of 24 KiB when it is deployed on a normal EVM chain. Even
@@ -439,7 +443,7 @@ evaluation:
 - `vk runtime`
 - `total runtime`
 - `total tx gas_used`
-- The checkpoint labeled `quotient evaluation (Fr arithmetic)`
+- The checkpoint labeled `batched identity numerator reconstruction`
 
 ## Open Questions
 
