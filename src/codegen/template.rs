@@ -165,6 +165,8 @@ pub(crate) struct Halo2Verifier {
     /// where they would overlap the permanent eval/commitment regions.
     pub(crate) batch_invert_scratch_mptr: usize,
     pub(crate) quotient_external: Option<QuotientExternal>,
+    pub(crate) expected_quotient_len: Option<usize>,
+    pub(crate) expected_quotient_codehash: Option<U256>,
     pub(crate) quotient_inline_computations: Vec<Vec<String>>,
     pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
     pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,

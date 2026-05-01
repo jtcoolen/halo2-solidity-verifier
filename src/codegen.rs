@@ -1806,6 +1806,7 @@ impl<'a> SolidityGenerator<'a> {
             crate::SOLIDITY_TRACE_ENABLED,
             crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
             false,
+            None,
         )
         .render(verifier_writer)
     }
@@ -1822,7 +1823,13 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED, false)
+        self.generate_verifier(
+            false,
+            true,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            false,
+            None,
+        )
             .render(verifier_writer)
     }
 
@@ -1841,7 +1848,7 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         verifier_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED, true, false)
+        self.generate_verifier(false, crate::SOLIDITY_TRACE_ENABLED, true, false, None)
             .render(verifier_writer)
     }
 
@@ -1869,6 +1876,7 @@ impl<'a> SolidityGenerator<'a> {
             crate::SOLIDITY_TRACE_ENABLED,
             crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
             false,
+            None,
         )
         .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
@@ -1898,6 +1906,7 @@ impl<'a> SolidityGenerator<'a> {
             crate::SOLIDITY_TRACE_ENABLED,
             crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
             true,
+            None,
         )
         .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
@@ -1919,13 +1928,81 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output, quotient_output))
     }
 
+    /// Render only `Halo2QuotientEvaluator.sol`. Production deployment
+    /// tooling can compile/deploy this first, compute its runtime length and
+    /// codehash, then render a verifier with
+    /// [`render_separately_with_pinned_quotient_into`].
+    pub fn render_quotient_evaluator_into(
+        &self,
+        quotient_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_quotient_evaluator().render(quotient_writer)
+    }
+
+    /// Render only `Halo2QuotientEvaluator.sol` and return it as a `String`.
+    pub fn render_quotient_evaluator(&self) -> Result<String, fmt::Error> {
+        let mut quotient_output = String::new();
+        self.render_quotient_evaluator_into(&mut quotient_output)?;
+        Ok(quotient_output)
+    }
+
+    /// Render `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`, and
+    /// `Halo2QuotientEvaluator.sol`, with the verifier hard-pinned to the
+    /// supplied quotient evaluator runtime length and codehash.
+    pub fn render_separately_with_pinned_quotient_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+        quotient_writer: &mut impl fmt::Write,
+        expected_quotient_len: usize,
+        expected_quotient_codehash: U256,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(
+            true,
+            crate::SOLIDITY_TRACE_ENABLED,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            true,
+            Some((expected_quotient_len, expected_quotient_codehash)),
+        )
+        .render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        self.generate_quotient_evaluator().render(quotient_writer)?;
+        Ok(())
+    }
+
+    /// Render the separated verifier/VK/quotient sources with a hard-pinned
+    /// quotient evaluator.
+    pub fn render_separately_with_pinned_quotient(
+        &self,
+        expected_quotient_len: usize,
+        expected_quotient_codehash: U256,
+    ) -> Result<(String, String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        let mut quotient_output = String::new();
+        self.render_separately_with_pinned_quotient_into(
+            &mut verifier_output,
+            &mut vk_output,
+            &mut quotient_output,
+            expected_quotient_len,
+            expected_quotient_codehash,
+        )?;
+        Ok((verifier_output, vk_output, quotient_output))
+    }
+
     /// Render a trace-enabled `Halo2Verifier.sol` and `Halo2VerifyingKey.sol` into writers.
     pub fn render_trace_separately_into(
         &self,
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, true, crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED, false)
+        self.generate_verifier(
+            true,
+            true,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            false,
+            None,
+        )
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
@@ -1949,7 +2026,7 @@ impl<'a> SolidityGenerator<'a> {
         verifier_writer: &mut impl fmt::Write,
         vk_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED, true, false)
+        self.generate_verifier(true, crate::SOLIDITY_TRACE_ENABLED, true, false, None)
             .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
@@ -3636,7 +3713,12 @@ impl<'a> SolidityGenerator<'a> {
         trace: bool,
         gas_checkpoints: bool,
         external_quotient: bool,
+        expected_quotient: Option<(usize, U256)>,
     ) -> Halo2Verifier {
+        assert!(
+            expected_quotient.is_none() || external_quotient,
+            "quotient pinning requires an external quotient evaluator"
+        );
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
@@ -3679,6 +3761,9 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_external = external_quotient.then(|| {
             Self::quotient_external_frame(vk_mptr, vk_len, &meta, &data, sorted_simple.len())
         });
+        let (expected_quotient_len, expected_quotient_codehash) = expected_quotient
+            .map(|(len, codehash)| (Some(len), Some(codehash)))
+            .unwrap_or((None, None));
         let (quotient_program, quotient_stack_mptr) = if let Some(quotient_program_build) =
             quotient_program_build
         {
@@ -3929,6 +4014,8 @@ impl<'a> SolidityGenerator<'a> {
             selector_acc_mptr,
             batch_invert_scratch_mptr,
             quotient_external,
+            expected_quotient_len,
+            expected_quotient_codehash,
             proof_cptr,
             num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
             instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + 0x20,
