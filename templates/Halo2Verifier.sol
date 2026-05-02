@@ -151,6 +151,7 @@ contract Halo2Verifier {
     uint256 internal constant     REVERSED_EVALS_MPTR = {{ memory.reversed_evals_mptr }};
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
     uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ memory.batch_invert_scratch_mptr|hex() }};
+    uint256 internal constant        TRACE_U256_MPTR = {{ memory.trace_u256_mptr|hex() }};
 
     // ----------------------------------------------------------------------
     // Per-category bases for EIP-2537 padded G1 commitments. The proof
@@ -901,11 +902,11 @@ contract Halo2Verifier {
             // Production keeps it logless; trace builds emit the value.
             function trace_u256(id, value) {
                 {%- if self.trace %}
-                mstore(0x5e00, value)
-                log1(0x5e00, 0x20, id)
+                mstore(TRACE_U256_MPTR, value)
+                log1(TRACE_U256_MPTR, 0x20, id)
                 {%- else %}
                 pop(id)
-                mstore(0x5e00, value)
+                mstore(TRACE_U256_MPTR, value)
                 {%- endif %}
             }
             {%- if self.trace %}

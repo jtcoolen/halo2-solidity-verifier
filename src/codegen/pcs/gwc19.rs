@@ -583,11 +583,6 @@ pub(super) fn computations(
     distinct_rotations.sort_unstable();
     distinct_rotations.dedup();
 
-    // Scratch above every decompressed commitment slot. Block 3 uses it as
-    // a compact eval-address table; Block 5 reuses the same region as the
-    // fused final MSM input buffer.
-    let pcs_scratch_mptr = memory.pcs_scratch_mptr;
-
     let mut blocks: Vec<Vec<String>> = Vec::new();
 
     // ------------------------------------------------------------------
@@ -745,7 +740,7 @@ pub(super) fn computations(
         // for tiny m where loop overhead dominates).
         // ------------------------------------------------------------------
         const ROLL_THRESHOLD: usize = 4;
-        let eval_src_table_mptr: usize = pcs_scratch_mptr;
+        let eval_src_table_mptr: usize = memory.pcs_q_eval_source_table_mptr;
 
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let mut lines: Vec<String> = Vec::new();

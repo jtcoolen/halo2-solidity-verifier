@@ -693,6 +693,28 @@ mod tests {
     }
 
     #[test]
+    fn trace_u256_uses_planned_memory_slot() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient_template = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let memory_source = include_str!("memory.rs");
+
+        for source in [verifier_template, quotient_template] {
+            assert!(
+                source.contains("TRACE_U256_MPTR"),
+                "trace_u256 should write through a planned memory slot"
+            );
+            assert!(
+                !source.contains("0x5e00"),
+                "trace_u256 must not use the old hard-coded scratch word"
+            );
+        }
+        assert!(
+            memory_source.contains("trace_u256_log_word"),
+            "memory planner should register the trace_u256 log buffer"
+        );
+    }
+
+    #[test]
     fn batch_invert_handles_empty_and_singleton_ranges() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 

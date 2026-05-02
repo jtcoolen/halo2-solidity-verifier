@@ -21,6 +21,7 @@ use crate::codegen::{
     template::Halo2VerifyingKey,
     util::{ConstraintSystemMeta, Ptr},
 };
+use std::collections::BTreeMap;
 
 /// EVM word size. BLS12-381 Fr values are rendered as one canonical
 /// big-endian EVM word in calldata/memory.
@@ -106,7 +107,7 @@ const X1_POWERS_CAP_WORDS: usize = Q_EVAL_SET_OFFSET_WORDS - X1_POWERS_OFFSET_WO
 const Q_COM_CAP_WORDS: usize = Q_EVAL_SET_OFFSET_WORDS - Q_COM_OFFSET_WORDS;
 const Q_EVAL_SET_CAP_WORDS: usize = Q_EVAL_CPTR_OFFSET_WORDS - Q_EVAL_SET_OFFSET_WORDS;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MemoryPhase {
     /// Constructor-only precompile smoke tests.
     ConstructorSmoke,
@@ -247,6 +248,91 @@ impl MemoryMap {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MemoryArena {
+    map: MemoryMap,
+}
+
+impl MemoryArena {
+    /// Register a region at an explicit historical or precompile-required
+    /// byte address.
+    pub(crate) fn alloc_fixed(
+        &mut self,
+        name: &'static str,
+        start: usize,
+        len: usize,
+        lifetime: MemoryLifetime,
+    ) -> usize {
+        self.map.push(MemoryRegion::new(name, start, len, lifetime));
+        start
+    }
+
+    /// Register a region immediately after an existing anchor range, rounded
+    /// up to the next EVM word. This is the compatibility-mode equivalent of
+    /// "place this after that", without trying to repack earlier anchors.
+    pub(crate) fn alloc_after(
+        &mut self,
+        name: &'static str,
+        anchor_start: usize,
+        anchor_len: usize,
+        len: usize,
+        lifetime: MemoryLifetime,
+    ) -> usize {
+        let start = (anchor_start + anchor_len).next_multiple_of(WORD_BYTES);
+        self.alloc_fixed(name, start, len, lifetime)
+    }
+
+    /// Register fixed-address scratch that is live only during one phase.
+    pub(crate) fn alloc_phase_scratch(
+        &mut self,
+        name: &'static str,
+        start: usize,
+        len: usize,
+        phase: MemoryPhase,
+    ) -> usize {
+        self.alloc_fixed(name, start, len, MemoryLifetime::Phase(phase))
+    }
+
+    /// Create a phase-aware scratch allocator rooted at `base`.
+    ///
+    /// Each phase has its own cursor, so allocations in different phases reuse
+    /// `base`, while multiple allocations in the same phase advance
+    /// sequentially. That exactly models the current verifier's intentional
+    /// scratch aliasing without changing byte addresses.
+    pub(crate) fn scratch_allocator(&mut self, base: usize) -> ScratchAllocator<'_> {
+        ScratchAllocator {
+            arena: self,
+            base,
+            cursors: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn into_map(self) -> MemoryMap {
+        self.map
+    }
+}
+
+pub(crate) struct ScratchAllocator<'arena> {
+    arena: &'arena mut MemoryArena,
+    base: usize,
+    cursors: BTreeMap<MemoryPhase, usize>,
+}
+
+impl ScratchAllocator<'_> {
+    /// Allocate phase-scoped scratch from this allocator's base.
+    pub(crate) fn alloc_phase_scratch(
+        &mut self,
+        name: &'static str,
+        len: usize,
+        phase: MemoryPhase,
+    ) -> usize {
+        let cursor = self.cursors.entry(phase).or_insert(self.base);
+        let start = *cursor;
+        *cursor = (start + len).next_multiple_of(WORD_BYTES);
+        self.arena.alloc_phase_scratch(name, start, len, phase)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FinalMsmShape {
     /// Number of `(G1, scalar)` pairs emitted for this MSM.
@@ -343,14 +429,16 @@ pub(crate) struct VerifierMemoryLayout {
     /// selector accumulators are accounted for.
     pub(crate) quotient_tmp_mptr: usize,
     pub(crate) quotient_stack_mptr: usize,
-    /// Canonical transient PCS scratch base. Subregions below intentionally
-    /// alias this byte range and are distinguished by lifetime phase.
-    pub(crate) pcs_scratch_mptr: usize,
     pub(crate) pcs_q_eval_source_table_mptr: usize,
     pub(crate) pcs_q_com_trace_scratch_mptr: usize,
     pub(crate) pcs_final_msm_scratch_mptr: usize,
     /// Public accumulator MSM buffer, historically floored at 0x7000.
     pub(crate) acc_msm_scratch: usize,
+    /// One-word buffer used only to materialize LOG data for trace builds.
+    /// It is planned after every permanent and scratch region because
+    /// `trace_u256` may be called between long-lived reads from the VK,
+    /// decoded evals, and decompressed commitments.
+    pub(crate) trace_u256_mptr: usize,
     pub(crate) pcs: PcsMemoryRequirements,
 }
 
@@ -379,14 +467,79 @@ impl VerifierMemoryLayout {
         vk_mptr: Ptr,
         config: VerifierMemoryLayoutConfig,
     ) -> Self {
+        let commitments_len = commitment_g1_count(meta) * G1_BYTES;
+        let selector_len = meta.num_simple_selectors * WORD_BYTES;
+        let quotient_tmp_len = config.quotient_cse_temps * WORD_BYTES;
+        let quotient_stack_len = config.quotient_stack_words * WORD_BYTES;
+        let q_eval_source_len = config.pcs.q_eval_source_table_words * WORD_BYTES;
+        let q_com_trace_len = config.pcs.q_com_trace_msm.input_bytes;
+        let final_msm_len = config.pcs.final_msm.input_bytes;
+        let acc_msm_len = config.acc_msm_terms * G1_MSM_PAIR_BYTES;
+        let batch_invert_len = batch_invert_scratch_bytes(meta, config.num_instances);
+
+        let mut arena = MemoryArena::default();
+
+        // Low-memory helpers are phase-scoped because the transcript buffer is
+        // no longer live once algebra/precompile work begins.
+        arena.alloc_phase_scratch(
+            "constructor_smoke_scratch",
+            G1_BYTES,
+            PAIRING_PAIR_BYTES,
+            MemoryPhase::ConstructorSmoke,
+        );
+        arena.alloc_phase_scratch(
+            "transcript_buffer",
+            0,
+            config.transcript_words * WORD_BYTES,
+            MemoryPhase::Transcript,
+        );
+        arena.alloc_phase_scratch(
+            "pcs_pairing_tmp",
+            0,
+            G1_BYTES + G1_MSM_PAIR_BYTES,
+            MemoryPhase::PcsPairing,
+        );
+        arena.alloc_phase_scratch(
+            "final_pairing_scratch",
+            PAIRING_TWO_PAIR_BYTES,
+            PAIRING_TWO_PAIR_BYTES,
+            MemoryPhase::FinalPairing,
+        );
+
         // VK bytes are copied first, then user-phase challenge slots, then
         // the fixed theta-relative region. The caller is responsible for
         // choosing a stable `vk_mptr` after proof-shape planning; this keeps
         // the transcript buffer below the VK payload.
-        let challenge_mptr = vk_mptr + vk.len() / WORD_BYTES;
-        let theta_mptr = challenge_mptr + meta.challenge_indices.len();
-        let theta_words = theta_mptr.value().as_usize() / WORD_BYTES;
-        let at_theta = |words: usize| Ptr::memory((theta_words + words) * WORD_BYTES);
+        let vk_start = arena.alloc_fixed(
+            "vk_payload",
+            vk_mptr.value().as_usize(),
+            vk.len(),
+            MemoryLifetime::Permanent,
+        );
+        arena.alloc_phase_scratch(
+            "scalar_inv_scratch",
+            vk_start.saturating_sub(MODEXP_SCRATCH_BYTES),
+            MODEXP_FRAME_BYTES,
+            MemoryPhase::ScalarInv,
+        );
+        let challenge_start = arena.alloc_after(
+            "challenge_slots",
+            vk_start,
+            vk.len(),
+            meta.challenge_indices.len() * WORD_BYTES,
+            MemoryLifetime::Permanent,
+        );
+        let theta_start = arena.alloc_after(
+            "theta_scalar_and_g1_slots",
+            challenge_start,
+            meta.challenge_indices.len() * WORD_BYTES,
+            ROT_POINTS_OFFSET_WORDS * WORD_BYTES,
+            MemoryLifetime::Permanent,
+        );
+        let challenge_mptr = Ptr::memory(challenge_start);
+        let theta_mptr = Ptr::memory(theta_start);
+        let at_theta = |words: usize| theta_start + words * WORD_BYTES;
+        let ptr_at_theta = |words: usize| Ptr::memory(at_theta(words));
 
         let total_advices: usize = meta.num_user_advices.iter().sum();
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
@@ -397,8 +550,55 @@ impl VerifierMemoryLayout {
             + meta.num_lookups
             + meta.num_trashcans;
         let committed_g1s = non_quotient_g1s + meta.num_quotients;
-        let reversed_evals_mptr = at_theta(REVERSED_EVALS_OFFSET_WORDS);
-        let comms_mptr_base = at_theta(REVERSED_EVALS_OFFSET_WORDS + meta.num_evals);
+        let rot_points_mptr = Ptr::memory(arena.alloc_fixed(
+            "rot_points",
+            at_theta(ROT_POINTS_OFFSET_WORDS),
+            config.pcs.rot_points_words * WORD_BYTES,
+            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
+        ));
+        let x1_powers_mptr = Ptr::memory(arena.alloc_fixed(
+            "x1_powers",
+            at_theta(X1_POWERS_OFFSET_WORDS),
+            config.pcs.x1_powers_words * WORD_BYTES,
+            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
+        ));
+        let q_com_mptr = Ptr::memory(arena.alloc_fixed(
+            "q_com_fixed_window",
+            at_theta(Q_COM_OFFSET_WORDS),
+            config.pcs.q_com_words * WORD_BYTES,
+            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
+        ));
+        let q_eval_set_mptr = Ptr::memory(arena.alloc_fixed(
+            "q_eval_set",
+            at_theta(Q_EVAL_SET_OFFSET_WORDS),
+            config.pcs.q_eval_set_words * WORD_BYTES,
+            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
+        ));
+        let q_eval_cptr_mptr = Ptr::memory(arena.alloc_fixed(
+            "q_eval_cptr_slot",
+            at_theta(Q_EVAL_CPTR_OFFSET_WORDS),
+            WORD_BYTES,
+            MemoryLifetime::Permanent,
+        ));
+        let g1_identity_mptr = Ptr::memory(arena.alloc_fixed(
+            "g1_identity",
+            at_theta(G1_IDENTITY_OFFSET_WORDS),
+            G1_BYTES,
+            MemoryLifetime::Permanent,
+        ));
+        let reversed_evals_mptr = Ptr::memory(arena.alloc_fixed(
+            "decoded_evals",
+            at_theta(REVERSED_EVALS_OFFSET_WORDS),
+            meta.num_evals * WORD_BYTES,
+            MemoryLifetime::Permanent,
+        ));
+        let comms_mptr_base = Ptr::memory(arena.alloc_after(
+            "decompressed_commitments",
+            reversed_evals_mptr.value().as_usize(),
+            meta.num_evals * WORD_BYTES,
+            commitments_len,
+            MemoryLifetime::Permanent,
+        ));
         let advice_comms_mptr_base = comms_mptr_base;
         let lookup_m_comms_mptr_base = advice_comms_mptr_base + G1_WORDS * total_advices;
         let perm_z_comms_mptr_base = lookup_m_comms_mptr_base + G1_WORDS * meta.num_lookups;
@@ -413,55 +613,137 @@ impl VerifierMemoryLayout {
         // Decompressed proof commitments are stored contiguously by category.
         // Everything after this point is either selector state or scratch.
         let after_comms = comms_mptr_base.value().as_usize() + committed_g1s * G1_BYTES;
-        let selector_acc_mptr = after_comms.next_multiple_of(WORD_BYTES);
-        let batch_invert_scratch_mptr = selector_acc_mptr;
-        let quotient_tmp_mptr = (selector_acc_mptr + meta.num_simple_selectors * WORD_BYTES)
-            .next_multiple_of(WORD_BYTES);
-        let quotient_stack_mptr = quotient_tmp_mptr + config.quotient_cse_temps * WORD_BYTES;
-        // The PCS emitter is allowed to reuse quotient temp/stack bytes in
-        // later phases; validation distinguishes those uses by phase.
+        let selector_acc_mptr = arena.alloc_after(
+            "selector_accumulators",
+            comms_mptr_base.value().as_usize(),
+            commitments_len,
+            selector_len,
+            MemoryLifetime::Phase(MemoryPhase::PcsFinalMsm),
+        );
+        let batch_invert_scratch_mptr = {
+            let mut scratch = arena.scratch_allocator(selector_acc_mptr);
+            scratch.alloc_phase_scratch(
+                "batch_invert_scratch",
+                batch_invert_len,
+                MemoryPhase::LagrangeBatchInvert,
+            )
+        };
+        let quotient_tmp_base = (selector_acc_mptr + selector_len).next_multiple_of(WORD_BYTES);
+        let (quotient_tmp_mptr, quotient_stack_mptr) = {
+            let mut scratch = arena.scratch_allocator(quotient_tmp_base);
+            let quotient_tmp_mptr = scratch.alloc_phase_scratch(
+                "quotient_temps",
+                quotient_tmp_len,
+                MemoryPhase::QuotientVm,
+            );
+            let quotient_stack_mptr = scratch.alloc_phase_scratch(
+                "quotient_stack",
+                quotient_stack_len.max(MODEXP_FRAME_BYTES),
+                MemoryPhase::QuotientVm,
+            );
+            (quotient_tmp_mptr, quotient_stack_mptr)
+        };
         let pcs_scratch_mptr = quotient_tmp_mptr;
-        let acc_msm_scratch = after_comms
+        let (
+            pcs_q_eval_source_table_mptr,
+            pcs_q_com_trace_scratch_mptr,
+            pcs_final_msm_scratch_mptr,
+        ) = {
+            let mut scratch = arena.scratch_allocator(pcs_scratch_mptr);
+            let q_eval = scratch.alloc_phase_scratch(
+                "pcs_q_eval_source_table",
+                q_eval_source_len,
+                MemoryPhase::PcsQEvalSourceTable,
+            );
+            let q_com = scratch.alloc_phase_scratch(
+                "pcs_q_com_trace_msm",
+                q_com_trace_len,
+                MemoryPhase::PcsQComTrace,
+            );
+            let final_msm = scratch.alloc_phase_scratch(
+                "pcs_final_msm",
+                final_msm_len,
+                MemoryPhase::PcsFinalMsm,
+            );
+            (q_eval, q_com, final_msm)
+        };
+        let acc_msm_scratch_base = after_comms
             .max(ACC_MSM_MIN_SCRATCH_BYTES)
             .next_multiple_of(WORD_BYTES);
+        let acc_msm_scratch = {
+            let mut scratch = arena.scratch_allocator(acc_msm_scratch_base);
+            scratch.alloc_phase_scratch("accumulator_msm", acc_msm_len, MemoryPhase::AccumulatorMsm)
+        };
+        arena.alloc_phase_scratch(
+            "accumulator_pairing_batch",
+            G1ADD_INPUT_BYTES,
+            ACCUMULATOR_PAIRING_BATCH_BYTES,
+            MemoryPhase::AccumulatorPairingBatch,
+        );
+        let trace_u256_mptr = [
+            vk_start + vk.len(),
+            challenge_start + meta.challenge_indices.len() * WORD_BYTES,
+            theta_start + ROT_POINTS_OFFSET_WORDS * WORD_BYTES,
+            g1_identity_mptr.value().as_usize() + G1_BYTES,
+            reversed_evals_mptr.value().as_usize() + meta.num_evals * WORD_BYTES,
+            comms_mptr_base.value().as_usize() + commitments_len,
+            selector_acc_mptr + selector_len,
+            batch_invert_scratch_mptr + batch_invert_len,
+            quotient_stack_mptr + quotient_stack_len.max(MODEXP_FRAME_BYTES),
+            pcs_q_eval_source_table_mptr + q_eval_source_len,
+            pcs_q_com_trace_scratch_mptr + q_com_trace_len,
+            pcs_final_msm_scratch_mptr + final_msm_len,
+            acc_msm_scratch + acc_msm_len,
+            G1ADD_INPUT_BYTES + ACCUMULATOR_PAIRING_BATCH_BYTES,
+        ]
+        .into_iter()
+        .max()
+        .expect("trace scratch bounds are non-empty")
+        .next_multiple_of(WORD_BYTES);
+        arena.alloc_fixed(
+            "trace_u256_log_word",
+            trace_u256_mptr,
+            WORD_BYTES,
+            MemoryLifetime::Permanent,
+        );
 
-        let mut layout = Self {
-            map: MemoryMap::default(),
+        Self {
+            map: arena.into_map(),
             vk_mptr,
             challenge_mptr,
             theta_mptr,
-            beta_mptr: at_theta(1),
-            gamma_mptr: at_theta(2),
-            trash_challenge_mptr: at_theta(3),
-            y_mptr: at_theta(4),
-            x_mptr: at_theta(5),
-            x1_mptr: at_theta(6),
-            x2_mptr: at_theta(7),
-            x3_mptr: at_theta(8),
-            x4_mptr: at_theta(9),
-            f_com_mptr: at_theta(10),
-            pi_mptr: at_theta(14),
-            acc_lhs_mptr: at_theta(18),
-            acc_rhs_mptr: at_theta(22),
-            x_n_mptr: at_theta(26),
-            x_n_minus_1_inv_mptr: at_theta(27),
-            l_last_mptr: at_theta(28),
-            l_blind_mptr: at_theta(29),
-            l_0_mptr: at_theta(30),
-            instance_eval_mptr: at_theta(31),
-            quotient_eval_mptr: at_theta(32),
-            quotient_mptr: at_theta(33),
-            f_eval_mptr: at_theta(38),
-            v_mptr: at_theta(39),
-            final_com_mptr: at_theta(40),
-            pairing_lhs_mptr: at_theta(44),
-            pairing_rhs_mptr: at_theta(48),
-            rot_points_mptr: at_theta(ROT_POINTS_OFFSET_WORDS),
-            x1_powers_mptr: at_theta(X1_POWERS_OFFSET_WORDS),
-            q_com_mptr: at_theta(Q_COM_OFFSET_WORDS),
-            q_eval_set_mptr: at_theta(Q_EVAL_SET_OFFSET_WORDS),
-            q_eval_cptr_mptr: at_theta(Q_EVAL_CPTR_OFFSET_WORDS),
-            g1_identity_mptr: at_theta(G1_IDENTITY_OFFSET_WORDS),
+            beta_mptr: ptr_at_theta(1),
+            gamma_mptr: ptr_at_theta(2),
+            trash_challenge_mptr: ptr_at_theta(3),
+            y_mptr: ptr_at_theta(4),
+            x_mptr: ptr_at_theta(5),
+            x1_mptr: ptr_at_theta(6),
+            x2_mptr: ptr_at_theta(7),
+            x3_mptr: ptr_at_theta(8),
+            x4_mptr: ptr_at_theta(9),
+            f_com_mptr: ptr_at_theta(10),
+            pi_mptr: ptr_at_theta(14),
+            acc_lhs_mptr: ptr_at_theta(18),
+            acc_rhs_mptr: ptr_at_theta(22),
+            x_n_mptr: ptr_at_theta(26),
+            x_n_minus_1_inv_mptr: ptr_at_theta(27),
+            l_last_mptr: ptr_at_theta(28),
+            l_blind_mptr: ptr_at_theta(29),
+            l_0_mptr: ptr_at_theta(30),
+            instance_eval_mptr: ptr_at_theta(31),
+            quotient_eval_mptr: ptr_at_theta(32),
+            quotient_mptr: ptr_at_theta(33),
+            f_eval_mptr: ptr_at_theta(38),
+            v_mptr: ptr_at_theta(39),
+            final_com_mptr: ptr_at_theta(40),
+            pairing_lhs_mptr: ptr_at_theta(44),
+            pairing_rhs_mptr: ptr_at_theta(48),
+            rot_points_mptr,
+            x1_powers_mptr,
+            q_com_mptr,
+            q_eval_set_mptr,
+            q_eval_cptr_mptr,
+            g1_identity_mptr,
             reversed_evals_mptr,
             comms_mptr_base,
             advice_comms_mptr_base,
@@ -475,15 +757,13 @@ impl VerifierMemoryLayout {
             batch_invert_scratch_mptr,
             quotient_tmp_mptr,
             quotient_stack_mptr,
-            pcs_scratch_mptr,
-            pcs_q_eval_source_table_mptr: pcs_scratch_mptr,
-            pcs_q_com_trace_scratch_mptr: pcs_scratch_mptr,
-            pcs_final_msm_scratch_mptr: pcs_scratch_mptr,
+            pcs_q_eval_source_table_mptr,
+            pcs_q_com_trace_scratch_mptr,
+            pcs_final_msm_scratch_mptr,
             acc_msm_scratch,
+            trace_u256_mptr,
             pcs: config.pcs,
-        };
-        layout.populate_map(meta, vk, config);
-        layout
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -515,179 +795,6 @@ impl VerifierMemoryLayout {
         self.map.validate()?;
 
         Ok(())
-    }
-
-    fn populate_map(
-        &mut self,
-        meta: &ConstraintSystemMeta,
-        vk: &Halo2VerifyingKey,
-        config: VerifierMemoryLayoutConfig,
-    ) {
-        let vk_start = self.vk_mptr.value().as_usize();
-        let challenge_start = self.challenge_mptr.value().as_usize();
-        let theta_start = self.theta_mptr.value().as_usize();
-        let commitments_len = commitment_g1_count(meta) * G1_BYTES;
-        let selector_len = meta.num_simple_selectors * WORD_BYTES;
-        let quotient_tmp_len = config.quotient_cse_temps * WORD_BYTES;
-        let quotient_stack_len = config.quotient_stack_words * WORD_BYTES;
-        let q_eval_source_len = self.pcs.q_eval_source_table_words * WORD_BYTES;
-        let q_com_trace_len = self.pcs.q_com_trace_msm.input_bytes;
-        let final_msm_len = self.pcs.final_msm.input_bytes;
-        let acc_msm_len = config.acc_msm_terms * G1_MSM_PAIR_BYTES;
-        let batch_invert_len = batch_invert_scratch_bytes(meta, config.num_instances);
-
-        // Low-memory helpers are phase-scoped because the transcript buffer is
-        // no longer live once algebra/precompile work begins.
-        self.map.push(MemoryRegion::new(
-            "constructor_smoke_scratch",
-            G1_BYTES,
-            PAIRING_PAIR_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::ConstructorSmoke),
-        ));
-        self.map.push(MemoryRegion::new(
-            "transcript_buffer",
-            0,
-            config.transcript_words * WORD_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::Transcript),
-        ));
-        self.map.push(MemoryRegion::new(
-            "scalar_inv_scratch",
-            vk_start.saturating_sub(MODEXP_SCRATCH_BYTES),
-            MODEXP_FRAME_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::ScalarInv),
-        ));
-        self.map.push(MemoryRegion::new(
-            "pcs_pairing_tmp",
-            0,
-            G1_BYTES + G1_MSM_PAIR_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::PcsPairing),
-        ));
-        self.map.push(MemoryRegion::new(
-            "final_pairing_scratch",
-            PAIRING_TWO_PAIR_BYTES,
-            PAIRING_TWO_PAIR_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::FinalPairing),
-        ));
-        self.map.push(MemoryRegion::new(
-            "vk_payload",
-            vk_start,
-            vk.len(),
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "challenge_slots",
-            challenge_start,
-            meta.challenge_indices.len() * WORD_BYTES,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "theta_scalar_and_g1_slots",
-            theta_start,
-            ROT_POINTS_OFFSET_WORDS * WORD_BYTES,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "rot_points",
-            self.rot_points_mptr.value().as_usize(),
-            self.pcs.rot_points_words * WORD_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
-        ));
-        self.map.push(MemoryRegion::new(
-            "x1_powers",
-            self.x1_powers_mptr.value().as_usize(),
-            self.pcs.x1_powers_words * WORD_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
-        ));
-        self.map.push(MemoryRegion::new(
-            "q_com_fixed_window",
-            self.q_com_mptr.value().as_usize(),
-            self.pcs.q_com_words * WORD_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
-        ));
-        self.map.push(MemoryRegion::new(
-            "q_eval_set",
-            self.q_eval_set_mptr.value().as_usize(),
-            self.pcs.q_eval_set_words * WORD_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::PcsFixed),
-        ));
-        self.map.push(MemoryRegion::new(
-            "q_eval_cptr_slot",
-            self.q_eval_cptr_mptr.value().as_usize(),
-            WORD_BYTES,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "g1_identity",
-            self.g1_identity_mptr.value().as_usize(),
-            G1_BYTES,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "decoded_evals",
-            self.reversed_evals_mptr.value().as_usize(),
-            meta.num_evals * WORD_BYTES,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "decompressed_commitments",
-            self.comms_mptr_base.value().as_usize(),
-            commitments_len,
-            MemoryLifetime::Permanent,
-        ));
-        self.map.push(MemoryRegion::new(
-            "batch_invert_scratch",
-            self.batch_invert_scratch_mptr,
-            batch_invert_len,
-            MemoryLifetime::Phase(MemoryPhase::LagrangeBatchInvert),
-        ));
-        self.map.push(MemoryRegion::new(
-            "selector_accumulators",
-            self.selector_acc_mptr,
-            selector_len,
-            MemoryLifetime::Phase(MemoryPhase::PcsFinalMsm),
-        ));
-        self.map.push(MemoryRegion::new(
-            "quotient_temps",
-            self.quotient_tmp_mptr,
-            quotient_tmp_len,
-            MemoryLifetime::Phase(MemoryPhase::QuotientVm),
-        ));
-        self.map.push(MemoryRegion::new(
-            "quotient_stack",
-            self.quotient_stack_mptr,
-            quotient_stack_len.max(MODEXP_FRAME_BYTES),
-            MemoryLifetime::Phase(MemoryPhase::QuotientVm),
-        ));
-        self.map.push(MemoryRegion::new(
-            "pcs_q_eval_source_table",
-            self.pcs_q_eval_source_table_mptr,
-            q_eval_source_len,
-            MemoryLifetime::Phase(MemoryPhase::PcsQEvalSourceTable),
-        ));
-        self.map.push(MemoryRegion::new(
-            "pcs_q_com_trace_msm",
-            self.pcs_q_com_trace_scratch_mptr,
-            q_com_trace_len,
-            MemoryLifetime::Phase(MemoryPhase::PcsQComTrace),
-        ));
-        self.map.push(MemoryRegion::new(
-            "pcs_final_msm",
-            self.pcs_final_msm_scratch_mptr,
-            final_msm_len,
-            MemoryLifetime::Phase(MemoryPhase::PcsFinalMsm),
-        ));
-        self.map.push(MemoryRegion::new(
-            "accumulator_msm",
-            self.acc_msm_scratch,
-            acc_msm_len,
-            MemoryLifetime::Phase(MemoryPhase::AccumulatorMsm),
-        ));
-        self.map.push(MemoryRegion::new(
-            "accumulator_pairing_batch",
-            G1ADD_INPUT_BYTES,
-            ACCUMULATOR_PAIRING_BATCH_BYTES,
-            MemoryLifetime::Phase(MemoryPhase::AccumulatorPairingBatch),
-        ));
     }
 }
 
@@ -771,6 +878,44 @@ mod tests {
         let mut map = MemoryMap::default();
         map.push(region("a", 0x100, WORD_BYTES - 1, MemoryPhase::QuotientVm));
         assert!(map.validate().unwrap_err().contains("unaligned"));
+    }
+
+    #[test]
+    fn arena_alloc_after_aligns_after_anchor() {
+        let mut arena = MemoryArena::default();
+        let after = arena.alloc_after(
+            "after",
+            0x101,
+            WORD_BYTES,
+            WORD_BYTES,
+            MemoryLifetime::Permanent,
+        );
+        let map = arena.into_map();
+
+        assert_eq!(after, 0x140);
+        assert_eq!(map.region("after").unwrap().start, 0x140);
+        map.validate().expect("allocated region is word-aligned");
+    }
+
+    #[test]
+    fn scratch_allocator_reuses_base_across_phases_and_advances_within_phase() {
+        let mut arena = MemoryArena::default();
+        {
+            let mut scratch = arena.scratch_allocator(0x400);
+            let first = scratch.alloc_phase_scratch("first", WORD_BYTES, MemoryPhase::QuotientVm);
+            let second = scratch.alloc_phase_scratch("second", WORD_BYTES, MemoryPhase::QuotientVm);
+            let reused =
+                scratch.alloc_phase_scratch("reused", WORD_BYTES, MemoryPhase::PcsFinalMsm);
+
+            assert_eq!(first, 0x400);
+            assert_eq!(second, 0x420);
+            assert_eq!(reused, 0x400);
+        }
+
+        arena
+            .into_map()
+            .validate()
+            .expect("scratch phases may reuse the same base");
     }
 
     fn synthetic_vk() -> Halo2VerifyingKey {
@@ -872,6 +1017,38 @@ mod tests {
             .expect("accumulator MSM region registered");
 
         assert_eq!(region.len, 4 * G1_MSM_PAIR_BYTES);
+    }
+
+    #[test]
+    fn trace_log_word_is_registered_after_scratch_regions() {
+        let meta = ConstraintSystemMeta {
+            num_user_advices: vec![8],
+            num_quotients: 4,
+            num_evals: 16,
+            ..ConstraintSystemMeta::default()
+        };
+        let vk = synthetic_vk();
+        let config = VerifierMemoryLayoutConfig {
+            acc_msm_terms: 3,
+            pcs: PcsMemoryRequirements {
+                q_com_trace_msm: FinalMsmShape::from_terms(9),
+                final_msm: FinalMsmShape::from_terms(10),
+                ..PcsMemoryRequirements::default()
+            },
+            ..VerifierMemoryLayoutConfig::default()
+        };
+        let layout = VerifierMemoryLayout::new(&meta, &vk, Ptr::memory(0x1000), config);
+        let region = layout
+            .map
+            .region("trace_u256_log_word")
+            .expect("trace_u256 region registered");
+
+        assert_eq!(region.start, layout.trace_u256_mptr);
+        assert_eq!(region.len, WORD_BYTES);
+        assert!(
+            layout.trace_u256_mptr >= layout.pcs_final_msm_scratch_mptr + 10 * G1_MSM_PAIR_BYTES
+        );
+        layout.validate().expect("trace log word must not overlap");
     }
 
     #[test]

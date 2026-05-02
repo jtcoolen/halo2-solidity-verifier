@@ -13,6 +13,39 @@ The current planner is conservative. It preserves the existing generated
 addresses and only centralizes naming, sizing, and validation. It is not a
 deterministic repacker yet.
 
+## Planner APIs
+
+`MemoryArena` owns the memory map. It has three compatibility-mode allocation
+primitives:
+
+| API | Purpose |
+| --- | --- |
+| `alloc_fixed(name, start, len, lifetime)` | Register a region at an explicit historical or precompile-required byte address. |
+| `alloc_after(name, anchor_start, anchor_len, len, lifetime)` | Register a region immediately after an anchor range, rounded up to the next EVM word. |
+| `alloc_phase_scratch(name, start, len, phase)` | Register fixed-address scratch that is live only during one `MemoryPhase`. |
+
+`ScratchAllocator` is rooted at a fixed base and keeps one cursor per phase.
+Allocations in the same phase advance sequentially; allocations in different
+phases intentionally reuse the base. That models the current verifier layout
+without repacking it:
+
+```text
+base = quotient_tmp_mptr
+
+QuotientVm:
+  quotient_temps -> base
+  quotient_stack -> base + quotient_temps_len
+
+PcsQEvalSourceTable:
+  q_eval source table -> base
+
+PcsQComTrace:
+  optional q_com trace MSM -> base
+
+PcsFinalMsm:
+  final MSM input -> base
+```
+
 ## Units
 
 All planned regions are byte ranges, but every start and length must be aligned
@@ -42,7 +75,8 @@ which changes the transcript-buffer bound. The verifier reserves:
 3. user challenge slots after the VK payload;
 4. fixed theta-relative slots;
 5. decoded evals and decompressed commitments;
-6. phase-scoped scratch regions.
+6. phase-scoped scratch regions;
+7. one non-overlapping `trace_u256` log word after all live regions.
 
 `VerifierMemoryLayout::validate()` rejects:
 
@@ -55,6 +89,18 @@ Intentional reuse is represented by giving the same byte range disjoint
 lifetimes. For example, `batch_invert_scratch`, quotient VM scratch, q_eval
 source tables, q_com trace scratch, and final MSM scratch can share bytes when
 their phases do not overlap.
+
+The `trace_u256` log word is deliberately not a historical fixed constant.
+Trace hooks can run between reads from long-lived VK/eval/commitment memory, so
+their one-word `mstore` must sit outside every permanent and phase-scoped
+region. This avoids the old failure mode where a diagnostic log buffer inside a
+large VK payload corrupted a later G1MSM input.
+
+The external quotient evaluator has a separate EVM memory space. Its trace hook
+is logless because the evaluator is called through `STATICCALL`, so it uses
+callee-local word `0x00` and overwrites that word with the return-frame magic
+immediately before returning. It must not use the verifier's high
+`trace_u256_mptr`, which can overlap the evaluator's VM stack in the callee.
 
 ## Theta-Relative Offsets
 
@@ -128,7 +174,7 @@ MSM, so the generic PCS scratch begins after that selector block:
 
 ```text
 quotient_tmp_mptr = selector_acc_mptr + num_simple_selectors * WORD_BYTES
-pcs_scratch_mptr  = quotient_tmp_mptr
+PCS scratch base  = quotient_tmp_mptr
 ```
 
 ## Scratch Lifetimes
@@ -153,7 +199,7 @@ The planner validates by lifetime, not just by address.
 When changing generated memory usage:
 
 1. Add or update the named region in `VerifierMemoryLayout`.
-2. Register it in `populate_map()` with the narrowest correct lifetime.
+2. Register it through `MemoryArena` with the narrowest correct lifetime.
 3. Use named constants (`WORD_BYTES`, `G1_BYTES`, `G1_MSM_PAIR_BYTES`, etc.)
    instead of raw byte literals when the literal describes layout.
 4. If a fixed theta-relative offset changes, update this document and the

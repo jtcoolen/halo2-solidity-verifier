@@ -79,6 +79,10 @@ contract Halo2QuotientEvaluator {
     // The numerator block writes one bucket per simple selector, then the
     // fallback copies those buckets into the compact return frame.
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
+    // Callee-local scratch for logless trace hooks. This evaluator is invoked
+    // through STATICCALL, so trace hooks cannot emit LOG records; word 0 is
+    // overwritten with QUOTIENT_MAGIC immediately before returning.
+    uint256 internal constant        TRACE_U256_MPTR = 0x00;
 
     // External-call frame metadata. The main verifier staticcalls this
     // contract with exactly QUOTIENT_FRAME_LEN bytes starting at
@@ -182,7 +186,7 @@ contract Halo2QuotientEvaluator {
             // this helper is always logless here.
             function trace_u256(id, value) {
                 pop(id)
-                mstore(0x5e00, value)
+                mstore(TRACE_U256_MPTR, value)
             }
 
             // This included block is the main body of the evaluator. It:
