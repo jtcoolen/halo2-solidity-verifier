@@ -220,10 +220,9 @@ Examples:
 
 Impact:
 
-- The event is Fiat-Shamir-negligible, but with truncated challenges the bound
-  is closer to 2^-128 for `x3` collisions.
-- Continuing after a zero denominator makes the soundness error implicit and
-  harder to reason about.
+- The event is Fiat-Shamir-negligible under the configured challenge sampling,
+  but continuing after a zero denominator makes the soundness error implicit
+  and harder to reason about.
 
 Recommendation:
 
@@ -910,3 +909,343 @@ The current `templates/Halo2Verifier.sol` blocks this path via `AUTHORIZED_VK` +
    any phase), two high-severity issues (F-2: Fiat-Shamir mismatch on empty advice phases; F-3: read_g1_point hashes raw calldata before validating EIP-2537 padding), and a handful
     of medium/low items around accumulator decoding, identity-point handling, the hard-coded delta constant, and trace-mode footguns. The pinned-VK + EXPECTED_VK_CODEHASH pattern 
    correctly closes the original BN254 caller-controlled-VK hole, and EIP-2537 transitively gives the G2 subgroup check that the BN254 path was missing.
+
+## 2026-05-02 production-readiness findings: IVC verifier artifact
+
+Scope note: these findings are about the generated IVC verifier artifact and
+its production hardening. Challenge truncation is intentionally out of scope
+for this note: the compiler keeps that behavior optional, and this review
+looked at an IVC build that enables the option.
+
+Conclusion: the verifier is not production-ready yet. Several issues are
+deployment-integrity, fail-closed, or integration hazards rather than immediate
+cryptographic breaks, but they should be closed before shipping.
+
+### High-priority findings
+
+#### A-1. Production builds must pin the quotient evaluator hash and length
+
+Severity: High.
+
+The verifier pins the VK with an expected runtime length and codehash. The
+quotient evaluator must be treated the same way, because the external quotient
+contract reconstructs the batched identity numerator, the linearization
+expected evaluation, and the simple-selector accumulators. It is not merely a
+gas optimization.
+
+The template now supports an `EXPECTED_QUOTIENT_LENGTH` /
+`EXPECTED_QUOTIENT_CODEHASH` path, but the fallback path still accepts any
+non-empty quotient evaluator in the constructor and pins whatever codehash was
+passed:
+
+```solidity
+require(authorizedQuotient.code.length != 0, "invalid quotient");
+AUTHORIZED_QUOTIENT_CODEHASH = authorizedQuotient.codehash;
+```
+
+Impact:
+
+- A malicious or mistaken deployment can wire a quotient evaluator that returns
+  forged `QUOTIENT_EVAL_MPTR` and selector accumulators.
+- The rest of the verifier can then verify a different statement than the one
+  implied by the intended circuit and VK.
+- This is especially dangerous for factories, registries, copied deployment
+  scripts, and third-party verifier addresses.
+
+Recommendation:
+
+- Generate and deploy production IVC verifiers only through the hard-coded
+  quotient hash path.
+- Make `EXPECTED_QUOTIENT_LENGTH` and `EXPECTED_QUOTIENT_CODEHASH` mandatory
+  for external quotient evaluator builds.
+- Add a negative deployment test that rejects a quotient evaluator with the
+  same ABI and different runtime bytecode.
+
+#### A-2. Invalid G1/G2 points can burn almost all supplied gas
+
+Severity: High.
+
+The verifier forwards `gas()` to EIP-2537 precompiles:
+
+```yul
+staticcall(gas(), 0x0c, ...)
+staticcall(gas(), 0x0f, ...)
+```
+
+EIP-2537 specifies that failed precompile calls burn all gas supplied to the
+precompile. It also requires errors for invalid encodings, non-curve points,
+points outside the subgroup for MSM/pairing, and invalid input length. The
+verifier range-checks G1 coordinates before transcript absorption, but
+curve-membership and subgroup checks are deferred to MSM/pairing precompiles.
+
+Impact:
+
+- A caller can submit field-canonical but off-curve proof points and cause a
+  later G1MSM or pairing call to burn nearly all remaining gas.
+- If users call the verifier directly this is a UX/DoS issue. If another
+  protocol calls the verifier, the gas griefing is more serious.
+
+Recommendation:
+
+- Use bounded-gas wrappers for EIP-2537 calls, sized from the expected valid
+  input length plus a safety margin.
+- Check exact return sizes after every precompile call.
+- Add negative tests for off-curve G1, wrong-subgroup G1 in MSM, malformed G2,
+  and invalid pairing inputs.
+
+#### A-3. Accumulator RHS fixed-base scalar handling must be schema-checked
+
+Severity: High for general codegen, low/medium for the current IVC artifact.
+
+The accumulator block documents an RHS layout containing point limbs, one
+scalar, and fixed-base scalars in `BTreeMap` key order. The current code walks
+`fixed_scalar_ptr` only when generated fixed-base points exist; for the concrete
+IVC layout there appears to be no tail, so the current artifact is probably
+consistent. The template still needs an explicit schema assertion.
+
+Impact:
+
+- A future circuit with fixed-base accumulator terms could silently verify the
+  wrong accumulator equation if the codegen metadata, comments, and instance
+  layout diverge.
+- Without a schema assertion, a layout mismatch fails unclearly.
+
+Recommendation:
+
+- For the concrete IVC verifier, assert that the accumulator layout consumes
+  exactly the expected instance words.
+- For general codegen, either implement the documented fixed-base tail MSM for
+  every generated fixed-base term or make the zero-tail invariant explicit in
+  VK/codegen metadata and generated tests.
+
+#### A-4. Accumulator limb decoding is non-canonical
+
+Severity: High/Medium.
+
+`load_acc_coord_shifted` extracts packed accumulator limbs with masks:
+
+```yul
+let limb := and(shr(mul(mod(i, limbs_per_word), bits), packed), mask)
+```
+
+For 56-bit limbs, a coordinate is split across words with unused high bits. The
+verifier checks each public-input word is `< Fr`, but it does not reject unused
+high bits in the packed words. Those bits are silently ignored by the
+accumulator decoder.
+
+Impact:
+
+- Multiple public-input encodings can decode to the same BLS point.
+- The transcript absorbs the full public-input words, so this is not
+  automatically a bypass, but it is a canonicality hole.
+- It can become a soundness bug if the circuit-side public-input packing does
+  not enforce the same unused-bit zero constraints.
+
+Recommendation:
+
+- Add verifier-side checks that unused high bits are zero for every packed
+  accumulator coordinate word.
+- For the identity encoding, accept only the exact full-point identity form and
+  require strict packing for all non-identity coordinates.
+- Add negative tests for high unused accumulator bits.
+
+### Medium-priority findings
+
+#### A-5. Gas checkpoints must not be present in production builds
+
+Severity: Medium.
+
+`gas_checkpoint()` emits `LOG1` repeatedly during verification when the gas
+checkpoint build path is enabled. That makes the verifier non-`view`, prevents
+safe `staticcall` usage, leaks profiling artifacts into logs, and adds gas to
+every proof.
+
+Implementation note: the checkpoint helper and all call sites are Askama
+branches in `templates/Halo2Verifier.sol`, guarded by `self.gas_checkpoints`.
+Default render paths set this from the `solidity-gas-checkpoints` Cargo feature,
+while `render_with_gas_checkpoints*` helpers force it on for benchmarking. The
+separate `Halo2QuotientEvaluator.sol` template does not currently emit
+checkpoint logs; it copies the verifier frame, runs the quotient numerator
+block, and returns the fixed output frame.
+
+Recommendation:
+
+- Keep gas checkpoints only in explicit debug/bench artifacts.
+- Ensure production generation disables trace/gas flags and emits:
+
+```solidity
+function verifyProof(
+    bytes calldata proof,
+    uint256[] calldata instances
+) external view returns (bool)
+```
+
+#### A-6. The Solidity pragma is too loose for the generated opcode set
+
+Severity: Medium.
+
+The generated templates currently use:
+
+```solidity
+pragma solidity ^0.8.0;
+```
+
+The verifier uses Yul `mcopy`, which requires compiler support for Cancun-era
+opcodes. The generated source should require a compiler version that supports
+the emitted Yul and should be compiled for an EVM target that supports both
+MCOPY and EIP-2537 on the destination chain.
+
+Recommendation:
+
+- Pin the generated templates to at least Solidity `^0.8.24`, or a narrower
+  exact compiler version used by CI.
+- Compile with the intended EVM version and record the compiler/EVM target in
+  deployment artifacts.
+
+#### A-7. Invalid proofs mostly revert despite a bool-returning API
+
+Severity: Medium.
+
+The public API returns `bool`, but many invalid proof paths use
+`revert(0, 0)`. Only some early deployment-binding checks return `false`.
+
+Impact:
+
+- Integrators may expect invalid proofs to return `false`, while malformed
+  proofs, invalid scalars, invalid points, denominator failures, bad quotient
+  output, and bad pairings mostly revert.
+- The API is harder to safely compose in other contracts.
+
+Recommendation:
+
+- Decide on one policy:
+  - revert on all invalid proofs and document that behavior; or
+  - consistently return `false`.
+- Prefer custom errors or clear NatSpec if reverting remains the production
+  policy.
+
+#### A-8. The manual ABI parser should check dynamic offsets
+
+Severity: Medium.
+
+The verifier hardcodes calldata locations such as:
+
+```yul
+PROOF_LEN_CPTR
+PROOF_CPTR
+NUM_INSTANCE_CPTR
+INSTANCE_CPTR
+```
+
+It should also assert the dynamic ABI heads match the hand-rolled parser:
+
+```yul
+success := and(success, eq(calldataload(0x04), 0x40))
+success := and(success, eq(calldataload(0x24), EXPECTED_INSTANCE_HEAD))
+```
+
+Recommendation:
+
+- Add canonical ABI-offset checks for `proof` and `instances`.
+- Alternatively, use Solidity's `proof.offset`, `proof.length`,
+  `instances.offset`, and `instances.length` values directly in the assembly.
+
+#### A-9. Check the quotient evaluator against EIP-170 in CI
+
+Severity: Medium.
+
+The external quotient evaluator is close to Ethereum's `0x6000` runtime
+code-size limit. Contract creation fails when returned runtime code exceeds
+24,576 bytes.
+
+Recommendation:
+
+- Compile the exact production evaluator with the intended optimizer and EVM
+  target in CI.
+- Assert deployed runtime length is below 24,576 bytes with margin.
+- Split the evaluator or move static data if the margin becomes too small.
+
+### Lower-priority hardening
+
+#### A-10. Comments still describe compressed proof commitments
+
+Severity: Low.
+
+Some template comments still describe proof commitments as zcash-compressed
+points that are decompressed inline. The current verifier expects
+EIP-2537-padded uncompressed G1 points in calldata and hashes that 128-byte
+form into the transcript.
+
+Recommendation:
+
+- Update stale comments around proof serialization, transcript absorption, and
+  commitment memory layout.
+- Treat serialization comments as security-sensitive because off-chain repack
+  bugs cause hard-to-debug transcript mismatches.
+
+#### A-11. Add generated layout invariant tests
+
+Severity: Low.
+
+This verifier is layout-sensitive. A cheap generated test suite should assert
+relationships such as:
+
+```text
+PROOF_CPTR + proof_len == NUM_INSTANCE_CPTR
+INSTANCE_CPTR == NUM_INSTANCE_CPTR + 0x20
+ADVICE_COMMS_MPTR_BASE + advice_count * 0x80 == LOOKUP_M_COMMS_MPTR_BASE
+```
+
+Recommendation:
+
+- Generate Foundry/Hardhat or Rust-side tests for the rendered constants.
+- Keep these as CI checks rather than runtime production assertions unless the
+  cost is negligible.
+
+#### A-12. Remove unused constants and dead paths
+
+Severity: Low.
+
+Examples observed in generated or adjacent code include unused quotient cursor
+constants, scratch constants, and stale helper paths.
+
+Recommendation:
+
+- Remove dead constants and helpers from production renders.
+- Keep debug-only helpers behind explicit trace/bench flags.
+
+### Things that looked internally consistent
+
+- The proof parser's section lengths appear internally consistent for the IVC
+  artifact.
+- VK runtime length and verifier `extcodecopy` layout agree in the generated
+  artifact.
+- EIP-2537 coordinate canonicality checks reject non-zero top padding bytes and
+  accept coordinates up to `p - 1`.
+- The final KZG pairing argument order appears consistent with the helper's
+  `e(arg0, G2_BASE) * e(arg1, NEG_S_G2_BASE) == 1` convention.
+
+### Recommended action list
+
+1. Make expected quotient codehash/length mandatory for external quotient
+   evaluator production builds.
+2. Remove gas checkpoints from production artifacts and make production
+   `verifyProof` `external view`.
+3. Add bounded-gas wrappers and exact return-size checks for EIP-2537 calls.
+4. Add canonical packed-limb checks for accumulator public inputs.
+5. Assert accumulator schemas consume all expected instance words, or implement
+   the documented fixed-base tail in general codegen.
+6. Require a Solidity compiler/EVM target that supports the emitted Yul and
+   target-chain precompiles.
+7. Add ABI dynamic-offset checks for the hand-rolled parser.
+8. Add CI checks for quotient evaluator runtime size under EIP-170.
+9. Add negative tests for malformed/off-curve/wrong-subgroup points, high
+   accumulator padding bits, wrong quotient codehash, wrong ABI offsets, wrong
+   proof length, and mutated quotient output.
+
+References:
+
+- EIP-2537: https://eips.ethereum.org/EIPS/eip-2537
+- Solidity 0.8.24 release notes: https://www.soliditylang.org/blog/2024/01/26/solidity-0.8.24-release-announcement/
+- Ethereum Pectra announcement: https://blog.ethereum.org/2025/04/23/pectra-mainnet
+- EIP-170: https://eips.ethereum.org/EIPS/eip-170
