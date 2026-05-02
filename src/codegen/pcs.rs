@@ -60,6 +60,14 @@ use crate::codegen::util::{ConstraintSystemMeta, Data};
 
 mod gwc19;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PcsScratchRequirements {
+    pub(crate) rot_points_words: usize,
+    pub(crate) x1_powers_words: usize,
+    pub(crate) q_com_words: usize,
+    pub(crate) q_eval_set_words: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOpenScheme {
     /// Midnight-proofs multi-prepare KZG flow. The variant name is kept
@@ -88,6 +96,16 @@ impl BatchOpenScheme {
     ) -> Vec<Vec<String>> {
         match self {
             Self::Gwc19 => gwc19::computations(meta, data, truncated_challenges, trace),
+        }
+    }
+
+    pub(crate) fn scratch_requirements(
+        &self,
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+    ) -> PcsScratchRequirements {
+        match self {
+            Self::Gwc19 => gwc19::scratch_requirements(meta, data),
         }
     }
 

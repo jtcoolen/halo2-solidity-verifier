@@ -4900,6 +4900,7 @@ impl<'a> SolidityGenerator<'a> {
                 .flat_map(|block| block.iter())
                 .any(|line| line.contains("q_limb7_wide("));
 
+        let pcs_scratch_requirements = self.scheme.scratch_requirements(&meta, &data);
         let pcs_computations =
             self.scheme
                 .computations(&meta, &data, cfg!(feature = "truncated-challenges"), trace);
@@ -5022,6 +5023,7 @@ impl<'a> SolidityGenerator<'a> {
             lookup_chunks: meta.lookup_chunks.clone(),
             comms_mptr_base: data.comms_mptr_base,
             reversed_evals_mptr: data.reversed_evals_mptr,
+            pcs_scratch_requirements,
             selector_acc_mptr,
             batch_invert_scratch_mptr,
             quotient_external,

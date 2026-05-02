@@ -2,7 +2,7 @@
 
 use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
-    pcs::BatchOpenScheme,
+    pcs::{BatchOpenScheme, PcsScratchRequirements},
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -209,6 +209,9 @@ pub(crate) struct Halo2Verifier {
     /// to this buffer so that every later eval reference renders as
     /// `mload(...)`.
     pub(crate) reversed_evals_mptr: Ptr,
+    /// Codegen-time sizes of variable-width PCS scratch tables that are
+    /// currently mapped into fixed template windows.
+    pub(crate) pcs_scratch_requirements: PcsScratchRequirements,
     /// Scratch base for simple-selector linearization accumulators.
     /// These values are needed only between quotient-eval emission and
     /// the linearization MSM, so the region may be reused by later PCS
@@ -331,6 +334,11 @@ impl Halo2VerifyingKey {
 
 impl Halo2Verifier {
     pub(crate) fn validate_layout(&self) -> Result<(), String> {
+        const ROT_POINTS_CAP_WORDS: usize = 80 - 52;
+        const X1_POWERS_CAP_WORDS: usize = 112 - 80;
+        const Q_COM_CAP_WORDS: usize = 144 - 112;
+        const Q_EVAL_SET_CAP_WORDS: usize = 200 - 144;
+
         let proof_cptr = self.proof_cptr.value().as_usize();
         if proof_cptr + self.proof_len != self.num_instance_cptr {
             return Err(format!(
@@ -387,6 +395,32 @@ impl Halo2Verifier {
             ));
         }
 
+        let pcs = self.pcs_scratch_requirements;
+        if pcs.rot_points_words > ROT_POINTS_CAP_WORDS {
+            return Err(format!(
+                "PCS scratch layout mismatch: ROT_POINTS_MPTR needs {} word(s), capacity is {ROT_POINTS_CAP_WORDS}",
+                pcs.rot_points_words
+            ));
+        }
+        if pcs.x1_powers_words > X1_POWERS_CAP_WORDS {
+            return Err(format!(
+                "PCS scratch layout mismatch: X1_POWERS_MPTR needs {} word(s), capacity is {X1_POWERS_CAP_WORDS}",
+                pcs.x1_powers_words
+            ));
+        }
+        if pcs.q_com_words > Q_COM_CAP_WORDS {
+            return Err(format!(
+                "PCS scratch layout mismatch: Q_COM_MPTR needs {} word(s), capacity is {Q_COM_CAP_WORDS}",
+                pcs.q_com_words
+            ));
+        }
+        if pcs.q_eval_set_words > Q_EVAL_SET_CAP_WORDS {
+            return Err(format!(
+                "PCS scratch layout mismatch: Q_EVAL_SET_MPTR needs {} word(s), capacity is {Q_EVAL_SET_CAP_WORDS}",
+                pcs.q_eval_set_words
+            ));
+        }
+
         Ok(())
     }
 
@@ -433,7 +467,10 @@ mod filters {
 mod tests {
     use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
     use crate::codegen::artifact::PayloadSectionKind;
-    use crate::codegen::{pcs::BatchOpenScheme::Gwc19, util::Ptr};
+    use crate::codegen::{
+        pcs::{BatchOpenScheme::Gwc19, PcsScratchRequirements},
+        util::Ptr,
+    };
     use ruint::aliases::U256;
 
     fn synthetic_vk(num_fixed: usize, num_perm: usize) -> Halo2VerifyingKey {
@@ -569,6 +606,7 @@ mod tests {
             lookup_chunks: vec![lookup_helper_chunks_total],
             comms_mptr_base: Ptr::memory(comms_mptr_base),
             reversed_evals_mptr: Ptr::memory(0x3000),
+            pcs_scratch_requirements: PcsScratchRequirements::default(),
             selector_acc_mptr,
             batch_invert_scratch_mptr: selector_acc_mptr,
             quotient_external: None,
@@ -712,6 +750,33 @@ mod tests {
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("VK memory layout mismatch"),
+            "unexpected layout error: {err}"
+        );
+    }
+
+    #[test]
+    fn verifier_layout_validation_rejects_pcs_scratch_overflow() {
+        let mut verifier = synthetic_verifier();
+        verifier.pcs_scratch_requirements.rot_points_words = 29;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("ROT_POINTS_MPTR needs 29 word"),
+            "unexpected layout error: {err}"
+        );
+
+        let mut verifier = synthetic_verifier();
+        verifier.pcs_scratch_requirements.x1_powers_words = 33;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("X1_POWERS_MPTR needs 33 word"),
+            "unexpected layout error: {err}"
+        );
+
+        let mut verifier = synthetic_verifier();
+        verifier.pcs_scratch_requirements.q_eval_set_words = 57;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("Q_EVAL_SET_MPTR needs 57 word"),
             "unexpected layout error: {err}"
         );
     }

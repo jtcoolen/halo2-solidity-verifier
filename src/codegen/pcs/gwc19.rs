@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 
+use super::PcsScratchRequirements;
 use crate::codegen::{
     protocol::{PcsQuerySource, PermutationZEval},
     util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word},
@@ -398,6 +399,40 @@ pub(crate) fn intermediate_sets(meta: &ConstraintSystemMeta, data: &Data) -> Int
 
 pub(super) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize {
     intermediate_sets(meta, data).point_sets.len()
+}
+
+pub(super) fn scratch_requirements(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+) -> PcsScratchRequirements {
+    let sets = intermediate_sets(meta, data);
+    let n_sets = sets.point_sets.len();
+    if n_sets == 0 {
+        return PcsScratchRequirements::default();
+    }
+
+    let mut commitments_per_set = vec![0usize; n_sets];
+    for c in &sets.commitments {
+        commitments_per_set[c.set_index] += 1;
+    }
+
+    let mut distinct_rotations: Vec<i32> = sets
+        .point_sets
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .collect();
+    distinct_rotations.sort_unstable();
+    distinct_rotations.dedup();
+
+    PcsScratchRequirements {
+        rot_points_words: distinct_rotations.len(),
+        x1_powers_words: commitments_per_set.into_iter().max().unwrap_or(0),
+        // Current q_com materialization is fused into the final MSM scratch
+        // instead of Q_COM_MPTR. Keep the field explicit so a future
+        // Q_COM_MPTR user must also participate in layout validation.
+        q_com_words: 0,
+        q_eval_set_words: sets.point_sets.iter().map(Vec::len).sum(),
+    }
 }
 
 /// Returns the number of dummy queries (and thus the number of extra
