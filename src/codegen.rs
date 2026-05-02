@@ -4576,6 +4576,30 @@ impl<'a> SolidityGenerator<'a> {
             self.scheme.static_working_memory_size(&self.meta, &mock)
         };
 
+        let transcript_words = Self::transcript_buffer_words_bound(&self.meta, self.num_instances);
+
+        itertools::max([
+            // Transcript buffer (streaming Keccak256). The buffer must
+            // fit *below* `VK_MPTR` because every `mload(VK_MPTR + ...)`
+            // assumes the VK contract bytes copied via `extcodecopy`
+            // remain intact, and the buffer would otherwise overwrite
+            // them as it grows past the start of the VK area.
+            transcript_words,
+            // PCS computation scratch
+            pcs_computation,
+            // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each)
+            // = 24 words, plus 1-word output buffer.
+            25,
+            // Modexp scratch for decompression (240 bytes input + 48
+            // bytes output = 9 words; we round up to 16 to leave room
+            // for separate scratch areas).
+            16,
+        ])
+        .unwrap()
+            * 0x20
+    }
+
+    fn transcript_buffer_words_bound(meta: &ConstraintSystemMeta, num_instances: usize) -> usize {
         // The Step 6 transcript model is a streaming Keccak256 buffer at
         // memory `[0..buf_len)`. The buffer monotonically grows between
         // two challenge squeezes and is reset to 32 bytes after each
@@ -4601,63 +4625,37 @@ impl<'a> SolidityGenerator<'a> {
         // causes the keccak buffer to overrun `VK_MPTR` mid-verify and
         // silently corrupt `K_MPTR`, `OMEGA_MPTR`, etc., producing a
         // multi-billion-gas spin in the Lagrange block.
-        let transcript_words: usize = {
-            // (a) initial run: vk_digest (32) + committed_pi (128)
-            //     + num_instances scalar (32) + num_instances * 32
-            //     + phase_1_advices * 128 + 32 cushion.
-            let phase_1_advices = self.meta.num_user_advices.first().copied().unwrap_or(0);
-            let initial_run = 32                      // vk_digest
-                + 128                                 // committed_pi
-                + 32                                  // num_instances scalar
-                + self.num_instances * 32             // committed instances
-                + phase_1_advices * 128               // phase-1 advices
-                + 32; // post-squeeze seed cushion
+        // (a) initial run: vk_digest (32) + committed_pi (128)
+        //     + num_instances scalar (32) + num_instances * 32
+        //     + phase-1 advices * 128 + 32 cushion.
+        let phase_1_advices = meta.num_user_advices.first().copied().unwrap_or(0);
+        let initial_run = 32                  // vk_digest
+            + 128                             // committed_pi
+            + 32                              // num_instances scalar
+            + num_instances * 32              // committed instances
+            + phase_1_advices * 128           // phase-1 advices
+            + 32; // post-squeeze seed cushion
 
-            // (b) eval-block run: quotient_limbs (Keccak common_uncompressed
-            //     of each quotient G1) + num_evals scalars + num_point_sets
-            //     scalars + 32 cushion.
-            let eval_run = self.meta.num_quotients * 128
-                + self.meta.num_evals * 32
-                + self.meta.num_point_sets * 32
-                + 32;
+        // (b) eval-block run: quotient limbs + num_evals scalars
+        //     + num_point_sets scalars + 32 cushion.
+        let eval_run =
+            meta.num_quotients * 128 + meta.num_evals * 32 + meta.num_point_sets * 32 + 32;
 
-            // Catch-all: any other phase. We bound it by every G1 + every
-            // scalar absorbed across the whole transcript; this is a
-            // strict overestimate but cheap and finite.
-            let total_g1: usize = self.meta.num_user_advices.iter().sum::<usize>()
-                + self.meta.num_lookups
-                + self.meta.num_permutation_zs
-                + self.meta.lookup_chunks.iter().sum::<usize>()
-                + self.meta.num_lookups
-                + self.meta.num_trashcans
-                + self.meta.num_quotients
-                + 2; // f_com + pi
-            let total_scalar = self.meta.num_evals + self.meta.num_point_sets + 32;
-            let total_run = 32 + total_g1 * 128 + total_scalar * 32 + 32;
+        // Catch-all: any other phase. We bound it by every G1 + every
+        // scalar absorbed across the whole transcript; this is a strict
+        // overestimate but cheap and finite.
+        let total_g1: usize = meta.num_user_advices.iter().sum::<usize>()
+            + meta.num_lookups
+            + meta.num_permutation_zs
+            + meta.lookup_chunks.iter().sum::<usize>()
+            + meta.num_lookups
+            + meta.num_trashcans
+            + meta.num_quotients
+            + 2; // f_com + pi
+        let total_scalar = meta.num_evals + meta.num_point_sets + 32;
+        let total_run = 32 + total_g1 * 128 + total_scalar * 32 + 32;
 
-            let peak = initial_run.max(eval_run).max(total_run);
-            peak.div_ceil(0x20)
-        };
-
-        itertools::max([
-            // Transcript buffer (streaming Keccak256). The buffer must
-            // fit *below* `VK_MPTR` because every `mload(VK_MPTR + ...)`
-            // assumes the VK contract bytes copied via `extcodecopy`
-            // remain intact, and the buffer would otherwise overwrite
-            // them as it grows past the start of the VK area.
-            transcript_words,
-            // PCS computation scratch
-            pcs_computation,
-            // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each)
-            // = 24 words, plus 1-word output buffer.
-            25,
-            // Modexp scratch for decompression (240 bytes input + 48
-            // bytes output = 9 words; we round up to 16 to leave room
-            // for separate scratch areas).
-            16,
-        ])
-        .unwrap()
-            * 0x20
+        initial_run.max(eval_run).max(total_run).div_ceil(0x20)
     }
 }
 
@@ -4739,6 +4737,28 @@ mod tests {
         assert_eq!(frame.frame_len, 0x4e0);
         assert_eq!(frame.output_len, 0xa0);
         assert_eq!(frame.magic, QUOTIENT_EXTERNAL_MAGIC);
+    }
+
+    #[test]
+    fn transcript_memory_bound_handles_wide_bls_advice_phase() {
+        let mut cs = ConstraintSystem::default();
+        for _ in 0..64 {
+            cs.advice_column();
+        }
+        let meta = ConstraintSystemMeta::new(&cs, 0);
+
+        let words = SolidityGenerator::transcript_buffer_words_bound(&meta, 0);
+
+        // Regression for the BN254-era `n * 2 + 1` sizing bug: the BLS
+        // transcript absorbs each proof commitment as a 128-byte
+        // EIP-2537-padded G1, so 64 first-phase advice commitments need
+        // vk_digest + committed_pi + num_instances + 64 G1s + squeeze seed.
+        let first_phase_run = 32 + 128 + 32 + 64 * 128 + 32;
+        assert!(words * 0x20 >= first_phase_run);
+        assert!(
+            words > 64 * 2 + 1,
+            "transcript memory bound must not regress to the BN254 stride"
+        );
     }
 
     #[test]
