@@ -249,7 +249,7 @@ contract Halo2Verifier {
     function verifyProof(
         bytes calldata proof,
         uint256[] calldata instances
-    ) public {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
+    ) external {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
         assembly ("memory-safe") {
             if iszero(and(eq(calldataload(0x04), 0x40), eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4)))) {
                 revert(0, 0)

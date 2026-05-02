@@ -5037,6 +5037,20 @@ mod tests {
     }
 
     #[test]
+    fn production_verifier_entrypoint_is_external_view() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains(") external {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %}"),
+            "generated verifyProof entrypoint should render as external view in production"
+        );
+        assert!(
+            !verifier_template.contains(") public {%- if self.trace || self.gas_checkpoints %}"),
+            "production verifier should not expose the calldata entrypoint as public"
+        );
+    }
+
+    #[test]
     fn permutation_delta_literal_is_computed_from_field_constant() {
         let computed = u256_string(fe_to_u256::<Fq>(&Fq::DELTA));
 

@@ -291,8 +291,8 @@ fn production_renders_do_not_emit_gas_checkpoints() {
             "{name} production render unexpectedly emits LOG1"
         );
         assert!(
-            source.contains(") public view returns (bool)"),
-            "{name} production render should keep verifyProof view"
+            source.contains(") external view returns (bool)"),
+            "{name} production render should keep verifyProof external view"
         );
     }
 }
