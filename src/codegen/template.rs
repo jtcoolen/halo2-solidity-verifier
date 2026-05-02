@@ -264,6 +264,57 @@ impl Halo2VerifyingKey {
 }
 
 impl Halo2Verifier {
+    pub(crate) fn validate_layout(&self) -> Result<(), String> {
+        let proof_cptr = self.proof_cptr.value().as_usize();
+        if proof_cptr + self.proof_len != self.num_instance_cptr {
+            return Err(format!(
+                "proof calldata layout mismatch: proof_cptr({proof_cptr:#x}) + proof_len({:#x}) != num_instance_cptr({:#x})",
+                self.proof_len, self.num_instance_cptr
+            ));
+        }
+        if self.num_instance_cptr + 0x20 != self.instance_cptr {
+            return Err(format!(
+                "instance calldata layout mismatch: num_instance_cptr({:#x}) + 0x20 != instance_cptr({:#x})",
+                self.num_instance_cptr, self.instance_cptr
+            ));
+        }
+
+        let non_quotient_g1s = self.total_advices
+            + self.num_lookups
+            + self.num_permutation_zs
+            + self.lookup_helper_chunks_total
+            + self.num_lookups
+            + self.num_trashcans;
+        let expected_quotient_cptr = proof_cptr + non_quotient_g1s * 0x80;
+        let quotient_cptr = self.quotient_comm_cptr.value().as_usize();
+        if quotient_cptr != expected_quotient_cptr {
+            return Err(format!(
+                "quotient commitment calldata mismatch: got {quotient_cptr:#x}, expected {expected_quotient_cptr:#x}"
+            ));
+        }
+
+        let expected_proof_len = (non_quotient_g1s + self.num_quotients + 2) * 0x80
+            + (self.num_evals + self.num_point_sets) * 0x20;
+        if self.proof_len != expected_proof_len {
+            return Err(format!(
+                "proof length mismatch: got {:#x}, expected {expected_proof_len:#x}",
+                self.proof_len
+            ));
+        }
+
+        let comms_base = self.comms_mptr_base.value().as_usize();
+        let committed_g1s = non_quotient_g1s + self.num_quotients;
+        let expected_selector_acc = (comms_base + committed_g1s * 0x80).next_multiple_of(0x20);
+        if self.selector_acc_mptr != expected_selector_acc {
+            return Err(format!(
+                "selector accumulator layout mismatch: got {:#x}, expected {expected_selector_acc:#x}",
+                self.selector_acc_mptr
+            ));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
             Error::Fmt(err) => err,
@@ -305,7 +356,8 @@ mod filters {
 
 #[cfg(test)]
 mod tests {
-    use super::{G1Words, Halo2VerifyingKey};
+    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
+    use crate::codegen::{pcs::BatchOpenScheme::Gwc19, util::Ptr};
     use ruint::aliases::U256;
 
     fn synthetic_vk(num_fixed: usize, num_perm: usize) -> Halo2VerifyingKey {
@@ -386,6 +438,84 @@ mod tests {
         }
     }
 
+    fn synthetic_verifier() -> Halo2Verifier {
+        let proof_cptr = 0x64usize;
+        let total_advices = 2usize;
+        let num_lookups = 1usize;
+        let num_permutation_zs = 1usize;
+        let lookup_helper_chunks_total = 2usize;
+        let num_trashcans = 1usize;
+        let num_quotients = 3usize;
+        let num_evals = 5usize;
+        let num_point_sets = 2usize;
+        let non_quotient_g1s = total_advices
+            + num_lookups
+            + num_permutation_zs
+            + lookup_helper_chunks_total
+            + num_lookups
+            + num_trashcans;
+        let proof_len =
+            (non_quotient_g1s + num_quotients + 2) * 0x80 + (num_evals + num_point_sets) * 0x20;
+        let comms_mptr_base = 0x2000usize;
+        let selector_acc_mptr = comms_mptr_base + (non_quotient_g1s + num_quotients) * 0x80;
+
+        Halo2Verifier {
+            scheme: Gwc19,
+            trace: false,
+            gas_checkpoints: false,
+            quotient_yul_helpers: false,
+            quotient_pow5_helper: false,
+            quotient_limb7_helper: false,
+            quotient_wide_limb7_helper: false,
+            embedded_vk: None,
+            expected_vk_codehash: Some(U256::from(1u64)),
+            vk_len: 0,
+            proof_len,
+            vk_mptr: Ptr::memory(0x1000),
+            challenge_mptr: Ptr::memory(0x1200),
+            theta_mptr: Ptr::memory(0x1300),
+            proof_cptr: Ptr::calldata(proof_cptr),
+            num_instance_cptr: proof_cptr + proof_len,
+            instance_cptr: proof_cptr + proof_len + 0x20,
+            quotient_comm_cptr: Ptr::calldata(proof_cptr + non_quotient_g1s * 0x80),
+            num_neg_lagranges: 0,
+            user_phases: vec![],
+            num_user_challenges: 0,
+            num_lookups,
+            num_permutation_zs,
+            lookup_h_plus_acc: lookup_helper_chunks_total + num_lookups,
+            num_trashcans,
+            num_quotients,
+            num_evals,
+            num_point_sets,
+            total_advices,
+            lookup_helper_chunks_total,
+            lookup_chunks: vec![lookup_helper_chunks_total],
+            comms_mptr_base: Ptr::memory(comms_mptr_base),
+            reversed_evals_mptr: Ptr::memory(0x3000),
+            selector_acc_mptr,
+            batch_invert_scratch_mptr: selector_acc_mptr,
+            quotient_external: None,
+            expected_quotient_len: None,
+            expected_quotient_codehash: None,
+            quotient_inline_computations: vec![],
+            quotient_eval_numer_computations: vec![],
+            quotient_post_vm_computations: vec![],
+            quotient_native_permutation_computation: vec![],
+            quotient_native_identity_computations: vec![],
+            quotient_native_trash_computation: vec![],
+            quotient_program: None,
+            pcs_computations: vec![],
+            simple_selector_cols: vec![],
+            fixed_comm_mptr: 0,
+            truncated_challenges: false,
+            fewer_point_sets: false,
+            num_dummy_evals: 0,
+            acc_fixed_bases: vec![],
+            acc_msm_scratch: 0x7000,
+        }
+    }
+
     #[test]
     fn vk_layout_byte_consistency() {
         // For a synthetic VK with 31 named scalars + N=2 fixed + M=3
@@ -423,6 +553,23 @@ mod tests {
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&vk.bytes()[off..off + 32]);
         assert_eq!(U256::from_be_bytes(buf), U256::from(0x80_u64));
+    }
+
+    #[test]
+    fn verifier_layout_validation_checks_calldata_and_memory_cursors() {
+        let verifier = synthetic_verifier();
+        verifier.validate_layout().expect("synthetic layout");
+    }
+
+    #[test]
+    fn verifier_layout_validation_rejects_cursor_drift() {
+        let mut verifier = synthetic_verifier();
+        verifier.num_instance_cptr += 0x20;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("proof calldata layout mismatch"),
+            "unexpected layout error: {err}"
+        );
     }
 
     #[test]

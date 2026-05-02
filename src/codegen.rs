@@ -4298,7 +4298,7 @@ impl<'a> SolidityGenerator<'a> {
 
         let acc_msm_scratch = after_comms.max(0x7000).next_multiple_of(0x20);
 
-        Halo2Verifier {
+        let verifier = Halo2Verifier {
             scheme: self.scheme,
             trace,
             gas_checkpoints,
@@ -4356,7 +4356,11 @@ impl<'a> SolidityGenerator<'a> {
             num_dummy_evals: meta.num_dummy_evals,
             acc_fixed_bases,
             acc_msm_scratch,
-        }
+        };
+        verifier
+            .validate_layout()
+            .unwrap_or_else(|err| panic!("invalid generated verifier layout: {err}"));
+        verifier
     }
 
     fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
