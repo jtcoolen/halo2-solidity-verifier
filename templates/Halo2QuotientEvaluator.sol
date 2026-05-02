@@ -123,14 +123,18 @@ contract Halo2QuotientEvaluator {
             // Compact evaluator for a recurring 7-limb linear combination.
             //
             // Rust source shape:
+            //   proofs/src/plonk/mod.rs::partially_evaluate_identities
+            //   proofs/src/plonk/verifier.rs evaluation-read path
             //   circuits/src/field/foreign/params.rs::base_powers
             //   foreign/gates/norm.rs::Foreign-field normalization
             //   foreign/gates/mul.rs::Foreign-field multiplication
             //
             // This is the Fr evaluation of sum_i base_powers[i] * limb_i for
-            // the generated 7-limb foreign-field basis. It is used for the
-            // normalization gate and the sum_x/sum_y/sum_z pieces of the
-            // multiplication gate. The constants are VK/codegen constants,
+            // the generated 7-limb foreign-field basis. The circuit is
+            // emulating arithmetic modulo a different modulus `m` using limbs
+            // in base 2^LOG2_BASE, but the Solidity verifier only evaluates
+            // the resulting PLONK identity over BLS12-381 Fr. The constants
+            // are Fr encodings of base^i mod m from the VK/codegen path,
             // never proof-selected values.
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
@@ -148,14 +152,17 @@ contract Halo2QuotientEvaluator {
             // multiplication.
             //
             // Rust source shape:
+            //   proofs/src/plonk/mod.rs::partially_evaluate_identities
             //   foreign/gates/mul.rs::Foreign-field multiplication
+            //   ecc/foreign/gates/{on_curve,slope,tangent,lambda_squared}.rs
             //   xys = pair_wise_prod(xs, ys)
             //   sum_exprs(double_base_powers, xys)
             //
             // The native multiplication callbacks group repeated 7-term slices
             // of the double-base product-convolution basis into q_limb7_wide.
-            // This keeps the lowered quotient expression smaller while
-            // computing the same gate polynomial over Fr.
+            // double_base_powers contains base^(i+j) mod the emulated modulus
+            // `m`; each coefficient is then embedded into Fr so the verifier
+            // can evaluate the same gate polynomial with addmod/mulmod.
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
                 z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)

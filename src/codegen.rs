@@ -302,6 +302,8 @@ const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
 const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS";
 const QUOTIENT_STRUCTURED_TAIL_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL";
 const QUOTIENT_NATIVE_PERMUTATION_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_PERMUTATION";
+const QUOTIENT_LIMB_VM_OPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS";
+const QUOTIENT_SHAPE_PROFILE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE";
 const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
 const LIMB7_YUL_COEFFS: [&str; 6] = [
     "0x100000000000000",
@@ -352,6 +354,9 @@ const Q_OP_PUSH_TEMP: u8 = 0x17;
 const Q_OP_STORE_TEMP: u8 = 0x18;
 const Q_OP_NATIVE_PERMUTATION: u8 = 0x19;
 const Q_OP_NATIVE_IDENTITY: u8 = 0x1b;
+const Q_OP_LIN7: u8 = 0x1c;
+const Q_OP_BILIN7_ROW: u8 = 0x1d;
+const Q_OP_BILIN7_PAIRWISE: u8 = 0x1e;
 
 const Q_MEM_L0: u8 = 0x01;
 const Q_MEM_L_LAST: u8 = 0x02;
@@ -378,6 +383,41 @@ enum QuotientExpr {
     Add(Box<QuotientExpr>, Box<QuotientExpr>),
     Mul(Box<QuotientExpr>, Box<QuotientExpr>),
     Neg(Box<QuotientExpr>),
+}
+
+#[derive(Clone, Debug, Default)]
+struct QuotientShapeProfile {
+    lin7: usize,
+    bilin7_row: usize,
+    bilin7_pairwise: usize,
+    fallback_vm_ops: usize,
+}
+
+#[derive(Clone, Debug)]
+enum QuotientLimbShape {
+    // Structural forms from the Midfall foreign-field chips, not gate-name
+    // dispatch. Rust source shapes:
+    //   circuits/src/field/foreign/util.rs::sum_exprs
+    //   circuits/src/field/foreign/util.rs::pair_wise_prod
+    //   circuits/src/field/foreign/params.rs::base_powers
+    //   circuits/src/field/foreign/params.rs::double_base_powers
+    //
+    // These expressions emulate arithmetic modulo a foreign modulus `m`
+    // inside the circuit, but the verifier still evaluates the resulting
+    // PLONK identity polynomial over the native BLS12-381 scalar field Fr.
+    // The coefficients are Fr encodings of base^i mod m or base^(i+j) mod m.
+    Lin7 {
+        terms: Vec<(U256, u16)>,
+    },
+    Bilin7Row {
+        lhs: u16,
+        terms: Vec<(U256, u16)>,
+    },
+    Bilin7Pairwise {
+        lhs_base: u16,
+        rhs_base: u16,
+        coeffs: Vec<U256>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -636,9 +676,18 @@ struct QuotientProgramBuilder {
     vars: HashMap<String, QuotientExpr>,
     stack_depth: usize,
     max_stack: usize,
+    limb_vm_ops: bool,
+    profile: QuotientShapeProfile,
 }
 
 impl QuotientProgramBuilder {
+    fn with_limb_vm_ops(enabled: bool) -> Self {
+        Self {
+            limb_vm_ops: enabled,
+            ..Default::default()
+        }
+    }
+
     fn identity_expr(
         &mut self,
         expr: &QuotientExpr,
@@ -698,10 +747,30 @@ impl QuotientProgramBuilder {
 
     fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
         let cse_temps = self.cse_temps();
+        if encoding == QuotientProgramEncoding::Packed32
+            && quotient_program_uses_limb_ops(&self.bytes)
+        {
+            panic!(
+                "{QUOTIENT_LIMB_VM_OPS_ENV}=1 is only supported with {QUOTIENT_ENCODING_ENV}=bytes"
+            );
+        }
         let bytes = match encoding {
             QuotientProgramEncoding::Bytes => compact_quotient_runs(&self.bytes),
             QuotientProgramEncoding::Packed32 => pack_quotient_u32_program(&self.bytes),
         };
+        let profile = self.profile;
+        if quotient_shape_profile_enabled() {
+            eprintln!(
+                "quotient shape profile: lin7={} bilin7_row={} bilin7_pairwise={} fallback_vm_ops={} raw_program_bytes={} compact_program_bytes={} consts={}",
+                profile.lin7,
+                profile.bilin7_row,
+                profile.bilin7_pairwise,
+                profile.fallback_vm_ops,
+                self.bytes.len(),
+                bytes.len(),
+                self.consts.len(),
+            );
+        }
         QuotientProgramBuild {
             bytes,
             consts: self.consts,
@@ -755,6 +824,10 @@ impl QuotientProgramBuilder {
     }
 
     fn emit_expr(&mut self, expr: &QuotientExpr) {
+        if self.try_emit_limb_shape(expr) {
+            return;
+        }
+
         match expr {
             QuotientExpr::Const(value) => {
                 self.emit_const(*value);
@@ -825,6 +898,10 @@ impl QuotientProgramBuilder {
     }
 
     fn emit_expr_cse_inner(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
+        if self.try_emit_limb_shape(expr) {
+            return;
+        }
+
         match expr {
             QuotientExpr::Const(value) => {
                 self.emit_const(*value);
@@ -878,7 +955,90 @@ impl QuotientProgramBuilder {
         }
     }
 
+    fn try_emit_limb_shape(&mut self, expr: &QuotientExpr) -> bool {
+        if !self.limb_vm_ops {
+            return false;
+        }
+
+        let Some(shape) = quotient_limb_shape(expr) else {
+            return false;
+        };
+        if !self.limb_shape_has_u8_const_slots(&shape) {
+            return false;
+        }
+
+        self.emit_limb_shape(shape);
+        true
+    }
+
+    fn limb_shape_has_u8_const_slots(&self, shape: &QuotientLimbShape) -> bool {
+        let coeffs = match shape {
+            QuotientLimbShape::Lin7 { terms } => terms.iter().map(|(coeff, _)| *coeff).collect(),
+            QuotientLimbShape::Bilin7Row { terms, .. } => {
+                terms.iter().map(|(coeff, _)| *coeff).collect()
+            }
+            QuotientLimbShape::Bilin7Pairwise { coeffs, .. } => coeffs.clone(),
+        };
+        self.peek_u8_const_slots(&coeffs).is_some()
+    }
+
+    fn emit_limb_shape(&mut self, shape: QuotientLimbShape) {
+        match shape {
+            QuotientLimbShape::Lin7 { terms } => {
+                // LIN7 is the VM encoding of:
+                //   sum_exprs(base_powers, limbs)
+                // from foreign-field normalization/multiplication and EC
+                // gates. It packs seven limb-evaluation loads and their
+                // generated Fr coefficients into one interpreter opcode.
+                self.bytes.push(Q_OP_LIN7);
+                for (coeff, ptr) in terms {
+                    let slot = self.const_slot(coeff);
+                    let slot = u8::try_from(slot).expect("lin7 const slot checked");
+                    self.bytes.push(slot);
+                    self.u16(ptr as usize);
+                }
+                self.profile.lin7 += 1;
+            }
+            QuotientLimbShape::Bilin7Row { lhs, terms } => {
+                // BILIN7_ROW captures the repeated row shape
+                // lhs * sum_i coeff[i] * rhs[i]. It appears after lowering
+                // pair_wise_prod slices in foreign-field multiplication and
+                // EC slope/tangent/on-curve/lambda-squared identities.
+                self.bytes.push(Q_OP_BILIN7_ROW);
+                self.u16(lhs as usize);
+                for (coeff, rhs) in terms {
+                    let slot = self.const_slot(coeff);
+                    let slot = u8::try_from(slot).expect("bilin7 row const slot checked");
+                    self.bytes.push(slot);
+                    self.u16(rhs as usize);
+                }
+                self.profile.bilin7_row += 1;
+            }
+            QuotientLimbShape::Bilin7Pairwise {
+                lhs_base,
+                rhs_base,
+                coeffs,
+            } => {
+                // BILIN7_PAIRWISE captures the full 7-by-7 convolution:
+                //   sum_{i,j} coeff[i+j] * lhs[i] * rhs[j]
+                // matching sum_exprs(double_base_powers,
+                // pair_wise_prod(lhs, rhs)).
+                self.bytes.push(Q_OP_BILIN7_PAIRWISE);
+                self.u16(lhs_base as usize);
+                self.u16(rhs_base as usize);
+                for coeff in coeffs {
+                    let slot = self.const_slot(coeff);
+                    let slot = u8::try_from(slot).expect("bilin7 pairwise const slot checked");
+                    self.bytes.push(slot);
+                }
+                self.profile.bilin7_pairwise += 1;
+            }
+        }
+        self.push_stack();
+    }
+
     fn emit_const(&mut self, value: U256) {
+        self.record_fallback_vm_op();
         let slot = self.const_slot(value);
         if let Ok(slot) = u8::try_from(slot) {
             self.bytes.push(Q_OP_PUSH_CONST_U8);
@@ -890,6 +1050,7 @@ impl QuotientProgramBuilder {
     }
 
     fn emit_mem_literal(&mut self, ptr: u32) {
+        self.record_fallback_vm_op();
         if let Ok(ptr) = u16::try_from(ptr) {
             self.bytes.push(Q_OP_PUSH_MEM_U16);
             self.u16(ptr as usize);
@@ -970,6 +1131,7 @@ impl QuotientProgramBuilder {
     }
 
     fn emit_product_add(&mut self, product: QuotientProductAdd) {
+        self.record_fallback_vm_op();
         match product {
             QuotientProductAdd::MemMemConstU8 { lhs, rhs, scalar } => {
                 let slot = self.const_slot(scalar);
@@ -1095,12 +1257,20 @@ impl QuotientProgramBuilder {
     }
 
     fn op0(&mut self, op: u8) {
+        self.record_fallback_vm_op();
         self.bytes.push(op);
     }
 
     fn op_binary(&mut self, op: u8) {
+        self.record_fallback_vm_op();
         self.bytes.push(op);
         self.pop_stack();
+    }
+
+    fn record_fallback_vm_op(&mut self) {
+        if self.limb_vm_ops {
+            self.profile.fallback_vm_ops += 1;
+        }
     }
 
     fn push_stack(&mut self) {
@@ -1141,6 +1311,26 @@ impl QuotientProgramBuilder {
             .get(&value)
             .is_some_and(|slot| u8::try_from(*slot).is_ok())
             || (!self.const_slots.contains_key(&value) && self.consts.len() <= u8::MAX as usize)
+    }
+
+    fn peek_u8_const_slots(&self, values: &[U256]) -> Option<Vec<u8>> {
+        let mut next_slot = self.consts.len();
+        let mut pending = HashMap::new();
+        let mut slots = Vec::with_capacity(values.len());
+        for value in values {
+            let slot = if let Some(slot) = self.const_slots.get(value).copied() {
+                slot as usize
+            } else if let Some(slot) = pending.get(value).copied() {
+                slot
+            } else {
+                let slot = next_slot;
+                next_slot += 1;
+                pending.insert(*value, slot);
+                slot
+            };
+            slots.push(u8::try_from(slot).ok()?);
+        }
+        Some(slots)
     }
 
     fn cse_temps(&self) -> usize {
@@ -1209,6 +1399,10 @@ fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
+    if quotient_program_uses_limb_ops(bytes) {
+        panic!("{QUOTIENT_LIMB_VM_OPS_ENV}=1 is only supported with {QUOTIENT_ENCODING_ENV}=bytes");
+    }
+
     let mut out = Vec::with_capacity(bytes.len().next_multiple_of(4));
     let mut idx = 0usize;
     while idx < bytes.len() {
@@ -1279,6 +1473,20 @@ fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if matches!(
+            bytes[idx],
+            Q_OP_LIN7 | Q_OP_BILIN7_ROW | Q_OP_BILIN7_PAIRWISE
+        ) {
+            return true;
+        }
+        idx += quotient_op_len(bytes, idx);
+    }
+    false
 }
 
 fn push_packed_quotient_op(out: &mut Vec<u8>, op: u8, arg: u32) {
@@ -1402,6 +1610,30 @@ fn quotient_native_permutation_enabled() -> bool {
         "" | "0" | "false" | "off" | "no" => false,
         "1" | "true" | "on" | "yes" | "native" => true,
         other => panic!("unsupported {QUOTIENT_NATIVE_PERMUTATION_ENV}={other}; use 0/1"),
+    }
+}
+
+fn quotient_limb_vm_ops_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_LIMB_VM_OPS_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "limb" | "limbs" => true,
+        other => panic!("unsupported {QUOTIENT_LIMB_VM_OPS_ENV}={other}; use 0/1"),
+    }
+}
+
+fn quotient_shape_profile_enabled() -> bool {
+    let Ok(value) = std::env::var(QUOTIENT_SHAPE_PROFILE_ENV) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" | "profile" => true,
+        other => panic!("unsupported {QUOTIENT_SHAPE_PROFILE_ENV}={other}; use 0/1"),
     }
 }
 
@@ -1691,6 +1923,9 @@ fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
         Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => 6,
         Q_OP_ADD_MUL_CONST_U8_MEM_U16 => 4,
         Q_OP_ADD_MUL_MEM_MEM => 5,
+        Q_OP_LIN7 => 1 + 7 * 3,
+        Q_OP_BILIN7_ROW => 1 + 2 + 7 * 3,
+        Q_OP_BILIN7_PAIRWISE => 1 + 2 + 2 + 13,
         op => panic!("unknown quotient op {op:#x} at byte {idx}"),
     }
 }
@@ -1718,6 +1953,294 @@ fn collect_product_leaves(expr: &QuotientExpr, leaves: &mut Vec<QuotientLeaf>) -
         }
         QuotientExpr::Add(_, _) | QuotientExpr::Neg(_) => false,
     }
+}
+
+fn quotient_limb_shape(expr: &QuotientExpr) -> Option<QuotientLimbShape> {
+    // Recover foreign-field limb algebra from the generic `QuotientExpr`
+    // tree. This deliberately does not look at gate names: the Rust verifier
+    // source of truth remains proofs/src/plonk/mod.rs::partially_evaluate_identities,
+    // which evaluates `vk.cs.gates` expression trees in order. The recognizer
+    // only changes how obvious `sum_exprs` / `pair_wise_prod` shapes are
+    // encoded for Solidity.
+    let mut terms = Vec::new();
+    if !collect_quotient_sum_terms(expr, Fq::ONE, &mut terms) {
+        return None;
+    }
+    terms.retain(|(coeff, _)| *coeff != Fq::ZERO);
+
+    try_quotient_bilin7_pairwise_shape(&terms)
+        .or_else(|| try_quotient_bilin7_row_shape(&terms))
+        .or_else(|| try_quotient_lin7_shape(&terms))
+}
+
+fn collect_quotient_sum_terms<'a>(
+    expr: &'a QuotientExpr,
+    coeff: Fq,
+    terms: &mut Vec<(Fq, &'a QuotientExpr)>,
+) -> bool {
+    if coeff == Fq::ZERO {
+        return true;
+    }
+
+    match expr {
+        QuotientExpr::Add(lhs, rhs) => {
+            collect_quotient_sum_terms(lhs, coeff, terms)
+                && collect_quotient_sum_terms(rhs, coeff, terms)
+        }
+        QuotientExpr::Neg(inner) => collect_quotient_sum_terms(inner, -coeff, terms),
+        QuotientExpr::Mul(lhs, rhs) => {
+            if let QuotientExpr::Const(value) = lhs.as_ref() {
+                let Some(value) = quotient_fq_from_u256(*value) else {
+                    return false;
+                };
+                collect_quotient_sum_terms(rhs, coeff * value, terms)
+            } else if let QuotientExpr::Const(value) = rhs.as_ref() {
+                let Some(value) = quotient_fq_from_u256(*value) else {
+                    return false;
+                };
+                collect_quotient_sum_terms(lhs, coeff * value, terms)
+            } else {
+                terms.push((coeff, expr));
+                true
+            }
+        }
+        QuotientExpr::Const(value) => {
+            let Some(value) = quotient_fq_from_u256(*value) else {
+                return false;
+            };
+            coeff * value == Fq::ZERO
+        }
+        QuotientExpr::Mem(_) => {
+            terms.push((coeff, expr));
+            true
+        }
+    }
+}
+
+fn try_quotient_lin7_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<QuotientLimbShape> {
+    // Matches:
+    //   circuits/src/field/foreign/gates/norm.rs
+    //     sum_exprs(base_powers, shifted_x) - sum_exprs(base_powers, zs)
+    //   circuits/src/field/foreign/gates/mul.rs
+    //     sum_exprs(base_powers, xs/ys/zs)
+    // and the same base-power sums reused by ECC foreign gates.
+    let mut grouped = Vec::<(u16, Fq)>::new();
+    for (coeff, expr) in terms {
+        let (inner_coeff, ptr) = quotient_mem_term(expr)?;
+        add_grouped_limb_coeff(&mut grouped, ptr, *coeff * inner_coeff);
+    }
+    grouped.retain(|(_, coeff)| *coeff != Fq::ZERO);
+    if grouped.len() != 7 {
+        return None;
+    }
+    grouped.sort_by_key(|(ptr, _)| *ptr);
+    Some(QuotientLimbShape::Lin7 {
+        terms: grouped
+            .into_iter()
+            .map(|(ptr, coeff)| (quotient_fq_to_u256(coeff), ptr))
+            .collect(),
+    })
+}
+
+fn try_quotient_bilin7_row_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<QuotientLimbShape> {
+    // Matches one fixed limb multiplied across a 7-limb vector. This is a
+    // local slice of the `pair_wise_prod` formulas in:
+    //   circuits/src/field/foreign/gates/mul.rs
+    //   circuits/src/ecc/foreign/gates/{on_curve,slope,tangent,lambda_squared}.rs
+    let mut pairs = Vec::with_capacity(terms.len());
+    for (coeff, expr) in terms {
+        let (inner_coeff, lhs, rhs) = quotient_product_mem_pair(expr)?;
+        pairs.push((*coeff * inner_coeff, lhs, rhs));
+    }
+    if pairs.len() != 7 {
+        return None;
+    }
+
+    for candidate in [pairs[0].1, pairs[0].2] {
+        let mut grouped = Vec::<(u16, Fq)>::new();
+        let mut ok = true;
+        for (coeff, lhs, rhs) in &pairs {
+            let other = if *lhs == candidate {
+                *rhs
+            } else if *rhs == candidate {
+                *lhs
+            } else {
+                ok = false;
+                break;
+            };
+            add_grouped_limb_coeff(&mut grouped, other, *coeff);
+        }
+        grouped.retain(|(_, coeff)| *coeff != Fq::ZERO);
+        if ok && grouped.len() == 7 {
+            grouped.sort_by_key(|(ptr, _)| *ptr);
+            return Some(QuotientLimbShape::Bilin7Row {
+                lhs: candidate,
+                terms: grouped
+                    .into_iter()
+                    .map(|(ptr, coeff)| (quotient_fq_to_u256(coeff), ptr))
+                    .collect(),
+            });
+        }
+    }
+
+    None
+}
+
+fn try_quotient_bilin7_pairwise_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<QuotientLimbShape> {
+    // Matches the full foreign-field product convolution:
+    //   sum_exprs(double_base_powers, pair_wise_prod(lhs, rhs))
+    // where double_base_powers[k] = base^k mod m. The Rust helper
+    // pair_wise_prod emits 49 terms in row-major order; after collection we
+    // require coefficients with the same i+j to agree, exactly the
+    // base^(i+j) pattern documented in foreign/params.rs.
+    let mut pairs = Vec::with_capacity(terms.len());
+    let mut ptrs = HashSet::new();
+    for (coeff, expr) in terms {
+        let (inner_coeff, lhs, rhs) = quotient_product_mem_pair(expr)?;
+        pairs.push((*coeff * inner_coeff, lhs, rhs));
+        ptrs.insert(lhs);
+        ptrs.insert(rhs);
+    }
+    if pairs.len() != 49 {
+        return None;
+    }
+
+    let bases = limb7_base_candidates(&ptrs);
+    for lhs_base in &bases {
+        for rhs_base in &bases {
+            let mut coeffs = vec![Fq::ZERO; 49];
+            let mut seen = vec![false; 49];
+            let mut ok = true;
+
+            for (coeff, lhs, rhs) in &pairs {
+                let direct = limb7_index(*lhs_base, *lhs).zip(limb7_index(*rhs_base, *rhs));
+                let swapped = limb7_index(*lhs_base, *rhs).zip(limb7_index(*rhs_base, *lhs));
+                let Some((i, j)) = direct.or(swapped) else {
+                    ok = false;
+                    break;
+                };
+                let idx = i * 7 + j;
+                coeffs[idx] += *coeff;
+                seen[idx] = true;
+            }
+
+            if !ok || seen.iter().any(|seen| !seen) {
+                continue;
+            }
+
+            let mut by_sum = vec![None; 13];
+            for i in 0..7 {
+                for j in 0..7 {
+                    let coeff = coeffs[i * 7 + j];
+                    let slot = &mut by_sum[i + j];
+                    if let Some(expected) = slot {
+                        if *expected != coeff {
+                            ok = false;
+                            break;
+                        }
+                    } else {
+                        *slot = Some(coeff);
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+
+            if ok {
+                return Some(QuotientLimbShape::Bilin7Pairwise {
+                    lhs_base: *lhs_base,
+                    rhs_base: *rhs_base,
+                    coeffs: by_sum
+                        .into_iter()
+                        .map(|coeff| quotient_fq_to_u256(coeff.expect("pairwise sum coefficient")))
+                        .collect(),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn quotient_mem_term(expr: &QuotientExpr) -> Option<(Fq, u16)> {
+    let (coeff, ptrs) = quotient_product_mem_factors(expr)?;
+    if ptrs.len() == 1 {
+        Some((coeff, ptrs[0]))
+    } else {
+        None
+    }
+}
+
+fn quotient_product_mem_pair(expr: &QuotientExpr) -> Option<(Fq, u16, u16)> {
+    let (coeff, ptrs) = quotient_product_mem_factors(expr)?;
+    if ptrs.len() == 2 {
+        Some((coeff, ptrs[0], ptrs[1]))
+    } else {
+        None
+    }
+}
+
+fn quotient_product_mem_factors(expr: &QuotientExpr) -> Option<(Fq, Vec<u16>)> {
+    let mut leaves = Vec::new();
+    if !collect_product_leaves(expr, &mut leaves) {
+        return None;
+    }
+
+    let mut coeff = Fq::ONE;
+    let mut ptrs = Vec::new();
+    for leaf in leaves {
+        match leaf {
+            QuotientLeaf::Const(value) => coeff *= quotient_fq_from_u256(value)?,
+            QuotientLeaf::Mem(QuotientMem::Literal(ptr)) => ptrs.push(u16::try_from(ptr).ok()?),
+            QuotientLeaf::Mem(QuotientMem::Token(_))
+            | QuotientLeaf::Mem(QuotientMem::TokenOffset(_, _)) => return None,
+        }
+    }
+    Some((coeff, ptrs))
+}
+
+fn add_grouped_limb_coeff(grouped: &mut Vec<(u16, Fq)>, ptr: u16, coeff: Fq) {
+    if let Some((_, existing)) = grouped.iter_mut().find(|(existing, _)| *existing == ptr) {
+        *existing += coeff;
+    } else {
+        grouped.push((ptr, coeff));
+    }
+}
+
+fn limb7_base_candidates(ptrs: &HashSet<u16>) -> Vec<u16> {
+    let mut bases = ptrs
+        .iter()
+        .copied()
+        .filter(|base| {
+            (0..7).all(|idx| {
+                base.checked_add((idx * 0x20) as u16)
+                    .is_some_and(|ptr| ptrs.contains(&ptr))
+            })
+        })
+        .collect::<Vec<_>>();
+    bases.sort_unstable();
+    bases.dedup();
+    bases
+}
+
+fn limb7_index(base: u16, ptr: u16) -> Option<usize> {
+    let diff = ptr.checked_sub(base)?;
+    if diff % 0x20 != 0 {
+        return None;
+    }
+    let idx = (diff / 0x20) as usize;
+    (idx < 7).then_some(idx)
+}
+
+fn quotient_fq_from_u256(value: U256) -> Option<Fq> {
+    let bytes = value.to_le_bytes::<32>();
+    let repr = <Fq as PrimeField>::Repr::from(bytes);
+    Option::<Fq>::from(Fq::from_repr(repr))
+}
+
+fn quotient_fq_to_u256(value: Fq) -> U256 {
+    fe_to_u256::<Fq>(&value)
 }
 
 fn parse_mem(ptr: &str) -> QuotientMem {
@@ -4449,7 +4972,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
-        let mut builder = QuotientProgramBuilder::default();
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         // Mirror snark-verifier's loader cache shape: when VM CSE is enabled,
         // choose repeated expression temps across the whole quotient program,
         // not just within one identity.
@@ -5375,6 +5898,193 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn quotient_vm_lin7_matches_direct_expr_eval() {
+        let mut values = HashMap::new();
+        let mut expr = QuotientExpr::Const(U256::ZERO);
+        for i in 0..7u32 {
+            let ptr = 0x300 + i * 0x20;
+            values.insert(ptr, Fq::from(11 + i as u64));
+            expr = quotient_add_expr(
+                expr,
+                quotient_scale_expr(
+                    Fq::from(3 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(ptr)),
+                ),
+            );
+        }
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_LIN7);
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_bilin7_row_matches_direct_expr_eval() {
+        let lhs = 0x440;
+        let mut values = HashMap::new();
+        values.insert(lhs, Fq::from(29u64));
+        let mut expr = QuotientExpr::Const(U256::ZERO);
+        for i in 0..7u32 {
+            let rhs = 0x500 + i * 0x20;
+            values.insert(rhs, Fq::from(37 + i as u64));
+            expr = quotient_add_expr(
+                expr,
+                quotient_scale_expr(
+                    Fq::from(5 + i as u64),
+                    quotient_mul_expr(
+                        QuotientExpr::Mem(QuotientMem::Literal(lhs)),
+                        QuotientExpr::Mem(QuotientMem::Literal(rhs)),
+                    ),
+                ),
+            );
+        }
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_BILIN7_ROW);
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_bilin7_pairwise_matches_direct_expr_eval() {
+        let lhs_base = 0x620;
+        let rhs_base = 0x820;
+        let mut values = HashMap::new();
+        for i in 0..7u32 {
+            values.insert(lhs_base + i * 0x20, Fq::from(41 + i as u64));
+            values.insert(rhs_base + i * 0x20, Fq::from(71 + i as u64));
+        }
+
+        let mut expr = QuotientExpr::Const(U256::ZERO);
+        for i in 0..7u32 {
+            for j in 0..7u32 {
+                expr = quotient_add_expr(
+                    expr,
+                    quotient_scale_expr(
+                        Fq::from(9 + i as u64 + j as u64),
+                        quotient_mul_expr(
+                            QuotientExpr::Mem(QuotientMem::Literal(lhs_base + i * 0x20)),
+                            QuotientExpr::Mem(QuotientMem::Literal(rhs_base + j * 0x20)),
+                        ),
+                    ),
+                );
+            }
+        }
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_BILIN7_PAIRWISE);
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn unmatched_limb_shape_falls_back_to_existing_vm_ops() {
+        let mut values = HashMap::new();
+        let mut expr = QuotientExpr::Const(U256::ZERO);
+        for i in 0..6u32 {
+            let ptr = 0x980 + i * 0x20;
+            values.insert(ptr, Fq::from(101 + i as u64));
+            expr = quotient_add_expr(
+                expr,
+                quotient_scale_expr(
+                    Fq::from(17 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(ptr)),
+                ),
+            );
+        }
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_ne!(builder.bytes[0], Q_OP_LIN7);
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn native_arithmetic_linear_next_run_stays_structured() {
+        let run = (0..3usize)
+            .map(|idx| {
+                let off = idx * 0x20;
+                (
+                    vec![
+                        "let var0 := 0x1".to_string(),
+                        format!("let a := mload({:#x})", 0x1000 + off),
+                        format!("let f := mload({:#x})", 0x2000 + off),
+                        "let sum := addmod(a, f, r)".to_string(),
+                        format!("let next := mload({:#x})", 0x3000 + off),
+                        "let neg_next := sub(r, next)".to_string(),
+                        "let eval := addmod(sum, neg_next, r)".to_string(),
+                        "let out := mulmod(var0, eval, r)".to_string(),
+                    ],
+                    "out".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let (count, block) =
+            SolidityGenerator::selector_linear_next_loop_block(&run).expect("linear run");
+
+        assert_eq!(count, 3);
+        assert!(
+            block.iter().any(|line| line.contains("q_gate_lin_i")),
+            "arith/parallel-add linear-next identities should keep the existing loop lowering"
+        );
+    }
+
+    fn quotient_add_expr(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Add(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn quotient_mul_expr(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Mul(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn quotient_scale_expr(coeff: Fq, expr: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Mul(
+            Box::new(QuotientExpr::Const(fe_to_u256::<Fq>(&coeff))),
+            Box::new(expr),
+        )
+    }
+
+    fn eval_quotient_expr_for_test(expr: &QuotientExpr, mem: &HashMap<u32, Fq>) -> Fq {
+        match expr {
+            QuotientExpr::Const(value) => fq_from_u256(*value),
+            QuotientExpr::Mem(QuotientMem::Literal(ptr)) => mem[ptr],
+            QuotientExpr::Mem(QuotientMem::Token(_))
+            | QuotientExpr::Mem(QuotientMem::TokenOffset(_, _)) => {
+                panic!("test expressions use literal memory only")
+            }
+            QuotientExpr::Add(lhs, rhs) => {
+                eval_quotient_expr_for_test(lhs, mem) + eval_quotient_expr_for_test(rhs, mem)
+            }
+            QuotientExpr::Mul(lhs, rhs) => {
+                eval_quotient_expr_for_test(lhs, mem) * eval_quotient_expr_for_test(rhs, mem)
+            }
+            QuotientExpr::Neg(inner) => -eval_quotient_expr_for_test(inner, mem),
+        }
+    }
+
     fn eval_quotient_vm_for_test(bytes: &[u8], consts: &[U256], mem: &HashMap<u32, Fq>) -> Fq {
         let mut idx = 0usize;
         let mut stack: Vec<Fq> = Vec::new();
@@ -5475,6 +6185,46 @@ mod tests {
                     let acc = stack.pop().expect("acc");
                     stack.push(acc + mem[&lhs] * mem[&rhs]);
                     idx += 5;
+                }
+                Q_OP_LIN7 => {
+                    let mut acc = Fq::ZERO;
+                    idx += 1;
+                    for _ in 0..7 {
+                        let slot = bytes[idx] as usize;
+                        let ptr = read_u16(bytes, idx + 1) as u32;
+                        acc += fq_from_u256(consts[slot]) * mem[&ptr];
+                        idx += 3;
+                    }
+                    stack.push(acc);
+                }
+                Q_OP_BILIN7_ROW => {
+                    let lhs = read_u16(bytes, idx + 1) as u32;
+                    let lhs_value = mem[&lhs];
+                    let mut acc = Fq::ZERO;
+                    idx += 3;
+                    for _ in 0..7 {
+                        let slot = bytes[idx] as usize;
+                        let rhs = read_u16(bytes, idx + 1) as u32;
+                        acc += lhs_value * mem[&rhs] * fq_from_u256(consts[slot]);
+                        idx += 3;
+                    }
+                    stack.push(acc);
+                }
+                Q_OP_BILIN7_PAIRWISE => {
+                    let lhs_base = read_u16(bytes, idx + 1) as u32;
+                    let rhs_base = read_u16(bytes, idx + 3) as u32;
+                    let coeff_idx = idx + 5;
+                    let mut acc = Fq::ZERO;
+                    for i in 0..7 {
+                        let lhs = mem[&(lhs_base + i * 0x20)];
+                        for j in 0..7 {
+                            let rhs = mem[&(rhs_base + j * 0x20)];
+                            let slot = bytes[coeff_idx + i as usize + j as usize] as usize;
+                            acc += lhs * rhs * fq_from_u256(consts[slot]);
+                        }
+                    }
+                    idx += 18;
+                    stack.push(acc);
                 }
                 op => panic!("unsupported test quotient VM op {op:#x} at byte {idx}"),
             }

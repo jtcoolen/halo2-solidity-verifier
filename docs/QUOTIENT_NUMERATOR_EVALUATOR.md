@@ -490,12 +490,35 @@ The VM has opcodes for:
 - loading memory-backed evaluations/challenges;
 - field add/mul/neg;
 - fused add/mul forms used by expression lowering;
+- optional limb-aware non-SHA foreign-field shapes;
 - folding main identities;
 - folding selector identities;
 - invoking native callbacks.
 
 The VM is the bytecode-size lever: moving identities into it usually shrinks
 deployed bytecode but costs more runtime gas.
+
+The limb-aware opcodes are behind:
+
+```text
+HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=1
+```
+
+They are opt-in until the IVC gas/size/trace gates are rebenchmarked. The
+default remains the measured gas-capped path. The generator also validates that
+the expanded VK quotient payload does not overlap the challenge/evaluation
+memory frame; if an experiment would overrun that reserved space, rendering
+fails closed instead of producing a verifier with corrupted transcript state.
+To inspect what the structural matcher found in the opt-in lowering path,
+run generation with both:
+
+```text
+HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=1
+HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE=1
+```
+
+The profile reports counts for `LIN7`, `BILIN7_ROW`,
+`BILIN7_PAIRWISE`, and fallback VM operations.
 
 ### Native Callbacks
 
@@ -521,6 +544,9 @@ The generated source may include:
 q_pow5
 q_limb7
 q_limb7_wide
+LIN7
+BILIN7_ROW
+BILIN7_PAIRWISE
 ```
 
 These helpers are not protocol rules. They are code-size/gas helpers for
@@ -529,6 +555,44 @@ what values are computed; the helpers only replace repeated Yul chains with
 shared local functions when the generator recognizes an exact pattern.
 
 Unrecognized expressions fall back to the compact VM or direct generated Yul.
+
+### Are These Limbs Emulating A Different Field?
+
+Yes, but with an important verifier-side caveat.
+
+The Midfall foreign-field chips represent values from an emulated modulus `m`
+as limbs:
+
+```text
+value = limb_0 + limb_1 * B + ... + limb_6 * B^6
+```
+
+where `B = 2^LOG2_BASE`, and the powers are reduced modulo `m`. The relevant
+Rust source is:
+
+```text
+circuits/src/field/foreign/params.rs::base_powers
+circuits/src/field/foreign/params.rs::double_base_powers
+circuits/src/field/foreign/util.rs::sum_exprs
+circuits/src/field/foreign/util.rs::pair_wise_prod
+```
+
+The circuit uses this representation to emulate arithmetic in a different
+field or modulus inside the native proving field. The Solidity verifier does
+not perform arithmetic in that foreign field directly. It evaluates the PLONK
+identity polynomial over the native BLS12-381 scalar field `Fr`, exactly as the
+Rust verifier does in:
+
+```text
+proofs/src/plonk/mod.rs::partially_evaluate_identities
+proofs/src/plonk/verifier.rs
+proofs/src/plonk/linearization/verifier.rs::compute_linearization_commitment
+```
+
+So the limb helpers are a compact lowering of already-generated constraint
+expressions. They do not introduce a new trust assumption or a new runtime
+field; they encode the same Fr polynomial identities that enforce congruences
+modulo the foreign modulus `m` inside the circuit.
 
 ### Rust Gate Mapping
 
@@ -602,6 +666,27 @@ sum_exprs(base_powers, zs)
 The constants in `q_limb7` are the generated Fr residues for this verifier's
 7-limb foreign-field basis. They are not dynamic proof inputs.
 
+`LIN7` is the VM form of the same idea, but table-backed:
+
+```text
+LIN7(values, coeffs) = sum_{i=0..6} coeff[i] * values[i] mod Fr
+```
+
+The generator emits it only after structurally recognizing a 7-term linear
+combination over literal memory-backed evaluations. Coefficients are inserted
+into the generated quotient constant table; proof calldata never selects
+coefficient tables.
+
+`BILIN7_ROW` is the row form:
+
+```text
+BILIN7_ROW(lhs, rhs[0..6], coeffs)
+  = sum_{i=0..6} coeff[i] * lhs * rhs[i] mod Fr
+```
+
+This is useful for foreign-field multiplication and EC formulas where one limb
+is multiplied across a 7-limb vector.
+
 `q_limb7_wide(x0, ..., x6)` is the analogous helper for the product-convolution
 side of the foreign-field multiplication gate. Rust computes all pairwise limb
 products and weights them with `FieldEmulationParams::double_base_powers()`:
@@ -615,13 +700,40 @@ The generated native gate code groups repeated 7-term slices of this wide basis
 into calls to `q_limb7_wide`. This is why the native multiplication callbacks
 contain many terms of the form `q_limb7_wide(a_i * b_0, ..., a_i * b_6)`.
 
+`BILIN7_PAIRWISE` is the VM form of the full 7-by-7 convolution:
+
+```text
+BILIN7_PAIRWISE(lhs[0..6], rhs[0..6], coeff_by_sum[0..12])
+  = sum_{i=0..6} sum_{j=0..6}
+      coeff_by_sum[i + j] * lhs[i] * rhs[j] mod Fr
+```
+
+It structurally corresponds to:
+
+```text
+pair_wise_prod(xs, ys)
+sum_exprs(double_base_powers, pair_wise_prod(xs, ys))
+```
+
+from the foreign-field multiplication gates. The opcode is generic enough for
+the foreign-field EC gates too, including `is_on_curve`, lambda-slope,
+`assert_tangent`, and `assert_lambda_squared`, whenever their lowered
+expressions contain the same 7-limb bilinear shape.
+
+This pass deliberately does not add SHA256, SHA512, RIPEMD, or spread
+decomposition recognizers. Those chips are outside the current IVC verifier
+scope, so recognizing them would add codegen surface without a measured win.
+
 These helpers therefore relate to these specific Rust circuit gates:
 
-| Helper | Rust gate source | Meaning |
+| Helper/opcode | Rust gate source | Meaning |
 |---|---|---|
 | `q_pow5` | Poseidon full/partial/skipped-round gates | Poseidon S-box `x^5` |
 | `q_limb7` | foreign-field normalization and multiplication | base-power limb packing |
 | `q_limb7_wide` | foreign-field multiplication | double-base pairwise-product packing |
+| `LIN7` | foreign-field normalization/multiplication and EC gates | table-backed 7-term linear limb packing |
+| `BILIN7_ROW` | foreign-field multiplication and EC gates | one limb times a 7-limb weighted row |
+| `BILIN7_PAIRWISE` | foreign-field multiplication and EC gates | 7-by-7 double-base bilinear convolution |
 
 ## Failure Modes
 

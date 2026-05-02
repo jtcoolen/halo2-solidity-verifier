@@ -118,6 +118,8 @@
                 //   0x17/0x18 load/store CSE temp
                 //   0x19 native permutation    0x1a native trash
                 //   0x1b native heavy identity
+                //   0x1c LIN7                 0x1d BILIN7_ROW
+                //   0x1e BILIN7_PAIRWISE
                 //
                 // There are two physical encodings for the same logical VM:
                 // packed32 and byte-oriented. The generator chooses one; both
@@ -582,6 +584,111 @@
                                 r
                             )
                         }
+                    }
+                    // Limb-aware opcodes are opt-in compact forms for
+                    // structurally recognized non-SHA foreign-field shapes.
+                    // Coefficients are indexes into q_const_mptr, which is
+                    // generated from VK/program data, never from proof
+                    // calldata.
+                    //
+                    // Rust source shape:
+                    //   proofs/src/plonk/mod.rs::partially_evaluate_identities
+                    //   circuits/src/field/foreign/util.rs::{sum_exprs,pair_wise_prod}
+                    //   circuits/src/field/foreign/params.rs::{base_powers,double_base_powers}
+                    //
+                    // "Foreign field" means the circuit represents elements
+                    // modulo another modulus m as 7 limbs in base
+                    // 2^LOG2_BASE. The verifier does not switch fields; it
+                    // evaluates the lowered identity over BLS12-381 Fr, using
+                    // Fr coefficients equal to base^i mod m or base^(i+j) mod m.
+                    case 0x1c {
+                        // LIN7: sum_i coeff[i] * value[i] over Fr.
+                        // Typical Rust origin: foreign/gates/norm.rs
+                        // normalization and foreign/gates/mul.rs base-power
+                        // sums for x/y/z limbs.
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        let q_acc := 0
+                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                            let qconst := byte(0, mload(q_pc))
+                            let q_ptr := shr(240, mload(add(q_pc, 1)))
+                            q_pc := add(q_pc, 3)
+                            q_acc := addmod(
+                                q_acc,
+                                mulmod(mload(add(q_const_mptr, shl(5, qconst))), mload(q_ptr), r),
+                                r
+                            )
+                        }
+                        q_top := q_acc
+                        q_has_top := 1
+                    }
+                    case 0x1d {
+                        // BILIN7_ROW: lhs * sum_i coeff[i] * rhs[i].
+                        // Typical Rust origin: one row/slice of
+                        // pair_wise_prod in foreign multiplication and EC
+                        // on_curve/slope/tangent/lambda_squared gates.
+                        let q_lhs := shr(240, mload(q_pc))
+                        q_pc := add(q_pc, 2)
+                        let q_lhs_value := mload(q_lhs)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        let q_acc := 0
+                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                            let qconst := byte(0, mload(q_pc))
+                            let q_rhs := shr(240, mload(add(q_pc, 1)))
+                            q_pc := add(q_pc, 3)
+                            q_acc := addmod(
+                                q_acc,
+                                mulmod(
+                                    mulmod(q_lhs_value, mload(q_rhs), r),
+                                    mload(add(q_const_mptr, shl(5, qconst))),
+                                    r
+                                ),
+                                r
+                            )
+                        }
+                        q_top := q_acc
+                        q_has_top := 1
+                    }
+                    case 0x1e {
+                        // BILIN7_PAIRWISE:
+                        //   sum_{i=0..6,j=0..6} coeff[i+j] * lhs[i] * rhs[j].
+                        // Bases point to contiguous 7-word limb vectors.
+                        // Typical Rust origin:
+                        //   sum_exprs(double_base_powers,
+                        //             pair_wise_prod(lhs, rhs))
+                        // where double_base_powers[k] = base^k mod m.
+                        let q_lhs_base := shr(240, mload(q_pc))
+                        let q_rhs_base := shr(240, mload(add(q_pc, 2)))
+                        q_pc := add(q_pc, 4)
+                        let q_coeff_pc := q_pc
+                        q_pc := add(q_pc, 13)
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+                        let q_acc := 0
+                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                            let q_lhs_value := mload(add(q_lhs_base, shl(5, q_i)))
+                            for { let q_j := 0 } lt(q_j, 7) { q_j := add(q_j, 1) } {
+                                let qconst := byte(0, mload(add(q_coeff_pc, add(q_i, q_j))))
+                                q_acc := addmod(
+                                    q_acc,
+                                    mulmod(
+                                        mulmod(q_lhs_value, mload(add(q_rhs_base, shl(5, q_j))), r),
+                                        mload(add(q_const_mptr, shl(5, qconst))),
+                                        r
+                                    ),
+                                    r
+                                )
+                            }
+                        }
+                        q_top := q_acc
+                        q_has_top := 1
                     }
                     {%- if quotient_native_permutation_computation.len() > 0 %}
                     // Native permutation callback. It evaluates the

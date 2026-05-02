@@ -287,6 +287,15 @@ impl Halo2Verifier {
                 self.num_instance_cptr, self.instance_cptr
             ));
         }
+        let vk_end = self.vk_mptr.value().as_usize() + self.vk_len;
+        let challenge_mptr = self.challenge_mptr.value().as_usize();
+        if vk_end > challenge_mptr {
+            return Err(format!(
+                "VK memory layout mismatch: VK_MPTR({:#x}) + vk_len({:#x}) overlaps challenge_mptr({challenge_mptr:#x})",
+                self.vk_mptr.value().as_usize(),
+                self.vk_len
+            ));
+        }
 
         let non_quotient_g1s = self.total_advices
             + self.num_lookups
@@ -581,6 +590,17 @@ mod tests {
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("proof calldata layout mismatch"),
+            "unexpected layout error: {err}"
+        );
+    }
+
+    #[test]
+    fn verifier_layout_validation_rejects_vk_challenge_overlap() {
+        let mut verifier = synthetic_verifier();
+        verifier.vk_len = 0x220;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("VK memory layout mismatch"),
             "unexpected layout error: {err}"
         );
     }
