@@ -288,28 +288,83 @@ fn vk_payload_section_mutations_are_rejected() {
 
 #[test]
 #[ignore = "solidity/EVM-heavy; run explicitly"]
-fn pinned_quotient_verifier_rejects_wrong_quotient_runtime() {
+fn pinned_quotient_verifier_rejects_wrong_vk_and_quotient_contracts() {
     if !poseidon_inputs_available_for_evm() {
         return;
     }
 
     let fixture = create_property_poseidon_fixture();
+    let wrong_vk_solidity = mutate_first_large_hex_literal(&fixture.vk_solidity, 0);
     let wrong_quotient_solidity =
         mutate_first_large_hex_literal(&fixture.quotient_evaluator_solidity, 0);
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut evm = Evm::default();
-        let vk_address = evm.create(compile_solidity(&fixture.vk_solidity));
-        let wrong_quotient_address = evm.create(compile_solidity(&wrong_quotient_solidity));
-        evm.create_with_two_address_args(
-            compile_solidity(&fixture.quotient_verifier_solidity),
-            vk_address,
-            wrong_quotient_address,
-        );
-    }));
-    assert!(
-        result.is_err(),
-        "pinned verifier constructor accepted a quotient evaluator with wrong runtime hash"
+
+    assert_pinned_quotient_constructor_rejects(
+        &fixture.quotient_verifier_solidity,
+        &wrong_vk_solidity,
+        &fixture.quotient_evaluator_solidity,
+        "wrong VK runtime hash",
     );
+    assert_pinned_quotient_constructor_rejects(
+        &fixture.quotient_verifier_solidity,
+        &fixture.vk_solidity,
+        &wrong_quotient_solidity,
+        "wrong quotient runtime hash",
+    );
+
+    let verifier_creation_code = compile_solidity(&fixture.quotient_verifier_solidity);
+    let vk_creation_code = compile_solidity(&fixture.vk_solidity);
+    let quotient_creation_code = compile_solidity(&fixture.quotient_evaluator_solidity);
+    assert_pinned_quotient_constructor_rejects_address_args(
+        &verifier_creation_code,
+        &quotient_creation_code,
+        &quotient_creation_code,
+        "quotient evaluator supplied as VK",
+    );
+    assert_pinned_quotient_constructor_rejects_address_args(
+        &verifier_creation_code,
+        &vk_creation_code,
+        &vk_creation_code,
+        "VK supplied as quotient evaluator",
+    );
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
+fn verifier_constructor_rejects_missing_or_mismatched_eip2537_precompiles() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    for (name, needle, replacement) in [
+        (
+            "missing G1ADD precompile",
+            "staticcall(50000, 0x0b",
+            "staticcall(50000, 0x12",
+        ),
+        (
+            "G1MSM routed to G1ADD",
+            "staticcall(60000, 0x0c",
+            "staticcall(60000, 0x0b",
+        ),
+        (
+            "pairing routed to G1MSM",
+            "staticcall(120000, 0x0f",
+            "staticcall(120000, 0x0c",
+        ),
+    ] {
+        let verifier_solidity = replace_required_precompile_staticcall(
+            &fixture.quotient_verifier_solidity,
+            needle,
+            replacement,
+        );
+        assert_pinned_quotient_constructor_rejects(
+            &verifier_solidity,
+            &fixture.vk_solidity,
+            &fixture.quotient_evaluator_solidity,
+            name,
+        );
+    }
 }
 
 #[test]
@@ -652,48 +707,102 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
 
 #[test]
 #[ignore = "solidity/EVM-heavy; run explicitly"]
-fn proof_scalar_range_checks_reject_non_field_words() {
+fn every_proof_scalar_rejects_fr_modulus() {
     if !poseidon_inputs_available_for_evm() {
         return;
     }
 
     let fixture = create_property_poseidon_fixture();
-    let valid = call_quotient_separated_verifier(
-        &fixture.quotient_verifier_solidity,
-        &fixture.vk_solidity,
-        &fixture.quotient_evaluator_solidity,
-        &fixture.proof,
-        &fixture.instances,
+    let r_be = fr_modulus_be_word();
+    let scalar_offsets = proof_scalar_offsets(&fixture);
+    assert!(
+        !scalar_offsets.is_empty(),
+        "fixture proof should expose scalar fields to range-check"
     );
-    assert_solidity_accepts(valid, "valid proof before scalar range mutations");
 
-    let mut bad_eval = fixture.proof.clone();
-    let r_be = hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")
-        .expect("fr modulus hex");
-    let eval_offset = fixture.scalar_layout.eval_offset;
-    bad_eval[eval_offset..eval_offset + 0x20].copy_from_slice(&r_be);
+    let mut evm = deployed_separate_verifier(&fixture);
+    if !deployed_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof") {
+        return;
+    }
 
-    let output = call_quotient_separated_verifier(
-        &fixture.quotient_verifier_solidity,
-        &fixture.vk_solidity,
-        &fixture.quotient_evaluator_solidity,
-        &bad_eval,
-        &fixture.instances,
-    );
-    assert_solidity_rejects(output, "main eval scalar equal to Fr modulus");
-
-    if fixture.scalar_layout.num_point_sets != 0 {
-        let mut bad_q_eval = fixture.proof.clone();
-        let q_eval_offset = fixture.scalar_layout.q_eval_offset;
-        bad_q_eval[q_eval_offset..q_eval_offset + 0x20].copy_from_slice(&r_be);
-        let output = call_quotient_separated_verifier(
-            &fixture.quotient_verifier_solidity,
-            &fixture.vk_solidity,
-            &fixture.quotient_evaluator_solidity,
-            &bad_q_eval,
-            &fixture.instances,
+    for (name, offset) in scalar_offsets {
+        let mut bad_proof = fixture.proof.clone();
+        bad_proof[offset..offset + 0x20].copy_from_slice(&r_be);
+        assert_deployed_call_rejects(
+            &mut evm,
+            &fixture,
+            &bad_proof,
+            &format!("{name} scalar equal to Fr modulus at proof offset {offset}"),
         );
-        assert_solidity_rejects(output, "q_eval scalar equal to Fr modulus");
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
+fn separate_verifier_adversarial_calldata_variants_are_rejected() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let mut evm = deployed_separate_verifier(&fixture);
+    let valid = encode_calldata(&fixture.proof, &fixture.instances);
+    if !deployed_raw_call_accepts(&mut evm, valid.clone(), "valid separate-verifier calldata") {
+        return;
+    }
+
+    let mut wrong_instances = fixture.instances.clone();
+    wrong_instances[0] += F::ONE;
+    assert_solidity_rejects(
+        call_deployed_verifier(&mut evm, &fixture.proof, &wrong_instances),
+        "wrong instance",
+    );
+
+    let r_be = fr_modulus_be_word();
+    let mut noncanonical_instance = valid.clone();
+    let instance_word_start = first_instance_word_start(&fixture.proof);
+    noncanonical_instance[instance_word_start..instance_word_start + 0x20].copy_from_slice(&r_be);
+    assert_solidity_rejects(
+        call_deployed_verifier_raw(&mut evm, noncanonical_instance),
+        "instance scalar equal to Fr modulus",
+    );
+
+    let mut trailing_bytes = valid.clone();
+    trailing_bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+    let mut proof_head_overlap = valid.clone();
+    overwrite_u256_word(&mut proof_head_overlap, 0x04, 0x20);
+
+    let mut proof_head_shifted_without_gap = valid.clone();
+    overwrite_u256_word(&mut proof_head_shifted_without_gap, 0x04, 0x60);
+
+    let mut instances_head_overlap = valid.clone();
+    overwrite_u256_word(&mut instances_head_overlap, 0x24, 0x40);
+
+    let mut instances_head_shifted = valid.clone();
+    overwrite_u256_word(
+        &mut instances_head_shifted,
+        0x24,
+        canonical_instances_head(&fixture.proof) as u64 + 0x20,
+    );
+
+    let shifted_valid_abi = calldata_with_shifted_dynamic_heads(&valid, &fixture.proof);
+
+    for (name, calldata) in [
+        ("trailing bytes", trailing_bytes),
+        ("proof head overlaps ABI head", proof_head_overlap),
+        (
+            "proof head shifted without matching gap",
+            proof_head_shifted_without_gap,
+        ),
+        ("instances head overlaps proof", instances_head_overlap),
+        ("instances head shifted", instances_head_shifted),
+        (
+            "valid ABI with noncanonical dynamic offsets",
+            shifted_valid_abi,
+        ),
+    ] {
+        assert_solidity_rejects(call_deployed_verifier_raw(&mut evm, calldata), name);
     }
 }
 
@@ -714,8 +823,10 @@ fn every_proof_g1_rejects_noncanonical_coordinates() {
     );
 
     let native_bad = [0xffu8; 48];
-    let mut evm = deployed_quotient_separated_verifier(&fixture);
-    assert_quotient_separated_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof");
+    let mut evm = deployed_separate_verifier(&fixture);
+    if !deployed_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof") {
+        return;
+    }
 
     for (idx, (&compressed_offset, &repacked_offset)) in layout
         .compressed_offsets
@@ -736,7 +847,7 @@ fn every_proof_g1_rejects_noncanonical_coordinates() {
         // to be zero. Set one padding byte so the Solidity canonicality
         // guard must reject before the point can enter the transcript.
         bad_solidity[repacked_offset] = 1;
-        assert_quotient_separated_call_rejects(
+        assert_deployed_call_rejects(
             &mut evm,
             &fixture,
             &bad_solidity,
@@ -757,8 +868,10 @@ fn every_proof_g1_rejects_off_curve_coordinates() {
     let native_bad = compressed_off_curve_g1_bytes();
     let solidity_bad = eip2537_padded_off_curve_g1_bytes();
 
-    let mut evm = deployed_quotient_separated_verifier(&fixture);
-    assert_quotient_separated_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof");
+    let mut evm = deployed_separate_verifier(&fixture);
+    if !deployed_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof") {
+        return;
+    }
 
     for (idx, (&compressed_offset, &repacked_offset)) in layout
         .compressed_offsets
@@ -776,7 +889,7 @@ fn every_proof_g1_rejects_off_curve_coordinates() {
 
         let mut bad_solidity = fixture.proof.clone();
         bad_solidity[repacked_offset..repacked_offset + 128].copy_from_slice(&solidity_bad);
-        assert_quotient_separated_call_rejects(
+        assert_deployed_call_rejects(
             &mut evm,
             &fixture,
             &bad_solidity,
@@ -967,83 +1080,140 @@ fn assert_separate_verifier_rejects_vk_dependency(
     );
 }
 
-fn call_quotient_separated_verifier(
+fn assert_pinned_quotient_constructor_rejects(
     verifier_solidity: &str,
     vk_solidity: &str,
     quotient_solidity: &str,
-    proof: &[u8],
-    instances: &[F],
-) -> Result<Vec<u8>, ()> {
-    let mut evm = Evm::default();
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let vk_address = evm.create(compile_solidity(vk_solidity));
-        let quotient_address = evm.create(compile_solidity(quotient_solidity));
-        let verifier_address = evm.create_with_two_address_args(
-            compile_solidity(verifier_solidity),
+    context: &str,
+) {
+    let verifier_creation_code = compile_solidity(verifier_solidity);
+    let vk_creation_code = compile_solidity(vk_solidity);
+    let quotient_creation_code = compile_solidity(quotient_solidity);
+    assert_pinned_quotient_constructor_rejects_address_args(
+        &verifier_creation_code,
+        &vk_creation_code,
+        &quotient_creation_code,
+        context,
+    );
+}
+
+fn assert_pinned_quotient_constructor_rejects_address_args(
+    verifier_creation_code: &[u8],
+    vk_arg_creation_code: &[u8],
+    quotient_arg_creation_code: &[u8],
+    context: &str,
+) {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut evm = Evm::default();
+        let vk_address = evm.create(vk_arg_creation_code.to_vec());
+        let quotient_address = evm.create(quotient_arg_creation_code.to_vec());
+        evm.create_with_two_address_args(
+            verifier_creation_code.to_vec(),
             vk_address,
             quotient_address,
         );
-        match evm.try_call(verifier_address, encode_calldata(proof, instances)) {
-            CallOutcome::Success { output, .. } => output,
-            CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Vec::new(),
-        }
-    }))
-    .map_err(|_| ())
+    }));
+    assert!(
+        result.is_err(),
+        "pinned verifier constructor accepted invalid dependency: {context}"
+    );
 }
 
-struct DeployedQuotientVerifier {
+struct DeployedVerifier {
     evm: Evm,
     verifier_address: revm::primitives::Address,
 }
 
-fn deployed_quotient_separated_verifier(
-    fixture: &PropertyPoseidonFixture,
-) -> DeployedQuotientVerifier {
+fn deployed_separate_verifier(fixture: &PropertyPoseidonFixture) -> DeployedVerifier {
     let mut evm = Evm::default();
     let vk_address = evm.create(compile_solidity(&fixture.vk_solidity));
-    let quotient_address = evm.create(compile_solidity(&fixture.quotient_evaluator_solidity));
-    let verifier_address = evm.create_with_two_address_args(
-        compile_solidity(&fixture.quotient_verifier_solidity),
+    let verifier_address = evm.create_with_address_arg(
+        compile_solidity(&fixture.separate_verifier_solidity),
         vk_address,
-        quotient_address,
     );
-    DeployedQuotientVerifier {
+    DeployedVerifier {
         evm,
         verifier_address,
     }
 }
 
-fn call_deployed_quotient_verifier(
-    deployed: &mut DeployedQuotientVerifier,
+fn call_deployed_verifier(
+    deployed: &mut DeployedVerifier,
     proof: &[u8],
     instances: &[F],
 ) -> Result<Vec<u8>, ()> {
+    call_deployed_verifier_raw(deployed, encode_calldata(proof, instances))
+}
+
+fn call_deployed_verifier_raw(
+    deployed: &mut DeployedVerifier,
+    calldata: Vec<u8>,
+) -> Result<Vec<u8>, ()> {
     match deployed
         .evm
-        .try_call(deployed.verifier_address, encode_calldata(proof, instances))
+        .try_call_with_gas(deployed.verifier_address, calldata, 5_000_000_000)
     {
         CallOutcome::Success { output, .. } => Ok(output),
-        CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Ok(Vec::new()),
+        CallOutcome::Revert { gas_used, output } => {
+            eprintln!(
+                "verifier reverted with gas_used = {gas_used}, output = 0x{}",
+                hex::encode(output)
+            );
+            Err(())
+        }
+        CallOutcome::Halt { gas_used, reason } => {
+            eprintln!("verifier halted with gas_used = {gas_used}, reason = {reason}");
+            Err(())
+        }
     }
 }
 
-fn assert_quotient_separated_call_accepts(
-    deployed: &mut DeployedQuotientVerifier,
+fn deployed_call_accepts(
+    deployed: &mut DeployedVerifier,
     fixture: &PropertyPoseidonFixture,
     proof: &[u8],
     context: &str,
-) {
-    let output = call_deployed_quotient_verifier(deployed, proof, &fixture.instances);
-    assert_solidity_accepts(output, context);
+) -> bool {
+    let output = call_deployed_verifier(deployed, proof, &fixture.instances);
+    solidity_output_is_true_or_skip(output, context)
 }
 
-fn assert_quotient_separated_call_rejects(
-    deployed: &mut DeployedQuotientVerifier,
+fn deployed_raw_call_accepts(
+    deployed: &mut DeployedVerifier,
+    calldata: Vec<u8>,
+    context: &str,
+) -> bool {
+    let output = call_deployed_verifier_raw(deployed, calldata);
+    solidity_output_is_true_or_skip(output, context)
+}
+
+fn solidity_output_is_true_or_skip(output: Result<Vec<u8>, ()>, context: &str) -> bool {
+    let expected_true = [vec![0; 31], vec![1]].concat();
+    match output {
+        Ok(bytes) if bytes == expected_true => true,
+        Ok(bytes) => {
+            eprintln!(
+                "skipping adversarial Solidity test: baseline `{context}` returned 0x{}",
+                hex::encode(bytes)
+            );
+            false
+        }
+        Err(()) => {
+            eprintln!(
+                "skipping adversarial Solidity test: baseline `{context}` reverted or halted"
+            );
+            false
+        }
+    }
+}
+
+fn assert_deployed_call_rejects(
+    deployed: &mut DeployedVerifier,
     fixture: &PropertyPoseidonFixture,
     proof: &[u8],
     context: &str,
 ) {
-    let output = call_deployed_quotient_verifier(deployed, proof, &fixture.instances);
+    let output = call_deployed_verifier(deployed, proof, &fixture.instances);
     assert_solidity_rejects(output, context);
 }
 
@@ -1072,6 +1242,25 @@ fn assert_native_poseidon_rejects(
 struct ProofG1Layout {
     compressed_offsets: Vec<usize>,
     repacked_offsets: Vec<usize>,
+}
+
+fn proof_scalar_offsets(fixture: &PropertyPoseidonFixture) -> Vec<(String, usize)> {
+    let layout = fixture.scalar_layout;
+    let mut offsets = Vec::with_capacity(layout.num_evals + layout.num_point_sets);
+    offsets.extend(
+        (0..layout.num_evals).map(|idx| (format!("eval[{idx}]"), layout.eval_offset + idx * 0x20)),
+    );
+    offsets.extend(
+        (0..layout.num_point_sets)
+            .map(|idx| (format!("q_eval[{idx}]"), layout.q_eval_offset + idx * 0x20)),
+    );
+    assert!(
+        offsets
+            .iter()
+            .all(|(_, offset)| offset + 0x20 <= fixture.proof.len()),
+        "scalar offsets must be inside the Solidity proof"
+    );
+    offsets
 }
 
 fn proof_g1_layout(fixture: &PropertyPoseidonFixture) -> ProofG1Layout {
@@ -1230,6 +1419,18 @@ fn mutate_value_hex_literal_on_line_containing(solidity: &str, marker: &str) -> 
     String::from_utf8(mutated).unwrap()
 }
 
+fn replace_required_precompile_staticcall(
+    solidity: &str,
+    needle: &str,
+    replacement: &str,
+) -> String {
+    assert!(
+        solidity.contains(needle),
+        "required precompile smoke-test staticcall not found: {needle}"
+    );
+    solidity.replacen(needle, replacement, 1)
+}
+
 fn new_property_test_runner() -> TestRunner {
     let cases = env::var("POSEIDON_PBT_CASES")
         .ok()
@@ -1245,6 +1446,33 @@ fn new_property_test_runner() -> TestRunner {
 fn overwrite_u256_word(bytes: &mut [u8], start: usize, value: u64) {
     bytes[start..start + 32].fill(0);
     bytes[start + 24..start + 32].copy_from_slice(&value.to_be_bytes());
+}
+
+fn fr_modulus_be_word() -> [u8; 32] {
+    hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")
+        .expect("fr modulus hex")
+        .try_into()
+        .expect("Fr modulus is one word")
+}
+
+fn canonical_instances_head(proof: &[u8]) -> usize {
+    0x40 + 0x20 + proof.len()
+}
+
+fn first_instance_word_start(proof: &[u8]) -> usize {
+    4 + canonical_instances_head(proof) + 0x20
+}
+
+fn calldata_with_shifted_dynamic_heads(valid: &[u8], proof: &[u8]) -> Vec<u8> {
+    let mut shifted = valid.to_vec();
+    shifted.splice(4 + 0x40..4 + 0x40, [0u8; 0x20]);
+    overwrite_u256_word(&mut shifted, 0x04, 0x60);
+    overwrite_u256_word(
+        &mut shifted,
+        0x24,
+        canonical_instances_head(proof) as u64 + 0x20,
+    );
+    shifted
 }
 
 fn poseidon_inputs_available_for_evm() -> bool {

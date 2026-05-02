@@ -125,7 +125,10 @@ contract Halo2Verifier {
     // Multi-prepare scratch (sized at codegen time).
     uint256 internal constant       ROT_POINTS_MPTR = {{ theta_mptr + 52 }};
     uint256 internal constant       X1_POWERS_MPTR = {{ theta_mptr + 80 }};
-    uint256 internal constant            Q_COM_MPTR = {{ theta_mptr + 112 }};
+    // Q_COM materialization is currently fused into the final MSM scratch,
+    // so this marker intentionally aliases Q_EVAL_SET_MPTR and has zero
+    // reserved capacity until a future emitter starts writing Q_COM_MPTR.
+    uint256 internal constant            Q_COM_MPTR = {{ theta_mptr + 144 }};
     uint256 internal constant      Q_EVAL_SET_MPTR = {{ theta_mptr + 144 }};
 
     // Q_EVAL_CPTR is set at runtime once the verifier reaches the q_evals
