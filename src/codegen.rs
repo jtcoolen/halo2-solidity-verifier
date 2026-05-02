@@ -5051,6 +5051,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_heavy_assemblies_do_not_claim_memory_safe() {
+        for (name, source) in [
+            (
+                "Halo2Verifier.sol",
+                include_str!("../templates/Halo2Verifier.sol"),
+            ),
+            (
+                "Halo2QuotientEvaluator.sol",
+                include_str!("../templates/Halo2QuotientEvaluator.sol"),
+            ),
+        ] {
+            assert!(
+                !source.contains("assembly (\"memory-safe\")"),
+                "{name} should not claim memory-safe assembly while using low-memory transcript/scratch buffers"
+            );
+        }
+    }
+
+    #[test]
     fn permutation_delta_literal_is_computed_from_field_constant() {
         let computed = u256_string(fe_to_u256::<Fq>(&Fq::DELTA));
 
