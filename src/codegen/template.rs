@@ -197,6 +197,15 @@ pub(crate) struct Halo2Verifier {
     /// Number of dummy evals appended to the proof's eval block when
     /// `fewer_point_sets` is enabled. Zero otherwise.
     pub(crate) num_dummy_evals: usize,
+    /// Accumulator metadata expected by this generated verifier. These
+    /// constants mirror the generator-side `AccumulatorEncoding` and are
+    /// checked against the VK header after `extcodecopy` / embedded VK
+    /// materialization, so a stale or mismatched VK fails before public-input
+    /// decoding chooses the wrong schema.
+    pub(crate) expected_has_accumulator: bool,
+    pub(crate) expected_acc_offset: usize,
+    pub(crate) expected_num_acc_limbs: usize,
+    pub(crate) expected_num_acc_limb_bits: usize,
     /// Fixed bases serialized by `AssignedAccumulator<S>::as_public_input`
     /// for the RHS accumulator MSM, in the exact lexicographic
     /// `BTreeMap` order used by midnight-circuits. This is the public
@@ -511,6 +520,10 @@ mod tests {
             truncated_challenges: false,
             fewer_point_sets: false,
             num_dummy_evals: 0,
+            expected_has_accumulator: false,
+            expected_acc_offset: 0,
+            expected_num_acc_limbs: 0,
+            expected_num_acc_limb_bits: 0,
             acc_fixed_bases: vec![],
             acc_msm_scratch: 0x7000,
         }

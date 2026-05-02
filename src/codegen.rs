@@ -4295,6 +4295,22 @@ impl<'a> SolidityGenerator<'a> {
             .into_iter()
             .map(|(_, mptr, negate)| (mptr, negate))
             .collect();
+        let (
+            expected_has_accumulator,
+            expected_acc_offset,
+            expected_num_acc_limbs,
+            expected_num_acc_limb_bits,
+        ) = self
+            .acc_encoding
+            .map(|acc_encoding| {
+                (
+                    true,
+                    acc_encoding.offset,
+                    acc_encoding.num_limbs,
+                    acc_encoding.num_limb_bits,
+                )
+            })
+            .unwrap_or((false, 0, 0, 0));
 
         let acc_msm_scratch = after_comms.max(0x7000).next_multiple_of(0x20);
 
@@ -4354,6 +4370,10 @@ impl<'a> SolidityGenerator<'a> {
             truncated_challenges: cfg!(feature = "truncated-challenges"),
             fewer_point_sets: cfg!(feature = "outer-fewer-point-sets"),
             num_dummy_evals: meta.num_dummy_evals,
+            expected_has_accumulator,
+            expected_acc_offset,
+            expected_num_acc_limbs,
+            expected_num_acc_limb_bits,
             acc_fixed_bases,
             acc_msm_scratch,
         };
@@ -4868,6 +4888,27 @@ mod tests {
         assert!(
             verifier_template.contains("eq(mload(NUM_INSTANCES_MPTR), acc_expected_words)"),
             "accumulator verifier must reject extra or missing accumulator tail words"
+        );
+    }
+
+    #[test]
+    fn accumulator_vk_header_is_checked_against_codegen_metadata() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        for expected_check in [
+            "eq(mload(HAS_ACCUMULATOR_MPTR)",
+            "eq(mload(ACC_OFFSET_MPTR)",
+            "eq(mload(NUM_ACC_LIMBS_MPTR)",
+            "eq(mload(NUM_ACC_LIMB_BITS_MPTR)",
+        ] {
+            assert!(
+                verifier_template.contains(expected_check),
+                "verifier must check VK accumulator metadata against generated codegen constants: {expected_check}"
+            );
+        }
+        assert!(
+            verifier_template.contains("the VK header agrees"),
+            "template should document why accumulator metadata is checked before instance decoding"
         );
     }
 

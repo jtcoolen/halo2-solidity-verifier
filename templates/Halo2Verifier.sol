@@ -742,6 +742,15 @@ contract Halo2Verifier {
                 extcodecopy(vk, VK_MPTR, 0x00, {{ vk_len|hex() }})
                 {%- endmatch %}
 
+                // The code generator knows whether this verifier expects
+                // public accumulator limbs and how they are packed. Check
+                // the VK header agrees before decoding instance words under
+                // the wrong schema.
+                success := and(success, eq(mload(HAS_ACCUMULATOR_MPTR), {%- if self.expected_has_accumulator %} 1 {%- else %} 0 {%- endif %}))
+                success := and(success, eq(mload(ACC_OFFSET_MPTR), {{ self.expected_acc_offset }}))
+                success := and(success, eq(mload(NUM_ACC_LIMBS_MPTR), {{ self.expected_num_acc_limbs }}))
+                success := and(success, eq(mload(NUM_ACC_LIMB_BITS_MPTR), {{ self.expected_num_acc_limb_bits }}))
+
                 success := and(success, eq({{ proof_len|hex() }}, calldataload(PROOF_LEN_CPTR)))
 
                 let num_instances := mload(NUM_INSTANCES_MPTR)
