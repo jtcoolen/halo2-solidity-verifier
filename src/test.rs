@@ -1,5 +1,5 @@
 use crate::{
-    compile_solidity, encode_calldata, BatchOpenScheme::Gwc19, Evm, SolidityGenerator,
+    compile_solidity, encode_calldata, BatchOpenScheme::Gwc19, CallOutcome, Evm, SolidityGenerator,
     FN_SIG_VERIFY_PROOF,
 };
 use ff::Field;
@@ -431,12 +431,15 @@ impl Relation for PoseidonExample {
 struct PropertyPoseidonFixture {
     compressed_proof: Vec<u8>,
     proof: Vec<u8>,
+    scalar_layout: crate::codegen::RepackedProofScalarLayout,
     instances: Vec<F>,
     params_verifier: PoseidonVerifierParams,
     vk: MidnightVK,
     embedded_verifier_solidity: String,
     separate_verifier_solidity: String,
     vk_solidity: String,
+    quotient_verifier_solidity: String,
+    quotient_evaluator_solidity: String,
     trace_verifier_solidity: String,
     trace_vk_solidity: String,
 }
@@ -461,22 +464,80 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
     let embedded_verifier_solidity = generator.render().expect("embedded render");
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
+    let (quotient_verifier_solidity, quotient_vk_solidity, quotient_evaluator_solidity) = generator
+        .render_separately_with_quotient()
+        .expect("separate render with quotient evaluator");
+    assert_eq!(
+        vk_solidity, quotient_vk_solidity,
+        "plain and quotient-separated render paths must share the same VK"
+    );
     let (trace_verifier_solidity, trace_vk_solidity) =
         generator.render_trace_separately().expect("trace render");
     let proof = generator.repack_compressed_proof(&compressed_proof);
+    let scalar_layout = generator.repacked_proof_scalar_layout_for_test();
     let params_verifier = srs.verifier_params();
 
     PropertyPoseidonFixture {
         compressed_proof,
         proof,
+        scalar_layout,
         instances: vec![instance],
         params_verifier,
         vk,
         embedded_verifier_solidity,
         separate_verifier_solidity,
         vk_solidity,
+        quotient_verifier_solidity,
+        quotient_evaluator_solidity,
         trace_verifier_solidity,
         trace_vk_solidity,
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
+fn proof_scalar_range_checks_reject_non_field_words() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let valid = call_quotient_separated_verifier(
+        &fixture.quotient_verifier_solidity,
+        &fixture.vk_solidity,
+        &fixture.quotient_evaluator_solidity,
+        &fixture.proof,
+        &fixture.instances,
+    );
+    assert_solidity_accepts(valid, "valid proof before scalar range mutations");
+
+    let mut bad_eval = fixture.proof.clone();
+    let r_be = hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")
+        .expect("fr modulus hex");
+    let eval_offset = fixture.scalar_layout.eval_offset;
+    bad_eval[eval_offset..eval_offset + 0x20].copy_from_slice(&r_be);
+
+    let output = call_quotient_separated_verifier(
+        &fixture.quotient_verifier_solidity,
+        &fixture.vk_solidity,
+        &fixture.quotient_evaluator_solidity,
+        &bad_eval,
+        &fixture.instances,
+    );
+    assert_solidity_rejects(output, "main eval scalar equal to Fr modulus");
+
+    if fixture.scalar_layout.num_point_sets != 0 {
+        let mut bad_q_eval = fixture.proof.clone();
+        let q_eval_offset = fixture.scalar_layout.q_eval_offset;
+        bad_q_eval[q_eval_offset..q_eval_offset + 0x20].copy_from_slice(&r_be);
+        let output = call_quotient_separated_verifier(
+            &fixture.quotient_verifier_solidity,
+            &fixture.vk_solidity,
+            &fixture.quotient_evaluator_solidity,
+            &bad_q_eval,
+            &fixture.instances,
+        );
+        assert_solidity_rejects(output, "q_eval scalar equal to Fr modulus");
     }
 }
 
@@ -642,6 +703,30 @@ fn call_separate_verifier(
             evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
         evm.call(verifier_address, encode_calldata(proof, instances))
             .1
+    }))
+    .map_err(|_| ())
+}
+
+fn call_quotient_separated_verifier(
+    verifier_solidity: &str,
+    vk_solidity: &str,
+    quotient_solidity: &str,
+    proof: &[u8],
+    instances: &[F],
+) -> Result<Vec<u8>, ()> {
+    let mut evm = Evm::default();
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let vk_address = evm.create(compile_solidity(vk_solidity));
+        let quotient_address = evm.create(compile_solidity(quotient_solidity));
+        let verifier_address = evm.create_with_two_address_args(
+            compile_solidity(verifier_solidity),
+            vk_address,
+            quotient_address,
+        );
+        match evm.try_call(verifier_address, encode_calldata(proof, instances)) {
+            CallOutcome::Success { output, .. } => output,
+            CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Vec::new(),
+        }
     }))
     .map_err(|_| ())
 }

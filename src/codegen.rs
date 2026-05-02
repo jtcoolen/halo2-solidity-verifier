@@ -4,7 +4,10 @@ use crate::codegen::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
         QuotientProgram, UserPhase,
     },
-    util::{fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Ptr},
+    util::{
+        fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
+        Word,
+    },
 };
 // midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
 // = midnight_curves::Fq (BLS12-381 scalar) and CS = KZGCommitmentScheme<Bls12>.
@@ -18,7 +21,7 @@ use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
 use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, G2Affine};
 use midnight_proofs::{
-    plonk::VerifyingKey,
+    plonk::{Expression, Selector, VerifyingKey},
     poly::{
         kzg::{params::ParamsKZG, KZGCommitmentScheme},
         Rotation,
@@ -179,6 +182,16 @@ struct QuotientIdentity {
     lines: Vec<String>,
     var: String,
     target: QuotientTarget,
+    expr: Option<QuotientExpr>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RepackedProofScalarLayout {
+    pub(crate) eval_offset: usize,
+    pub(crate) num_evals: usize,
+    pub(crate) q_eval_offset: usize,
+    pub(crate) num_point_sets: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -313,7 +326,15 @@ const Q_MEM_THETA: u8 = 0x07;
 const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
 const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
 
-#[derive(Clone, Debug)]
+fn scalar_le_to_be_word(bytes: &[u8]) -> [u8; 32] {
+    assert_eq!(bytes.len(), 32, "scalar proof element must be 32 bytes");
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(bytes);
+    scalar.reverse();
+    scalar
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum QuotientExpr {
     Const(U256),
     Mem(QuotientMem),
@@ -366,7 +387,7 @@ impl QuotientCseState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum QuotientMem {
     Literal(u32),
     Token(u8),
@@ -581,20 +602,26 @@ struct QuotientProgramBuilder {
 }
 
 impl QuotientProgramBuilder {
-    fn identity(
+    fn identity_expr(
         &mut self,
-        lines: &[String],
-        final_var: &str,
+        expr: &QuotientExpr,
         target: QuotientTarget,
         cse: Option<&mut QuotientCseState>,
     ) {
         self.vars.clear();
         self.stack_depth = 0;
 
-        for line in lines {
-            self.assignment(line);
+        if let Some(cse) = cse {
+            self.emit_expr_cse(expr, cse);
+        } else {
+            self.emit_expr(expr);
         }
-        self.expr(final_var, cse);
+        self.fold_identity(target);
+
+        assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
+    }
+
+    fn fold_identity(&mut self, target: QuotientTarget) {
         match target {
             QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
             QuotientTarget::Selector(idx) => {
@@ -606,8 +633,6 @@ impl QuotientProgramBuilder {
         if matches!(target, QuotientTarget::Main) {
             self.pop_stack();
         }
-
-        assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
     }
 
     fn native_permutation(&mut self) {
@@ -650,15 +675,6 @@ impl QuotientProgramBuilder {
             .unwrap_or_else(|| panic!("unsupported quotient assignment: {line}"));
         let expr = self.parse_expr(expr.trim());
         self.vars.insert(dst.trim().to_string(), expr);
-    }
-
-    fn expr(&mut self, expr: &str, cse: Option<&mut QuotientCseState>) {
-        let expr = self.parse_expr(expr);
-        if let Some(cse) = cse {
-            self.emit_expr_cse(&expr, cse);
-        } else {
-            self.emit_expr(&expr);
-        }
     }
 
     fn parse_expr(&self, expr: &str) -> QuotientExpr {
@@ -1473,6 +1489,138 @@ fn quotient_mem_token_name(token: u8) -> &'static str {
         Q_MEM_TRASH_CHALLENGE => "TRASH_CHALLENGE_MPTR",
         Q_MEM_INSTANCE_EVAL => "INSTANCE_EVAL_MPTR",
         _ => panic!("unknown quotient memory token {token:#x}"),
+    }
+}
+
+fn quotient_mem_token_from_name(name: &str) -> Option<u8> {
+    match name {
+        "L_0_MPTR" => Some(Q_MEM_L0),
+        "L_LAST_MPTR" => Some(Q_MEM_L_LAST),
+        "L_BLIND_MPTR" => Some(Q_MEM_L_BLIND),
+        "BETA_MPTR" => Some(Q_MEM_BETA),
+        "GAMMA_MPTR" => Some(Q_MEM_GAMMA),
+        "X_MPTR" => Some(Q_MEM_X),
+        "THETA_MPTR" => Some(Q_MEM_THETA),
+        "TRASH_CHALLENGE_MPTR" => Some(Q_MEM_TRASH_CHALLENGE),
+        "INSTANCE_EVAL_MPTR" => Some(Q_MEM_INSTANCE_EVAL),
+        _ => None,
+    }
+}
+
+trait QuotientExpressionEnv {
+    fn selector(&self, selector: Selector) -> QuotientExpr;
+    fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    fn advice(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    fn instance(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    fn challenge(&self, index: usize) -> QuotientExpr;
+}
+
+fn quotient_expr_from_expression<E: QuotientExpressionEnv>(
+    env: &E,
+    expression: &Expression<Fq>,
+) -> QuotientExpr {
+    expression.evaluate(
+        &|scalar| QuotientExpr::Const(fe_to_u256::<Fq>(&scalar)),
+        &|selector| env.selector(selector),
+        &|query| env.fixed(query.column_index(), query.rotation().0),
+        &|query| env.advice(query.column_index(), query.rotation().0),
+        &|query| env.instance(query.column_index(), query.rotation().0),
+        &|challenge| env.challenge(challenge.index()),
+        &|inner| QuotientExpr::Neg(Box::new(inner)),
+        &|lhs, rhs| QuotientExpr::Add(Box::new(lhs), Box::new(rhs)),
+        &|lhs, rhs| QuotientExpr::Mul(Box::new(lhs), Box::new(rhs)),
+        &|inner, scalar| {
+            QuotientExpr::Mul(
+                Box::new(inner),
+                Box::new(QuotientExpr::Const(fe_to_u256::<Fq>(&scalar))),
+            )
+        },
+    )
+}
+
+struct DataQuotientExpressionEnv<'a> {
+    meta: &'a ConstraintSystemMeta,
+    data: &'a Data,
+}
+
+impl QuotientExpressionEnv for DataQuotientExpressionEnv<'_> {
+    fn selector(&self, _selector: Selector) -> QuotientExpr {
+        panic!("virtual selectors must be removed before quotient lowering")
+    }
+
+    fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+        if self.meta.simple_selector_cols.contains(&column_index) {
+            QuotientExpr::Const(U256::from(1u64))
+        } else {
+            word_to_quotient_expr(
+                *self
+                    .data
+                    .fixed_evals
+                    .get(&(column_index, rotation))
+                    .expect("fixed eval present"),
+            )
+        }
+    }
+
+    fn advice(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+        word_to_quotient_expr(
+            *self
+                .data
+                .advice_evals
+                .get(&(column_index, rotation))
+                .expect("advice eval present"),
+        )
+    }
+
+    fn instance(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+        if column_index < self.meta.num_committed_instances {
+            word_to_quotient_expr(
+                *self
+                    .data
+                    .committed_instance_evals
+                    .get(&(column_index, rotation))
+                    .expect("committed instance eval present"),
+            )
+        } else {
+            word_to_quotient_expr(self.data.instance_eval)
+        }
+    }
+
+    fn challenge(&self, index: usize) -> QuotientExpr {
+        word_to_quotient_expr(self.data.challenges[index])
+    }
+}
+
+fn word_to_quotient_expr(word: Word) -> QuotientExpr {
+    assert_eq!(
+        word.loc(),
+        Location::Memory,
+        "quotient expressions can only load memory-backed words"
+    );
+    QuotientExpr::Mem(ptr_to_quotient_mem(word.ptr()))
+}
+
+fn ptr_to_quotient_mem(ptr: Ptr) -> QuotientMem {
+    assert_eq!(
+        ptr.loc(),
+        Location::Memory,
+        "quotient expressions can only load memory-backed words"
+    );
+    match ptr.value() {
+        Value::Integer(offset) => {
+            assert!(offset >= 0, "negative quotient memory pointer");
+            QuotientMem::Literal(offset as u32)
+        }
+        Value::Identifier(name, offset) => {
+            assert!(offset >= 0, "negative quotient memory token offset");
+            let token = quotient_mem_token_from_name(name)
+                .unwrap_or_else(|| panic!("unsupported quotient memory token: {name}"));
+            if offset == 0 {
+                QuotientMem::Token(token)
+            } else {
+                QuotientMem::TokenOffset(token, offset as u32)
+            }
+        }
     }
 }
 
@@ -2348,8 +2496,24 @@ impl<'a> SolidityGenerator<'a> {
         simple_selector_count: usize,
     ) -> QuotientExternal {
         let frame_base = vk_mptr.value().as_usize();
+        Self::quotient_external_frame_from_bounds(
+            frame_base,
+            vk_len,
+            data.reversed_evals_mptr.value().as_usize(),
+            meta.num_evals,
+            simple_selector_count,
+        )
+    }
+
+    fn quotient_external_frame_from_bounds(
+        frame_base: usize,
+        vk_len: usize,
+        evals_base: usize,
+        num_evals: usize,
+        simple_selector_count: usize,
+    ) -> QuotientExternal {
         let vk_end = frame_base + vk_len;
-        let evals_end = data.reversed_evals_mptr.value().as_usize() + meta.num_evals * 0x20;
+        let evals_end = evals_base + num_evals * 0x20;
         let frame_end = vk_end.max(evals_end);
         QuotientExternal {
             frame_base,
@@ -2361,7 +2525,8 @@ impl<'a> SolidityGenerator<'a> {
 
     fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
         let mut builder = QuotientProgramBuilder::default();
-        builder.identity(&identity.lines, &identity.var, identity.target, None);
+        let expr = Self::quotient_identity_expr(identity);
+        builder.identity_expr(&expr, identity.target, None);
         builder.bytes.len()
     }
 
@@ -2372,6 +2537,19 @@ impl<'a> SolidityGenerator<'a> {
     ) -> QuotientIdentityParts {
         let evaluator = Evaluator::new(self.vk.cs(), meta, data);
         let gate_items = evaluator.gate_computations_tagged();
+        let gate_exprs = self
+            .vk
+            .cs()
+            .gates()
+            .iter()
+            .flat_map(|gate| gate.polynomials().iter())
+            .map(|poly| Self::quotient_expr_from_plonk_expr(meta, data, poly))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gate_items.len(),
+            gate_exprs.len(),
+            "gate Yul expressions and typed expressions must stay aligned"
+        );
         let perm_items = evaluator.permutation_computations();
         let lookup_items = evaluator.lookup_computations();
         let trash_items = evaluator.trashcan_computations();
@@ -2380,7 +2558,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple.sort_unstable();
 
         let mut gates = Vec::with_capacity(gate_items.len());
-        for (lines, var, sel_idx) in gate_items {
+        for ((lines, var, sel_idx), expr) in gate_items.into_iter().zip(gate_exprs) {
             let target = match sel_idx {
                 Some(col) => {
                     let idx = sorted_simple
@@ -2391,7 +2569,12 @@ impl<'a> SolidityGenerator<'a> {
                 }
                 None => QuotientTarget::Main,
             };
-            gates.push(QuotientIdentity { lines, var, target });
+            gates.push(QuotientIdentity {
+                lines,
+                var,
+                target,
+                expr: Some(expr),
+            });
         }
         let mut permutation = Vec::with_capacity(perm_items.len());
         for (lines, var) in perm_items {
@@ -2399,6 +2582,7 @@ impl<'a> SolidityGenerator<'a> {
                 lines,
                 var,
                 target: QuotientTarget::Main,
+                expr: None,
             });
         }
         let mut lookup = Vec::with_capacity(lookup_items.len());
@@ -2407,6 +2591,7 @@ impl<'a> SolidityGenerator<'a> {
                 lines,
                 var,
                 target: QuotientTarget::Main,
+                expr: None,
             });
         }
         let mut trash = Vec::with_capacity(trash_items.len());
@@ -2415,6 +2600,7 @@ impl<'a> SolidityGenerator<'a> {
                 lines,
                 var,
                 target: QuotientTarget::Main,
+                expr: None,
             });
         }
 
@@ -2449,11 +2635,26 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn quotient_identity_expr(identity: &QuotientIdentity) -> QuotientExpr {
+        if let Some(expr) = &identity.expr {
+            return expr.clone();
+        }
+        Self::quotient_identity_yul_expr(identity)
+    }
+
+    fn quotient_identity_yul_expr(identity: &QuotientIdentity) -> QuotientExpr {
         let mut parser = QuotientProgramBuilder::default();
         for line in &identity.lines {
             parser.assignment(line);
         }
         parser.parse_expr(&identity.var)
+    }
+
+    fn quotient_expr_from_plonk_expr(
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        expression: &Expression<Fq>,
+    ) -> QuotientExpr {
+        quotient_expr_from_expression(&DataQuotientExpressionEnv { meta, data }, expression)
     }
 
     fn inline_cse_quotient_computations(
@@ -2465,7 +2666,7 @@ impl<'a> SolidityGenerator<'a> {
         let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
         let exprs = identities
             .iter()
-            .map(Self::quotient_identity_expr)
+            .map(Self::quotient_identity_yul_expr)
             .collect::<Vec<_>>();
         let plan = QuotientInlineCsePlan::new(&exprs);
         let eval_scratch_slot = cse_mptr + plan.slots.len() * 0x20;
@@ -4089,12 +4290,8 @@ impl<'a> SolidityGenerator<'a> {
         for item in items {
             match item {
                 QuotientProgramItem::Identity(identity) => {
-                    builder.identity(
-                        &identity.lines,
-                        &identity.var,
-                        identity.target,
-                        cse.as_mut(),
-                    );
+                    let expr = Self::quotient_identity_expr(identity);
+                    builder.identity_expr(&expr, identity.target, cse.as_mut());
                 }
                 QuotientProgramItem::NativePermutation => builder.native_permutation(),
                 QuotientProgramItem::NativeIdentity(native_idx) => {
@@ -4244,10 +4441,7 @@ impl<'a> SolidityGenerator<'a> {
             out.extend_from_slice(&y_be[16..48]);
         };
         let push_scalar_be = |cursor: &mut usize, out: &mut Vec<u8>| {
-            let mut scalar = [0u8; 32];
-            scalar.copy_from_slice(&compressed[*cursor..*cursor + 32]);
-            scalar.reverse();
-            out.extend_from_slice(&scalar);
+            out.extend_from_slice(&scalar_le_to_be_word(&compressed[*cursor..*cursor + 32]));
             *cursor += 32;
         };
         for &n in &g1_groups {
@@ -4274,6 +4468,65 @@ impl<'a> SolidityGenerator<'a> {
             "compressed proof not fully consumed"
         );
         out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repacked_proof_scalar_layout_for_test(&self) -> RepackedProofScalarLayout {
+        let proof_cptr = Ptr::calldata(0x64);
+        let vk = self.generate_vk();
+        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
+
+        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
+        let mut meta = self.meta.clone();
+        let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
+            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
+        } else {
+            0
+        };
+        let main_evals = meta.num_evals;
+        meta.set_num_dummy_evals(n_dummy);
+        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
+        if n_dummy > 0 {
+            data.set_dummy_eval_words(main_evals, n_dummy);
+        }
+        let num_point_sets = BatchOpenScheme::num_point_sets(&meta, &data);
+
+        let cs = self.vk.cs();
+        let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
+        let mut g1_groups: Vec<usize> = Vec::new();
+        let advice_phase = cs.advice_column_phase();
+        let max_phase = *advice_phase.iter().max().unwrap_or(&0);
+        for phase in 0..=max_phase {
+            let n = advice_phase.iter().filter(|p| **p == phase).count();
+            if n != 0 {
+                g1_groups.push(n);
+            }
+        }
+        if !cs.lookups().is_empty() {
+            g1_groups.push(cs.lookups().len());
+        }
+        if perm_chunks != 0 {
+            g1_groups.push(perm_chunks);
+        }
+        for lookup in cs.lookups().iter() {
+            let nb_chunks = lookup.chunk_by_degree(cs.degree()).num_chunks();
+            g1_groups.push(nb_chunks);
+            g1_groups.push(1);
+        }
+        if !cs.trashcans().is_empty() {
+            g1_groups.push(cs.trashcans().len());
+        }
+        g1_groups.push(cs.degree() - 1);
+
+        let prefix_g1_count: usize = g1_groups.iter().sum();
+        let eval_offset = prefix_g1_count * 0x80;
+        let q_eval_offset = eval_offset + meta.num_evals * 0x20 + 0x80;
+        RepackedProofScalarLayout {
+            eval_offset,
+            num_evals: meta.num_evals,
+            q_eval_offset,
+            num_point_sets,
+        }
     }
 
     fn static_working_memory_size(&self, vk: &Halo2VerifyingKey, proof_cptr: Ptr) -> usize {
@@ -4382,4 +4635,254 @@ pub fn encode_calldata_bls_padded(
     instances: &[Fq],
 ) -> Vec<u8> {
     crate::evm::encode_calldata(proof, instances)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midnight_proofs::{
+        plonk::{ConstraintSystem, Constraints, FirstPhase},
+        poly::Rotation,
+    };
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct TestQuotientExpressionEnv {
+        fixed: HashMap<(usize, i32), QuotientExpr>,
+        advice: HashMap<(usize, i32), QuotientExpr>,
+        instance: HashMap<(usize, i32), QuotientExpr>,
+        challenges: HashMap<usize, QuotientExpr>,
+    }
+
+    impl QuotientExpressionEnv for TestQuotientExpressionEnv {
+        fn selector(&self, _selector: Selector) -> QuotientExpr {
+            panic!("test expression should not contain selectors")
+        }
+
+        fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+            self.fixed[&(column_index, rotation)].clone()
+        }
+
+        fn advice(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+            self.advice[&(column_index, rotation)].clone()
+        }
+
+        fn instance(&self, column_index: usize, rotation: i32) -> QuotientExpr {
+            self.instance[&(column_index, rotation)].clone()
+        }
+
+        fn challenge(&self, index: usize) -> QuotientExpr {
+            self.challenges[&index].clone()
+        }
+    }
+
+    #[test]
+    fn scalar_le_to_be_word_reverses_exactly_one_word() {
+        let mut le = [0u8; 32];
+        le[0] = 0x01;
+        le[1] = 0x23;
+        le[30] = 0xab;
+        le[31] = 0xcd;
+
+        let be = scalar_le_to_be_word(&le);
+        assert_eq!(be[0], 0xcd);
+        assert_eq!(be[1], 0xab);
+        assert_eq!(be[30], 0x23);
+        assert_eq!(be[31], 0x01);
+    }
+
+    #[test]
+    fn external_quotient_frame_covers_vk_and_eval_memory() {
+        let frame =
+            SolidityGenerator::quotient_external_frame_from_bounds(0x1000, 0x300, 0x1400, 7, 3);
+        assert_eq!(frame.frame_base, 0x1000);
+        assert_eq!(frame.frame_len, 0x4e0);
+        assert_eq!(frame.output_len, 0xa0);
+        assert_eq!(frame.magic, QUOTIENT_EXTERNAL_MAGIC);
+    }
+
+    #[test]
+    fn expression_lowering_matches_quotient_vm_eval() {
+        let mut cs = ConstraintSystem::default();
+        let advice = cs.advice_column();
+        let fixed = cs.fixed_column();
+        let instance = cs.instance_column();
+        let challenge = cs.challenge_usable_after(FirstPhase);
+        cs.create_gate("typed lowering", |meta| {
+            let a = meta.query_advice(advice, Rotation::next());
+            let f = meta.query_fixed(fixed, Rotation::prev());
+            let i = meta.query_instance(instance, Rotation::cur());
+            let c = meta.query_challenge(challenge);
+            let seven = Expression::Constant(Fq::from(7u64));
+            Constraints::without_selector(vec![(
+                "typed lowering",
+                a.clone() * f.clone() + i.clone() * c.clone() + seven * a - f,
+            )])
+        });
+        let expr = cs.gates()[0].polynomials()[0].clone();
+
+        let mut values = HashMap::new();
+        values.insert(0x100, Fq::from(11u64));
+        values.insert(0x120, Fq::from(13u64));
+        values.insert(0x140, Fq::from(17u64));
+        values.insert(0x160, Fq::from(19u64));
+
+        let mut env = TestQuotientExpressionEnv::default();
+        env.advice.insert(
+            (advice.index(), 1),
+            QuotientExpr::Mem(QuotientMem::Literal(0x100)),
+        );
+        env.fixed.insert(
+            (fixed.index(), -1),
+            QuotientExpr::Mem(QuotientMem::Literal(0x120)),
+        );
+        env.instance.insert(
+            (instance.index(), 0),
+            QuotientExpr::Mem(QuotientMem::Literal(0x140)),
+        );
+        env.challenges.insert(
+            challenge.index(),
+            QuotientExpr::Mem(QuotientMem::Literal(0x160)),
+        );
+
+        let expected = expr.evaluate(
+            &|scalar| scalar,
+            &|_| panic!("test expression should not contain selectors"),
+            &|_query| values[&0x120],
+            &|query| {
+                assert_eq!(query.rotation(), Rotation::next());
+                values[&0x100]
+            },
+            &|query| {
+                assert_eq!(query.rotation(), Rotation::cur());
+                values[&0x140]
+            },
+            &|_| values[&0x160],
+            &|inner| -inner,
+            &|lhs, rhs| lhs + rhs,
+            &|lhs, rhs| lhs * rhs,
+            &|inner, scalar| inner * scalar,
+        );
+
+        let lowered = quotient_expr_from_expression(&env, &expr);
+        let mut builder = QuotientProgramBuilder::default();
+        builder.emit_expr(&lowered);
+        let actual = eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values);
+        assert_eq!(actual, expected);
+    }
+
+    fn eval_quotient_vm_for_test(bytes: &[u8], consts: &[U256], mem: &HashMap<u32, Fq>) -> Fq {
+        let mut idx = 0usize;
+        let mut stack: Vec<Fq> = Vec::new();
+
+        while idx < bytes.len() {
+            match bytes[idx] {
+                Q_OP_PUSH_CONST => {
+                    let slot = read_u16(bytes, idx + 1) as usize;
+                    stack.push(fq_from_u256(consts[slot]));
+                    idx += 3;
+                }
+                Q_OP_PUSH_CONST_U8 => {
+                    let slot = bytes[idx + 1] as usize;
+                    stack.push(fq_from_u256(consts[slot]));
+                    idx += 2;
+                }
+                Q_OP_PUSH_MEM_U16 => {
+                    let ptr = read_u16(bytes, idx + 1) as u32;
+                    stack.push(mem[&ptr]);
+                    idx += 3;
+                }
+                Q_OP_PUSH_MEM_LITERAL => {
+                    let ptr = read_u32(bytes, idx + 1);
+                    stack.push(mem[&ptr]);
+                    idx += 5;
+                }
+                Q_OP_ADD => {
+                    let rhs = stack.pop().expect("rhs");
+                    let lhs = stack.pop().expect("lhs");
+                    stack.push(lhs + rhs);
+                    idx += 1;
+                }
+                Q_OP_MUL => {
+                    let rhs = stack.pop().expect("rhs");
+                    let lhs = stack.pop().expect("lhs");
+                    stack.push(lhs * rhs);
+                    idx += 1;
+                }
+                Q_OP_NEG => {
+                    let value = stack.pop().expect("value");
+                    stack.push(-value);
+                    idx += 1;
+                }
+                Q_OP_ADD_CONST_U8 => {
+                    let slot = bytes[idx + 1] as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + fq_from_u256(consts[slot]));
+                    idx += 2;
+                }
+                Q_OP_MUL_CONST_U8 => {
+                    let slot = bytes[idx + 1] as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc * fq_from_u256(consts[slot]));
+                    idx += 2;
+                }
+                Q_OP_ADD_CONST => {
+                    let slot = read_u16(bytes, idx + 1) as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + fq_from_u256(consts[slot]));
+                    idx += 3;
+                }
+                Q_OP_MUL_CONST => {
+                    let slot = read_u16(bytes, idx + 1) as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc * fq_from_u256(consts[slot]));
+                    idx += 3;
+                }
+                Q_OP_ADD_MEM_U16 => {
+                    let ptr = read_u16(bytes, idx + 1) as u32;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + mem[&ptr]);
+                    idx += 3;
+                }
+                Q_OP_MUL_MEM_U16 => {
+                    let ptr = read_u16(bytes, idx + 1) as u32;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc * mem[&ptr]);
+                    idx += 3;
+                }
+                Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => {
+                    let lhs = read_u16(bytes, idx + 1) as u32;
+                    let rhs = read_u16(bytes, idx + 3) as u32;
+                    let slot = bytes[idx + 5] as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + mem[&lhs] * mem[&rhs] * fq_from_u256(consts[slot]));
+                    idx += 6;
+                }
+                Q_OP_ADD_MUL_CONST_U8_MEM_U16 => {
+                    let ptr = read_u16(bytes, idx + 1) as u32;
+                    let slot = bytes[idx + 3] as usize;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + fq_from_u256(consts[slot]) * mem[&ptr]);
+                    idx += 4;
+                }
+                Q_OP_ADD_MUL_MEM_MEM => {
+                    let lhs = read_u16(bytes, idx + 1) as u32;
+                    let rhs = read_u16(bytes, idx + 3) as u32;
+                    let acc = stack.pop().expect("acc");
+                    stack.push(acc + mem[&lhs] * mem[&rhs]);
+                    idx += 5;
+                }
+                op => panic!("unsupported test quotient VM op {op:#x} at byte {idx}"),
+            }
+        }
+
+        assert_eq!(stack.len(), 1, "test VM should leave one result");
+        stack.pop().unwrap()
+    }
+
+    fn fq_from_u256(value: U256) -> Fq {
+        let bytes = value.to_le_bytes::<32>();
+        let repr = <Fq as PrimeField>::Repr::from(bytes);
+        Option::<Fq>::from(Fq::from_repr(repr)).expect("canonical field element")
+    }
 }

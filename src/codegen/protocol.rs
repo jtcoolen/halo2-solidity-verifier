@@ -129,6 +129,9 @@ impl QuotientIdentityPlan {
     }
 }
 
+pub(crate) const TRACE_QUOTIENT_IDENTITY_BASE: u64 = 1_000;
+pub(crate) const TRACE_PCS_QUERY_BASE: u64 = 2_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UsedQueries {
     pub(crate) fixed: BTreeSet<QueryKey>,
@@ -227,6 +230,8 @@ pub(crate) struct ProtocolPlan {
     pub(crate) rotation_last: i32,
     pub(crate) proof: ProofReadPlan,
     pub(crate) pcs_queries: Vec<PcsQuerySource>,
+    pub(crate) quotient_trace_ids: Vec<u64>,
+    pub(crate) pcs_query_trace_ids: Vec<u64>,
     pub(crate) common_polys: BTreeSet<CommonPoly>,
     pub(crate) quotient: QuotientIdentityPlan,
 }
@@ -483,6 +488,12 @@ impl ProtocolPlan {
             lookup: lookup_identity_count,
             trash: num_trashcans,
         };
+        let quotient_trace_ids = (0..quotient.total())
+            .map(|idx| TRACE_QUOTIENT_IDENTITY_BASE + idx as u64)
+            .collect::<Vec<_>>();
+        let pcs_query_trace_ids = (0..pcs_queries.len())
+            .map(|idx| TRACE_PCS_QUERY_BASE + idx as u64)
+            .collect::<Vec<_>>();
 
         let plan = Self {
             num_fixeds,
@@ -507,6 +518,8 @@ impl ProtocolPlan {
             rotation_last,
             proof,
             pcs_queries,
+            quotient_trace_ids,
+            pcs_query_trace_ids,
             common_polys,
             quotient,
         };
@@ -616,6 +629,28 @@ impl ProtocolPlan {
             return Err("PCS query schedule must end with linearization query".to_string());
         }
 
+        if self.quotient_trace_ids.len() != self.quotient.total() {
+            return Err(format!(
+                "quotient trace id count mismatch: ids={} identities={}",
+                self.quotient_trace_ids.len(),
+                self.quotient.total()
+            ));
+        }
+        if self.pcs_query_trace_ids.len() != self.pcs_queries.len() {
+            return Err(format!(
+                "PCS trace id count mismatch: ids={} queries={}",
+                self.pcs_query_trace_ids.len(),
+                self.pcs_queries.len()
+            ));
+        }
+        if self
+            .quotient_trace_ids
+            .iter()
+            .any(|id| self.pcs_query_trace_ids.contains(id))
+        {
+            return Err("quotient and PCS trace id spaces overlap".to_string());
+        }
+
         let pcs_without_linearization = self.pcs_queries.len().saturating_sub(1);
         let proof_query_evals = self.proof.evals.len();
         if pcs_without_linearization != proof_query_evals {
@@ -648,6 +683,7 @@ mod tests {
         plonk::{Constraints, FirstPhase},
         poly::Rotation,
     };
+    use proptest::prelude::*;
 
     fn simple_cs() -> ConstraintSystem<Fq> {
         let mut cs = ConstraintSystem::default();
@@ -727,6 +763,13 @@ mod tests {
             ]
         );
         assert_eq!(plan.num_main_evals(), 4);
+        assert_eq!(plan.quotient_trace_ids, vec![TRACE_QUOTIENT_IDENTITY_BASE]);
+        assert_eq!(
+            plan.pcs_query_trace_ids,
+            (0..plan.pcs_queries.len())
+                .map(|idx| TRACE_PCS_QUERY_BASE + idx as u64)
+                .collect::<Vec<_>>()
+        );
         assert!(plan.validate().is_ok());
     }
 
@@ -784,5 +827,74 @@ mod tests {
         plan.proof.evals.push(EvalRead::Fixed(QueryKey::new(0, 0)));
         let err = plan.validate().unwrap_err();
         assert!(err.contains("simple selector"));
+    }
+
+    proptest! {
+        #[test]
+        fn protocol_plan_invariants_hold_for_small_constraint_systems(
+            n_advice in 1usize..6,
+            n_fixed in 0usize..4,
+            n_instance in 0usize..3,
+            n_perm in 0usize..6,
+            n_committed_instance in 0usize..3,
+        ) {
+            let mut cs = ConstraintSystem::default();
+            let advice = (0..n_advice).map(|_| cs.advice_column()).collect::<Vec<_>>();
+            let fixed = (0..n_fixed).map(|_| cs.fixed_column()).collect::<Vec<_>>();
+            let instance = (0..n_instance).map(|_| cs.instance_column()).collect::<Vec<_>>();
+
+            for column in advice.iter().take(n_perm.min(n_advice)) {
+                cs.enable_equality(*column);
+            }
+
+            cs.create_gate("pbt protocol plan", |meta| {
+                let mut expr = meta.query_advice(advice[0], Rotation::cur())
+                    * meta.query_advice(advice[0], Rotation::next())
+                    * meta.query_advice(advice[0], Rotation::prev());
+
+                for (idx, column) in advice.iter().enumerate() {
+                    let rotation = match idx % 3 {
+                        0 => Rotation::cur(),
+                        1 => Rotation::next(),
+                        _ => Rotation::prev(),
+                    };
+                    expr = expr + meta.query_advice(*column, rotation);
+                }
+                for (idx, column) in fixed.iter().enumerate() {
+                    let rotation = if idx % 2 == 0 { Rotation::cur() } else { Rotation::prev() };
+                    expr = expr + meta.query_fixed(*column, rotation);
+                }
+                for (idx, column) in instance.iter().enumerate() {
+                    let rotation = if idx % 2 == 0 { Rotation::cur() } else { Rotation::next() };
+                    expr = expr + meta.query_instance(*column, rotation);
+                }
+
+                Constraints::without_selector(vec![("pbt", expr)])
+            });
+
+            let committed = n_committed_instance.min(n_instance);
+            let plan = ProtocolPlan::from_constraint_system(&cs, committed);
+            prop_assert!(plan.validate().is_ok());
+            prop_assert_eq!(plan.pcs_queries.len(), plan.proof.evals.len() + 1);
+            prop_assert_eq!(plan.quotient_trace_ids.len(), plan.quotient.total());
+            prop_assert_eq!(plan.pcs_query_trace_ids.len(), plan.pcs_queries.len());
+            let simple_selector_eval = plan
+                .proof
+                .evals
+                .iter()
+                .all(|eval| !matches!(eval, EvalRead::Fixed(q) if plan.simple_selector_cols.contains(&q.column)));
+            prop_assert!(simple_selector_eval);
+
+            let committed_instance_reads_in_bounds = plan
+                .proof
+                .evals
+                .iter()
+                .filter_map(|eval| match eval {
+                    EvalRead::CommittedInstance(q) => Some(q.column),
+                    _ => None,
+                })
+                .all(|column| column < committed);
+            prop_assert!(committed_instance_reads_in_bounds);
+        }
     }
 }
