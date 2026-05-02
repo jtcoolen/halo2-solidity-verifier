@@ -1262,7 +1262,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 
 | Severity | Issue | Why it matters |
 | --- | --- | --- |
-| High / needs confirmation | Accumulator RHS fixed-base tail appears documented but not verified | The comment says RHS layout includes fixed-base scalars after the RHS point/scalar, but `fixed_scalar_ptr` is never used and `acc_expected_words` only permits two points plus two scalars. If the IVC accumulator relation is supposed to include terms such as `-G`, fixed commitments, or permutation commitments, the on-chain accumulator pairing is incomplete. |
+| Resolved / clarified | Accumulator RHS fixed-base tail appears documented but not verified | The current IVC verifier fully collapses the carried proof accumulator, so no fixed-base scalar tail remains in public instances. The generator now renders the no-tail layout explicitly and emits `fixed_scalar_ptr` only for future non-collapsed layouts with generated fixed bases. |
 | High / needs confirmation | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | The code says only `x3` is truncated, but `X1_POWERS_MPTR` stores `and(acc, 2^128 - 1)` and `x4_pow_i` is also masked. If the Rust verifier uses full Fr powers for these batching challenges, Solidity checks a different PCS batching equation. |
 | Medium | Gas logging is live in production path | `gas_checkpoint()` emits `LOG1` throughout `verifyProof`. This prevents `staticcall`/`view` usage, permanently emits logs for accepted proofs, and adds gas. A production verifier should compile this out. |
 | Medium / integration | Raw `verifyProof` does not bind application semantics | It verifies "this proof is valid for these public instances," but does not check what the first non-accumulator instances mean. A wrapper must bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
@@ -1271,7 +1271,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 
 ### F-1. Accumulator fixed-base terms look omitted
 
-Severity: High / needs confirmation.
+Status: Resolved / clarified.
 
 This block is suspicious:
 
@@ -1282,24 +1282,26 @@ let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
 let acc_msm_len := sub(acc_pair_ptr, acc_scratch)
 ```
 
-`fixed_scalar_ptr` is dead. No fixed-base scalars are read, and no MSM is
-built over `G1_BASE`, fixed commitments, or permutation commitments for the
-accumulator RHS.
+The current IVC verifier fully collapses the carried proof accumulator before it
+is exposed as public input. That means the on-chain accumulator schema is:
 
-This may be correct only if the collapsed accumulator public input already
-includes all fixed-base contributions inside `ACC_RHS_MPTR` and there is no
-scalar tail. If so, the comment is dangerous and should be deleted. If the
-comment is correct, this is a serious verifier soundness bug.
+```text
+acc_offset
+  LHS point limbs x/y, LHS scalar
+  RHS point limbs x/y, RHS scalar
+```
 
-Recommendation:
+No `-G`, fixed commitment, or permutation commitment scalar tail remains for
+this verifier. The generator now states this directly in the rendered
+`Halo2Verifier.sol` comments and renders `fixed_scalar_ptr` only when
+`acc_fixed_bases.len() > 0`, which is reserved for future partially-collapsed
+layouts. The instance-count check remains explicit:
 
-- Make the accumulator layout explicit in the generated comments and metadata.
-- If no fixed-base tail exists in this accumulator encoding, say so directly.
-- If the tail is real, include it in the RHS MSM and update `NUM_INSTANCES`
-  expectations accordingly.
-- Add a negative test where a nonzero fixed-base accumulator scalar is
-  required; the current code should fail that test if the tail is part of the
-  real relation.
+```solidity
+acc_expected_words = acc_offset + lhs_point + lhs_scalar + rhs_point + rhs_scalar + fixed_tail_len
+```
+
+For the current fully-collapsed IVC layout, `fixed_tail_len == 0`.
 
 ### F-2. Challenge truncation looks inconsistent
 
