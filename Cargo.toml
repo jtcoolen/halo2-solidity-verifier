@@ -128,7 +128,7 @@ fewer-point-sets = ["in-circuit-fewer-point-sets", "outer-fewer-point-sets"]
 # Enables native midfall verifier trace hooks used by the Rust/Solidity
 # differential coverage test. This is diagnostic-only and should stay off for
 # production verifier generation.
-rust-verifier-trace = ["midnight-proofs/solidity-verifier-trace"]
+rust-verifier-trace = ["midnight-proofs/solidity-verifier-trace", "truncated-challenges"]
 
 [[example]]
 name = "separately"

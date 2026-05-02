@@ -1,5 +1,203 @@
 # CTF Vulnerability Analysis: Halo2 Solidity Verifier
 
+## 2026-05-02 audit addendum: PCS scratch layout and instance-column shape
+
+Scope: current dirty worktree for the Halo2/Midnight Solidity verifier
+generator, especially:
+
+- `templates/Halo2Verifier.sol`
+- `src/codegen.rs`
+- `src/codegen/evaluator.rs`
+- `src/codegen/pcs/gwc19.rs`
+
+This pass focuses on generated verifier soundness, transcript equivalence with
+native Midnight verification, memory layout safety, and trace-mode behavior.
+
+### Findings overview
+
+| ID | Severity | Title |
+| --- | --- | --- |
+| D-1 | High | Variable PCS scratch writes can overwrite live verifier state |
+| D-2 | Medium | Committed-instance transcript shape is hardcoded to one identity |
+| D-3 | Medium | Multiple public instance columns are accepted but aliased |
+| D-4 | Low | Trace-only precompile calls perturb verifier success |
+
+### D-1. Variable PCS scratch writes can overwrite live verifier state
+
+Severity: High.
+
+The template reserves fixed scratch windows for rotations, x1 powers, q_com,
+and q_eval_set:
+
+- `templates/Halo2Verifier.sol`: `ROT_POINTS_MPTR`
+- `templates/Halo2Verifier.sol`: `X1_POWERS_MPTR`
+- `templates/Halo2Verifier.sol`: `Q_COM_MPTR`
+- `templates/Halo2Verifier.sol`: `Q_EVAL_SET_MPTR`
+- `templates/Halo2Verifier.sol`: `Q_EVAL_CPTR_MPTR`
+- `templates/Halo2Verifier.sol`: `G1_IDENTITY_MPTR`
+
+The PCS emitter then writes circuit-dependent lengths into those fixed windows:
+
+- `src/codegen/pcs/gwc19.rs`: `distinct_rotations`
+- `src/codegen/pcs/gwc19.rs`: `nb_x1_powers`
+- `src/codegen/pcs/gwc19.rs`: q_eval_set persistence under
+  `Q_EVAL_SET_MPTR`
+
+There is no capacity check in `Halo2Verifier::validate_layout`; it validates
+proof, VK, commitment, and selector layout, but not the PCS scratch bounds.
+
+Impact:
+
+- A circuit with enough distinct rotations, enough commitments in one point
+  set, or wide enough point sets can overwrite adjacent live state.
+- Overwrites can corrupt `Q_EVAL_CPTR_MPTR`, `G1_IDENTITY_MPTR`, decoded evals,
+  or copied commitments.
+- The transcript can absorb one set of q_eval scalars while the PCS algebra
+  reads another memory location, making the generated verifier check a
+  corrupted statement.
+
+Recommendation:
+
+- Derive the scratch offsets and reserved sizes from the generated circuit
+  dimensions.
+- Or reject unsupported dimensions in the generator before rendering Solidity.
+- Add layout validation for:
+  - `distinct_rotations.len()`
+  - `nb_x1_powers`
+  - total q_eval_set width, i.e. `sum(point_sets[s].len())`
+  - any trace-only MSM scratch reuse
+
+### D-2. Committed-instance transcript shape is hardcoded to one identity
+
+Severity: Medium.
+
+The Solidity verifier always absorbs one committed public-instance commitment:
+
+```yul
+// Absorb committed_pi = G1Affine::identity()
+mstore(buf_len, 0)
+mstore(add(buf_len, 0x20), 0)
+mstore(add(buf_len, 0x40), 0)
+mstore(add(buf_len, 0x60), 0)
+buf_len := add(buf_len, 0x80)
+```
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: unconditional committed identity absorb
+- `src/codegen.rs`: `SolidityGenerator::new` defaults
+  `num_committed_instances` to zero
+- `src/codegen.rs`: `set_num_committed_instances` accepts arbitrary `n`
+
+Native Midnight verification absorbs exactly the committed instance commitments
+provided to the verifier. Zero committed instance columns means absorb none;
+two committed columns means absorb two. The Solidity template currently hashes
+exactly one identity regardless of the generator setting.
+
+Impact:
+
+- With the default generator setting, the Solidity verifier transcript diverges
+  from native verification by one identity commitment.
+- With more than one committed instance column, the Solidity verifier omits the
+  remaining commitments.
+- Integrators can generate a verifier for a different Fiat-Shamir transcript
+  than the intended circuit/proof statement.
+
+Recommendation:
+
+- Enforce exactly one committed identity column if that is the only supported
+  Midnight deployment shape.
+- Otherwise generate transcript logic from `num_committed_instances`.
+- If commitments are not always identity, expose and validate them explicitly in
+  the verifier ABI.
+
+### D-3. Multiple public instance columns are accepted but aliased
+
+Severity: Medium.
+
+The generator accepts up to two instance columns:
+
+```rust
+if vk.cs().num_instance_columns() > 2 {
+    return Err(GeneratorError::TooManyInstanceColumns { ... });
+}
+```
+
+But all non-committed instance queries resolve to one flat `INSTANCE_EVAL_MPTR`
+value:
+
+- `templates/Halo2Verifier.sol`: computes one `instance_eval` from one flat
+  `instances` array
+- `src/codegen.rs`: non-committed instance queries return
+  `self.data.instance_eval`
+- `src/codegen/evaluator.rs`: `instance_eval_at` returns
+  `self.data.instance_eval` for all non-committed columns
+
+Native Midnight verification absorbs and evaluates each non-committed instance
+column separately.
+
+Impact:
+
+- A circuit with two normal public instance columns can be generated without an
+  error.
+- The Solidity verifier treats constraints over column 1 as constraints over
+  the same flat public-input evaluation used for column 0.
+- Proofs are checked against an aliased public-input statement rather than the
+  native per-column statement.
+
+Recommendation:
+
+- Reject configurations with more than one non-committed instance column.
+- Or generate a column-separated ABI, transcript absorb, and Lagrange
+  evaluation path.
+- Add tests covering at least:
+  - zero committed plus two non-committed instance columns
+  - one committed plus one non-committed instance column
+  - two committed instance columns
+
+### D-4. Trace-only precompile calls perturb verifier success
+
+Severity: Low.
+
+The new trace materialization paths use:
+
+```yul
+success := and(success, staticcall(...))
+```
+
+Yul evaluates the `staticcall` even when `success` is already false. The call
+result is then folded into production `success`.
+
+Relevant code:
+
+- `src/codegen/pcs/gwc19.rs`: trace per-set q_com materialization
+- `templates/Halo2Verifier.sol`: trace linearization commitment
+  materialization
+
+Impact:
+
+- Trace builds can enter EC precompiles on paths that production logic intends
+  to skip after a prior failure.
+- Trace-only precompile failures can change the verifier result.
+- Trace output can stop being a faithful diagnostic view of the production
+  verifier.
+
+Recommendation:
+
+- Guard diagnostic precompile calls with `if success { ... }`.
+- Or accumulate trace precompile status in a separate `trace_success` variable
+  that does not affect verifier acceptance.
+- Keep trace scratch isolated from production scratch regions.
+
+Test status:
+
+- `cargo test --lib --quiet` failed with 64 passing tests and one failure:
+  `codegen::tests::failed_success_paths_do_not_enter_ec_precompiles`.
+- The failing test confirms that `and(success, staticcall(...))` reappeared in
+  trace paths.
+
+---
+
 ## 2026-05-01 audit pass: current split BLS12-381 verifier generator
 
 Scope: current Halo2/Midnight Solidity verifier generator, especially:
@@ -1505,3 +1703,135 @@ The two items to resolve first are the accumulator RHS layout mismatch and the
 Reference:
 
 - EIP-2537: https://eips.ethereum.org/EIPS/eip-2537
+
+## 2026-05-02 continuation review findings
+
+Scope: follow-up static review of the current working tree, with emphasis on
+CTF-relevant compiler shape mismatches and deployable generated artifacts.
+
+### R-1. Unsupported instance columns collapse into one eval
+
+Severity: High.
+
+Relevant code:
+
+- `src/codegen/evaluator.rs`: `instance_eval_at`
+- `templates/Halo2Verifier.sol`: instance transcript absorption and Lagrange
+  evaluation prologue
+- `src/codegen.rs`: `try_new` and `set_num_committed_instances`
+
+The generator accepts up to two instance columns, but every non-committed
+instance query is mapped to the single `INSTANCE_EVAL_MPTR` value. The Solidity
+ABI/transcript also absorbs one flat `instances` array, not one length/value
+stream per instance column.
+
+Impact:
+
+- A circuit with two non-committed instance columns can be compiled into a
+  verifier for a different public-input statement.
+- Constraints querying distinct non-committed instance columns can be evaluated
+  against the same Lagrange-combined instance value.
+- This is a miscompiler for unsupported shapes, even if the current zkstdlib
+  fixture uses the narrow one committed / one non-committed split.
+
+Recommendation:
+
+- Reject generation unless
+  `vk.cs().num_instance_columns() - num_committed_instances == 1`.
+- Alternatively, implement per-column instance calldata layout, transcript
+  absorption, Lagrange evaluation buffers, and expression/quotient plumbing.
+
+### R-2. Committed instance commitments are hard-coded as identity
+
+Severity: High.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: unconditional `committed_pi =
+  G1Affine::identity()` absorption
+- `src/codegen/util.rs`: `committed_instance_comms`
+- `src/codegen/pcs/gwc19.rs`: committed-instance PCS query construction
+- `src/codegen.rs`: `set_num_committed_instances`
+
+The Solidity transcript always absorbs exactly one identity commitment, and the
+codegen points every committed-instance PCS query at `G1_IDENTITY_MPTR`. This
+only matches the narrow zkstdlib path with one identity committed instance.
+
+Impact:
+
+- Non-identity committed public inputs are not represented.
+- Zero committed inputs or multiple committed columns diverge from the native
+  transcript schedule.
+- Generated verifiers can silently verify a different Fiat-Shamir / PCS
+  statement than the circuit author intended.
+
+Recommendation:
+
+- Hard-reject unsupported `num_committed_instances` values and document the
+  identity-only committed instance mode.
+- Or extend the ABI/codegen to pass the actual committed commitment list, absorb
+  the exact count in the transcript, and use those commitments in PCS queries.
+
+### R-3. Stale generated verifiers still miss precompile return checks
+
+Severity: Medium.
+
+Relevant code:
+
+- `generated/Halo2Verifier-10.sol`: `ec_add_acc`, `ec_mul_acc`,
+  `ec_add_tmp`, `ec_mul_tmp`, and `ec_pairing`
+- Other checked-in `generated/Halo2Verifier-*.sol` artifacts with the same
+  helper shape
+
+The current templates include much better EIP-2537 precompile return-size
+checks and constructor smoke tests, but the checked-in generated verifier
+artifacts are stale. They still call precompiles using only the `staticcall`
+success bit, then consume output memory without requiring the expected
+`returndatasize()`.
+
+Impact:
+
+- On chains or local forks without EIP-2537 at the expected addresses, calls to
+  empty accounts can succeed with empty returndata and stale memory.
+- If a stale generated artifact is deployed as the CTF target, invalid proofs
+  may fail open in wrong-chain or inaccurate-test-environment conditions.
+
+Recommendation:
+
+- Regenerate all committed `generated/*.sol` artifacts from the fixed templates.
+- Remove stale generated verifier artifacts from deployable outputs if they are
+  not intended to be used.
+- Add a check in CI that generated artifacts contain the same precompile
+  return-size and smoke-test guards as the templates.
+
+### R-4. Accumulator zero scalars skip point validation
+
+Severity: Medium.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: LHS accumulator scalar switch
+- `templates/Halo2Verifier.sol`: RHS accumulator scalar switch
+- `templates/Halo2Verifier.sol`: `load_acc_point`
+
+`load_acc_point` range-decodes accumulator points, but curve/subgroup
+validation is deferred until the point reaches an EIP-2537 MSM or pairing call.
+When the public scalar is zero, the LHS path normalizes the decoded point to
+identity and never sends the supplied point to a precompile; the RHS path also
+drops a zero-scalar variable-base contribution.
+
+Impact:
+
+- Arbitrary in-field coordinates can be accepted as an equivalent zero
+  contribution when the associated scalar is zero.
+- If consumers bind raw public-input bytes, this creates calldata malleability
+  around accumulator encodings.
+- If the circuit/application expects canonical accumulator points even for
+  zero-scalar terms, the Solidity verifier accepts encodings outside that
+  intended language.
+
+Recommendation:
+
+- Validate decoded accumulator points before applying the scalar switch.
+- Or explicitly require the canonical identity encoding whenever the associated
+  scalar is zero.

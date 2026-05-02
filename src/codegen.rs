@@ -3370,6 +3370,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         cse_mptr: usize,
         helpers: bool,
+        trace: bool,
     ) -> Vec<Vec<String>> {
         let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
         let exprs = identities
@@ -3394,6 +3395,12 @@ impl<'a> SolidityGenerator<'a> {
             let value = emitter.emit_identity(expr, &mut block);
             block.push(format!("mstore({eval_scratch_slot:#x}, {value})"));
             block.push("}".to_string());
+            if trace {
+                block.push(format!(
+                    "trace_u256(q_trace_id, mload({eval_scratch_slot:#x}))"
+                ));
+                block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+            }
             block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
             for idx in 0..sorted_simple.len() {
                 block.push(format!(
@@ -3432,6 +3439,7 @@ impl<'a> SolidityGenerator<'a> {
         target: QuotientTarget,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
+        trace: bool,
     ) -> Vec<String> {
         let mut block = Vec::with_capacity(lines.len() + 6);
         block.push("{".to_string());
@@ -3441,6 +3449,12 @@ impl<'a> SolidityGenerator<'a> {
         }
         block.push(format!("mstore({eval_scratch_slot:#x}, {var})"));
         block.push("}".to_string());
+        if trace {
+            block.push(format!(
+                "trace_u256(q_trace_id, mload({eval_scratch_slot:#x}))"
+            ));
+            block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+        }
         block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
         if !sorted_simple.is_empty() {
             block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
@@ -3721,6 +3735,7 @@ impl<'a> SolidityGenerator<'a> {
         pending_run: &mut Vec<(Vec<String>, String)>,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
+        trace: bool,
     ) {
         let Some(selector_idx) = pending_selector.take() else {
             return;
@@ -3734,6 +3749,7 @@ impl<'a> SolidityGenerator<'a> {
                 QuotientTarget::Selector(selector_idx),
                 sorted_simple,
                 eval_scratch_slot,
+                trace,
             ));
         } else if !run.is_empty() {
             computations.push(Self::selector_run_quotient_block(
@@ -3875,7 +3891,12 @@ impl<'a> SolidityGenerator<'a> {
         block: &mut Vec<String>,
         value: impl AsRef<str>,
         sorted_simple: &[usize],
+        trace: bool,
     ) {
+        if trace {
+            block.push(format!("trace_u256(q_trace_id, {})", value.as_ref()));
+            block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+        }
         Self::push_structured_fold_advance(block, 1, sorted_simple, "q_main_fold_i");
         block.push(format!(
             "quotient_eval_numer := addmod(quotient_eval_numer, {}, r)",
@@ -3902,6 +3923,7 @@ impl<'a> SolidityGenerator<'a> {
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
         scratch_mptr: usize,
+        trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_permutation_zs == 0 {
             return None;
@@ -3991,6 +4013,10 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let fold_eval = |block: &mut Vec<String>| {
+            if trace {
+                block.push("trace_u256(q_trace_id, q_perm_eval)".to_string());
+                block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+            }
             block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
             if !sorted_simple.is_empty() {
                 block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
@@ -4093,6 +4119,7 @@ impl<'a> SolidityGenerator<'a> {
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
         scratch_mptr: usize,
+        trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_lookups == 0 {
             return None;
@@ -4138,7 +4165,7 @@ impl<'a> SolidityGenerator<'a> {
                 "let q_lookup_eval := mulmod(q_lookup_lsum, {}, r)",
                 z_eval
             ));
-            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
             block.push("}".to_string());
 
             for (input_chunk, h_eval) in
@@ -4149,7 +4176,12 @@ impl<'a> SolidityGenerator<'a> {
 
                 if k == 0 {
                     block.push("let q_lookup_eval := 0".to_string());
-                    Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+                    Self::push_structured_main_fold(
+                        &mut block,
+                        "q_lookup_eval",
+                        sorted_simple,
+                        trace,
+                    );
                     block.push("}".to_string());
                     continue;
                 }
@@ -4229,7 +4261,7 @@ impl<'a> SolidityGenerator<'a> {
                     "let q_lookup_eval := addmod(mulmod({}, q_lookup_product, r), sub(r, q_lookup_sum), r)",
                     h_eval
                 ));
-                Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+                Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
                 block.push("}".to_string());
             }
 
@@ -4272,7 +4304,7 @@ impl<'a> SolidityGenerator<'a> {
             ));
             block
                 .push("let q_lookup_eval := mulmod(q_lookup_active, q_lookup_core, r)".to_string());
-            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple);
+            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
             block.push("}".to_string());
 
             block.push("}".to_string());
@@ -4288,6 +4320,7 @@ impl<'a> SolidityGenerator<'a> {
         data: &Data,
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
+        trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_trashcans == 0 {
             return None;
@@ -4319,7 +4352,7 @@ impl<'a> SolidityGenerator<'a> {
             block.push(format!(
                 "let q_trash_eval := addmod({compressed_var}, sub(r, q_trash_scaled), r)"
             ));
-            Self::push_structured_main_fold(&mut block, "q_trash_eval", sorted_simple);
+            Self::push_structured_main_fold(&mut block, "q_trash_eval", sorted_simple, trace);
             block.push("}".to_string());
         }
 
@@ -4333,6 +4366,7 @@ impl<'a> SolidityGenerator<'a> {
         data: &Data,
         sorted_simple: &[usize],
         scratch_mptr: usize,
+        trace: bool,
     ) -> Vec<Vec<String>> {
         let evaluator = Evaluator::new(self.vk.cs(), meta, data).with_pow5_helper(true);
         let eval_scratch_slot =
@@ -4395,6 +4429,7 @@ impl<'a> SolidityGenerator<'a> {
                             &mut pending_selector_run,
                             sorted_simple,
                             eval_scratch_slot,
+                            trace,
                         );
                         pending_selector = Some(idx);
                         pending_selector_run.push((lines, var));
@@ -4407,6 +4442,7 @@ impl<'a> SolidityGenerator<'a> {
                         &mut pending_selector_run,
                         sorted_simple,
                         eval_scratch_slot,
+                        trace,
                     );
                     computations.push(Self::direct_quotient_block(
                         &lines,
@@ -4414,6 +4450,7 @@ impl<'a> SolidityGenerator<'a> {
                         target,
                         sorted_simple,
                         eval_scratch_slot,
+                        trace,
                     ));
                 }
             }
@@ -4424,6 +4461,7 @@ impl<'a> SolidityGenerator<'a> {
             &mut pending_selector_run,
             sorted_simple,
             eval_scratch_slot,
+            trace,
         );
 
         if let Some(block) = Self::structured_permutation_loop_block(
@@ -4432,6 +4470,7 @@ impl<'a> SolidityGenerator<'a> {
             &evaluator,
             sorted_simple,
             scratch_mptr,
+            trace,
         ) {
             computations.push(block);
         }
@@ -4442,11 +4481,13 @@ impl<'a> SolidityGenerator<'a> {
             &evaluator,
             sorted_simple,
             eval_scratch_slot,
+            trace,
         ) {
             computations.push(block);
         }
 
-        if let Some(block) = self.structured_trash_loop_block(meta, data, &evaluator, sorted_simple)
+        if let Some(block) =
+            self.structured_trash_loop_block(meta, data, &evaluator, sorted_simple, trace)
         {
             computations.push(block);
         }
@@ -4553,6 +4594,7 @@ impl<'a> SolidityGenerator<'a> {
                 identity.target,
                 &sorted_simple,
                 eval_scratch_slot,
+                false,
             ));
         }
         if quotient_plan.has_native_permutation {
@@ -4562,6 +4604,7 @@ impl<'a> SolidityGenerator<'a> {
                 &evaluator,
                 &sorted_simple,
                 quotient_stack_mptr,
+                false,
             ) {
                 quotient_native_permutation_computation = block;
             }
@@ -4573,13 +4616,14 @@ impl<'a> SolidityGenerator<'a> {
                 identity.target,
                 &sorted_simple,
                 eval_scratch_slot,
+                false,
             ));
         }
         if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
             && meta.num_trashcans > 0
         {
             if let Some(block) =
-                self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple)
+                self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple, false)
             {
                 quotient_post_vm_computations.push(block);
             }
@@ -4611,6 +4655,7 @@ impl<'a> SolidityGenerator<'a> {
             .any(|line| line.contains("q_limb7_wide("));
 
         Halo2QuotientEvaluator {
+            trace: false,
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,
@@ -4760,6 +4805,7 @@ impl<'a> SolidityGenerator<'a> {
                 &data,
                 &sorted_simple,
                 quotient_tmp_mptr,
+                trace,
             );
         } else if use_inline_cse {
             quotient_eval_numer_computations = Self::inline_cse_quotient_computations(
@@ -4767,6 +4813,7 @@ impl<'a> SolidityGenerator<'a> {
                 &sorted_simple,
                 quotient_tmp_mptr,
                 quotient_yul_helpers,
+                trace,
             );
         } else {
             let eval_scratch_slot = quotient_stack_mptr;
@@ -4779,6 +4826,7 @@ impl<'a> SolidityGenerator<'a> {
                     identity.target,
                     &sorted_simple,
                     eval_scratch_slot,
+                    trace,
                 ));
             }
 
@@ -4789,6 +4837,7 @@ impl<'a> SolidityGenerator<'a> {
                     &evaluator,
                     &sorted_simple,
                     quotient_stack_mptr,
+                    trace,
                 ) {
                     quotient_native_permutation_computation = block;
                 }
@@ -4801,15 +4850,20 @@ impl<'a> SolidityGenerator<'a> {
                     identity.target,
                     &sorted_simple,
                     eval_scratch_slot,
+                    trace,
                 ));
             }
 
             if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
                 && meta.num_trashcans > 0
             {
-                if let Some(block) =
-                    self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple)
-                {
+                if let Some(block) = self.structured_trash_loop_block(
+                    &meta,
+                    &data,
+                    &evaluator,
+                    &sorted_simple,
+                    trace,
+                ) {
                     quotient_post_vm_computations.push(block);
                 }
             }
@@ -4848,7 +4902,7 @@ impl<'a> SolidityGenerator<'a> {
 
         let pcs_computations =
             self.scheme
-                .computations(&meta, &data, cfg!(feature = "truncated-challenges"));
+                .computations(&meta, &data, cfg!(feature = "truncated-challenges"), trace);
 
         // Per-user-phase breakdown (advices + user challenges).
         let mut challenge_offset = 0usize;

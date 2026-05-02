@@ -899,6 +899,10 @@ contract Halo2Verifier {
             // ===============================================================
             let proof_cptr := PROOF_CPTR
             let advice_walk := ADVICE_COMMS_MPTR_BASE
+            {%- if self.trace %}
+            let proof_commit_trace_id := 10000
+            let proof_eval_trace_id := 20000
+            {%- endif %}
 
             {%- for phase in user_phases %}
             // ---- User phase {{ loop.index }} ----
@@ -907,6 +911,10 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(advice_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, advice_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 advice_walk := add(advice_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
@@ -930,6 +938,10 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(lookup_m_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, lookup_m_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 lookup_m_walk := add(lookup_m_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
@@ -951,6 +963,10 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(perm_z_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, perm_z_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 perm_z_walk := add(perm_z_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
@@ -971,11 +987,19 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(lookup_helper_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, lookup_helper_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 lookup_helper_walk := add(lookup_helper_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
             calldatacopy(lookup_z_walk, proof_cptr, 0x80)
+            {%- if self.trace %}
+            trace_point(proof_commit_trace_id, lookup_z_walk)
+            proof_commit_trace_id := add(proof_commit_trace_id, 1)
+            {%- endif %}
             lookup_z_walk := add(lookup_z_walk, 0x80)
             proof_cptr := add(proof_cptr, 0x80)
             {%- endfor %}
@@ -995,6 +1019,10 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(trashcan_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, trashcan_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 trashcan_walk := add(trashcan_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
@@ -1018,6 +1046,10 @@ contract Halo2Verifier {
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
                 calldatacopy(quotient_walk, proof_cptr, 0x80)
+                {%- if self.trace %}
+                trace_point(proof_commit_trace_id, quotient_walk)
+                proof_commit_trace_id := add(proof_commit_trace_id, 1)
+                {%- endif %}
                 quotient_walk := add(quotient_walk, 0x80)
                 proof_cptr := add(proof_cptr, 0x80)
             }
@@ -1040,10 +1072,14 @@ contract Halo2Verifier {
                     lt(proof_cptr, end)
                     {} {
                     let eval := calldataload(proof_cptr)
-                    success := and(success, lt(eval, r))
+                    if iszero(lt(eval, r)) { revert(0, 0) }
                     mstore(eval_buf, eval)
                     eval_buf := add(eval_buf, 0x20)
                     buf_len := common_word(buf_len, eval)
+                    {%- if self.trace %}
+                    trace_u256(proof_eval_trace_id, eval)
+                    proof_eval_trace_id := add(proof_eval_trace_id, 1)
+                    {%- endif %}
                     proof_cptr := add(proof_cptr, 0x20)
                 }
             }
@@ -1055,6 +1091,10 @@ contract Halo2Verifier {
             // ---- f_com (1 uncompressed G1) ----
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
             calldatacopy(F_COM_MPTR, proof_cptr, 0x80)
+            {%- if self.trace %}
+            trace_point(proof_commit_trace_id, F_COM_MPTR)
+            proof_commit_trace_id := add(proof_commit_trace_id, 1)
+            {%- endif %}
             proof_cptr := add(proof_cptr, 0x80)
 
             // ---- x3 ----
@@ -1078,8 +1118,12 @@ contract Halo2Verifier {
                 lt(proof_cptr, end)
                 {} {
                 let eval := calldataload(proof_cptr)
-                success := and(success, lt(eval, r))
+                if iszero(lt(eval, r)) { revert(0, 0) }
                 buf_len := common_word(buf_len, eval)
+                {%- if self.trace %}
+                trace_u256(proof_eval_trace_id, eval)
+                proof_eval_trace_id := add(proof_eval_trace_id, 1)
+                {%- endif %}
                 proof_cptr := add(proof_cptr, 0x20)
             }
 
@@ -1089,13 +1133,17 @@ contract Halo2Verifier {
             // ---- pi (1 uncompressed G1) ----
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
             calldatacopy(PI_MPTR, proof_cptr, 0x80)
+            {%- if self.trace %}
+            trace_point(proof_commit_trace_id, PI_MPTR)
+            proof_commit_trace_id := add(proof_commit_trace_id, 1)
+            {%- endif %}
             proof_cptr := add(proof_cptr, 0x80)
 
             // The hand-rolled proof parser must consume exactly the ABI
             // `proof` bytes before the `instances` length word. This is
             // redundant with the generated proof length today, but makes
             // future proof-layout drift fail closed.
-            success := and(success, eq(proof_cptr, NUM_INSTANCE_CPTR))
+            if iszero(eq(proof_cptr, NUM_INSTANCE_CPTR)) { revert(0, 0) }
 
             if iszero(success) { revert(0, 0) }
 
@@ -1244,6 +1292,36 @@ contract Halo2Verifier {
                 mstore(QUOTIENT_MPTR, x_split)
                 mstore(add(QUOTIENT_MPTR, 0x20), one_minus_x_n)
             }
+
+            {%- if self.trace %}
+            // Diagnostic-only materialization of the linearization commitment.
+            // The production path fuses these terms into the final PCS MSM.
+            {
+                let lin_scratch := add(SELECTOR_ACC_MPTR, {{ (simple_selector_cols.len() * 0x20)|hex() }})
+                let lin_pair := lin_scratch
+                let lin_cur_scalar := mload(add(QUOTIENT_MPTR, 0x20))
+                {%- for _ in 0..num_quotients %}
+                mcopy(lin_pair, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {{ (loop.index0 * 0x80)|hex() }}), 0x80)
+                mstore(add(lin_pair, 0x80), lin_cur_scalar)
+                lin_pair := add(lin_pair, 0xa0)
+                {%- if !loop.last %}
+                lin_cur_scalar := mulmod(lin_cur_scalar, mload(QUOTIENT_MPTR), r)
+                {%- endif %}
+                {%- endfor %}
+                {%- for col in simple_selector_cols %}
+                mcopy(lin_pair, {{ (fixed_comm_mptr + col * 0x80)|hex() }}, 0x80)
+                mstore(add(lin_pair, 0x80), mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }})))
+                lin_pair := add(lin_pair, 0xa0)
+                {%- endfor %}
+                let lin_trace_ok := staticcall(g1msm_gas_cap({{ ((num_quotients + simple_selector_cols.len()) * 0xa0)|hex() }}), 0x0c, lin_scratch, {{ ((num_quotients + simple_selector_cols.len()) * 0xa0)|hex() }}, lin_scratch, 0x80)
+                lin_trace_ok := and(lin_trace_ok, eq(returndatasize(), 0x80))
+                if iszero(lin_trace_ok) {
+                    mstore(0, 34)
+                    revert(0, 0x20)
+                }
+                trace_point(34, lin_scratch)
+            }
+            {%- endif %}
 
             {%- if self.gas_checkpoints %}
             gas_checkpoint(13) // after linearization scalar prep

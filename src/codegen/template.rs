@@ -287,6 +287,7 @@ pub(crate) struct QuotientExternal {
 #[derive(Template)]
 #[template(path = "Halo2QuotientEvaluator.sol")]
 pub(crate) struct Halo2QuotientEvaluator {
+    pub(crate) trace: bool,
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,

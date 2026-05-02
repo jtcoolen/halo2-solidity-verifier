@@ -429,6 +429,7 @@ pub(super) fn computations(
     meta: &ConstraintSystemMeta,
     data: &Data,
     truncated_challenges: bool,
+    trace: bool,
 ) -> Vec<Vec<String>> {
     /// 128-bit mask for `truncate(scalar)` in midnight-proofs:
     /// `truncate` keeps the lower `ceil(NUM_BITS/8)/2 = 16` bytes
@@ -775,6 +776,113 @@ pub(super) fn computations(
             blocks.push(lines);
             let _ = q_eval_base; // not needed at this layer, kept for symmetry.
         }
+    }
+
+    if trace {
+        let mut lines: Vec<String> = Vec::new();
+        let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
+        let linearization_comm = data.computed_quotient_comm;
+        let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
+        let linearization_term_count = meta.num_quotients + simple_selector_cols.len();
+        let trace_scratch = pcs_scratch_mptr;
+        lines.push("// trace per-set q_com commitments".to_string());
+        for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
+            let non_identity_terms = commitments_in_set
+                .iter()
+                .map(|entry| {
+                    if entry.comm == g1_identity {
+                        0
+                    } else if entry.comm == linearization_comm {
+                        linearization_term_count
+                    } else {
+                        1
+                    }
+                })
+                .sum::<usize>();
+            if non_identity_terms == 0 {
+                lines.push(format!("mcopy({trace_scratch:#x}, G1_IDENTITY_MPTR, 0x80)"));
+                lines.push(format!(
+                    "trace_point({}, {trace_scratch:#x})",
+                    40000 + set_idx
+                ));
+                continue;
+            }
+
+            let mut pair_idx = 0usize;
+            for (commitment_idx, c) in commitments_in_set.iter().enumerate() {
+                if c.comm == g1_identity {
+                    continue;
+                }
+                let scalar = if commitment_idx == 0 {
+                    "1".to_string()
+                } else {
+                    format!("mload(add(X1_POWERS_MPTR, {:#x}))", commitment_idx * 0x20)
+                };
+                if c.comm == linearization_comm {
+                    let lin_query_var =
+                        format!("q_com_lin_query_scalar_{set_idx}_{commitment_idx}");
+                    let lin_cur_var = format!("q_com_lin_cur_scalar_{set_idx}_{commitment_idx}");
+                    lines.push(format!("let {lin_query_var} := {scalar}"));
+                    lines.push(format!(
+                        "let {lin_cur_var} := mulmod({lin_query_var}, mload(add(QUOTIENT_MPTR, 0x20)), r)"
+                    ));
+
+                    for q_idx in 0..meta.num_quotients {
+                        let pair_base = trace_scratch + pair_idx * 0xa0;
+                        lines.push(format!(
+                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), 0x80)",
+                            q_idx * 0x80
+                        ));
+                        lines.push(format!("mstore({:#x}, {lin_cur_var})", pair_base + 0x80));
+                        pair_idx += 1;
+                        if q_idx + 1 != meta.num_quotients {
+                            lines.push(format!(
+                                "{lin_cur_var} := mulmod({lin_cur_var}, mload(QUOTIENT_MPTR), r)"
+                            ));
+                        }
+                    }
+
+                    for (sel_idx, col) in simple_selector_cols.iter().copied().enumerate() {
+                        let pair_base = trace_scratch + pair_idx * 0xa0;
+                        let selector_scalar =
+                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * 0x20);
+                        lines.push(format!(
+                            "mcopy({pair_base:#x}, {}, 0x80)",
+                            data.fixed_comms[col].ptr()
+                        ));
+                        lines.push(format!(
+                            "mstore({:#x}, mulmod({lin_query_var}, {}, r))",
+                            pair_base + 0x80,
+                            selector_scalar
+                        ));
+                        pair_idx += 1;
+                    }
+                } else {
+                    let pair_base = trace_scratch + pair_idx * 0xa0;
+                    lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
+                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + 0x80));
+                    pair_idx += 1;
+                }
+            }
+            debug_assert_eq!(pair_idx, non_identity_terms);
+            lines.push(format!(
+                "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({:#x}), 0x0c, {trace_scratch:#x}, {:#x}, {trace_scratch:#x}, 0x80)",
+                non_identity_terms * 0xa0,
+                non_identity_terms * 0xa0
+            ));
+            lines.push(format!(
+                "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), 0x80))"
+            ));
+            lines.push(format!(
+                "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, 0x20) }}",
+                40000 + set_idx
+            ));
+            lines.push(format!(
+                "trace_point({}, {trace_scratch:#x})",
+                40000 + set_idx
+            ));
+        }
+        blocks.push(lines);
     }
 
     // ------------------------------------------------------------------

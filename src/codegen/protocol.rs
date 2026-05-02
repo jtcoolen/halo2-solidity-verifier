@@ -129,7 +129,7 @@ impl QuotientIdentityPlan {
     }
 }
 
-pub(crate) const TRACE_QUOTIENT_IDENTITY_BASE: u64 = 1_000;
+pub(crate) const TRACE_QUOTIENT_IDENTITY_BASE: u64 = 30_000;
 pub(crate) const TRACE_PCS_QUERY_BASE: u64 = 2_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

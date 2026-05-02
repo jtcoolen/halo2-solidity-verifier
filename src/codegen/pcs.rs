@@ -84,9 +84,10 @@ impl BatchOpenScheme {
         meta: &ConstraintSystemMeta,
         data: &Data,
         truncated_challenges: bool,
+        trace: bool,
     ) -> Vec<Vec<String>> {
         match self {
-            Self::Gwc19 => gwc19::computations(meta, data, truncated_challenges),
+            Self::Gwc19 => gwc19::computations(meta, data, truncated_challenges, trace),
         }
     }
 
