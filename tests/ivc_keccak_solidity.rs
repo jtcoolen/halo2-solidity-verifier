@@ -815,6 +815,7 @@ fn ivc_final_keccak_solidity_e2e() {
     const IVC_K: u32 = 19;
     const DECIDER_K: u32 = 20;
     const SOLC_OPTIMIZE_RUNS: u32 = 1;
+    const EIP170_MAX_RUNTIME_SIZE: usize = 0x6000;
 
     // Bail out cleanly when solc isn't on PATH.
     if std::process::Command::new("solc")
@@ -1113,6 +1114,16 @@ fn ivc_final_keccak_solidity_e2e() {
         evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
     let vk_runtime_size = evm.code_size(vk_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
+    for (name, runtime_size) in [
+        ("Halo2Verifier", verifier_runtime_size),
+        ("Halo2VerifyingKey", vk_runtime_size),
+        ("Halo2QuotientEvaluator", quotient_runtime_size),
+    ] {
+        assert!(
+            runtime_size <= EIP170_MAX_RUNTIME_SIZE,
+            "{name} runtime {runtime_size} exceeds EIP-170 limit {EIP170_MAX_RUNTIME_SIZE}"
+        );
+    }
     let contract_size_summary = format!(
         "solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
          solc CBOR metadata: omitted\n\
