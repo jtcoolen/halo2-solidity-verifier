@@ -2,7 +2,8 @@
 
 use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
-    pcs::{BatchOpenScheme, PcsScratchRequirements},
+    memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
+    pcs::BatchOpenScheme,
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -112,8 +113,8 @@ impl Halo2VerifyingKey {
 
     pub(crate) fn len(&self) -> usize {
         // 32 bytes per scalar constant + 128 bytes per G1 point (EIP-2537 padded).
-        (self.constants.len() * 0x20)
-            + (self.fixed_comms.len() + self.permutation_comms.len()) * 0x80
+        (self.constants.len() * WORD_BYTES)
+            + (self.fixed_comms.len() + self.permutation_comms.len()) * G1_BYTES
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
@@ -164,6 +165,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
     pub(crate) proof_len: usize,
+    pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
@@ -211,7 +213,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) reversed_evals_mptr: Ptr,
     /// Codegen-time sizes of variable-width PCS scratch tables that are
     /// currently mapped into fixed template windows.
-    pub(crate) pcs_scratch_requirements: PcsScratchRequirements,
+    pub(crate) pcs_memory_requirements: PcsMemoryRequirements,
     /// Scratch base for simple-selector linearization accumulators.
     /// These values are needed only between quotient-eval emission and
     /// the linearization MSM, so the region may be reused by later PCS
@@ -295,6 +297,7 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
+    pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
@@ -335,10 +338,7 @@ impl Halo2VerifyingKey {
 
 impl Halo2Verifier {
     pub(crate) fn validate_layout(&self) -> Result<(), String> {
-        const ROT_POINTS_CAP_WORDS: usize = 80 - 52;
-        const X1_POWERS_CAP_WORDS: usize = 145 - 80;
-        const Q_COM_CAP_WORDS: usize = 0;
-        const Q_EVAL_SET_CAP_WORDS: usize = 201 - 145;
+        self.memory.validate()?;
 
         let proof_cptr = self.proof_cptr.value().as_usize();
         if proof_cptr + self.proof_len != self.num_instance_cptr {
@@ -347,7 +347,7 @@ impl Halo2Verifier {
                 self.proof_len, self.num_instance_cptr
             ));
         }
-        if self.num_instance_cptr + 0x20 != self.instance_cptr {
+        if self.num_instance_cptr + WORD_BYTES != self.instance_cptr {
             return Err(format!(
                 "instance calldata layout mismatch: num_instance_cptr({:#x}) + 0x20 != instance_cptr({:#x})",
                 self.num_instance_cptr, self.instance_cptr
@@ -369,7 +369,7 @@ impl Halo2Verifier {
             + self.lookup_helper_chunks_total
             + self.num_lookups
             + self.num_trashcans;
-        let expected_quotient_cptr = proof_cptr + non_quotient_g1s * 0x80;
+        let expected_quotient_cptr = proof_cptr + non_quotient_g1s * G1_BYTES;
         let quotient_cptr = self.quotient_comm_cptr.value().as_usize();
         if quotient_cptr != expected_quotient_cptr {
             return Err(format!(
@@ -377,8 +377,8 @@ impl Halo2Verifier {
             ));
         }
 
-        let expected_proof_len = (non_quotient_g1s + self.num_quotients + 2) * 0x80
-            + (self.num_evals + self.num_point_sets) * 0x20;
+        let expected_proof_len = (non_quotient_g1s + self.num_quotients + 2) * G1_BYTES
+            + (self.num_evals + self.num_point_sets) * WORD_BYTES;
         if self.proof_len != expected_proof_len {
             return Err(format!(
                 "proof length mismatch: got {:#x}, expected {expected_proof_len:#x}",
@@ -388,37 +388,12 @@ impl Halo2Verifier {
 
         let comms_base = self.comms_mptr_base.value().as_usize();
         let committed_g1s = non_quotient_g1s + self.num_quotients;
-        let expected_selector_acc = (comms_base + committed_g1s * 0x80).next_multiple_of(0x20);
+        let expected_selector_acc =
+            (comms_base + committed_g1s * G1_BYTES).next_multiple_of(WORD_BYTES);
         if self.selector_acc_mptr != expected_selector_acc {
             return Err(format!(
                 "selector accumulator layout mismatch: got {:#x}, expected {expected_selector_acc:#x}",
                 self.selector_acc_mptr
-            ));
-        }
-
-        let pcs = self.pcs_scratch_requirements;
-        if pcs.rot_points_words > ROT_POINTS_CAP_WORDS {
-            return Err(format!(
-                "PCS scratch layout mismatch: ROT_POINTS_MPTR needs {} word(s), capacity is {ROT_POINTS_CAP_WORDS}",
-                pcs.rot_points_words
-            ));
-        }
-        if pcs.x1_powers_words > X1_POWERS_CAP_WORDS {
-            return Err(format!(
-                "PCS scratch layout mismatch: X1_POWERS_MPTR needs {} word(s), capacity is {X1_POWERS_CAP_WORDS}",
-                pcs.x1_powers_words
-            ));
-        }
-        if pcs.q_com_words > Q_COM_CAP_WORDS {
-            return Err(format!(
-                "PCS scratch layout mismatch: Q_COM_MPTR needs {} word(s), capacity is {Q_COM_CAP_WORDS}",
-                pcs.q_com_words
-            ));
-        }
-        if pcs.q_eval_set_words > Q_EVAL_SET_CAP_WORDS {
-            return Err(format!(
-                "PCS scratch layout mismatch: Q_EVAL_SET_MPTR needs {} word(s), capacity is {Q_EVAL_SET_CAP_WORDS}",
-                pcs.q_eval_set_words
             ));
         }
 
@@ -469,8 +444,12 @@ mod tests {
     use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
     use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{
-        pcs::{BatchOpenScheme::Gwc19, PcsScratchRequirements},
-        util::Ptr,
+        memory::{
+            PcsMemoryRequirements, VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES,
+            WORD_BYTES,
+        },
+        pcs::BatchOpenScheme::Gwc19,
+        util::{ConstraintSystemMeta, Ptr},
     };
     use ruint::aliases::U256;
 
@@ -568,10 +547,17 @@ mod tests {
             + lookup_helper_chunks_total
             + num_lookups
             + num_trashcans;
-        let proof_len =
-            (non_quotient_g1s + num_quotients + 2) * 0x80 + (num_evals + num_point_sets) * 0x20;
+        let proof_len = (non_quotient_g1s + num_quotients + 2) * G1_BYTES
+            + (num_evals + num_point_sets) * WORD_BYTES;
         let comms_mptr_base = 0x2000usize;
-        let selector_acc_mptr = comms_mptr_base + (non_quotient_g1s + num_quotients) * 0x80;
+        let selector_acc_mptr = comms_mptr_base + (non_quotient_g1s + num_quotients) * G1_BYTES;
+        let memory = VerifierMemoryLayout::new(
+            &ConstraintSystemMeta::default(),
+            &synthetic_vk(0, 0),
+            Ptr::memory(0x1000),
+            VerifierMemoryLayoutConfig::default(),
+        );
+        let acc_msm_scratch = memory.acc_msm_scratch;
 
         Halo2Verifier {
             scheme: Gwc19,
@@ -585,13 +571,14 @@ mod tests {
             expected_vk_codehash: Some(U256::from(1u64)),
             vk_len: 0,
             proof_len,
+            memory,
             vk_mptr: Ptr::memory(0x1000),
             challenge_mptr: Ptr::memory(0x1200),
             theta_mptr: Ptr::memory(0x1300),
             proof_cptr: Ptr::calldata(proof_cptr),
             num_instance_cptr: proof_cptr + proof_len,
-            instance_cptr: proof_cptr + proof_len + 0x20,
-            quotient_comm_cptr: Ptr::calldata(proof_cptr + non_quotient_g1s * 0x80),
+            instance_cptr: proof_cptr + proof_len + WORD_BYTES,
+            quotient_comm_cptr: Ptr::calldata(proof_cptr + non_quotient_g1s * G1_BYTES),
             num_neg_lagranges: 0,
             user_phases: vec![],
             num_user_challenges: 0,
@@ -607,7 +594,7 @@ mod tests {
             lookup_chunks: vec![lookup_helper_chunks_total],
             comms_mptr_base: Ptr::memory(comms_mptr_base),
             reversed_evals_mptr: Ptr::memory(0x3000),
-            pcs_scratch_requirements: PcsScratchRequirements::default(),
+            pcs_memory_requirements: PcsMemoryRequirements::default(),
             selector_acc_mptr,
             batch_invert_scratch_mptr: selector_acc_mptr,
             quotient_external: None,
@@ -631,7 +618,7 @@ mod tests {
             expected_num_acc_limbs: 0,
             expected_num_acc_limb_bits: 0,
             acc_fixed_bases: vec![],
-            acc_msm_scratch: 0x7000,
+            acc_msm_scratch,
         }
     }
 
@@ -758,7 +745,7 @@ mod tests {
     #[test]
     fn verifier_layout_validation_rejects_pcs_scratch_overflow() {
         let mut verifier = synthetic_verifier();
-        verifier.pcs_scratch_requirements.rot_points_words = 29;
+        verifier.memory.pcs.rot_points_words = 29;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("ROT_POINTS_MPTR needs 29 word"),
@@ -766,7 +753,7 @@ mod tests {
         );
 
         let mut verifier = synthetic_verifier();
-        verifier.pcs_scratch_requirements.x1_powers_words = 66;
+        verifier.memory.pcs.x1_powers_words = 66;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("X1_POWERS_MPTR needs 66 word"),
@@ -774,7 +761,7 @@ mod tests {
         );
 
         let mut verifier = synthetic_verifier();
-        verifier.pcs_scratch_requirements.q_com_words = 1;
+        verifier.memory.pcs.q_com_words = 1;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("Q_COM_MPTR needs 1 word"),
@@ -782,7 +769,7 @@ mod tests {
         );
 
         let mut verifier = synthetic_verifier();
-        verifier.pcs_scratch_requirements.q_eval_set_words = 57;
+        verifier.memory.pcs.q_eval_set_words = 57;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("Q_EVAL_SET_MPTR needs 57 word"),

@@ -1,6 +1,7 @@
 use crate::codegen::{
     artifact::{PackedProgramCodec, PayloadSectionKind, VkPayloadLayout},
     evaluator::Evaluator,
+    memory::{VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES, WORD_BYTES},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
         QuotientProgram, UserPhase,
@@ -39,6 +40,7 @@ mod artifact;
 mod config;
 mod evaluator;
 mod generator;
+mod memory;
 mod pcs;
 mod protocol;
 mod quotient;
@@ -731,6 +733,47 @@ mod tests {
         assert!(
             !verifier_template.contains("return false;"),
             "generated verifier should not mix false returns with revert-on-invalid semantics"
+        );
+    }
+
+    #[test]
+    fn templates_use_planned_memory_slots_for_theta_and_commitment_layout() {
+        for (name, source) in [
+            (
+                "Halo2Verifier",
+                include_str!("../../templates/Halo2Verifier.sol"),
+            ),
+            (
+                "Halo2QuotientEvaluator",
+                include_str!("../../templates/Halo2QuotientEvaluator.sol"),
+            ),
+        ] {
+            assert!(
+                !source.contains("theta_mptr +"),
+                "{name} should render named planned theta-relative slots"
+            );
+            assert!(
+                !source.contains("comms_mptr_base +"),
+                "{name} should render named planned commitment bases"
+            );
+        }
+    }
+
+    #[test]
+    fn final_msm_pair_count_is_a_codegen_assertion() {
+        let source = include_str!("pcs/gwc19.rs");
+
+        assert!(
+            source.contains("pair_idx, final_msm_terms"),
+            "PCS emission should compare emitted final MSM pairs with the planned shape"
+        );
+        assert!(
+            source.contains("final MSM input term count changed during emission"),
+            "PCS emission should fail loudly if final MSM shape and Yul emission diverge"
+        );
+        assert!(
+            !source.contains("debug_assert_eq!(\n            pair_idx, final_msm_terms"),
+            "final MSM shape mismatches must not be debug-only"
         );
     }
 

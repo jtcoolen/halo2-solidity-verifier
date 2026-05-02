@@ -82,8 +82,7 @@ impl<'a> SolidityGenerator<'a> {
     pub fn proof_evaluation_counts(&self) -> ProofEvaluationCounts {
         let proof_cptr = Ptr::calldata(0x64);
         let vk = self.generate_vk();
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-        let (meta, _) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (_, meta, _, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
 
         let committed_instance = meta
             .instance_queries
@@ -566,9 +565,8 @@ impl<'a> SolidityGenerator<'a> {
             return vk;
         }
 
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-
-        let (pre_meta, pre_data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (_vk_mptr, pre_meta, pre_data, _) =
+            self.meta_data_for_stable_static_layout(&vk, proof_cptr);
         let (pre_quotient_program_build, _) =
             self.compact_quotient_program_for(&pre_meta, &pre_data);
         let quotient_const_words = pre_quotient_program_build.consts.len();
@@ -602,7 +600,7 @@ impl<'a> SolidityGenerator<'a> {
         );
         assert_eq!(
             payload_layout.total_bytes(),
-            vk.len() + (quotient_const_words + quotient_program_words) * 0x20,
+            vk.len() + (quotient_const_words + quotient_program_words) * WORD_BYTES,
             "typed VK payload layout must preserve the emitted byte length"
         );
 
@@ -611,7 +609,7 @@ impl<'a> SolidityGenerator<'a> {
         vk.constants
             .extend((0..quotient_program_words).map(|_| ("quotient_program", U256::ZERO)));
 
-        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (_, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
         let (quotient_program_build, _) = self.compact_quotient_program_for(&meta, &data);
         let quotient_program_chunks =
             PackedProgramCodec::encode_words(&quotient_program_build.bytes);
@@ -647,7 +645,7 @@ impl<'a> SolidityGenerator<'a> {
         vk: &Halo2VerifyingKey,
         vk_mptr: Ptr,
         proof_cptr: Ptr,
-    ) -> (ConstraintSystemMeta, Data) {
+    ) -> (ConstraintSystemMeta, Data, VerifierMemoryLayout) {
         // ------------------------------------------------------------------
         // Phase 3 / outer-fewer-point-sets two-pass `Data` construction.
         //
@@ -665,7 +663,13 @@ impl<'a> SolidityGenerator<'a> {
         // against unchanged meta", and the result is byte-identical
         // to the pre-Phase-3 single-pass path.
         // ------------------------------------------------------------------
-        let raw_data = Data::new(&self.meta, vk, vk_mptr, proof_cptr);
+        let raw_memory = self.memory_layout_for(
+            &self.meta,
+            vk,
+            vk_mptr,
+            VerifierMemoryLayoutConfig::default(),
+        );
+        let raw_data = Data::new(&self.meta, vk, proof_cptr, &raw_memory);
         let mut meta = self.meta.clone();
         let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
             BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
@@ -674,13 +678,48 @@ impl<'a> SolidityGenerator<'a> {
         };
         let main_evals = meta.num_evals;
         meta.set_num_dummy_evals(n_dummy);
-        let mut data = Data::new(&meta, vk, vk_mptr, proof_cptr);
+        let memory =
+            self.memory_layout_for(&meta, vk, vk_mptr, VerifierMemoryLayoutConfig::default());
+        let mut data = Data::new(&meta, vk, proof_cptr, &memory);
         if n_dummy > 0 {
             data.set_dummy_eval_words(main_evals, n_dummy);
         }
 
         meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
-        (meta, data)
+        let memory =
+            self.memory_layout_for(&meta, vk, vk_mptr, VerifierMemoryLayoutConfig::default());
+        (meta, data, memory)
+    }
+
+    fn meta_data_for_stable_static_layout(
+        &self,
+        vk: &Halo2VerifyingKey,
+        proof_cptr: Ptr,
+    ) -> (Ptr, ConstraintSystemMeta, Data, VerifierMemoryLayout) {
+        let mut vk_mptr = Ptr::memory(self.static_working_memory_size_for_meta(&self.meta));
+
+        for _ in 0..3 {
+            let (meta, data, memory) = self.meta_data_for_vk(vk, vk_mptr, proof_cptr);
+            let planned_mptr = self.static_working_memory_size_for_meta(&meta);
+            if planned_mptr == vk_mptr.value().as_usize() {
+                return (vk_mptr, meta, data, memory);
+            }
+            vk_mptr = Ptr::memory(planned_mptr);
+        }
+
+        panic!("static verifier memory layout did not converge after proof-shape planning");
+    }
+
+    fn memory_layout_for(
+        &self,
+        meta: &ConstraintSystemMeta,
+        vk: &Halo2VerifyingKey,
+        vk_mptr: Ptr,
+        mut config: VerifierMemoryLayoutConfig,
+    ) -> VerifierMemoryLayout {
+        config.transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
+        config.num_instances = self.num_instances;
+        VerifierMemoryLayout::new(meta, vk, vk_mptr, config)
     }
 
     fn compact_quotient_program_for(
@@ -808,12 +847,12 @@ impl<'a> SolidityGenerator<'a> {
         simple_selector_count: usize,
     ) -> QuotientExternal {
         let vk_end = frame_base + vk_len;
-        let evals_end = evals_base + num_evals * 0x20;
+        let evals_end = evals_base + num_evals * WORD_BYTES;
         let frame_end = vk_end.max(evals_end);
         QuotientExternal {
             frame_base,
             frame_len: frame_end - frame_base,
-            output_len: 0x40 + simple_selector_count * 0x20,
+            output_len: 2 * WORD_BYTES + simple_selector_count * WORD_BYTES,
             magic: QUOTIENT_EXTERNAL_MAGIC,
         }
     }
@@ -2092,9 +2131,8 @@ impl<'a> SolidityGenerator<'a> {
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
         let vk_len = vk.len();
-        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (vk_mptr, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
         let quotient_plan = self.quotient_program_plan(&meta, &data);
         let sorted_simple = quotient_plan.sorted_simple.clone();
 
@@ -2107,21 +2145,19 @@ impl<'a> SolidityGenerator<'a> {
             "external quotient evaluator is only implemented for the compact VM quotient path"
         );
 
-        let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
-        let total_advices: usize = meta.num_user_advices.iter().sum();
-        let comm_g1_count = total_advices
-            + meta.num_lookups
-            + meta.num_permutation_zs
-            + lookup_helper_chunks_total
-            + meta.num_lookups
-            + meta.num_trashcans
-            + meta.num_quotients;
-        let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
-        let selector_acc_mptr = after_comms.next_multiple_of(0x20);
-        let quotient_tmp_mptr =
-            (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
-
         let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
+        let memory = self.memory_layout_for(
+            &meta,
+            &vk,
+            vk_mptr,
+            VerifierMemoryLayoutConfig {
+                quotient_cse_temps: quotient_program_build.cse_temps,
+                quotient_stack_words: quotient_program_build.max_stack,
+                ..VerifierMemoryLayoutConfig::default()
+            },
+        );
+        let selector_acc_mptr = memory.selector_acc_mptr;
+        let quotient_tmp_mptr = memory.quotient_tmp_mptr;
         let quotient_program_chunks =
             PackedProgramCodec::encode_words(&quotient_program_build.bytes);
         let quotient_const_words = vk.quotient_const_words;
@@ -2142,7 +2178,7 @@ impl<'a> SolidityGenerator<'a> {
             quotient_program_words,
             "quotient program length changed after VK payload reservation"
         );
-        let quotient_stack_mptr = quotient_tmp_mptr + quotient_program_build.cse_temps * 0x20;
+        let quotient_stack_mptr = memory.quotient_stack_mptr;
         let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
         let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
         let quotient_program = Some(QuotientProgram {
@@ -2238,6 +2274,7 @@ impl<'a> SolidityGenerator<'a> {
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,
+            memory,
             vk_mptr,
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
@@ -2281,9 +2318,7 @@ impl<'a> SolidityGenerator<'a> {
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-
-        let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
+        let (vk_mptr, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
 
         let quotient_plan = self.quotient_program_plan(&meta, &data);
         let identities = self.quotient_identity_parts(&meta, &data).all_identities();
@@ -2300,72 +2335,96 @@ impl<'a> SolidityGenerator<'a> {
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
-        let comm_g1_count = total_advices
-            + meta.num_lookups
-            + meta.num_permutation_zs
-            + lookup_helper_chunks_total
-            + meta.num_lookups
-            + meta.num_trashcans
-            + meta.num_quotients;
-        let after_comms = data.comms_mptr_base.value().as_usize() + comm_g1_count * 0x80;
-        let selector_acc_mptr = after_comms.next_multiple_of(0x20);
-        let batch_invert_scratch_mptr = selector_acc_mptr;
+        let acc_msm_terms = self
+            .acc_encoding
+            .map(|acc_encoding| {
+                let limbs_per_instance = (254 / acc_encoding.num_limb_bits).max(1);
+                let coord_words = acc_encoding.num_limbs.div_ceil(limbs_per_instance);
+                let point_and_scalar_words = 4 * coord_words + 2;
+                let fixed_scalar_count = self
+                    .num_instances
+                    .checked_sub(acc_encoding.offset + point_and_scalar_words)
+                    .expect("accumulator public input exceeds num_instances");
+                fixed_scalar_count + 1
+            })
+            .unwrap_or(0);
+        let pcs_memory_requirements = self.scheme.memory_requirements(&meta, &data);
+        let quotient_cse_temps = quotient_program_build
+            .as_ref()
+            .map(|build| build.cse_temps)
+            .unwrap_or(0);
+        let quotient_stack_words = quotient_program_build
+            .as_ref()
+            .map(|build| build.max_stack)
+            .unwrap_or(0);
+        let memory = self.memory_layout_for(
+            &meta,
+            &vk,
+            vk_mptr,
+            VerifierMemoryLayoutConfig {
+                quotient_cse_temps,
+                quotient_stack_words,
+                acc_msm_terms,
+                pcs: pcs_memory_requirements,
+                ..VerifierMemoryLayoutConfig::default()
+            },
+        );
+        let selector_acc_mptr = memory.selector_acc_mptr;
+        let batch_invert_scratch_mptr = memory.batch_invert_scratch_mptr;
         let expected_vk_codehash = separate.then(|| {
             let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
             U256::from_be_bytes(digest)
         });
         let vk_len = vk.len();
-        let quotient_tmp_mptr =
-            (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
+        let quotient_tmp_mptr = memory.quotient_tmp_mptr;
         let quotient_external = external_quotient.then(|| {
             Self::quotient_external_frame(vk_mptr, vk_len, &meta, &data, sorted_simple.len())
         });
         let (expected_quotient_len, expected_quotient_codehash) = expected_quotient
             .map(|(len, codehash)| (Some(len), Some(codehash)))
             .unwrap_or((None, None));
-        let (quotient_program, quotient_stack_mptr) = if let Some(quotient_program_build) =
-            quotient_program_build
-        {
-            let quotient_program_chunks =
-                PackedProgramCodec::encode_words(&quotient_program_build.bytes);
-            let quotient_const_words = vk.quotient_const_words;
-            let quotient_program_words = vk.quotient_program_words;
-            let quotient_const_offset_words = vk
-                .quotient_const_offset_words
-                .expect("VK must carry quotient constants");
-            let quotient_program_offset_words = vk
-                .quotient_program_offset_words
-                .expect("VK must carry quotient program");
-            assert_eq!(
-                quotient_program_build.consts.len(),
-                quotient_const_words,
-                "quotient const table changed after VK payload reservation"
-            );
-            assert_eq!(
-                quotient_program_chunks.len(),
-                quotient_program_words,
-                "quotient program length changed after VK payload reservation"
-            );
-            let quotient_stack_mptr = quotient_tmp_mptr + quotient_program_build.cse_temps * 0x20;
-            let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
-            let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
-            (
-                Some(QuotientProgram {
-                    consts: quotient_program_build.consts,
-                    chunks: quotient_program_chunks,
-                    len: quotient_program_build.bytes.len(),
-                    packed32: quotient_program_build.packed32,
-                    cse_temps: quotient_program_build.cse_temps,
-                    const_mptr,
-                    tmp_mptr: quotient_tmp_mptr,
-                    stack_mptr: quotient_stack_mptr,
-                    program_mptr,
-                }),
-                quotient_stack_mptr,
-            )
-        } else {
-            (None, quotient_tmp_mptr)
-        };
+        let (quotient_program, quotient_stack_mptr) =
+            if let Some(quotient_program_build) = quotient_program_build {
+                let quotient_program_chunks =
+                    PackedProgramCodec::encode_words(&quotient_program_build.bytes);
+                let quotient_const_words = vk.quotient_const_words;
+                let quotient_program_words = vk.quotient_program_words;
+                let quotient_const_offset_words = vk
+                    .quotient_const_offset_words
+                    .expect("VK must carry quotient constants");
+                let quotient_program_offset_words = vk
+                    .quotient_program_offset_words
+                    .expect("VK must carry quotient program");
+                assert_eq!(
+                    quotient_program_build.consts.len(),
+                    quotient_const_words,
+                    "quotient const table changed after VK payload reservation"
+                );
+                assert_eq!(
+                    quotient_program_chunks.len(),
+                    quotient_program_words,
+                    "quotient program length changed after VK payload reservation"
+                );
+                let quotient_stack_mptr = memory.quotient_stack_mptr;
+                let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
+                let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
+                (
+                    Some(QuotientProgram {
+                        consts: quotient_program_build.consts,
+                        chunks: quotient_program_chunks,
+                        len: quotient_program_build.bytes.len(),
+                        packed32: quotient_program_build.packed32,
+                        cse_temps: quotient_program_build.cse_temps,
+                        const_mptr,
+                        tmp_mptr: quotient_tmp_mptr,
+                        stack_mptr: quotient_stack_mptr,
+                        program_mptr,
+                    }),
+                    quotient_stack_mptr,
+                )
+            } else {
+                (None, quotient_tmp_mptr)
+            };
 
         let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
@@ -2479,10 +2538,13 @@ impl<'a> SolidityGenerator<'a> {
                 .flat_map(|block| block.iter())
                 .any(|line| line.contains("q_limb7_wide("));
 
-        let pcs_scratch_requirements = self.scheme.scratch_requirements(&meta, &data);
-        let pcs_computations =
-            self.scheme
-                .computations(&meta, &data, cfg!(feature = "truncated-challenges"), trace);
+        let pcs_computations = self.scheme.computations(
+            &meta,
+            &data,
+            &memory,
+            cfg!(feature = "truncated-challenges"),
+            trace,
+        );
 
         // Per-user-phase breakdown (advices + user challenges).
         let mut challenge_offset = 0usize;
@@ -2506,7 +2568,7 @@ impl<'a> SolidityGenerator<'a> {
         // Compute VK / accumulator layout helpers before moving vk into
         // the template struct.
         let fixed_comm_mptr_byte = (vk_mptr + vk.constants.len()).value().as_usize();
-        let permutation_comm_mptr_byte = fixed_comm_mptr_byte + vk.fixed_comms.len() * 0x80;
+        let permutation_comm_mptr_byte = fixed_comm_mptr_byte + vk.fixed_comms.len() * G1_BYTES;
         let g1_base_mptr_byte = (vk_mptr + 11).value().as_usize();
 
         let mut acc_fixed_bases: Vec<(String, usize, bool)> = Vec::new();
@@ -2533,14 +2595,14 @@ impl<'a> SolidityGenerator<'a> {
                 for i in 0..num_fixed_bases {
                     acc_fixed_bases.push((
                         format!("self_vk_fixed_com_{i}"),
-                        fixed_comm_mptr_byte + i * 0x80,
+                        fixed_comm_mptr_byte + i * G1_BYTES,
                         false,
                     ));
                 }
                 for i in 0..num_perm_bases {
                     acc_fixed_bases.push((
                         format!("self_vk_perm_com_{i}"),
-                        permutation_comm_mptr_byte + i * 0x80,
+                        permutation_comm_mptr_byte + i * G1_BYTES,
                         false,
                     ));
                 }
@@ -2573,7 +2635,7 @@ impl<'a> SolidityGenerator<'a> {
             })
             .unwrap_or((false, 0, 0, 0));
 
-        let acc_msm_scratch = after_comms.max(0x7000).next_multiple_of(0x20);
+        let acc_msm_scratch = memory.acc_msm_scratch;
 
         let verifier = Halo2Verifier {
             scheme: self.scheme,
@@ -2586,6 +2648,7 @@ impl<'a> SolidityGenerator<'a> {
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,
+            memory,
             vk_mptr,
             num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
             user_phases,
@@ -2602,7 +2665,7 @@ impl<'a> SolidityGenerator<'a> {
             lookup_chunks: meta.lookup_chunks.clone(),
             comms_mptr_base: data.comms_mptr_base,
             reversed_evals_mptr: data.reversed_evals_mptr,
-            pcs_scratch_requirements,
+            pcs_memory_requirements,
             selector_acc_mptr,
             batch_invert_scratch_mptr,
             quotient_external,
@@ -2610,7 +2673,7 @@ impl<'a> SolidityGenerator<'a> {
             expected_quotient_codehash,
             proof_cptr,
             num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
-            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + 0x20,
+            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + WORD_BYTES,
             quotient_comm_cptr: data.quotient_comm_cptr,
             proof_len: meta.proof_len(self.scheme),
             challenge_mptr: data.challenge_mptr,
@@ -2714,22 +2777,8 @@ impl<'a> SolidityGenerator<'a> {
         // ----------------------------------------------------------
         let proof_cptr = Ptr::calldata(0x64);
         let vk = self.generate_vk();
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-
-        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
-        let mut meta = self.meta.clone();
-        let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
-            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
-        } else {
-            0
-        };
-        let main_evals = meta.num_evals;
-        meta.set_num_dummy_evals(n_dummy);
-        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
-        if n_dummy > 0 {
-            data.set_dummy_eval_words(main_evals, n_dummy);
-        }
-        let n_point_sets = BatchOpenScheme::num_point_sets(&meta, &data);
+        let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
+        let n_point_sets = meta.num_point_sets;
 
         // ----------------------------------------------------------
         // Build the prefix-G1 group counts in transcript order.
@@ -2842,22 +2891,8 @@ impl<'a> SolidityGenerator<'a> {
     pub(crate) fn repacked_proof_scalar_layout_for_test(&self) -> RepackedProofScalarLayout {
         let proof_cptr = Ptr::calldata(0x64);
         let vk = self.generate_vk();
-        let vk_mptr = Ptr::memory(self.static_working_memory_size(&vk, proof_cptr));
-
-        let raw_data = Data::new(&self.meta, &vk, vk_mptr, proof_cptr);
-        let mut meta = self.meta.clone();
-        let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
-            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
-        } else {
-            0
-        };
-        let main_evals = meta.num_evals;
-        meta.set_num_dummy_evals(n_dummy);
-        let mut data = Data::new(&meta, &vk, vk_mptr, proof_cptr);
-        if n_dummy > 0 {
-            data.set_dummy_eval_words(main_evals, n_dummy);
-        }
-        let num_point_sets = BatchOpenScheme::num_point_sets(&meta, &data);
+        let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
+        let num_point_sets = meta.num_point_sets;
 
         let cs = self.vk.cs();
         let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
@@ -2887,8 +2922,8 @@ impl<'a> SolidityGenerator<'a> {
         g1_groups.push(cs.degree() - 1);
 
         let prefix_g1_count: usize = g1_groups.iter().sum();
-        let eval_offset = prefix_g1_count * 0x80;
-        let q_eval_offset = eval_offset + meta.num_evals * 0x20 + 0x80;
+        let eval_offset = prefix_g1_count * G1_BYTES;
+        let q_eval_offset = eval_offset + meta.num_evals * WORD_BYTES + G1_BYTES;
         RepackedProofScalarLayout {
             eval_offset,
             num_evals: meta.num_evals,
@@ -2897,14 +2932,9 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    fn static_working_memory_size(&self, vk: &Halo2VerifyingKey, proof_cptr: Ptr) -> usize {
-        let pcs_computation = {
-            let mock_vk_mptr = Ptr::memory(0x100000);
-            let mock = Data::new(&self.meta, vk, mock_vk_mptr, proof_cptr);
-            self.scheme.static_working_memory_size(&self.meta, &mock)
-        };
-
-        let transcript_words = Self::transcript_buffer_words_bound(&self.meta, self.num_instances);
+    fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
+        let pcs_computation = self.scheme.static_working_memory_size();
+        let transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
 
         itertools::max([
             // Transcript buffer (streaming Keccak256). The buffer must
@@ -2924,7 +2954,7 @@ impl<'a> SolidityGenerator<'a> {
             16,
         ])
         .unwrap()
-            * 0x20
+            * WORD_BYTES
     }
 
     pub(super) fn transcript_buffer_words_bound(

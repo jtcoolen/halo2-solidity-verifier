@@ -206,7 +206,7 @@ pub(crate) fn used_lagrange(
     out
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProtocolPlan {
     pub(crate) num_fixeds: usize,
     pub(crate) permutation_columns: Vec<Column<Any>>,

@@ -89,6 +89,10 @@ small artifact-layout and packed-program ideas borrowed from
 `privacy-ethereum/halo2-solidity-verifier` PR #17, and why this repo keeps a
 static pinned verifier instead of adopting a fully reusable runtime artifact.
 
+See [`docs/MEMORY_LAYOUT.md`](./docs/MEMORY_LAYOUT.md) for the generated
+verifier memory planner, including the fixed theta-relative offsets,
+precompile-frame constants, scratch lifetimes, and update rules.
+
 ## Acknowledgement
 
 The template is heavily inspired by Aztec's [`BaseUltraVerifier.sol`](https://github.com/AztecProtocol/barretenberg/blob/4c456a2b196282160fd69bead6a1cea85289af37/sol/src/ultra/BaseUltraVerifier.sol).

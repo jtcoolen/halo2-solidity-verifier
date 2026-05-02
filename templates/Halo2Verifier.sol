@@ -63,84 +63,84 @@ contract Halo2Verifier {
     // runtime comes the challenge slots (challenge_mptr..) and the
     // per-stage scratch (theta_mptr..).
     // ----------------------------------------------------------------------
-    uint256 internal constant                VK_MPTR = {{ vk_mptr }};
-    uint256 internal constant         VK_DIGEST_MPTR = {{ vk_mptr }};
-    uint256 internal constant     NUM_INSTANCES_MPTR = {{ vk_mptr + 1 }};
-    uint256 internal constant                 K_MPTR = {{ vk_mptr + 2 }};
-    uint256 internal constant             N_INV_MPTR = {{ vk_mptr + 3 }};
-    uint256 internal constant             OMEGA_MPTR = {{ vk_mptr + 4 }};
-    uint256 internal constant         OMEGA_INV_MPTR = {{ vk_mptr + 5 }};
-    uint256 internal constant    OMEGA_INV_TO_L_MPTR = {{ vk_mptr + 6 }};
-    uint256 internal constant   HAS_ACCUMULATOR_MPTR = {{ vk_mptr + 7 }};
-    uint256 internal constant        ACC_OFFSET_MPTR = {{ vk_mptr + 8 }};
-    uint256 internal constant     NUM_ACC_LIMBS_MPTR = {{ vk_mptr + 9 }};
-    uint256 internal constant NUM_ACC_LIMB_BITS_MPTR = {{ vk_mptr + 10 }};
-    uint256 internal constant            G1_BASE_MPTR = {{ vk_mptr + 11 }};
-    uint256 internal constant            G2_BASE_MPTR = {{ vk_mptr + 15 }};
-    uint256 internal constant      NEG_S_G2_BASE_MPTR = {{ vk_mptr + 23 }};
+    uint256 internal constant                VK_MPTR = {{ memory.vk_mptr }};
+    uint256 internal constant         VK_DIGEST_MPTR = {{ memory.vk_mptr }};
+    uint256 internal constant     NUM_INSTANCES_MPTR = {{ memory.vk_mptr + 1 }};
+    uint256 internal constant                 K_MPTR = {{ memory.vk_mptr + 2 }};
+    uint256 internal constant             N_INV_MPTR = {{ memory.vk_mptr + 3 }};
+    uint256 internal constant             OMEGA_MPTR = {{ memory.vk_mptr + 4 }};
+    uint256 internal constant         OMEGA_INV_MPTR = {{ memory.vk_mptr + 5 }};
+    uint256 internal constant    OMEGA_INV_TO_L_MPTR = {{ memory.vk_mptr + 6 }};
+    uint256 internal constant   HAS_ACCUMULATOR_MPTR = {{ memory.vk_mptr + 7 }};
+    uint256 internal constant        ACC_OFFSET_MPTR = {{ memory.vk_mptr + 8 }};
+    uint256 internal constant     NUM_ACC_LIMBS_MPTR = {{ memory.vk_mptr + 9 }};
+    uint256 internal constant NUM_ACC_LIMB_BITS_MPTR = {{ memory.vk_mptr + 10 }};
+    uint256 internal constant            G1_BASE_MPTR = {{ memory.vk_mptr + 11 }};
+    uint256 internal constant            G2_BASE_MPTR = {{ memory.vk_mptr + 15 }};
+    uint256 internal constant      NEG_S_G2_BASE_MPTR = {{ memory.vk_mptr + 23 }};
 
-    uint256 internal constant CHALLENGE_MPTR = {{ challenge_mptr }};
+    uint256 internal constant CHALLENGE_MPTR = {{ memory.challenge_mptr }};
 
     // Challenge layout. Squeeze order in midnight-proofs:
     //   user_phase challenges (variable count)
     //   theta -> beta, gamma -> trash_challenge -> y -> x ->
     //   x1, x2 -> x3 -> x4
-    uint256 internal constant            THETA_MPTR = {{ theta_mptr }};
-    uint256 internal constant             BETA_MPTR = {{ theta_mptr + 1 }};
-    uint256 internal constant            GAMMA_MPTR = {{ theta_mptr + 2 }};
-    uint256 internal constant TRASH_CHALLENGE_MPTR = {{ theta_mptr + 3 }};
-    uint256 internal constant                Y_MPTR = {{ theta_mptr + 4 }};
-    uint256 internal constant                X_MPTR = {{ theta_mptr + 5 }};
-    uint256 internal constant               X1_MPTR = {{ theta_mptr + 6 }};
-    uint256 internal constant               X2_MPTR = {{ theta_mptr + 7 }};
-    uint256 internal constant               X3_MPTR = {{ theta_mptr + 8 }};
-    uint256 internal constant               X4_MPTR = {{ theta_mptr + 9 }};
+    uint256 internal constant            THETA_MPTR = {{ memory.theta_mptr }};
+    uint256 internal constant             BETA_MPTR = {{ memory.beta_mptr }};
+    uint256 internal constant            GAMMA_MPTR = {{ memory.gamma_mptr }};
+    uint256 internal constant TRASH_CHALLENGE_MPTR = {{ memory.trash_challenge_mptr }};
+    uint256 internal constant                Y_MPTR = {{ memory.y_mptr }};
+    uint256 internal constant                X_MPTR = {{ memory.x_mptr }};
+    uint256 internal constant               X1_MPTR = {{ memory.x1_mptr }};
+    uint256 internal constant               X2_MPTR = {{ memory.x2_mptr }};
+    uint256 internal constant               X3_MPTR = {{ memory.x3_mptr }};
+    uint256 internal constant               X4_MPTR = {{ memory.x4_mptr }};
 
     // Batch-open commitments live in 4-word EIP-2537 padded slots.
-    uint256 internal constant             F_COM_MPTR = {{ theta_mptr + 10 }};
-    uint256 internal constant                PI_MPTR = {{ theta_mptr + 14 }};
+    uint256 internal constant             F_COM_MPTR = {{ memory.f_com_mptr }};
+    uint256 internal constant                PI_MPTR = {{ memory.pi_mptr }};
 
     // Accumulator (KZG IVC).
-    uint256 internal constant          ACC_LHS_MPTR = {{ theta_mptr + 18 }};
-    uint256 internal constant          ACC_RHS_MPTR = {{ theta_mptr + 22 }};
+    uint256 internal constant          ACC_LHS_MPTR = {{ memory.acc_lhs_mptr }};
+    uint256 internal constant          ACC_RHS_MPTR = {{ memory.acc_rhs_mptr }};
 
     // Lagrange / linearization scratch.
-    uint256 internal constant              X_N_MPTR = {{ theta_mptr + 26 }};
-    uint256 internal constant  X_N_MINUS_1_INV_MPTR = {{ theta_mptr + 27 }};
-    uint256 internal constant           L_LAST_MPTR = {{ theta_mptr + 28 }};
-    uint256 internal constant          L_BLIND_MPTR = {{ theta_mptr + 29 }};
-    uint256 internal constant              L_0_MPTR = {{ theta_mptr + 30 }};
-    uint256 internal constant     INSTANCE_EVAL_MPTR = {{ theta_mptr + 31 }};
+    uint256 internal constant              X_N_MPTR = {{ memory.x_n_mptr }};
+    uint256 internal constant  X_N_MINUS_1_INV_MPTR = {{ memory.x_n_minus_1_inv_mptr }};
+    uint256 internal constant           L_LAST_MPTR = {{ memory.l_last_mptr }};
+    uint256 internal constant          L_BLIND_MPTR = {{ memory.l_blind_mptr }};
+    uint256 internal constant              L_0_MPTR = {{ memory.l_0_mptr }};
+    uint256 internal constant     INSTANCE_EVAL_MPTR = {{ memory.instance_eval_mptr }};
     // Legacy name: this is not h(x). It stores the expected opening
     // scalar for the linearized commitment, i.e. the negated y-batched
     // identity numerator reconstructed from the alleged evals at x.
-    uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ theta_mptr + 32 }};
-    uint256 internal constant         QUOTIENT_MPTR = {{ theta_mptr + 33 }};   // 4 words
-    uint256 internal constant            F_EVAL_MPTR = {{ theta_mptr + 38 }};
-    uint256 internal constant                 V_MPTR = {{ theta_mptr + 39 }};
-    uint256 internal constant         FINAL_COM_MPTR = {{ theta_mptr + 40 }};   // 4 words
-    uint256 internal constant      PAIRING_LHS_MPTR = {{ theta_mptr + 44 }};   // 4 words
-    uint256 internal constant      PAIRING_RHS_MPTR = {{ theta_mptr + 48 }};   // 4 words
+    uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ memory.quotient_eval_mptr }};
+    uint256 internal constant         QUOTIENT_MPTR = {{ memory.quotient_mptr }};   // 4 words
+    uint256 internal constant            F_EVAL_MPTR = {{ memory.f_eval_mptr }};
+    uint256 internal constant                 V_MPTR = {{ memory.v_mptr }};
+    uint256 internal constant         FINAL_COM_MPTR = {{ memory.final_com_mptr }};   // 4 words
+    uint256 internal constant      PAIRING_LHS_MPTR = {{ memory.pairing_lhs_mptr }};   // 4 words
+    uint256 internal constant      PAIRING_RHS_MPTR = {{ memory.pairing_rhs_mptr }};   // 4 words
 
     // Multi-prepare scratch (sized at codegen time).
-    uint256 internal constant       ROT_POINTS_MPTR = {{ theta_mptr + 52 }};
-    uint256 internal constant       X1_POWERS_MPTR = {{ theta_mptr + 80 }};
+    uint256 internal constant       ROT_POINTS_MPTR = {{ memory.rot_points_mptr }};
+    uint256 internal constant       X1_POWERS_MPTR = {{ memory.x1_powers_mptr }};
     // Q_COM materialization is currently fused into the final MSM scratch,
     // so this marker intentionally aliases Q_EVAL_SET_MPTR and has zero
     // reserved capacity until a future emitter starts writing Q_COM_MPTR.
-    uint256 internal constant            Q_COM_MPTR = {{ theta_mptr + 145 }};
-    uint256 internal constant      Q_EVAL_SET_MPTR = {{ theta_mptr + 145 }};
+    uint256 internal constant            Q_COM_MPTR = {{ memory.q_com_mptr }};
+    uint256 internal constant      Q_EVAL_SET_MPTR = {{ memory.q_eval_set_mptr }};
 
     // Q_EVAL_CPTR is set at runtime once the verifier reaches the q_evals
     // block of the proof; we keep it as a memory slot for symmetry.
-    uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ theta_mptr + 201 }};
+    uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ memory.q_eval_cptr_mptr }};
 
     // Reserved 4-word slot for the G1 identity (point at infinity) in
     // EIP-2537 padded form. EVM memory is zero-initialised, and we
     // never write to this region, so the four `mload`s below produce
     // 0,0,0,0 which is exactly the identity encoding the EIP-2537
     // ec_add / ec_mul precompiles accept.
-    uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 209 }};
+    uint256 internal constant       G1_IDENTITY_MPTR = {{ memory.g1_identity_mptr }};
 
     // Decoded polynomial-eval buffer (Optimisation H3). The off-chain
     // Solidity proof shim rewrites proof scalars into canonical BE words,
@@ -148,9 +148,9 @@ contract Halo2Verifier {
     // side `evaluations` loop range-checks and spills that value here so
     // downstream eval references (gate evaluator + PCS q_eval Horner)
     // become 3-gas `mload(...)` instead of calldata reads.
-    uint256 internal constant     REVERSED_EVALS_MPTR = {{ reversed_evals_mptr }};
-    uint256 internal constant      SELECTOR_ACC_MPTR = {{ selector_acc_mptr|hex() }};
-    uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ batch_invert_scratch_mptr|hex() }};
+    uint256 internal constant     REVERSED_EVALS_MPTR = {{ memory.reversed_evals_mptr }};
+    uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
+    uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ memory.batch_invert_scratch_mptr|hex() }};
 
     // ----------------------------------------------------------------------
     // Per-category bases for EIP-2537 padded G1 commitments. The proof
@@ -167,13 +167,13 @@ contract Halo2Verifier {
     //   TRASHCAN_COMMS_MPTR_BASE        + ... + 4*num_lookups
     //   QUOTIENT_LIMB_COMMS_MPTR_BASE   + ... + 4*num_trashcans
     // ----------------------------------------------------------------------
-    uint256 internal constant         ADVICE_COMMS_MPTR_BASE = {{ comms_mptr_base }};
-    uint256 internal constant       LOOKUP_M_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices }};
-    uint256 internal constant         PERM_Z_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups }};
-    uint256 internal constant  LOOKUP_HELPER_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs }};
-    uint256 internal constant       LOOKUP_Z_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total }};
-    uint256 internal constant     TRASHCAN_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups }};
-    uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ comms_mptr_base + 4 * total_advices + 4 * num_lookups + 4 * num_permutation_zs + 4 * lookup_helper_chunks_total + 4 * num_lookups + 4 * num_trashcans }};
+    uint256 internal constant         ADVICE_COMMS_MPTR_BASE = {{ memory.advice_comms_mptr_base }};
+    uint256 internal constant       LOOKUP_M_COMMS_MPTR_BASE = {{ memory.lookup_m_comms_mptr_base }};
+    uint256 internal constant         PERM_Z_COMMS_MPTR_BASE = {{ memory.perm_z_comms_mptr_base }};
+    uint256 internal constant  LOOKUP_HELPER_COMMS_MPTR_BASE = {{ memory.lookup_helper_comms_mptr_base }};
+    uint256 internal constant       LOOKUP_Z_COMMS_MPTR_BASE = {{ memory.lookup_z_comms_mptr_base }};
+    uint256 internal constant     TRASHCAN_COMMS_MPTR_BASE = {{ memory.trashcan_comms_mptr_base }};
+    uint256 internal constant QUOTIENT_LIMB_COMMS_MPTR_BASE = {{ memory.quotient_limb_comms_mptr_base }};
 
     // Fr modulus.
     uint256 internal constant FR_MODULUS        = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
@@ -1529,7 +1529,7 @@ contract Halo2Verifier {
                 let lhs_scalar_ptr := add(acc_instance_ptr, mul(mul(2, coord_words), 0x20))
                 let lhs_ok, lhs_is_id := load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
                 success := and(success, lhs_ok)
-                let acc_scratch := {{ acc_msm_scratch|hex() }}
+                let acc_scratch := {{ memory.acc_msm_scratch|hex() }}
                 if iszero(lhs_is_id) {
                     let lhs_scalar := calldataload(lhs_scalar_ptr)
                     switch lhs_scalar

@@ -56,17 +56,12 @@
 //! For Step 5 we only emit the algebraic body; the template that
 //! consumes it will be rewritten in Step 6.
 
-use crate::codegen::util::{ConstraintSystemMeta, Data};
+use crate::codegen::{
+    memory::{PcsMemoryRequirements, VerifierMemoryLayout, PCS_STATIC_WORKING_WORDS},
+    util::{ConstraintSystemMeta, Data},
+};
 
 mod gwc19;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PcsScratchRequirements {
-    pub(crate) rot_points_words: usize,
-    pub(crate) x1_powers_words: usize,
-    pub(crate) q_com_words: usize,
-    pub(crate) q_eval_set_words: usize,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchOpenScheme {
@@ -77,13 +72,9 @@ pub enum BatchOpenScheme {
 }
 
 impl BatchOpenScheme {
-    pub(crate) fn static_working_memory_size(
-        &self,
-        meta: &ConstraintSystemMeta,
-        data: &Data,
-    ) -> usize {
+    pub(crate) fn static_working_memory_size(&self) -> usize {
         match self {
-            Self::Gwc19 => gwc19::static_working_memory_size(meta, data),
+            Self::Gwc19 => PCS_STATIC_WORKING_WORDS,
         }
     }
 
@@ -91,21 +82,22 @@ impl BatchOpenScheme {
         &self,
         meta: &ConstraintSystemMeta,
         data: &Data,
+        memory: &VerifierMemoryLayout,
         truncated_challenges: bool,
         trace: bool,
     ) -> Vec<Vec<String>> {
         match self {
-            Self::Gwc19 => gwc19::computations(meta, data, truncated_challenges, trace),
+            Self::Gwc19 => gwc19::computations(meta, data, memory, truncated_challenges, trace),
         }
     }
 
-    pub(crate) fn scratch_requirements(
+    pub(crate) fn memory_requirements(
         &self,
         meta: &ConstraintSystemMeta,
         data: &Data,
-    ) -> PcsScratchRequirements {
+    ) -> PcsMemoryRequirements {
         match self {
-            Self::Gwc19 => gwc19::scratch_requirements(meta, data),
+            Self::Gwc19 => gwc19::memory_requirements(meta, data),
         }
     }
 

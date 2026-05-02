@@ -43,42 +43,42 @@ contract Halo2QuotientEvaluator {
     // Start of the copied verifier-key payload in memory. The VK payload also
     // carries the compact quotient VM constant/program tables used by the
     // included numerator block.
-    uint256 internal constant                VK_MPTR = {{ vk_mptr }};
+    uint256 internal constant                VK_MPTR = {{ memory.vk_mptr }};
 
     // Fiat-Shamir challenge slots. Halo2Verifier sampled these in transcript
     // order before the external call. The evaluator only reads them.
-    uint256 internal constant        CHALLENGE_MPTR = {{ challenge_mptr }};
-    uint256 internal constant            THETA_MPTR = {{ theta_mptr }};
-    uint256 internal constant             BETA_MPTR = {{ theta_mptr + 1 }};
-    uint256 internal constant            GAMMA_MPTR = {{ theta_mptr + 2 }};
-    uint256 internal constant TRASH_CHALLENGE_MPTR = {{ theta_mptr + 3 }};
-    uint256 internal constant                Y_MPTR = {{ theta_mptr + 4 }};
-    uint256 internal constant                X_MPTR = {{ theta_mptr + 5 }};
-    uint256 internal constant               X1_MPTR = {{ theta_mptr + 6 }};
-    uint256 internal constant               X2_MPTR = {{ theta_mptr + 7 }};
-    uint256 internal constant               X3_MPTR = {{ theta_mptr + 8 }};
-    uint256 internal constant               X4_MPTR = {{ theta_mptr + 9 }};
+    uint256 internal constant        CHALLENGE_MPTR = {{ memory.challenge_mptr }};
+    uint256 internal constant            THETA_MPTR = {{ memory.theta_mptr }};
+    uint256 internal constant             BETA_MPTR = {{ memory.beta_mptr }};
+    uint256 internal constant            GAMMA_MPTR = {{ memory.gamma_mptr }};
+    uint256 internal constant TRASH_CHALLENGE_MPTR = {{ memory.trash_challenge_mptr }};
+    uint256 internal constant                Y_MPTR = {{ memory.y_mptr }};
+    uint256 internal constant                X_MPTR = {{ memory.x_mptr }};
+    uint256 internal constant               X1_MPTR = {{ memory.x1_mptr }};
+    uint256 internal constant               X2_MPTR = {{ memory.x2_mptr }};
+    uint256 internal constant               X3_MPTR = {{ memory.x3_mptr }};
+    uint256 internal constant               X4_MPTR = {{ memory.x4_mptr }};
 
     // Common polynomial values at x. Halo2Verifier computes these once after
     // sampling x and places them in the frame so the numerator block can share
     // the exact Rust verifier inputs.
-    uint256 internal constant              X_N_MPTR = {{ theta_mptr + 26 }};
-    uint256 internal constant  X_N_MINUS_1_INV_MPTR = {{ theta_mptr + 27 }};
-    uint256 internal constant           L_LAST_MPTR = {{ theta_mptr + 28 }};
-    uint256 internal constant          L_BLIND_MPTR = {{ theta_mptr + 29 }};
-    uint256 internal constant              L_0_MPTR = {{ theta_mptr + 30 }};
-    uint256 internal constant     INSTANCE_EVAL_MPTR = {{ theta_mptr + 31 }};
-    uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ theta_mptr + 32 }};
+    uint256 internal constant              X_N_MPTR = {{ memory.x_n_mptr }};
+    uint256 internal constant  X_N_MINUS_1_INV_MPTR = {{ memory.x_n_minus_1_inv_mptr }};
+    uint256 internal constant           L_LAST_MPTR = {{ memory.l_last_mptr }};
+    uint256 internal constant          L_BLIND_MPTR = {{ memory.l_blind_mptr }};
+    uint256 internal constant              L_0_MPTR = {{ memory.l_0_mptr }};
+    uint256 internal constant     INSTANCE_EVAL_MPTR = {{ memory.instance_eval_mptr }};
+    uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ memory.quotient_eval_mptr }};
 
     // Proof evaluation table. Values are already decoded as canonical Fr words
     // by Halo2Verifier. The generated numerator code indexes this table by the
     // same query order as the Rust verifier.
-    uint256 internal constant     REVERSED_EVALS_MPTR = {{ reversed_evals_mptr }};
+    uint256 internal constant     REVERSED_EVALS_MPTR = {{ memory.reversed_evals_mptr }};
 
     // Scratch/output region for simple-selector linearization accumulators.
     // The numerator block writes one bucket per simple selector, then the
     // fallback copies those buckets into the compact return frame.
-    uint256 internal constant      SELECTOR_ACC_MPTR = {{ selector_acc_mptr|hex() }};
+    uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
 
     // External-call frame metadata. The main verifier staticcalls this
     // contract with exactly QUOTIENT_FRAME_LEN bytes starting at

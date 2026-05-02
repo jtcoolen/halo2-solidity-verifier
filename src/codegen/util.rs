@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use crate::codegen::{
+    memory::{VerifierMemoryLayout, G1_BYTES, G1_WORDS, WORD_BYTES},
     protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
     BatchOpenScheme::{self, Gwc19},
@@ -60,7 +61,7 @@ type LookupEvalSlots = (Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Wo
 // `cargo check --lib` is green.
 // ----------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ConstraintSystemMeta {
     pub(crate) protocol: ProtocolPlan,
     pub(crate) num_fixeds: usize,
@@ -266,14 +267,16 @@ impl ConstraintSystemMeta {
         // hashes those padded bytes directly.
         let g1_count: usize =
             self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count(scheme);
-        g1_count * 0x80 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
+        g1_count * G1_BYTES
+            + self.num_evals * WORD_BYTES
+            + self.batch_open_extra_evals(scheme) * WORD_BYTES
     }
 
     pub(crate) fn batch_open_proof_len(&self, scheme: BatchOpenScheme) -> usize {
         match scheme {
             // Trailing G1 points are: f_com (1) + pi (1) = 2.
             // Plus the per-set q_evals (handled separately as scalars).
-            Gwc19 => self.batch_open_g1_count(scheme) * 0x80,
+            Gwc19 => self.batch_open_g1_count(scheme) * G1_BYTES,
         }
     }
 
@@ -400,15 +403,15 @@ impl Data {
     pub(crate) fn new(
         meta: &ConstraintSystemMeta,
         vk: &Halo2VerifyingKey,
-        vk_mptr: Ptr,
         proof_cptr: Ptr,
+        memory: &VerifierMemoryLayout,
     ) -> Self {
         // BLS12-381 G1 commitments occupy 4 words (EIP-2537 padded), so the
         // stride between consecutive points is 4 instead of the BN254-era 2.
-        let fixed_comm_mptr = vk_mptr + vk.constants.len();
-        let permutation_comm_mptr = fixed_comm_mptr + 4 * vk.fixed_comms.len();
-        let challenge_mptr = vk_mptr + vk.len() / 0x20;
-        let theta_mptr = challenge_mptr + meta.challenge_indices.len();
+        let fixed_comm_mptr = memory.vk_mptr + vk.constants.len();
+        let permutation_comm_mptr = fixed_comm_mptr + G1_WORDS * vk.fixed_comms.len();
+        let challenge_mptr = memory.challenge_mptr;
+        let theta_mptr = memory.theta_mptr;
 
         // ------------------------------------------------------------
         // Step 8 layout (2026-04-26):
@@ -436,14 +439,14 @@ impl Data {
             _ => unreachable!("proof_cptr must be a literal byte offset"),
         };
         let mut cd_byte = proof_cptr_bytes;
-        cd_byte += 0x80 * meta.advice_indices.len();
-        cd_byte += 0x80 * meta.num_lookups;
-        cd_byte += 0x80 * meta.num_permutation_zs;
-        cd_byte += 0x80 * lookup_helper_total;
-        cd_byte += 0x80 * meta.num_lookups;
-        cd_byte += 0x80 * meta.num_trashcans;
+        cd_byte += G1_BYTES * meta.advice_indices.len();
+        cd_byte += G1_BYTES * meta.num_lookups;
+        cd_byte += G1_BYTES * meta.num_permutation_zs;
+        cd_byte += G1_BYTES * lookup_helper_total;
+        cd_byte += G1_BYTES * meta.num_lookups;
+        cd_byte += G1_BYTES * meta.num_trashcans;
         let quotient_limb_cd = cd_byte;
-        cd_byte += 0x80 * meta.num_quotients;
+        cd_byte += G1_BYTES * meta.num_quotients;
         let eval_cd = cd_byte;
 
         let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
@@ -455,10 +458,6 @@ impl Data {
         // identifiers like `ADVICE_COMMS_MPTR_BASE`. The PCS code
         // generated below operates on absolute integer offsets so it
         // matches the constant values exactly.
-        let theta_words: usize = match theta_mptr.value() {
-            Value::Integer(b) => (b as usize) / 0x20,
-            _ => unreachable!("theta_mptr is always an integer offset"),
-        };
         // ------------------------------------------------------------
         // Optimisation H3: pre-decode polynomial evaluations.
         //
@@ -485,29 +484,14 @@ impl Data {
         // separate `eval_cd` byte offset for the per-iter
         // `calldataload(proof_cptr)`.
         //
-        // Memory layout:
-        //   theta_mptr + 209  G1_IDENTITY_MPTR (4 words)
-        //   theta_mptr + 220  REVERSED_EVALS_MPTR (num_evals words)
-        //   theta_mptr + 220 + num_evals  comms_mptr_base
-        //
-        // The 7-word gap between G1_IDENTITY (213) and 220 is preserved
-        // for alignment / future use.
-        let reversed_evals_mptr = Ptr::memory((theta_words + 220) * 0x20);
+        let reversed_evals_mptr = memory.reversed_evals_mptr;
         let eval_cptr = reversed_evals_mptr;
-        let comms_words_offset = 220 + meta.num_evals;
-        let comms_mptr_base = Ptr::memory((theta_words + comms_words_offset) * 0x20);
-        let advice_words = 4 * meta.advice_indices.len();
-        let lookup_m_words = 4 * meta.num_lookups;
-        let perm_z_words = 4 * meta.num_permutation_zs;
-        let lookup_helper_words = 4 * lookup_helper_total;
-        let lookup_z_words = 4 * meta.num_lookups;
-        let trashcan_words = 4 * meta.num_trashcans;
-        let lookup_m_comm_mem_base = comms_mptr_base + advice_words;
-        let perm_z_comm_mem_base = lookup_m_comm_mem_base + lookup_m_words;
-        let lookup_helper_comm_mem_base = perm_z_comm_mem_base + perm_z_words;
-        let lookup_z_comm_mem_base = lookup_helper_comm_mem_base + lookup_helper_words;
-        let trashcan_comm_mem_base = lookup_z_comm_mem_base + lookup_z_words;
-        let _ = trashcan_words; // included in template arithmetic
+        let comms_mptr_base = memory.comms_mptr_base;
+        let lookup_m_comm_mem_base = memory.lookup_m_comms_mptr_base;
+        let perm_z_comm_mem_base = memory.perm_z_comms_mptr_base;
+        let lookup_helper_comm_mem_base = memory.lookup_helper_comms_mptr_base;
+        let lookup_z_comm_mem_base = memory.lookup_z_comms_mptr_base;
+        let trashcan_comm_mem_base = memory.trashcan_comms_mptr_base;
 
         let fixed_comms = EcPoint::range(fixed_comm_mptr)
             .take(meta.num_fixeds)
@@ -528,7 +512,7 @@ impl Data {
         let advice_comms = meta
             .advice_indices
             .iter()
-            .map(|idx| comms_mptr_base + 4 * idx)
+            .map(|idx| comms_mptr_base + G1_WORDS * idx)
             .map_into()
             .collect();
         let lookup_m_comms = EcPoint::range(lookup_m_comm_mem_base)
@@ -543,7 +527,7 @@ impl Data {
         let mut helper_cursor = lookup_helper_comm_mem_base;
         for &chunks in &meta.lookup_chunks {
             let row: Vec<EcPoint> = EcPoint::range(helper_cursor).take(chunks).collect();
-            helper_cursor = helper_cursor + 4 * chunks;
+            helper_cursor = helper_cursor + G1_WORDS * chunks;
             lookup_helper_comms.push(row);
         }
         let lookup_z_comms = EcPoint::range(lookup_z_comm_mem_base)
@@ -826,8 +810,10 @@ impl Add<usize> for Value {
     type Output = Value;
     fn add(self, rhs: usize) -> Self::Output {
         match self {
-            Value::Integer(int) => Value::Integer(int + (rhs as isize) * 0x20),
-            Value::Identifier(name, off) => Value::Identifier(name, off + (rhs as isize) * 0x20),
+            Value::Integer(int) => Value::Integer(int + (rhs as isize) * WORD_BYTES as isize),
+            Value::Identifier(name, off) => {
+                Value::Identifier(name, off + (rhs as isize) * WORD_BYTES as isize)
+            }
         }
     }
 }
@@ -836,8 +822,10 @@ impl Sub<usize> for Value {
     type Output = Value;
     fn sub(self, rhs: usize) -> Self::Output {
         match self {
-            Value::Integer(int) => Value::Integer(int - (rhs as isize) * 0x20),
-            Value::Identifier(name, off) => Value::Identifier(name, off - (rhs as isize) * 0x20),
+            Value::Integer(int) => Value::Integer(int - (rhs as isize) * WORD_BYTES as isize),
+            Value::Identifier(name, off) => {
+                Value::Identifier(name, off - (rhs as isize) * WORD_BYTES as isize)
+            }
         }
     }
 }

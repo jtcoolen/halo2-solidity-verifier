@@ -36,8 +36,11 @@
 
 use std::collections::BTreeMap;
 
-use super::PcsScratchRequirements;
 use crate::codegen::{
+    memory::{
+        FinalMsmShape, PcsMemoryRequirements, VerifierMemoryLayout, G1ADD_INPUT_BYTES, G1_BYTES,
+        G1_MSM_PAIR_BYTES, WORD_BYTES,
+    },
     protocol::{PcsQuerySource, PermutationZEval},
     util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word},
 };
@@ -401,20 +404,92 @@ pub(super) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize 
     intermediate_sets(meta, data).point_sets.len()
 }
 
-pub(super) fn scratch_requirements(
+fn commitments_by_set(sets: &IntermediateSets, n_sets: usize) -> Vec<Vec<&CommitmentEntry>> {
+    let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
+    for c in &sets.commitments {
+        by_set[c.set_index].push(c);
+    }
+    by_set
+}
+
+fn linearization_term_count(meta: &ConstraintSystemMeta) -> usize {
+    meta.num_quotients + meta.simple_selector_cols.len()
+}
+
+fn q_com_terms_for_set(
     meta: &ConstraintSystemMeta,
     data: &Data,
-) -> PcsScratchRequirements {
+    commitments_in_set: &[&CommitmentEntry],
+) -> usize {
+    let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
+    let linearization_comm = data.computed_quotient_comm;
+    let linearization_term_count = linearization_term_count(meta);
+
+    commitments_in_set
+        .iter()
+        .map(|entry| {
+            if entry.comm == g1_identity {
+                0
+            } else if entry.comm == linearization_comm {
+                linearization_term_count
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn q_com_trace_terms(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    by_set: &[Vec<&CommitmentEntry>],
+) -> usize {
+    by_set
+        .iter()
+        .map(|commitments| q_com_terms_for_set(meta, data, commitments))
+        .max()
+        .unwrap_or(0)
+}
+
+fn final_msm_shape(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    by_set: &[Vec<&CommitmentEntry>],
+) -> FinalMsmShape {
+    let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
+    let linearization_comm = data.computed_quotient_comm;
+    let linearization_term_count = linearization_term_count(meta);
+    let terms = by_set
+        .iter()
+        .flat_map(|commitments| commitments.iter())
+        .filter(|entry| entry.comm != g1_identity)
+        .map(|entry| {
+            if entry.comm == linearization_comm {
+                linearization_term_count
+            } else {
+                1
+            }
+        })
+        .sum::<usize>()
+        + 1; // f_com
+
+    FinalMsmShape::from_terms(terms)
+}
+
+const ROLL_THRESHOLD: usize = 4;
+
+pub(super) fn memory_requirements(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+) -> PcsMemoryRequirements {
     let sets = intermediate_sets(meta, data);
     let n_sets = sets.point_sets.len();
     if n_sets == 0 {
-        return PcsScratchRequirements::default();
+        return PcsMemoryRequirements::default();
     }
 
-    let mut commitments_per_set = vec![0usize; n_sets];
-    for c in &sets.commitments {
-        commitments_per_set[c.set_index] += 1;
-    }
+    let by_set = commitments_by_set(&sets, n_sets);
+    let commitments_per_set = by_set.iter().map(Vec::len);
 
     let mut distinct_rotations: Vec<i32> = sets
         .point_sets
@@ -424,14 +499,26 @@ pub(super) fn scratch_requirements(
     distinct_rotations.sort_unstable();
     distinct_rotations.dedup();
 
-    PcsScratchRequirements {
+    let q_eval_source_table_words = by_set
+        .iter()
+        .zip(sets.point_sets.iter())
+        .filter(|(commitments, _)| commitments.len() >= ROLL_THRESHOLD)
+        .map(|(commitments, rotations)| commitments.len() * rotations.len())
+        .max()
+        .unwrap_or(0);
+    let q_com_trace_terms = q_com_trace_terms(meta, data, &by_set);
+
+    PcsMemoryRequirements {
         rot_points_words: distinct_rotations.len(),
-        x1_powers_words: commitments_per_set.into_iter().max().unwrap_or(0),
+        x1_powers_words: commitments_per_set.max().unwrap_or(0),
         // Current q_com materialization is fused into the final MSM scratch
         // instead of Q_COM_MPTR. Keep the field explicit so a future
         // Q_COM_MPTR user must also participate in layout validation.
         q_com_words: 0,
         q_eval_set_words: sets.point_sets.iter().map(Vec::len).sum(),
+        q_eval_source_table_words,
+        q_com_trace_msm: FinalMsmShape::from_terms(q_com_trace_terms),
+        final_msm: final_msm_shape(meta, data, &by_set),
     }
 }
 
@@ -464,6 +551,7 @@ pub(super) fn static_working_memory_size(_meta: &ConstraintSystemMeta, _data: &D
 pub(super) fn computations(
     meta: &ConstraintSystemMeta,
     data: &Data,
+    memory: &VerifierMemoryLayout,
     truncated_challenges: bool,
     trace: bool,
 ) -> Vec<Vec<String>> {
@@ -479,10 +567,7 @@ pub(super) fn computations(
 
     // Per-set commitment list. Reused by the q_eval fold block and the
     // fused final commitment MSM.
-    let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
-    for c in &sets.commitments {
-        by_set[c.set_index].push(c);
-    }
+    let by_set = commitments_by_set(&sets, n_sets);
 
     // The number of x1 powers is bounded by the largest commitments-per-set
     // count (one power per commitment within a set).
@@ -501,21 +586,7 @@ pub(super) fn computations(
     // Scratch above every decompressed commitment slot. Block 3 uses it as
     // a compact eval-address table; Block 5 reuses the same region as the
     // fused final MSM input buffer.
-    let comms_top_words = data.comms_mptr_base.value().as_usize() / 0x20
-        + 4 * (meta.num_user_advices.iter().sum::<usize>()
-            + meta.num_lookups
-            + meta.num_permutation_zs
-            + meta.lookup_chunks.iter().sum::<usize>()
-            + meta.num_lookups
-            + meta.num_trashcans
-            + meta.num_quotients);
-    // The PCS scratch starts immediately after decompressed commitments.
-    // That address also backs SELECTOR_ACC_MPTR in the Solidity template.
-    // After linearization expansion moved into Block 5, the final MSM still
-    // needs selector accumulators, while earlier PCS blocks use this scratch
-    // as transient tables. Keep the selector accumulator words live by
-    // starting PCS scratch just after them.
-    let pcs_scratch_mptr: usize = comms_top_words * 0x20 + meta.num_simple_selectors * 0x20;
+    let pcs_scratch_mptr = memory.pcs_scratch_mptr;
 
     let mut blocks: Vec<Vec<String>> = Vec::new();
 
@@ -553,7 +624,7 @@ pub(super) fn computations(
                 .map(|idx| {
                     format!(
                         "mstore(add(ROT_POINTS_MPTR, {:#x}), x_pow_of_omega)",
-                        idx * 0x20
+                        idx * WORD_BYTES
                     )
                 })
         };
@@ -628,7 +699,7 @@ pub(super) fn computations(
             lines.push(format!(
                 "for {{ let i := 0 }} lt(i, {last:#x}) {{ i := add(i, 1) }} {{"
             ));
-            lines.push("    p := add(p, 0x20)".to_string());
+            lines.push(format!("    p := add(p, {WORD_BYTES:#x})"));
             lines.push("    acc := mulmod(acc, x1, r)".to_string());
             if truncated_challenges {
                 lines.push(format!("    mstore(p, and(acc, {TRUNC_MASK_128}))"));
@@ -678,7 +749,7 @@ pub(super) fn computations(
 
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let mut lines: Vec<String> = Vec::new();
-            let q_eval_base = format!("add(Q_EVAL_SET_MPTR, {:#x})", set_idx * 0x20);
+            let q_eval_base = format!("add(Q_EVAL_SET_MPTR, {:#x})", set_idx * WORD_BYTES);
             let m = commitments_in_set.len();
 
             // q_eval_set[s] is itself a *vector* of |set| evaluations
@@ -724,7 +795,7 @@ pub(super) fn computations(
                         );
                         lines.push(format!(
                             "mstore({:#x}, {})",
-                            eval_src_table_mptr + (i * n_rot + k) * 0x20,
+                            eval_src_table_mptr + (i * n_rot + k) * WORD_BYTES,
                             ev.ptr()
                         ));
                     }
@@ -748,8 +819,8 @@ pub(super) fn computations(
                 //    to the unrolled block this halves the total mload
                 //    count and gives solc-via-ir a single basic block to
                 //    schedule.
-                let n_rot_stride = n_rot * 0x20;
-                lines.push("let pow_p := add(X1_POWERS_MPTR, 0x20)".to_string());
+                let n_rot_stride = n_rot * WORD_BYTES;
+                lines.push(format!("let pow_p := add(X1_POWERS_MPTR, {WORD_BYTES:#x})"));
                 lines.push(format!(
                     "let eval_p := add({:#x}, {:#x})",
                     eval_src_table_mptr, n_rot_stride
@@ -768,11 +839,11 @@ pub(super) fn computations(
                     } else {
                         lines.push(format!(
                             "    q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod(mload(mload(add(eval_p, {:#x}))), pow, r), r)",
-                            k * 0x20
+                            k * WORD_BYTES
                         ));
                     }
                 }
-                lines.push("    pow_p := add(pow_p, 0x20)".to_string());
+                lines.push(format!("    pow_p := add(pow_p, {WORD_BYTES:#x})"));
                 lines.push(format!("    eval_p := add(eval_p, {:#x})", n_rot_stride));
                 lines.push("}".to_string());
 
@@ -780,7 +851,7 @@ pub(super) fn computations(
                 for k in 0..n_rot {
                     lines.push(format!(
                         "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
-                        (set_eval_offset_words + k) * 0x20
+                        (set_eval_offset_words + k) * WORD_BYTES
                     ));
                 }
             } else {
@@ -792,7 +863,7 @@ pub(super) fn computations(
                     lines.push(format!("let q_eval_set_{k} := {ev}"));
                 }
                 for (i, c) in commitments_in_set.iter().enumerate().skip(1) {
-                    let x1_pow = format!("mload(add(X1_POWERS_MPTR, {:#x}))", i * 0x20);
+                    let x1_pow = format!("mload(add(X1_POWERS_MPTR, {:#x}))", i * WORD_BYTES);
                     for (k, ev) in c.evals.iter().enumerate() {
                         lines.push(format!(
                             "q_eval_set_{k} := addmod(q_eval_set_{k}, mulmod({ev}, {x1_pow}, r), r)"
@@ -804,7 +875,7 @@ pub(super) fn computations(
                 for k in 0..first.evals.len() {
                     lines.push(format!(
                         "mstore(add(Q_EVAL_SET_MPTR, {:#x}), q_eval_set_{k})",
-                        (set_eval_offset_words + k) * 0x20
+                        (set_eval_offset_words + k) * WORD_BYTES
                     ));
                 }
             }
@@ -819,8 +890,8 @@ pub(super) fn computations(
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
         let linearization_comm = data.computed_quotient_comm;
         let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
-        let linearization_term_count = meta.num_quotients + simple_selector_cols.len();
-        let trace_scratch = pcs_scratch_mptr;
+        let linearization_term_count = linearization_term_count(meta);
+        let trace_scratch = memory.pcs_q_com_trace_scratch_mptr;
         lines.push("// materialize per-set q_com inputs before the fused final MSM".to_string());
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let non_identity_terms = commitments_in_set
@@ -836,7 +907,9 @@ pub(super) fn computations(
                 })
                 .sum::<usize>();
             if non_identity_terms == 0 {
-                lines.push(format!("mcopy({trace_scratch:#x}, G1_IDENTITY_MPTR, 0x80)"));
+                lines.push(format!(
+                    "mcopy({trace_scratch:#x}, G1_IDENTITY_MPTR, {G1_BYTES:#x})"
+                ));
                 if trace {
                     lines.push(format!(
                         "trace_point({}, {trace_scratch:#x})",
@@ -854,7 +927,10 @@ pub(super) fn computations(
                 let scalar = if commitment_idx == 0 {
                     "1".to_string()
                 } else {
-                    format!("mload(add(X1_POWERS_MPTR, {:#x}))", commitment_idx * 0x20)
+                    format!(
+                        "mload(add(X1_POWERS_MPTR, {:#x}))",
+                        commitment_idx * WORD_BYTES
+                    )
                 };
                 if c.comm == linearization_comm {
                     let lin_query_var =
@@ -862,16 +938,19 @@ pub(super) fn computations(
                     let lin_cur_var = format!("q_com_lin_cur_scalar_{set_idx}_{commitment_idx}");
                     lines.push(format!("let {lin_query_var} := {scalar}"));
                     lines.push(format!(
-                        "let {lin_cur_var} := mulmod({lin_query_var}, mload(add(QUOTIENT_MPTR, 0x20)), r)"
+                        "let {lin_cur_var} := mulmod({lin_query_var}, mload(add(QUOTIENT_MPTR, {WORD_BYTES:#x})), r)"
                     ));
 
                     for q_idx in 0..meta.num_quotients {
-                        let pair_base = trace_scratch + pair_idx * 0xa0;
+                        let pair_base = trace_scratch + pair_idx * G1_MSM_PAIR_BYTES;
                         lines.push(format!(
-                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), 0x80)",
-                            q_idx * 0x80
+                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), {G1_BYTES:#x})",
+                            q_idx * G1_BYTES
                         ));
-                        lines.push(format!("mstore({:#x}, {lin_cur_var})", pair_base + 0x80));
+                        lines.push(format!(
+                            "mstore({:#x}, {lin_cur_var})",
+                            pair_base + G1_BYTES
+                        ));
                         pair_idx += 1;
                         if q_idx + 1 != meta.num_quotients {
                             lines.push(format!(
@@ -881,38 +960,44 @@ pub(super) fn computations(
                     }
 
                     for (sel_idx, col) in simple_selector_cols.iter().copied().enumerate() {
-                        let pair_base = trace_scratch + pair_idx * 0xa0;
+                        let pair_base = trace_scratch + pair_idx * G1_MSM_PAIR_BYTES;
                         let selector_scalar =
-                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * 0x20);
+                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * WORD_BYTES);
                         lines.push(format!(
-                            "mcopy({pair_base:#x}, {}, 0x80)",
+                            "mcopy({pair_base:#x}, {}, {G1_BYTES:#x})",
                             data.fixed_comms[col].ptr()
                         ));
                         lines.push(format!(
                             "mstore({:#x}, mulmod({lin_query_var}, {}, r))",
-                            pair_base + 0x80,
+                            pair_base + G1_BYTES,
                             selector_scalar
                         ));
                         pair_idx += 1;
                     }
                 } else {
-                    let pair_base = trace_scratch + pair_idx * 0xa0;
-                    lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
-                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + 0x80));
+                    let pair_base = trace_scratch + pair_idx * G1_MSM_PAIR_BYTES;
+                    lines.push(format!(
+                        "mcopy({pair_base:#x}, {}, {G1_BYTES:#x})",
+                        c.comm.ptr()
+                    ));
+                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + G1_BYTES));
                     pair_idx += 1;
                 }
             }
-            debug_assert_eq!(pair_idx, non_identity_terms);
-            let msm_len = non_identity_terms * 0xa0;
+            assert_eq!(
+                pair_idx, non_identity_terms,
+                "q_com trace MSM input term count changed during emission"
+            );
+            let msm_len = non_identity_terms * G1_MSM_PAIR_BYTES;
             if trace {
                 lines.push(format!(
-                    "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, 0x80)"
+                    "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, {G1_BYTES:#x})"
                 ));
                 lines.push(format!(
-                    "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), 0x80))"
+                    "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), {G1_BYTES:#x}))"
                 ));
                 lines.push(format!(
-                    "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, 0x20) }}",
+                    "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, {WORD_BYTES:#x}) }}",
                     40000 + set_idx
                 ));
                 lines.push(format!(
@@ -958,7 +1043,7 @@ pub(super) fn computations(
         for (i, _rot) in distinct_rotations.iter().enumerate() {
             lines.push(format!(
                 "let rot_pt_{i} := mload(add(ROT_POINTS_MPTR, {:#x}))",
-                i * 0x20
+                i * WORD_BYTES
             ));
         }
 
@@ -977,7 +1062,10 @@ pub(super) fn computations(
             // proof_eval is the s-th q_eval scalar in calldata. The
             // Solidity proof shim rewrites q_evals to canonical BE words, so
             // calldataload gives the field element directly.
-            let proof_eval = format!("calldataload(add(Q_EVAL_CPTR, {:#x}))", set_idx * 0x20);
+            let proof_eval = format!(
+                "calldataload(add(Q_EVAL_CPTR, {:#x}))",
+                set_idx * WORD_BYTES
+            );
             // Reference to q_eval_set[set_idx][k]:
             let set_eval_offset_words: usize = sets.point_sets[..set_idx]
                 .iter()
@@ -997,7 +1085,7 @@ pub(super) fn computations(
                 let pt = rot_pt_ref(points[0]);
                 let ev = format!(
                     "mload(add(Q_EVAL_SET_MPTR, {:#x}))",
-                    set_eval_offset_words * 0x20
+                    set_eval_offset_words * WORD_BYTES
                 );
                 lines.push(format!("let dx0 := addmod(x3, sub(r, {pt}), r)"));
                 lines.push("let dx0_inv := scalar_inv(dx0)".to_string());
@@ -1132,7 +1220,7 @@ pub(super) fn computations(
             for j in 0..m {
                 let ev_j = format!(
                     "mload(add(Q_EVAL_SET_MPTR, {:#x}))",
-                    (set_eval_offset_words + j) * 0x20
+                    (set_eval_offset_words + j) * WORD_BYTES
                 );
                 lines.push(format!(
                     "let term_{j} := mulmod(mulmod({ev_j}, dx_inv_{j}, r), lbasis_inv_{j}, r)"
@@ -1168,21 +1256,10 @@ pub(super) fn computations(
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
         let linearization_comm = data.computed_quotient_comm;
         let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
-        let final_msm_terms: usize = by_set
-            .iter()
-            .flat_map(|commitments| commitments.iter())
-            .filter(|entry| entry.comm != g1_identity)
-            .map(|entry| {
-                if entry.comm == linearization_comm {
-                    meta.num_quotients + simple_selector_cols.len()
-                } else {
-                    1
-                }
-            })
-            .sum::<usize>()
-            + 1; // f_com
-        let final_msm_len = final_msm_terms * 0xa0;
-        let final_msm_scratch = pcs_scratch_mptr;
+        let final_msm_shape = final_msm_shape(meta, data, &by_set);
+        let final_msm_terms = final_msm_shape.terms;
+        let final_msm_len = final_msm_shape.input_bytes;
+        let final_msm_scratch = memory.pcs_final_msm_scratch_mptr;
 
         lines.push("// build final_com and v (KZG single-opening proof, fused MSM)".to_string());
         lines.push(format!(
@@ -1190,7 +1267,9 @@ pub(super) fn computations(
         ));
         lines.push("let x4 := mload(X4_MPTR)".to_string());
         lines.push("let lin_x_split := mload(QUOTIENT_MPTR)".to_string());
-        lines.push("let lin_one_minus_x_n := mload(add(QUOTIENT_MPTR, 0x20))".to_string());
+        lines.push(format!(
+            "let lin_one_minus_x_n := mload(add(QUOTIENT_MPTR, {WORD_BYTES:#x}))"
+        ));
         // Resolve the calldata pointer to the q_evals block once.
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
@@ -1219,7 +1298,7 @@ pub(super) fn computations(
         for s in 1..n_sets {
             lines.push(format!(
                 "v := addmod(v, mulmod(calldataload(add(Q_EVAL_CPTR, {:#x})), x4_pow_{s}, r), r)",
-                s * 0x20
+                s * WORD_BYTES
             ));
         }
         lines.push(format!(
@@ -1233,7 +1312,10 @@ pub(super) fn computations(
             let x1_pow = if commitment_idx == 0 {
                 "1".to_string()
             } else {
-                format!("mload(add(X1_POWERS_MPTR, {:#x}))", commitment_idx * 0x20)
+                format!(
+                    "mload(add(X1_POWERS_MPTR, {:#x}))",
+                    commitment_idx * WORD_BYTES
+                )
             };
 
             match (set_idx, commitment_idx) {
@@ -1259,12 +1341,15 @@ pub(super) fn computations(
                     ));
 
                     for q_idx in 0..meta.num_quotients {
-                        let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                        let pair_base = final_msm_scratch + pair_idx * G1_MSM_PAIR_BYTES;
                         lines.push(format!(
-                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), 0x80)",
-                            q_idx * 0x80
+                            "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), {G1_BYTES:#x})",
+                            q_idx * G1_BYTES
                         ));
-                        lines.push(format!("mstore({:#x}, {lin_cur_var})", pair_base + 0x80,));
+                        lines.push(format!(
+                            "mstore({:#x}, {lin_cur_var})",
+                            pair_base + G1_BYTES,
+                        ));
                         pair_idx += 1;
                         if q_idx + 1 != meta.num_quotients {
                             lines.push(format!(
@@ -1274,45 +1359,56 @@ pub(super) fn computations(
                     }
 
                     for (sel_idx, col) in simple_selector_cols.iter().copied().enumerate() {
-                        let pair_base = final_msm_scratch + pair_idx * 0xa0;
+                        let pair_base = final_msm_scratch + pair_idx * G1_MSM_PAIR_BYTES;
                         let selector_scalar =
-                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * 0x20);
+                            format!("mload(add(SELECTOR_ACC_MPTR, {:#x}))", sel_idx * WORD_BYTES);
                         lines.push(format!(
-                            "mcopy({pair_base:#x}, {}, 0x80)",
+                            "mcopy({pair_base:#x}, {}, {G1_BYTES:#x})",
                             data.fixed_comms[col].ptr()
                         ));
                         lines.push(format!(
                             "mstore({:#x}, mulmod({lin_query_var}, {}, r))",
-                            pair_base + 0x80,
+                            pair_base + G1_BYTES,
                             selector_scalar
                         ));
                         pair_idx += 1;
                     }
                 } else {
-                    let pair_base = final_msm_scratch + pair_idx * 0xa0;
-                    lines.push(format!("mcopy({pair_base:#x}, {}, 0x80)", c.comm.ptr()));
-                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + 0x80));
+                    let pair_base = final_msm_scratch + pair_idx * G1_MSM_PAIR_BYTES;
+                    lines.push(format!(
+                        "mcopy({pair_base:#x}, {}, {G1_BYTES:#x})",
+                        c.comm.ptr()
+                    ));
+                    lines.push(format!("mstore({:#x}, {scalar})", pair_base + G1_BYTES));
                     pair_idx += 1;
                 }
             }
         }
 
-        let pair_base = final_msm_scratch + pair_idx * 0xa0;
-        lines.push(format!("mcopy({pair_base:#x}, F_COM_MPTR, 0x80)"));
-        lines.push(format!("mstore({:#x}, x4_pow_{n_sets})", pair_base + 0x80));
+        let pair_base = final_msm_scratch + pair_idx * G1_MSM_PAIR_BYTES;
+        lines.push(format!("mcopy({pair_base:#x}, F_COM_MPTR, {G1_BYTES:#x})"));
+        lines.push(format!(
+            "mstore({:#x}, x4_pow_{n_sets})",
+            pair_base + G1_BYTES
+        ));
         pair_idx += 1;
-        debug_assert_eq!(pair_idx, final_msm_terms);
+        assert_eq!(
+            pair_idx, final_msm_terms,
+            "final MSM input term count changed during emission"
+        );
 
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80)",
+            "    success := staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, {G1_BYTES:#x})",
             final_msm_len,
             final_msm_len
         ));
-        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push(format!(
+            "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
+        ));
         lines.push("}".to_string());
         lines.push(format!(
-            "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, 0x80)"
+            "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, {G1_BYTES:#x})"
         ));
         lines.push("mstore(V_MPTR, v)".to_string());
 
@@ -1340,47 +1436,55 @@ pub(super) fn computations(
         lines.push("// pairing inputs (LHS = pi; RHS = final_com - v*G + x3*pi)".to_string());
 
         // PAIRING_LHS = pi (paired against G2_BASE).
-        lines.push("mcopy(PAIRING_LHS_MPTR, PI_MPTR, 0x80)".to_string());
+        lines.push(format!("mcopy(PAIRING_LHS_MPTR, PI_MPTR, {G1_BYTES:#x})"));
 
         // tmp = (-v) * G  =>  load G into 0x00, scale by (r - v).
-        lines.push("mcopy(0x0, G1_BASE_MPTR, 0x80)".to_string());
-        lines.push("mstore(0x80, sub(r, mload(V_MPTR)))".to_string());
+        lines.push(format!("mcopy(0x0, G1_BASE_MPTR, {G1_BYTES:#x})"));
+        lines.push(format!("mstore({G1_BYTES:#x}, sub(r, mload(V_MPTR)))"));
         lines.push("if success {".to_string());
-        lines.push(
-            "    success := staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x00, 0xa0, 0x00, 0x80)"
-                .to_string(),
-        );
-        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push(format!(
+            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, 0x00, {G1_MSM_PAIR_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+        ));
+        lines.push(format!(
+            "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
+        ));
         lines.push("}".to_string());
 
         // tmp += final_com.
-        lines.push("mcopy(0x80, FINAL_COM_MPTR, 0x80)".to_string());
+        lines.push(format!(
+            "mcopy({G1_BYTES:#x}, FINAL_COM_MPTR, {G1_BYTES:#x})"
+        ));
         lines.push("if success {".to_string());
-        lines.push(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80)".to_string(),
-        );
-        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push(format!(
+            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, {G1ADD_INPUT_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+        ));
+        lines.push(format!(
+            "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
+        ));
         lines.push("}".to_string());
 
         // tmp += x3 * pi.
-        lines.push("mcopy(0x80, PI_MPTR, 0x80)".to_string());
-        lines.push("mstore(0x100, mload(X3_MPTR))".to_string());
+        lines.push(format!("mcopy({G1_BYTES:#x}, PI_MPTR, {G1_BYTES:#x})"));
+        lines.push(format!("mstore({G1ADD_INPUT_BYTES:#x}, mload(X3_MPTR))"));
         lines.push("if success {".to_string());
-        lines.push(
-            "    success := staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x80, 0xa0, 0x80, 0x80)"
-                .to_string(),
-        );
-        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push(format!(
+            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {G1_BYTES:#x}, {G1_MSM_PAIR_BYTES:#x}, {G1_BYTES:#x}, {G1_BYTES:#x})"
+        ));
+        lines.push(format!(
+            "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
+        ));
         lines.push("}".to_string());
         lines.push("if success {".to_string());
-        lines.push(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80)".to_string(),
-        );
-        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push(format!(
+            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, {G1ADD_INPUT_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+        ));
+        lines.push(format!(
+            "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
+        ));
         lines.push("}".to_string());
 
         // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
-        lines.push("mcopy(PAIRING_RHS_MPTR, 0x0, 0x80)".to_string());
+        lines.push(format!("mcopy(PAIRING_RHS_MPTR, 0x0, {G1_BYTES:#x})"));
 
         blocks.push(lines);
     }
@@ -1406,7 +1510,7 @@ fn rot_offset(rotations: &[i32], rot: i32) -> usize {
         .iter()
         .position(|r| *r == rot)
         .expect("rotation present in distinct_rotations")
-        * 0x20
+        * WORD_BYTES
 }
 
 // ---------------------------------------------------------------------------
