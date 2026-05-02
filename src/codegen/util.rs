@@ -1093,8 +1093,10 @@ fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
 /// big-endian and split (hi=top 16 bytes padded into u256, lo=bottom 32
 /// bytes).
 pub(crate) fn g1_to_u256s(ec_point: impl Borrow<G1Affine>) -> [U256; 4] {
-    let coords: Coordinates<G1Affine> =
-        Option::from(ec_point.borrow().coordinates()).expect("g1 identity not supported in VK");
+    let Some(coords) = Option::<Coordinates<G1Affine>>::from(ec_point.borrow().coordinates())
+    else {
+        return [U256::ZERO; 4];
+    };
     let mut x_be = [0u8; 48];
     x_be.copy_from_slice(coords.x().to_repr().as_ref());
     x_be.reverse();
@@ -1113,8 +1115,10 @@ pub(crate) fn g1_to_u256s(ec_point: impl Borrow<G1Affine>) -> [U256; 4] {
 /// in big-endian per coord. The midnight-curves convention matches:
 /// each `Fp` coordinate read via `to_repr()` returns LE bytes.
 pub(crate) fn g2_to_u256s(ec_point: impl Borrow<G2Affine>) -> [U256; 8] {
-    let coords: Coordinates<G2Affine> =
-        Option::from(ec_point.borrow().coordinates()).expect("g2 identity not supported in VK");
+    let Some(coords) = Option::<Coordinates<G2Affine>>::from(ec_point.borrow().coordinates())
+    else {
+        return [U256::ZERO; 8];
+    };
 
     let pack_fp = |fp: midnight_curves::Fp| -> [u8; 48] {
         let mut be = [0u8; 48];
@@ -1156,4 +1160,20 @@ where
     U256: UintTryFrom<T>,
 {
     U256::from(value).to_be_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use group::{Curve, Group};
+    use midnight_curves::{G1Projective, G2Projective};
+
+    #[test]
+    fn eip2537_encoders_accept_identity_points() {
+        let g1 = G1Projective::identity().to_affine();
+        let g2 = G2Projective::identity().to_affine();
+
+        assert_eq!(g1_to_u256s(&g1), [U256::ZERO; 4]);
+        assert_eq!(g2_to_u256s(&g2), [U256::ZERO; 8]);
+    }
 }
