@@ -1,5 +1,5 @@
 
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
 
 // Halo2 KZG verifier for the BLS12-381 curve, midnight-proofs flavour.
 //

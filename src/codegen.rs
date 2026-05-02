@@ -4881,6 +4881,29 @@ mod tests {
     }
 
     #[test]
+    fn generated_solidity_pragmas_require_mcopy_capable_compiler() {
+        for (name, source) in [
+            (
+                "Halo2Verifier.sol",
+                include_str!("../templates/Halo2Verifier.sol"),
+            ),
+            (
+                "Halo2VerifyingKey.sol",
+                include_str!("../templates/Halo2VerifyingKey.sol"),
+            ),
+            (
+                "Halo2QuotientEvaluator.sol",
+                include_str!("../templates/Halo2QuotientEvaluator.sol"),
+            ),
+        ] {
+            assert!(
+                source.contains("pragma solidity ^0.8.24;"),
+                "{name} must require Solidity 0.8.24+ for Cancun Yul opcodes"
+            );
+        }
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();
