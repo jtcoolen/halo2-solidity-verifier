@@ -244,7 +244,7 @@ fn vk_payload_section_mutations_are_rejected() {
         return;
     }
 
-    let fixture = create_property_poseidon_fixture();
+    let fixture = create_poseidon_vk_sources_fixture();
     let sections = [
         ("header", "vk_digest"),
         ("quotient constants", "quotient_const"),
@@ -260,13 +260,11 @@ fn vk_payload_section_mutations_are_rejected() {
         );
         let mutated_vk_solidity =
             mutate_value_hex_literal_on_line_containing(&fixture.vk_solidity, marker);
-        let output = call_separate_verifier(
+        assert_separate_verifier_rejects_vk_dependency(
             &fixture.separate_verifier_solidity,
             &mutated_vk_solidity,
-            &fixture.proof,
-            &fixture.instances,
+            &format!("mutated VK payload section: {section}"),
         );
-        assert_solidity_rejects(output, &format!("mutated VK payload section: {section}"));
     }
 }
 
@@ -538,6 +536,38 @@ struct PropertyPoseidonFixture {
     trace_verifier_solidity: String,
     #[cfg_attr(not(feature = "rust-verifier-trace"), allow(dead_code))]
     trace_vk_solidity: String,
+}
+
+#[derive(Clone)]
+struct PoseidonVkSourcesFixture {
+    separate_verifier_solidity: String,
+    vk_solidity: String,
+}
+
+fn create_poseidon_vk_sources_fixture() -> PoseidonVkSourcesFixture {
+    static FIXTURE: OnceLock<PoseidonVkSourcesFixture> = OnceLock::new();
+    FIXTURE
+        .get_or_init(load_poseidon_vk_sources_fixture)
+        .clone()
+}
+
+fn load_poseidon_vk_sources_fixture() -> PoseidonVkSourcesFixture {
+    let srs_dir = srs_dir();
+    env::set_var("SRS_DIR", &srs_dir);
+
+    let relation = PoseidonExample;
+    let srs = srs_for_test(&relation, Some(POSEIDON_K));
+    let vk = setup_vk(&srs, &relation);
+    assert_eq!(vk.k() as u32, POSEIDON_K, "unexpected Poseidon VK k");
+
+    let generator = SolidityGenerator::new(&srs, vk.vk(), Gwc19, 1).set_num_committed_instances(1);
+    let (separate_verifier_solidity, vk_solidity) =
+        generator.render_separately().expect("separate render");
+
+    PoseidonVkSourcesFixture {
+        separate_verifier_solidity,
+        vk_solidity,
+    }
 }
 
 fn create_property_poseidon_fixture() -> PropertyPoseidonFixture {
@@ -903,6 +933,22 @@ fn call_separate_verifier(
     .map_err(|_| ())
 }
 
+fn assert_separate_verifier_rejects_vk_dependency(
+    verifier_solidity: &str,
+    vk_solidity: &str,
+    context: &str,
+) {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut evm = Evm::default();
+        let vk_address = evm.create(compile_solidity(vk_solidity));
+        evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
+    }));
+    assert!(
+        result.is_err(),
+        "separate verifier constructor accepted invalid VK dependency: {context}"
+    );
+}
+
 fn call_quotient_separated_verifier(
     verifier_solidity: &str,
     vk_solidity: &str,
@@ -1136,17 +1182,15 @@ fn mutate_vk_digest_literal_only(solidity: &str) -> String {
 }
 
 fn mutate_value_hex_literal_on_line_containing(solidity: &str, marker: &str) -> String {
-    let marker_idx = solidity
-        .find(marker)
-        .unwrap_or_else(|| panic!("line marker not found: {marker}"));
-    let line_start = solidity[..marker_idx]
-        .rfind('\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    let line_end = solidity[line_start..]
-        .find('\n')
-        .map(|pos| line_start + pos)
-        .unwrap_or(solidity.len());
+    let (line_start, line_end, _) = solidity
+        .lines()
+        .scan(0usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len() + 1;
+            Some((start, start + line.len(), line))
+        })
+        .find(|(_, _, line)| line.contains("mstore(") && line.contains(marker))
+        .unwrap_or_else(|| panic!("mstore line marker not found: {marker}"));
     let line = &solidity[line_start..line_end];
     let value_start = line
         .find(',')
