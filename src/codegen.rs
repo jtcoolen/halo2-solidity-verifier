@@ -4873,9 +4873,18 @@ mod tests {
     #[test]
     fn transcript_memory_bound_handles_wide_bls_advice_phase() {
         let mut cs = ConstraintSystem::default();
+        let mut advices = Vec::new();
         for _ in 0..64 {
-            cs.advice_column();
+            advices.push(cs.advice_column());
         }
+        cs.create_gate("open wide advice phase", |meta| {
+            let acc = advices
+                .iter()
+                .fold(Expression::Constant(Fq::ZERO), |acc, col| {
+                    acc + meta.query_advice(*col, Rotation::cur())
+                });
+            Constraints::without_selector(vec![("open wide advice phase", acc)])
+        });
         let meta = ConstraintSystemMeta::new(&cs, 0);
 
         let words = SolidityGenerator::transcript_buffer_words_bound(&meta, 0);
