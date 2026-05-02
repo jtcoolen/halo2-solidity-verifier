@@ -4968,6 +4968,28 @@ mod tests {
     }
 
     #[test]
+    fn production_verifier_documents_revert_or_true_policy() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("success-or-revert"),
+            "verifyProof NatSpec must document invalid-proof failure semantics"
+        );
+        assert!(
+            verifier_template.contains("error InvalidVerifierDependency();"),
+            "pinned dependency failures should use an explicit custom error"
+        );
+        assert!(
+            verifier_template.contains("revert InvalidVerifierDependency();"),
+            "pinned dependency preflight failures should revert, not return false"
+        );
+        assert!(
+            !verifier_template.contains("return false;"),
+            "generated verifier should not mix false returns with revert-on-invalid semantics"
+        );
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();

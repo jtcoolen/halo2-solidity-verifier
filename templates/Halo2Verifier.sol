@@ -28,6 +28,8 @@ pragma solidity ^0.8.24;
 //       0x0c BLS12_G1MSM
 //       0x0f BLS12_PAIRING_CHECK
 contract Halo2Verifier {
+    error InvalidVerifierDependency();
+
     {%- match self.expected_vk_codehash %}
     {%- when Some with (expected_vk_codehash) %}
     address public immutable AUTHORIZED_VK;
@@ -242,14 +244,19 @@ contract Halo2Verifier {
     {%- endmatch %}
     {%- endmatch %}
 
+    /// @notice Verify a Halo2/Midfall proof for the generated verifying key.
+    /// @dev Production renders are success-or-revert: accepted proofs return
+    /// `true`, while malformed calldata, invalid proof material, failed
+    /// precompiles, or mismatched pinned dependency code revert. Trace renders
+    /// are diagnostic artifacts and may return the final success word for log
+    /// comparison.
     function verifyProof(
         bytes calldata proof,
         uint256[] calldata instances
     ) public {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
         assembly ("memory-safe") {
             if iszero(and(eq(calldataload(0x04), 0x40), eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4)))) {
-                mstore(0x00, 0)
-                return(0x00, 0x20)
+                revert(0, 0)
             }
         }
 
@@ -257,7 +264,7 @@ contract Halo2Verifier {
         {%- when None %}
         address vk = AUTHORIZED_VK;
         if (vk.code.length != EXPECTED_VK_LENGTH || vk.codehash != EXPECTED_VK_CODEHASH) {
-            return false;
+            revert InvalidVerifierDependency();
         }
         {%- else %}
         {%- endmatch %}
@@ -270,7 +277,7 @@ contract Halo2Verifier {
             quotientEvaluator.code.length != EXPECTED_QUOTIENT_LENGTH
                 || quotientEvaluator.codehash != EXPECTED_QUOTIENT_CODEHASH
         ) {
-            return false;
+            revert InvalidVerifierDependency();
         }
         {%- when None %}
         {%- endmatch %}
