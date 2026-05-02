@@ -1007,11 +1007,15 @@ contract Halo2Verifier {
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
             {%- if truncated_challenges %}
-            // truncated-challenges: x3 is the f_com evaluation point and
-            // is used directly (not as a power base); midnight-proofs
-            // truncates it to 128 bits at squeeze time, so we must mirror
-            // that here. The `and` cost (~3 gas) is negligible compared to
-            // the modexp ladders downstream that consume x3.
+            // truncated-challenges mirrors midnight-proofs
+            // proofs/src/poly/kzg/mod.rs:
+            //   - x3 is the f_com evaluation point and is truncated
+            //     immediately after squeeze.
+            //   - x1 and x4 remain full squeezed Fr words, but later PCS
+            //     batching stores truncate(x1^i) and truncate(x4^i) while
+            //     keeping the internal power accumulators full precision.
+            // This direct x3 mask is therefore one part of the PCS truncation
+            // rule, not the only truncated value used by the verifier.
             mstore(X3_MPTR, and(mload(X3_MPTR), 0xffffffffffffffffffffffffffffffff))
             {%- endif %}
 

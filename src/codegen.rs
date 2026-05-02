@@ -5800,6 +5800,41 @@ mod tests {
     }
 
     #[test]
+    fn truncated_challenge_comments_cover_x1_x4_power_masks() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+        let gwc19_codegen = include_str!("codegen/pcs/gwc19.rs");
+
+        assert!(
+            verifier_template.contains("x1 and x4 remain full squeezed Fr words"),
+            "x3 squeeze comment must clarify that x1/x4 are handled by truncated powers"
+        );
+        assert!(
+            verifier_template.contains("truncate(x1^i) and truncate(x4^i)"),
+            "verifier template should document the PCS power truncation rule"
+        );
+        assert!(
+            gwc19_codegen.contains("proofs/src/poly/kzg/mod.rs computes"),
+            "x1 power generation should point back to the Rust verifier source"
+        );
+        assert!(
+            gwc19_codegen.contains("power[i] = truncate(x1^i)"),
+            "x1 power generation should document truncated_powers(x1)"
+        );
+        assert!(
+            gwc19_codegen.contains("truncated_powers(x4)[i] = truncate(x4^i)"),
+            "x4 power generation should document truncated_powers(x4)"
+        );
+        assert!(
+            gwc19_codegen.contains("mstore(p, and(acc, {TRUNC_MASK_128}))"),
+            "x1 emitted powers must be masked under truncated-challenges"
+        );
+        assert!(
+            gwc19_codegen.contains("let x4_pow_{s} := and(x4_pow_full, {TRUNC_MASK_128})"),
+            "x4 emitted powers must be masked under truncated-challenges"
+        );
+    }
+
+    #[test]
     fn generated_heavy_assemblies_keep_memory_safe_for_via_ir() {
         for (name, source) in [
             (

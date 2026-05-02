@@ -577,7 +577,8 @@ pub(super) fn computations(
             //   ----
             //   ~20 gas/iter, × 32 = ~640 gas + 50 setup = ~700 gas
             //
-            // truncated-challenges: midnight-proofs computes
+            // truncated-challenges: midnight-proofs
+            // proofs/src/poly/kzg/mod.rs computes
             //   power[i] = truncate(x1^i)
             // where the internal x1^i accumulator stays at full
             // precision (powers(x1).map(truncate) in Rust). We mirror
@@ -1042,7 +1043,8 @@ pub(super) fn computations(
         // Resolve the calldata pointer to the q_evals block once.
         lines.push("let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string());
 
-        // truncated-challenges: midnight-proofs uses
+        // truncated-challenges: midnight-proofs
+        // proofs/src/poly/kzg/mod.rs uses
         //   truncated_powers(x4)[i] = truncate(x4^i)
         // i.e. the internal accumulator stays full precision while
         // each emitted power is truncated to 128 bits.

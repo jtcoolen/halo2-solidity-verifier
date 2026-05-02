@@ -1263,7 +1263,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | Severity | Issue | Why it matters |
 | --- | --- | --- |
 | Resolved / clarified | Accumulator RHS fixed-base tail appears documented but not verified | The current IVC verifier fully collapses the carried proof accumulator, so no fixed-base scalar tail remains in public instances. The generator now renders the no-tail layout explicitly and emits `fixed_scalar_ptr` only for future non-collapsed layouts with generated fixed bases. |
-| High / needs confirmation | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | The code says only `x3` is truncated, but `X1_POWERS_MPTR` stores `and(acc, 2^128 - 1)` and `x4_pow_i` is also masked. If the Rust verifier uses full Fr powers for these batching challenges, Solidity checks a different PCS batching equation. |
+| Resolved / confirmed mirrored | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | Confirmed against Midfall `proofs/src/poly/kzg/mod.rs`: with `truncated-challenges`, Rust truncates x3 directly and uses `truncated_powers(x1)` / `truncated_powers(x4)` for PCS batching. Solidity intentionally mirrors this by masking stored powers, while keeping x1/x4 accumulators full precision. |
 | Medium | Gas logging is live in production path | `gas_checkpoint()` emits `LOG1` throughout `verifyProof`. This prevents `staticcall`/`view` usage, permanently emits logs for accepted proofs, and adds gas. A production verifier should compile this out. |
 | Medium / integration | Raw `verifyProof` does not bind application semantics | It verifies "this proof is valid for these public instances," but does not check what the first non-accumulator instances mean. A wrapper must bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
 | Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
@@ -1311,7 +1311,7 @@ public-input scalar tail on `ACC_RHS_MPTR` for the carried proof accumulator.
 
 ### F-2. Challenge truncation looks inconsistent
 
-Severity: High / needs confirmation.
+Status: Resolved / confirmed mirrored.
 
 This comment says:
 
@@ -1335,19 +1335,23 @@ x4_pow_full := mulmod(x4_pow_full, x4, r)
 let x4_pow_1 := and(x4_pow_full, 0xffffffffffffffffffffffffffffffff)
 ```
 
-This is not the same as "the challenge is 128-bit." It uses the low 128 bits
-of each Fr power. That may be intentional, but it needs to match the native
-verifier exactly and should be documented in the protocol proof.
+This is not the same as "the challenge is 128-bit." It uses the low 128 bits of
+each emitted Fr power. That behavior has now been checked against the native
+source of truth:
 
-Recommendation:
+- `midfall/proofs/src/poly/kzg/mod.rs` truncates `x3` directly when
+  `truncated-challenges` is enabled.
+- The same Rust file builds `powers_x1` with `truncated_powers(x1)`.
+- The final commitment/evaluation fold uses `truncated_powers(x4)`.
 
-- Add differential trace coverage against the Rust verifier for `theta`,
-  `beta`, `gamma`, `y`, `x`, `x1`, `x2`, `x3`, `x4`, `x1^i` batching scalars,
-  `x4^i` batching scalars, `q_eval_set[*]`, `f_eval`, `final_com`, and pairing
-  `lhs/rhs`.
-- If Rust uses full Fr powers for `x1` or `x4`, remove the masks.
-- If Rust intentionally truncates these batching scalars, document the
-  resulting 128-bit soundness target.
+The Solidity code mirrors that shape: `x1` and `x4` themselves remain full
+squeezed Fr words, their internal power accumulators remain full precision, and
+only the emitted batching powers are masked to 128 bits before use. Existing
+trace hooks cover the squeezed challenges, `f_eval`, `v`, `final_com`, and
+pairing inputs; richer per-power trace IDs would still be useful diagnostics,
+but the current masks are not a Solidity-only divergence.
+The remaining protocol/documentation item is to state the resulting 128-bit
+batching-soundness target wherever the IVC verifier profile is described.
 
 ### F-3. Gas logging should be a separate trace build
 
