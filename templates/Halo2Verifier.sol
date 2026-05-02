@@ -43,7 +43,6 @@ contract Halo2Verifier {
     uint256 internal constant EXPECTED_QUOTIENT_LENGTH = {{ self.expected_quotient_len.unwrap() }};
     bytes32 internal constant EXPECTED_QUOTIENT_CODEHASH = bytes32({{ expected_quotient_codehash|hex_padded(64) }});
     {%- when None %}
-    bytes32 public immutable AUTHORIZED_QUOTIENT_CODEHASH;
     {%- endmatch %}
     {%- when None %}
     {%- endmatch %}
@@ -202,14 +201,12 @@ contract Halo2Verifier {
             "invalid quotient"
         );
         {%- when None %}
-        require(authorizedQuotient.code.length != 0, "invalid quotient");
         {%- endmatch %}
         AUTHORIZED_VK = authorizedVk;
         AUTHORIZED_QUOTIENT = authorizedQuotient;
         {%- match self.expected_quotient_codehash %}
         {%- when Some with (_) %}
         {%- when None %}
-        AUTHORIZED_QUOTIENT_CODEHASH = authorizedQuotient.codehash;
         {%- endmatch %}
     }
     {%- when None %}
@@ -234,13 +231,11 @@ contract Halo2Verifier {
             "invalid quotient"
         );
         {%- when None %}
-        require(authorizedQuotient.code.length != 0, "invalid quotient");
         {%- endmatch %}
         AUTHORIZED_QUOTIENT = authorizedQuotient;
         {%- match self.expected_quotient_codehash %}
         {%- when Some with (_) %}
         {%- when None %}
-        AUTHORIZED_QUOTIENT_CODEHASH = authorizedQuotient.codehash;
         {%- endmatch %}
     }
     {%- when None %}
@@ -271,12 +266,6 @@ contract Halo2Verifier {
             return false;
         }
         {%- when None %}
-        if (
-            quotientEvaluator.code.length == 0
-                || quotientEvaluator.codehash != AUTHORIZED_QUOTIENT_CODEHASH
-        ) {
-            return false;
-        }
         {%- endmatch %}
         {%- when None %}
         {%- endmatch %}

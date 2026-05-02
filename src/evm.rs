@@ -42,6 +42,7 @@ pub(crate) mod test {
         Evm as RevmEvm,
     };
     use ruint::aliases::U256;
+    use sha3::{Digest, Keccak256};
     use std::{
         fmt::{self, Debug, Formatter},
         io::{self, Write},
@@ -202,6 +203,21 @@ pub(crate) mod test {
                 .as_ref()
                 .map(|c| c.len())
                 .unwrap_or(0)
+        }
+
+        /// Return the Keccak256 hash of deployed runtime bytecode at `address`.
+        ///
+        /// # Panics
+        /// Panics if given address doesn't have bytecode.
+        pub fn code_hash(&mut self, address: Address) -> U256 {
+            let code = self.db.accounts[&address]
+                .info
+                .code
+                .as_ref()
+                .expect("address must have bytecode")
+                .original_bytes();
+            let digest: [u8; 32] = Keccak256::digest(&code).into();
+            U256::from_be_bytes(digest)
         }
 
         /// Apply create transaction with given `bytecode` as creation bytecode.

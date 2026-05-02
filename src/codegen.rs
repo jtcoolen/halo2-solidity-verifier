@@ -2041,80 +2041,75 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     /// Render `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`, and a linked
-    /// `Halo2QuotientEvaluator.sol`. The verifier passes a fixed memory
-    /// frame to the quotient evaluator via `staticcall`, keeping the bulky
-    /// native quotient code out of the verifier runtime.
+    /// `Halo2QuotientEvaluator.sol`.
+    ///
+    /// External quotient evaluators are correctness-critical. Production
+    /// callers must first render/compile/deploy the quotient evaluator, then
+    /// call [`render_separately_with_pinned_quotient_into`] with its runtime
+    /// length and codehash.
+    #[deprecated(
+        note = "external quotient evaluators must be pinned; use render_quotient_evaluator_into + render_separately_with_pinned_quotient_into"
+    )]
     pub fn render_separately_with_quotient_into(
         &self,
-        verifier_writer: &mut impl fmt::Write,
-        vk_writer: &mut impl fmt::Write,
-        quotient_writer: &mut impl fmt::Write,
+        _verifier_writer: &mut impl fmt::Write,
+        _vk_writer: &mut impl fmt::Write,
+        _quotient_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(
-            true,
-            crate::SOLIDITY_TRACE_ENABLED,
-            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
-            true,
-            None,
-        )
-        .render(verifier_writer)?;
-        self.generate_vk().render(vk_writer)?;
-        self.generate_quotient_evaluator().render(quotient_writer)?;
-        Ok(())
+        panic!(
+            "external quotient evaluator render requires a generated runtime length/codehash; \
+             render the quotient evaluator first, compile/deploy it, then call \
+             render_separately_with_pinned_quotient_into"
+        );
     }
 
     /// Render `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`, and
     /// `Halo2QuotientEvaluator.sol` and return them as `String`s.
+    #[deprecated(
+        note = "external quotient evaluators must be pinned; use render_quotient_evaluator + render_separately_with_pinned_quotient"
+    )]
     pub fn render_separately_with_quotient(&self) -> Result<(String, String, String), fmt::Error> {
-        let mut verifier_output = String::new();
-        let mut vk_output = String::new();
-        let mut quotient_output = String::new();
-        self.render_separately_with_quotient_into(
-            &mut verifier_output,
-            &mut vk_output,
-            &mut quotient_output,
-        )?;
-        Ok((verifier_output, vk_output, quotient_output))
+        panic!(
+            "external quotient evaluator render requires a generated runtime length/codehash; \
+             render the quotient evaluator first, compile/deploy it, then call \
+             render_separately_with_pinned_quotient"
+        );
     }
 
     /// Render a trace-enabled `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`,
     /// and linked `Halo2QuotientEvaluator.sol`.
     ///
-    /// This mirrors [`render_separately_with_quotient_into`] while forcing
-    /// trace output regardless of the crate-level `solidity-trace` feature.
+    /// External quotient evaluators must be pinned even in trace builds.
+    /// Use [`render_trace_separately_with_pinned_quotient_into`].
+    #[deprecated(
+        note = "external quotient evaluators must be pinned; use render_trace_separately_with_pinned_quotient_into"
+    )]
     pub fn render_trace_separately_with_quotient_into(
         &self,
-        verifier_writer: &mut impl fmt::Write,
-        vk_writer: &mut impl fmt::Write,
-        quotient_writer: &mut impl fmt::Write,
+        _verifier_writer: &mut impl fmt::Write,
+        _vk_writer: &mut impl fmt::Write,
+        _quotient_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_verifier(
-            true,
-            true,
-            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
-            true,
-            None,
-        )
-        .render(verifier_writer)?;
-        self.generate_vk().render(vk_writer)?;
-        self.generate_quotient_evaluator().render(quotient_writer)?;
-        Ok(())
+        panic!(
+            "trace external quotient evaluator render requires a generated runtime length/codehash; \
+             render the quotient evaluator first, compile/deploy it, then call \
+             render_trace_separately_with_pinned_quotient_into"
+        );
     }
 
     /// Render a trace-enabled split verifier/VK/quotient trio and return
     /// them as `String`s.
+    #[deprecated(
+        note = "external quotient evaluators must be pinned; use render_trace_separately_with_pinned_quotient"
+    )]
     pub fn render_trace_separately_with_quotient(
         &self,
     ) -> Result<(String, String, String), fmt::Error> {
-        let mut verifier_output = String::new();
-        let mut vk_output = String::new();
-        let mut quotient_output = String::new();
-        self.render_trace_separately_with_quotient_into(
-            &mut verifier_output,
-            &mut vk_output,
-            &mut quotient_output,
-        )?;
-        Ok((verifier_output, vk_output, quotient_output))
+        panic!(
+            "trace external quotient evaluator render requires a generated runtime length/codehash; \
+             render the quotient evaluator first, compile/deploy it, then call \
+             render_trace_separately_with_pinned_quotient"
+        );
     }
 
     /// Render only `Halo2QuotientEvaluator.sol`. Production deployment
@@ -2170,6 +2165,50 @@ impl<'a> SolidityGenerator<'a> {
         let mut vk_output = String::new();
         let mut quotient_output = String::new();
         self.render_separately_with_pinned_quotient_into(
+            &mut verifier_output,
+            &mut vk_output,
+            &mut quotient_output,
+            expected_quotient_len,
+            expected_quotient_codehash,
+        )?;
+        Ok((verifier_output, vk_output, quotient_output))
+    }
+
+    /// Render a trace-enabled separated verifier/VK/quotient trio with the
+    /// verifier hard-pinned to the supplied quotient evaluator runtime length
+    /// and codehash.
+    pub fn render_trace_separately_with_pinned_quotient_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+        quotient_writer: &mut impl fmt::Write,
+        expected_quotient_len: usize,
+        expected_quotient_codehash: U256,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(
+            true,
+            true,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            true,
+            Some((expected_quotient_len, expected_quotient_codehash)),
+        )
+        .render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        self.generate_quotient_evaluator().render(quotient_writer)?;
+        Ok(())
+    }
+
+    /// Render a trace-enabled separated verifier/VK/quotient trio with a
+    /// hard-pinned quotient evaluator.
+    pub fn render_trace_separately_with_pinned_quotient(
+        &self,
+        expected_quotient_len: usize,
+        expected_quotient_codehash: U256,
+    ) -> Result<(String, String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        let mut quotient_output = String::new();
+        self.render_trace_separately_with_pinned_quotient_into(
             &mut verifier_output,
             &mut vk_output,
             &mut quotient_output,
@@ -3982,6 +4021,11 @@ impl<'a> SolidityGenerator<'a> {
             expected_quotient.is_none() || external_quotient,
             "quotient pinning requires an external quotient evaluator"
         );
+        assert!(
+            !external_quotient || expected_quotient.is_some(),
+            "external quotient evaluator render requires a generated runtime length/codehash; \
+             render the quotient evaluator first and use the pinned quotient render API"
+        );
         let proof_cptr = Ptr::calldata(0x64);
 
         let vk = self.generate_vk();
@@ -4786,6 +4830,20 @@ mod tests {
         assert!(verifier_template.contains("function pairing_gas_cap(input_len)"));
         assert!(pcs_codegen.contains("g1msm_gas_cap"));
         assert!(pcs_codegen.contains("g1add_gas_cap"));
+    }
+
+    #[test]
+    fn external_quotient_template_has_no_unpinned_fallback() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            !verifier_template.contains("AUTHORIZED_QUOTIENT_CODEHASH"),
+            "external quotient builds must use generated expected length/hash constants"
+        );
+        assert!(
+            !verifier_template.contains("authorizedQuotient.code.length != 0"),
+            "constructor must not pin whichever quotient address the deployer passed"
+        );
     }
 
     #[test]

@@ -240,8 +240,34 @@ fn mutated_separate_vk_contract_is_rejected() {
 
 #[test]
 #[ignore = "solidity/EVM-heavy; run explicitly"]
+fn pinned_quotient_verifier_rejects_wrong_quotient_runtime() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let wrong_quotient_solidity =
+        mutate_first_large_hex_literal(&fixture.quotient_evaluator_solidity, 0);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut evm = Evm::default();
+        let vk_address = evm.create(compile_solidity(&fixture.vk_solidity));
+        let wrong_quotient_address = evm.create(compile_solidity(&wrong_quotient_solidity));
+        evm.create_with_two_address_args(
+            compile_solidity(&fixture.quotient_verifier_solidity),
+            vk_address,
+            wrong_quotient_address,
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "pinned verifier constructor accepted a quotient evaluator with wrong runtime hash"
+    );
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn standard_plonk_render_is_deterministic_for_same_seed() {
-    if !poseidon_srs_available() {
+    if !poseidon_inputs_available_for_evm() {
         return;
     }
 
@@ -468,9 +494,21 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
     let embedded_verifier_solidity = generator.render().expect("embedded render");
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
-    let (quotient_verifier_solidity, quotient_vk_solidity, quotient_evaluator_solidity) = generator
-        .render_separately_with_quotient()
-        .expect("separate render with quotient evaluator");
+    let quotient_evaluator_solidity = generator
+        .render_quotient_evaluator()
+        .expect("quotient evaluator render");
+    let quotient_creation_code = compile_solidity(&quotient_evaluator_solidity);
+    let mut pin_evm = Evm::default();
+    let quotient_address = pin_evm.create(quotient_creation_code);
+    let quotient_runtime_size = pin_evm.code_size(quotient_address);
+    let quotient_codehash = pin_evm.code_hash(quotient_address);
+    let (quotient_verifier_solidity, quotient_vk_solidity, pinned_quotient_solidity) = generator
+        .render_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
+        .expect("separate pinned render with quotient evaluator");
+    assert_eq!(
+        quotient_evaluator_solidity, pinned_quotient_solidity,
+        "pinning the quotient evaluator must not change the evaluator source"
+    );
     assert_eq!(
         vk_solidity, quotient_vk_solidity,
         "plain and quotient-separated render paths must share the same VK"

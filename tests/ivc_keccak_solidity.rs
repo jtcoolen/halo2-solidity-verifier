@@ -1017,18 +1017,34 @@ fn ivc_final_keccak_solidity_e2e() {
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
-    let (verifier_solidity, vk_solidity, quotient_solidity) =
+    let quotient_solidity = generator
+        .render_quotient_evaluator()
+        .expect("render_quotient_evaluator should succeed");
+    let quotient_creation_code = compile_solidity_with_runs(&quotient_solidity, SOLC_OPTIMIZE_RUNS);
+    let quotient_creation_size = quotient_creation_code.len();
+    let mut evm = Evm::default();
+    let quotient_address = evm.create(quotient_creation_code.clone());
+    let quotient_runtime_size = evm.code_size(quotient_address);
+    let quotient_codehash = evm.code_hash(quotient_address);
+    let (verifier_solidity, vk_solidity, pinned_quotient_solidity) =
         if cfg!(feature = "rust-verifier-trace") {
             generator
-                .render_trace_separately_with_quotient()
-                .expect("render_trace_separately_with_quotient should succeed")
+                .render_trace_separately_with_pinned_quotient(
+                    quotient_runtime_size,
+                    quotient_codehash,
+                )
+                .expect("render_trace_separately_with_pinned_quotient should succeed")
         } else {
             generator
-                .render_separately_with_quotient()
-                .expect("render_separately_with_quotient should succeed")
+                .render_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
+                .expect("render_separately_with_pinned_quotient should succeed")
         };
+    assert_eq!(
+        quotient_solidity, pinned_quotient_solidity,
+        "pinning the quotient evaluator must not change the evaluator source"
+    );
     println!(
-        "[ivc-keccak-solidity] rendered Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes, Halo2QuotientEvaluator.sol = {} bytes (took {:.2?})",
+        "[ivc-keccak-solidity] rendered pinned Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes, Halo2QuotientEvaluator.sol = {} bytes (took {:.2?})",
         verifier_solidity.len(),
         vk_solidity.len(),
         quotient_solidity.len(),
@@ -1066,10 +1082,8 @@ fn ivc_final_keccak_solidity_e2e() {
     // ----------------------------------------------------------
     let t0 = Instant::now();
     let vk_creation_code = compile_solidity_with_runs(&vk_solidity, SOLC_OPTIMIZE_RUNS);
-    let quotient_creation_code = compile_solidity_with_runs(&quotient_solidity, SOLC_OPTIMIZE_RUNS);
     let verifier_creation_code = compile_solidity_with_runs(&verifier_solidity, SOLC_OPTIMIZE_RUNS);
     let vk_creation_size = vk_creation_code.len();
-    let quotient_creation_size = quotient_creation_code.len();
     let verifier_creation_size = verifier_creation_code.len();
     std::fs::write(
         format!("{dump_dir}/Halo2Verifier.creation.bin"),
@@ -1094,13 +1108,10 @@ fn ivc_final_keccak_solidity_e2e() {
         quotient_creation_size
     );
 
-    let mut evm = Evm::default();
     let vk_address = evm.create(vk_creation_code);
-    let quotient_address = evm.create(quotient_creation_code);
     let verifier_address =
         evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
     let vk_runtime_size = evm.code_size(vk_address);
-    let quotient_runtime_size = evm.code_size(quotient_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
     let contract_size_summary = format!(
         "solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
