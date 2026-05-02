@@ -447,6 +447,36 @@ contract Halo2Verifier {
             // is no longer needed once all challenges are squeezed.
 
             function batch_invert(success, mptr_start, mptr_end, scratch_mptr, r) -> ret {
+                ret := success
+                if iszero(ret) { leave }
+                if lt(mptr_end, mptr_start) {
+                    ret := 0
+                    leave
+                }
+
+                let count_bytes := sub(mptr_end, mptr_start)
+                if iszero(count_bytes) { leave }
+
+                if eq(count_bytes, 0x20) {
+                    let x := mload(mptr_start)
+                    if iszero(x) {
+                        ret := 0
+                        leave
+                    }
+
+                    let single_scratch := scratch_mptr
+                    mstore(single_scratch, 0x20)
+                    mstore(add(single_scratch, 0x20), 0x20)
+                    mstore(add(single_scratch, 0x40), 0x20)
+                    mstore(add(single_scratch, 0x60), x)
+                    mstore(add(single_scratch, 0x80), sub(r, 2))
+                    mstore(add(single_scratch, 0xa0), r)
+                    ret := staticcall(gas(), 0x05, single_scratch, 0xc0, single_scratch, 0x20)
+                    ret := and(ret, eq(returndatasize(), 0x20))
+                    if ret { mstore(mptr_start, mload(single_scratch)) }
+                    leave
+                }
+
                 let gp_mptr := scratch_mptr
                 let gp := mload(mptr_start)
                 let mptr := add(mptr_start, 0x20)

@@ -4946,6 +4946,28 @@ mod tests {
     }
 
     #[test]
+    fn batch_invert_handles_empty_and_singleton_ranges() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("let count_bytes := sub(mptr_end, mptr_start)"),
+            "batch inversion must compute the requested range length"
+        );
+        assert!(
+            verifier_template.contains("if iszero(count_bytes) { leave }"),
+            "empty batch inversion ranges should be a no-op"
+        );
+        assert!(
+            verifier_template.contains("if eq(count_bytes, 0x20)"),
+            "singleton batch inversion ranges need a dedicated path"
+        );
+        assert!(
+            verifier_template.contains("if ret { mstore(mptr_start, mload(single_scratch)) }"),
+            "singleton batch inversion must store the single inverse in place"
+        );
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();
