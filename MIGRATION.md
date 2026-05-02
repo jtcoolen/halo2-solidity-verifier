@@ -204,21 +204,15 @@ tests still pass.
        `[0x00..buf_len)` with the 31-byte `"Domain separator for transcript"`.
     2. `common_word(buf_len, w)` and `common_compressed_g1(buf_len, cptr)`
        append `[PREFIX_COMMON=0x01, ...payload]` to the buffer.
-    3. `squeeze_to(buf_len, mptr)` implements the two-fork squeeze:
-       append `[PREFIX_CHALLENGE=0x02]`, then keccak with
-       `[..., 0x00]` and `[..., 0x01]` separately to produce a 64-byte
-       output, reseed the buffer, and sample an Fq via
-       `from_uniform_bytes(64)` = `a0 + a1 * 2^256 (mod r)` with the
-       Montgomery constant `2^256 mod r` baked in (`FR_R_2POW256_MOD`).
+    3. `squeeze_to(buf_len, mptr)` computes one Keccak digest of the
+       accumulated transcript bytes, reseeds the buffer with that digest,
+       and samples an Fq as `uint256(digest_be) mod r`.
     4. `decompress_g1(success, src, dst)` parses the zcash 48-byte
        compressed encoding (top 3 flag bits + 381-bit x), runs
        `modexp(x, 3, p)` then `modexp(y_sq, (p+1)/4, p)` to recover y,
        and selects the correct sign by comparing `y` vs `p-y` limb-wise.
        Identity points (infinity flag set) are written as four zero words.
     5. `scalar_inv(x)` computes `x^(r-2) mod r` via modexp.
-    6. `byte_reverse_32(x)` swaps the byte order of a 32-byte word
-       (used to convert calldata BE u256s to LE bytes for transcript
-       hashing, since midnight-proofs hashes `Fq::to_repr()` LE bytes).
 * New MPTR layout in `templates/Halo2Verifier.sol`:
     * `THETA, BETA, GAMMA, TRASH_CHALLENGE, Y, X` at `theta_mptr+0..+5`
     * `X1, X2, X3, X4` at `theta_mptr+6..+9`

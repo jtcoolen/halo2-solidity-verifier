@@ -23,17 +23,18 @@
 //!     For Fq scalars, `input` is the canonical big-endian 32-byte repr.
 //!   * `squeeze`: produces one 32-byte Keccak digest over the current
 //!     transcript data, then resets the transcript data to that digest.
-//!   * `sample::<Fq>(out32)`: copy the 32-byte digest into the low half
-//!     of a zeroed 64-byte buffer and call `Fq::from_uniform_bytes`.
+//!   * `sample::<Fq>(out32)`: interpret the 32-byte digest as a
+//!     big-endian integer and reduce it modulo the scalar-field modulus.
 //!
 //! The Solidity verifier (`templates/Halo2Verifier.sol`) ports this exactly:
 //! see Step 6 in MIGRATION.md for the planned Yul translation.
 
 use std::io::{self, Cursor, Read, Write};
 
-use ff::{FromUniformBytes, PrimeField};
+use ff::PrimeField;
 use group::{prime::PrimeCurveAffine, GroupEncoding, UncompressedEncoding};
 use midnight_curves::{Fq, G1Affine, G1Projective};
+use ruint::aliases::U256;
 use sha3::{Digest, Keccak256};
 
 /// In-memory Keccak256 transcript matching `CircuitTranscript<Keccak256>`.
@@ -64,26 +65,23 @@ impl<S> Keccak256Transcript<S> {
         self.transcript_data.extend_from_slice(input);
     }
 
-    /// Squeeze one 32-byte digest, zero-pad it to the 64-byte
-    /// `from_uniform_bytes` input, then reset the transcript data to the
+    /// Squeeze one 32-byte digest, then reset the transcript data to the
     /// squeezed digest.
-    fn squeeze_bytes(&mut self) -> [u8; 64] {
+    fn squeeze_bytes(&mut self) -> [u8; 32] {
         let out0 = Keccak256::digest(&self.transcript_data);
 
-        let mut out = [0u8; 64];
-        out[..32].copy_from_slice(&out0);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&out0);
 
         self.transcript_data = out0.to_vec();
 
         out
     }
 
-    /// Squeeze a Fq challenge using `from_uniform_bytes` semantics.
+    /// Squeeze a Fq challenge using BE digest modulo-r semantics.
     pub fn squeeze_challenge(&mut self) -> Fq {
-        let bytes = self.squeeze_bytes();
-        // Fq::from_uniform_bytes reduces the zero-padded 64-byte little-
-        // endian integer modulo r.
-        Fq::from_uniform_bytes(&bytes)
+        let digest = self.squeeze_bytes();
+        fq_from_be_digest_mod_r(digest)
     }
 
     /// Absorb a Fq scalar in its canonical 32-byte BE transcript repr.
@@ -106,6 +104,17 @@ impl<S> Keccak256Transcript<S> {
         self.absorb_bytes(&bytes);
         Ok(())
     }
+}
+
+fn fq_from_be_digest_mod_r(digest: [u8; 32]) -> Fq {
+    let modulus = U256::from_str_radix(Fq::MODULUS.trim_start_matches("0x"), 16)
+        .expect("Fq::MODULUS must parse as hex");
+    let reduced = U256::from_be_bytes(digest) % modulus;
+    let bytes = reduced.to_le_bytes::<32>();
+
+    let mut repr = <Fq as PrimeField>::Repr::default();
+    repr.as_mut().copy_from_slice(&bytes);
+    Option::from(Fq::from_repr(repr)).expect("reduced Keccak challenge must be canonical")
 }
 
 /// Encode a `G1Projective` as the 128-byte EIP-2537 padded uncompressed

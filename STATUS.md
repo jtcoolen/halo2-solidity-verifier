@@ -21,10 +21,10 @@ today.**
 
 | Rust check | Solidity counterpart |
 |---|---|
-| `vk.hash_into(transcript)` | `common_word(buf_len, byte_reverse_32(mload(VK_DIGEST_MPTR)))` |
-| Domain-separator `"Domain separator for transcript"` (31 B) + PREFIX_COMMON (0x01) / PREFIX_CHALLENGE (0x00) + two-fork keccak + `from_uniform_bytes(64) = a0 + a1·2^256 mod r` | `transcript_init`, `common_word`, `squeeze_to`, `FR_R_2POW256_MOD` |
+| `vk.hash_into(transcript)` | `common_word(buf_len, mload(VK_DIGEST_MPTR))` |
+| Keccak transcript data append + one-digest squeeze/reseed + BE digest modulo-r sampling | `transcript_init`, `common_word`, `common_uncompressed_g1`, `squeeze_to` |
 | Per user-phase advices then per-phase challenge squeeze; then `theta`, lookup multiplicities, `beta`, `gamma`, perm-Z, lookup helpers + accumulators, `trash_challenge`, trashcans, `y`, quotient limbs, `x`, evals, `x1, x2`, `f_com`, `x3`, `q_evals`, `x4`, `pi` | Same schedule in the Yul body |
-| Canonical scalar bound on every Fq read | `success := and(success, lt(eval_le, r))` for every instance / eval / q_eval |
+| Canonical scalar bound on every Fq read | `success := and(success, lt(eval, r))` for every instance / eval / q_eval |
 | `partially_evaluate_identities` (gates → permutation → logup → trash) | `Evaluator::{gate_computations_tagged, permutation_computations, lookup_computations, trashcan_computations}` Horner-folded with `y` |
 | `compute_linearization_commitment`: quotient limbs scaled by `(1-x^n)·x^(k(n-1))` + simple-selector fixed comms with `Σ y^k·eval_k`, eval target `-Σ eval_k` | Quotient-fold block + simple-selector loop, `quotient_eval := sub(r, quotient_eval_numer)` |
 | `construct_intermediate_sets` (BTreeSet of point indices, sort by `(len, i)`) | `pcs/gwc19.rs::construct_intermediate_sets_impl` + `sort_sets` |

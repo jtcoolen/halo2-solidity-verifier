@@ -58,8 +58,8 @@ pub(crate) mod test {
     /// constraint went away and `runs=200` is now both safe (the
     /// rendered bytecode comfortably fits under 24 kB) and significantly
     /// cheaper at runtime — the optimizer can deduplicate
-    /// `common_uncompressed_g1`, `scalar_inv`, `byte_reverse_32`, the
-    /// `ec_*` helpers, and hoist `mload` traffic in the gate evaluator.
+    /// `common_uncompressed_g1`, `scalar_inv`, the `ec_*` helpers, and
+    /// hoist `mload` traffic in the gate evaluator.
     /// Audit item #7 / OPTIMISATION.md "A".
     pub const DEFAULT_OPTIMIZE_RUNS: u32 = 200;
 

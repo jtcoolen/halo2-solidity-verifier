@@ -19,8 +19,8 @@ pragma solidity ^0.8.0;
 //   * Transcript accumulates raw absorbed inputs in order. Squeeze
 //     computes one Keccak digest of the accumulated bytes, resets the
 //     transcript buffer to that 32-byte digest, then samples by
-//     zero-padding the digest to 64 bytes.
-//   * Fq sampling: from_uniform_bytes(32-byte digest || 32 zero bytes).
+//     interpreting the digest as a big-endian integer modulo r.
+//   * Fq sampling: uint256(keccak_digest_be) mod r.
 //   * Scalar inversion uses modexp(scalar, r-2, r).
 //   * Precompiles:
 //       0x05 modexp (used for Fr inversion)
@@ -282,61 +282,8 @@ contract Halo2Verifier {
         {%- endmatch %}
         assembly ("memory-safe") {
             // ===============================================================
-            // Helpers: byte-order, modexp, decompress, transcript
+            // Helpers: modexp, decompress, transcript
             // ===============================================================
-
-            // Reverse the byte order of a 32-byte word. Used for Fq LE
-            // scalars read from calldata that need to be interpreted as
-            // big-endian integers (or vice versa).
-            // 256-bit byte reversal. We unroll 31 of the 32 iterations
-            // and leave the last as a trivial 1-trip loop. The loop
-            // guard is what stops solc from inlining the entire 32-step
-            // body at every call site (~184 sites in this verifier);
-            // when fully unrolled, solc inlines aggressively under
-            // `--via-ir` and the resulting bytecode triggers a
-            // pathology where the verifier consumes the full block
-            // gas limit instead of the expected ~1.5 M. Keeping a
-            // single-iter loop preserves the function-call boundary
-            // and saves ~480 kg vs the original 32-iter loop. Each
-            // call site goes from ~700 gas (loop overhead × 32 iters)
-            // to ~140 gas (32 byte-extracts + ORs, function-call
-            // overhead).
-            function byte_reverse_32(x) -> r {
-                r := byte(0, x)
-                r := or(r, shl(8, byte(1, x)))
-                r := or(r, shl(16, byte(2, x)))
-                r := or(r, shl(24, byte(3, x)))
-                r := or(r, shl(32, byte(4, x)))
-                r := or(r, shl(40, byte(5, x)))
-                r := or(r, shl(48, byte(6, x)))
-                r := or(r, shl(56, byte(7, x)))
-                r := or(r, shl(64, byte(8, x)))
-                r := or(r, shl(72, byte(9, x)))
-                r := or(r, shl(80, byte(10, x)))
-                r := or(r, shl(88, byte(11, x)))
-                r := or(r, shl(96, byte(12, x)))
-                r := or(r, shl(104, byte(13, x)))
-                r := or(r, shl(112, byte(14, x)))
-                r := or(r, shl(120, byte(15, x)))
-                r := or(r, shl(128, byte(16, x)))
-                r := or(r, shl(136, byte(17, x)))
-                r := or(r, shl(144, byte(18, x)))
-                r := or(r, shl(152, byte(19, x)))
-                r := or(r, shl(160, byte(20, x)))
-                r := or(r, shl(168, byte(21, x)))
-                r := or(r, shl(176, byte(22, x)))
-                r := or(r, shl(184, byte(23, x)))
-                r := or(r, shl(192, byte(24, x)))
-                r := or(r, shl(200, byte(25, x)))
-                r := or(r, shl(208, byte(26, x)))
-                r := or(r, shl(216, byte(27, x)))
-                r := or(r, shl(224, byte(28, x)))
-                r := or(r, shl(232, byte(29, x)))
-                r := or(r, shl(240, byte(30, x)))
-                for { let i := 31 } lt(i, 32) { i := add(i, 1) } {
-                    r := or(r, shl(mul(i, 8), byte(i, x)))
-                }
-            }
 
             // Inverse of a Fr scalar via modexp(x, r-2, r). The verifier
             // calls this only after transcript absorption is complete, so it
@@ -424,7 +371,7 @@ contract Halo2Verifier {
             // verifier entry it starts empty. Each common(input) appends
             // raw bytes. squeeze_*(buf_len) computes one Keccak digest,
             // reseeds the buffer with that 32-byte digest, and samples a
-            // Fq element via zero-padded from_uniform_bytes.
+            // Fq element as uint256(digest_be) mod r.
 
             function transcript_init() -> buf_len {
                 buf_len := 0
@@ -490,12 +437,9 @@ contract Halo2Verifier {
                 let h0 := keccak256(0x00, buf_len)
                 // Reseed: write the 32-byte digest at start of buffer.
                 mstore(0x00, h0)
-                // Sample Fq via from_uniform_bytes(digest || zero[32]).
-                // h0 is the BE-loaded 32-byte int of bytes [0..32];
-                // we need its LE int interpretation.
-                let a0 := byte_reverse_32(h0)
                 let r := FR_MODULUS
-                mstore(mptr, mod(a0, r))
+                // Sample Fq as uint256(keccak_digest_be) mod r.
+                mstore(mptr, mod(h0, r))
                 ret := 32
             }
 
