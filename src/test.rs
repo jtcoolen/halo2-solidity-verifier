@@ -20,10 +20,12 @@ use proptest::{
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+#[cfg(feature = "rust-verifier-trace")]
 use revm::primitives::B256;
 use sha3::Digest;
+#[cfg(feature = "rust-verifier-trace")]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
     env,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -440,7 +442,9 @@ struct PropertyPoseidonFixture {
     vk_solidity: String,
     quotient_verifier_solidity: String,
     quotient_evaluator_solidity: String,
+    #[cfg_attr(not(feature = "rust-verifier-trace"), allow(dead_code))]
     trace_verifier_solidity: String,
+    #[cfg_attr(not(feature = "rust-verifier-trace"), allow(dead_code))]
     trace_vk_solidity: String,
 }
 
@@ -538,6 +542,94 @@ fn proof_scalar_range_checks_reject_non_field_words() {
             &fixture.instances,
         );
         assert_solidity_rejects(output, "q_eval scalar equal to Fr modulus");
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
+fn every_proof_g1_rejects_noncanonical_coordinates() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let layout = proof_g1_layout(&fixture);
+
+    assert_eq!(
+        layout.compressed_offsets.len(),
+        layout.repacked_offsets.len(),
+        "native/Solidity proof G1 offset schedules must agree"
+    );
+
+    let native_bad = [0xffu8; 48];
+    let mut evm = deployed_quotient_separated_verifier(&fixture);
+    assert_quotient_separated_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof");
+
+    for (idx, (&compressed_offset, &repacked_offset)) in layout
+        .compressed_offsets
+        .iter()
+        .zip(layout.repacked_offsets.iter())
+        .enumerate()
+    {
+        let mut bad_native = fixture.compressed_proof.clone();
+        bad_native[compressed_offset..compressed_offset + 48].copy_from_slice(&native_bad);
+        assert_native_poseidon_rejects(
+            &fixture,
+            &bad_native,
+            &format!("native noncanonical G1 idx={idx} compressed_offset={compressed_offset}"),
+        );
+
+        let mut bad_solidity = fixture.proof.clone();
+        // EIP-2537 padded G1 words require the top 16 bytes of x_hi/y_hi
+        // to be zero. Set one padding byte so the Solidity canonicality
+        // guard must reject before the point can enter the transcript.
+        bad_solidity[repacked_offset] = 1;
+        assert_quotient_separated_call_rejects(
+            &mut evm,
+            &fixture,
+            &bad_solidity,
+            &format!("Solidity noncanonical G1 idx={idx} repacked_offset={repacked_offset}"),
+        );
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
+fn every_proof_g1_rejects_off_curve_coordinates() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let layout = proof_g1_layout(&fixture);
+    let native_bad = compressed_off_curve_g1_bytes();
+    let solidity_bad = eip2537_padded_off_curve_g1_bytes();
+
+    let mut evm = deployed_quotient_separated_verifier(&fixture);
+    assert_quotient_separated_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof");
+
+    for (idx, (&compressed_offset, &repacked_offset)) in layout
+        .compressed_offsets
+        .iter()
+        .zip(layout.repacked_offsets.iter())
+        .enumerate()
+    {
+        let mut bad_native = fixture.compressed_proof.clone();
+        bad_native[compressed_offset..compressed_offset + 48].copy_from_slice(&native_bad);
+        assert_native_poseidon_rejects(
+            &fixture,
+            &bad_native,
+            &format!("native off-curve G1 idx={idx} compressed_offset={compressed_offset}"),
+        );
+
+        let mut bad_solidity = fixture.proof.clone();
+        bad_solidity[repacked_offset..repacked_offset + 128].copy_from_slice(&solidity_bad);
+        assert_quotient_separated_call_rejects(
+            &mut evm,
+            &fixture,
+            &bad_solidity,
+            &format!("Solidity off-curve G1 idx={idx} repacked_offset={repacked_offset}"),
+        );
     }
 }
 
@@ -729,6 +821,169 @@ fn call_quotient_separated_verifier(
         }
     }))
     .map_err(|_| ())
+}
+
+struct DeployedQuotientVerifier {
+    evm: Evm,
+    verifier_address: revm::primitives::Address,
+}
+
+fn deployed_quotient_separated_verifier(
+    fixture: &PropertyPoseidonFixture,
+) -> DeployedQuotientVerifier {
+    let mut evm = Evm::default();
+    let vk_address = evm.create(compile_solidity(&fixture.vk_solidity));
+    let quotient_address = evm.create(compile_solidity(&fixture.quotient_evaluator_solidity));
+    let verifier_address = evm.create_with_two_address_args(
+        compile_solidity(&fixture.quotient_verifier_solidity),
+        vk_address,
+        quotient_address,
+    );
+    DeployedQuotientVerifier {
+        evm,
+        verifier_address,
+    }
+}
+
+fn call_deployed_quotient_verifier(
+    deployed: &mut DeployedQuotientVerifier,
+    proof: &[u8],
+    instances: &[F],
+) -> Result<Vec<u8>, ()> {
+    match deployed
+        .evm
+        .try_call(deployed.verifier_address, encode_calldata(proof, instances))
+    {
+        CallOutcome::Success { output, .. } => Ok(output),
+        CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Ok(Vec::new()),
+    }
+}
+
+fn assert_quotient_separated_call_accepts(
+    deployed: &mut DeployedQuotientVerifier,
+    fixture: &PropertyPoseidonFixture,
+    proof: &[u8],
+    context: &str,
+) {
+    let output = call_deployed_quotient_verifier(deployed, proof, &fixture.instances);
+    assert_solidity_accepts(output, context);
+}
+
+fn assert_quotient_separated_call_rejects(
+    deployed: &mut DeployedQuotientVerifier,
+    fixture: &PropertyPoseidonFixture,
+    proof: &[u8],
+    context: &str,
+) {
+    let output = call_deployed_quotient_verifier(deployed, proof, &fixture.instances);
+    assert_solidity_rejects(output, context);
+}
+
+fn assert_native_poseidon_rejects(
+    fixture: &PropertyPoseidonFixture,
+    compressed_proof: &[u8],
+    context: &str,
+) {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        midnight_zk_stdlib::verify::<PoseidonExample, sha3::Keccak256>(
+            &fixture.params_verifier,
+            &fixture.vk,
+            &fixture.instances[0],
+            None,
+            compressed_proof,
+        )
+    }));
+
+    match result {
+        Ok(Ok(())) => panic!("native verifier accepted malformed proof: {context}"),
+        Ok(Err(_)) | Err(_) => {}
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProofG1Layout {
+    compressed_offsets: Vec<usize>,
+    repacked_offsets: Vec<usize>,
+}
+
+fn proof_g1_layout(fixture: &PropertyPoseidonFixture) -> ProofG1Layout {
+    let prefix_g1_count = fixture.scalar_layout.eval_offset / 0x80;
+    assert_eq!(
+        fixture.scalar_layout.eval_offset % 0x80,
+        0,
+        "G1 prefix must end on a repacked G1 boundary"
+    );
+
+    let f_com_repacked_offset =
+        fixture.scalar_layout.eval_offset + fixture.scalar_layout.num_evals * 0x20;
+    let pi_repacked_offset =
+        fixture.scalar_layout.q_eval_offset + fixture.scalar_layout.num_point_sets * 0x20;
+    assert_eq!(
+        fixture.scalar_layout.q_eval_offset,
+        f_com_repacked_offset + 0x80,
+        "q_eval block must follow f_com"
+    );
+
+    let mut repacked_offsets = (0..prefix_g1_count)
+        .map(|idx| idx * 0x80)
+        .collect::<Vec<_>>();
+    repacked_offsets.push(f_com_repacked_offset);
+    repacked_offsets.push(pi_repacked_offset);
+
+    let f_com_compressed_offset = prefix_g1_count * 48 + fixture.scalar_layout.num_evals * 0x20;
+    let pi_compressed_offset =
+        f_com_compressed_offset + 48 + fixture.scalar_layout.num_point_sets * 0x20;
+    let mut compressed_offsets = (0..prefix_g1_count).map(|idx| idx * 48).collect::<Vec<_>>();
+    compressed_offsets.push(f_com_compressed_offset);
+    compressed_offsets.push(pi_compressed_offset);
+
+    assert!(
+        compressed_offsets
+            .iter()
+            .all(|offset| offset + 48 <= fixture.compressed_proof.len()),
+        "compressed G1 offsets must be inside the native proof"
+    );
+    assert!(
+        repacked_offsets
+            .iter()
+            .all(|offset| offset + 0x80 <= fixture.proof.len()),
+        "repacked G1 offsets must be inside the Solidity proof"
+    );
+
+    ProofG1Layout {
+        compressed_offsets,
+        repacked_offsets,
+    }
+}
+
+fn compressed_off_curve_g1_bytes() -> [u8; 48] {
+    use group::GroupEncoding;
+    use midnight_curves::G1Affine;
+
+    for x in 1u64..10_000 {
+        let mut candidate = [0u8; 48];
+        candidate[40..48].copy_from_slice(&x.to_be_bytes());
+        // BLS compressed flag, no infinity flag. The remaining high bits of
+        // the x-coordinate are zero, so the coordinate is canonical.
+        candidate[0] |= 0x80;
+
+        let mut repr = <G1Affine as GroupEncoding>::Repr::default();
+        repr.as_mut().copy_from_slice(&candidate);
+        if bool::from(G1Affine::from_bytes(&repr).is_none()) {
+            return candidate;
+        }
+    }
+
+    panic!("failed to find a canonical compressed x-coordinate with no G1 point");
+}
+
+fn eip2537_padded_off_curve_g1_bytes() -> [u8; 128] {
+    let mut out = [0u8; 128];
+    // EIP-2537 padded uncompressed layout is x_hi, x_lo, y_hi, y_lo.
+    // (0, 1) is field-canonical but not on BLS12-381 G1, whose affine
+    // equation has b = 4, so the G1 precompiles must reject it.
+    out[127] = 1;
+    out
 }
 
 fn assert_solidity_accepts(output: Result<Vec<u8>, ()>, context: &str) {
