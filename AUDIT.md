@@ -1264,7 +1264,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | --- | --- | --- |
 | Resolved / clarified | Accumulator RHS fixed-base tail appears documented but not verified | The current IVC verifier fully collapses the carried proof accumulator, so no fixed-base scalar tail remains in public instances. The generator now renders the no-tail layout explicitly and emits `fixed_scalar_ptr` only for future non-collapsed layouts with generated fixed bases. |
 | Resolved / confirmed mirrored | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | Confirmed against Midfall `proofs/src/poly/kzg/mod.rs`: with `truncated-challenges`, Rust truncates x3 directly and uses `truncated_powers(x1)` / `truncated_powers(x4)` for PCS batching. Solidity intentionally mirrors this by masking stored powers, while keeping x1/x4 accumulators full precision. |
-| Medium | Gas logging is live in production path | `gas_checkpoint()` emits `LOG1` throughout `verifyProof`. This prevents `staticcall`/`view` usage, permanently emits logs for accepted proofs, and adds gas. A production verifier should compile this out. |
+| Resolved / debug-only | Gas logging is live in production path | Production renders do not emit `gas_checkpoint()` and keep `verifyProof` as `external view`. Checkpoints are available only through the `solidity-gas-checkpoints` feature or explicit gas-checkpoint render helpers. |
 | Medium / integration | Raw `verifyProof` does not bind application semantics | It verifies "this proof is valid for these public instances," but does not check what the first non-accumulator instances mean. A wrapper must bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
 | Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
 | Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
@@ -1355,7 +1355,7 @@ batching-soundness target wherever the IVC verifier profile is described.
 
 ### F-3. Gas logging should be a separate trace build
 
-Severity: Medium.
+Status: Resolved / debug-only.
 
 The verifier may emit logs when compiled with gas checkpoints:
 
@@ -1365,20 +1365,20 @@ function gas_checkpoint(id) {
 }
 ```
 
-Production artifacts should not include this. Live checkpoint logs have three
-production problems:
+Production artifacts do not include this. The generated template gates the
+function and every call site behind `self.gas_checkpoints`; the default renderer
+sets that flag from the optional `solidity-gas-checkpoints` feature, while
+explicit `render_with_gas_checkpoints*` helpers force it for benchmarking.
+
+Live checkpoint logs would have three production problems:
 
 1. `verifyProof` cannot be safely exposed as `view`.
 2. Any contract using `staticcall` to query verification will fail because
    `LOG` is not allowed in a static context.
 3. Logs add recurring gas and noisy events.
 
-Recommendation:
-
-- Keep two artifacts: a trace/gas-checkpoint verifier and a production
-  verifier.
-- The production version should remain `external view returns (bool)` once all
-  logging is removed.
+The production ABI remains `external view returns (bool)` unless trace or gas
+checkpoint output is intentionally enabled.
 
 ### F-4. Precompile assumptions should be explicit
 

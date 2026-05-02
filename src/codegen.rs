@@ -5800,6 +5800,36 @@ mod tests {
     }
 
     #[test]
+    fn gas_checkpoints_are_debug_only_template_paths() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+        let lib_source = include_str!("lib.rs");
+
+        assert!(
+            verifier_template.contains("{%- if self.gas_checkpoints %}\n            // Section-boundary gas-attribution checkpoint"),
+            "gas checkpoint helper must be guarded by the gas-checkpoint template flag"
+        );
+        assert_eq!(
+            verifier_template.matches("gas_checkpoint(").count(),
+            verifier_template
+                .matches("{%- if self.gas_checkpoints")
+                .count(),
+            "every gas_checkpoint definition/call should have its own self.gas_checkpoints guard"
+        );
+        assert!(
+            verifier_template.contains(") external {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %}"),
+            "production renders should stay external view unless trace/gas logs are enabled"
+        );
+        assert!(
+            lib_source.contains("pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED"),
+            "gas checkpoints should remain an explicit feature flag"
+        );
+        assert!(
+            lib_source.contains("render_with_gas_checkpoints*"),
+            "docs should call out the explicit benchmarking render helpers"
+        );
+    }
+
+    #[test]
     fn truncated_challenge_comments_cover_x1_x4_power_masks() {
         let verifier_template = include_str!("../templates/Halo2Verifier.sol");
         let gwc19_codegen = include_str!("codegen/pcs/gwc19.rs");
