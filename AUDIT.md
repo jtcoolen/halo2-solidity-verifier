@@ -1249,3 +1249,206 @@ References:
 - Solidity 0.8.24 release notes: https://www.soliditylang.org/blog/2024/01/26/solidity-0.8.24-release-announcement/
 - Ethereum Pectra announcement: https://blog.ethereum.org/2025/04/23/pectra-mainnet
 - EIP-170: https://eips.ethereum.org/EIPS/eip-170
+
+## 2026-05-02 follow-up audit notes: accumulator and batching edge cases
+
+I found no obvious "any random proof passes" bug in the main KZG pairing path,
+but this verifier should still not be treated as production-ready without
+resolving the items below. The highest-risk items are accumulator handling and
+challenge truncation, because both can silently make the Solidity verifier
+check a different statement than the native Midnight/Halo2 verifier.
+
+### Findings overview
+
+| Severity | Issue | Why it matters |
+| --- | --- | --- |
+| High / needs confirmation | Accumulator RHS fixed-base tail appears documented but not verified | The comment says RHS layout includes fixed-base scalars after the RHS point/scalar, but `fixed_scalar_ptr` is never used and `acc_expected_words` only permits two points plus two scalars. If the IVC accumulator relation is supposed to include terms such as `-G`, fixed commitments, or permutation commitments, the on-chain accumulator pairing is incomplete. |
+| High / needs confirmation | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | The code says only `x3` is truncated, but `X1_POWERS_MPTR` stores `and(acc, 2^128 - 1)` and `x4_pow_i` is also masked. If the Rust verifier uses full Fr powers for these batching challenges, Solidity checks a different PCS batching equation. |
+| Medium | Gas logging is live in production path | `gas_checkpoint()` emits `LOG1` throughout `verifyProof`. This prevents `staticcall`/`view` usage, permanently emits logs for accepted proofs, and adds gas. A production verifier should compile this out. |
+| Medium / integration | Raw `verifyProof` does not bind application semantics | It verifies "this proof is valid for these public instances," but does not check what the first non-accumulator instances mean. A wrapper must bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
+| Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
+| Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
+
+### F-1. Accumulator fixed-base terms look omitted
+
+Severity: High / needs confirmation.
+
+This block is suspicious:
+
+```solidity
+// RHS layout: point limbs (x,y), scalar, then fixed-base
+// scalars in BTreeMap key order (`-G`, fixed_i, perm_i ...)
+let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
+let acc_msm_len := sub(acc_pair_ptr, acc_scratch)
+```
+
+`fixed_scalar_ptr` is dead. No fixed-base scalars are read, and no MSM is
+built over `G1_BASE`, fixed commitments, or permutation commitments for the
+accumulator RHS.
+
+This may be correct only if the collapsed accumulator public input already
+includes all fixed-base contributions inside `ACC_RHS_MPTR` and there is no
+scalar tail. If so, the comment is dangerous and should be deleted. If the
+comment is correct, this is a serious verifier soundness bug.
+
+Recommendation:
+
+- Make the accumulator layout explicit in the generated comments and metadata.
+- If no fixed-base tail exists in this accumulator encoding, say so directly.
+- If the tail is real, include it in the RHS MSM and update `NUM_INSTANCES`
+  expectations accordingly.
+- Add a negative test where a nonzero fixed-base accumulator scalar is
+  required; the current code should fail that test if the tail is part of the
+  real relation.
+
+### F-2. Challenge truncation looks inconsistent
+
+Severity: High / needs confirmation.
+
+This comment says:
+
+```solidity
+// truncated-challenges: x3 is the f_com evaluation point ...
+// midnight-proofs truncates it to 128 bits at squeeze time
+mstore(X3_MPTR, and(mload(X3_MPTR), 0xffffffffffffffffffffffffffffffff))
+```
+
+But later the verifier also truncates powers of `x1`:
+
+```solidity
+acc := mulmod(acc, x1, r)
+mstore(p, and(acc, 0xffffffffffffffffffffffffffffffff))
+```
+
+and powers of `x4`:
+
+```solidity
+x4_pow_full := mulmod(x4_pow_full, x4, r)
+let x4_pow_1 := and(x4_pow_full, 0xffffffffffffffffffffffffffffffff)
+```
+
+This is not the same as "the challenge is 128-bit." It uses the low 128 bits
+of each Fr power. That may be intentional, but it needs to match the native
+verifier exactly and should be documented in the protocol proof.
+
+Recommendation:
+
+- Add differential trace coverage against the Rust verifier for `theta`,
+  `beta`, `gamma`, `y`, `x`, `x1`, `x2`, `x3`, `x4`, `x1^i` batching scalars,
+  `x4^i` batching scalars, `q_eval_set[*]`, `f_eval`, `final_com`, and pairing
+  `lhs/rhs`.
+- If Rust uses full Fr powers for `x1` or `x4`, remove the masks.
+- If Rust intentionally truncates these batching scalars, document the
+  resulting 128-bit soundness target.
+
+### F-3. Gas logging should be a separate trace build
+
+Severity: Medium.
+
+The verifier may emit logs when compiled with gas checkpoints:
+
+```solidity
+function gas_checkpoint(id) {
+    log1(0, 0, or(shl(248, id), gas()))
+}
+```
+
+Production artifacts should not include this. Live checkpoint logs have three
+production problems:
+
+1. `verifyProof` cannot be safely exposed as `view`.
+2. Any contract using `staticcall` to query verification will fail because
+   `LOG` is not allowed in a static context.
+3. Logs add recurring gas and noisy events.
+
+Recommendation:
+
+- Keep two artifacts: a trace/gas-checkpoint verifier and a production
+  verifier.
+- The production version should remain `external view returns (bool)` once all
+  logging is removed.
+
+### F-4. Precompile assumptions should be explicit
+
+Severity: Low / hardening.
+
+The code depends on EIP-2537 addresses:
+
+```text
+0x0b BLS12_G1ADD
+0x0c BLS12_G1MSM
+0x0f BLS12_PAIRING_CHECK
+```
+
+The EIP defines those addresses and the 64-byte Fp encoding rules, including
+canonical field-element validation. Add a constructor or deployment-time
+self-test for the target chain. Also ensure the Solidity compiler/EVM target
+supports the emitted opcodes, including `mcopy`.
+
+One item not flagged: using `sub(r, v)` as an MSM scalar can produce `r` when
+`v == 0`, but EIP-2537 scalars for multiplication are not required to be less
+than the subgroup order.
+
+### F-5. Make failed parsing fail earlier
+
+Severity: Low / hardening.
+
+Malformed ABI/proof length sets `success`, but parsing can continue:
+
+```solidity
+success := and(success, eq(0x1e60, calldataload(PROOF_LEN_CPTR)))
+...
+if iszero(success) { revert(0, 0) }
+```
+
+For bad calldata, the verifier can still perform many transcript reads before
+reverting. Later, failed states can still evaluate expensive `staticcall`
+expressions because Yul builtins are not short-circuiting.
+
+Recommendation:
+
+- After ABI length, proof length, instance count, and calldata size checks,
+  immediately revert.
+- Around precompile calls, use:
+
+```solidity
+if success {
+    success := staticcall(...)
+}
+```
+
+instead of:
+
+```solidity
+success := and(success, staticcall(...))
+```
+
+### F-6. Add targeted negative tests
+
+Severity: Low / hardening.
+
+Recommended tests:
+
+1. Flip each proof G1 into an off-curve point; every mutation must revert.
+2. Flip each proof G1 into a wrong-subgroup point if one can be generated;
+   every mutation must revert.
+3. Set every scalar, evaluation, and public instance once to `r`; each Fr value
+   must reject.
+4. Mutate high bits of `x1`/`x4`-power-dependent openings; the result must
+   disagree with Rust if masks are wrong.
+5. Malform accumulator identity encodings:
+   - x identity flag with nonzero y;
+   - `p - 1` without identity flag;
+   - unused high bits in packed limb words.
+6. Add a nonzero accumulator fixed-base tail test if the tail is part of the
+   real IVC relation.
+7. `staticcall` the production verifier; it should succeed once logging is
+   removed.
+
+The two items to resolve first are the accumulator RHS layout mismatch and the
+`x1`/`x4` truncation. Those are the most likely to become real soundness or
+"Solidity verifies a different protocol" bugs.
+
+Reference:
+
+- EIP-2537: https://eips.ethereum.org/EIPS/eip-2537
