@@ -304,9 +304,17 @@ contract Halo2Verifier {
             }
 
             {%- if self.quotient_pow5_helper %}
-            // VK-specialized identity helpers. This is not an interpreter:
-            // repeated quintic terms from Poseidon/trash gates lower to a
-            // fixed helper instead of three duplicated mulmods at every site.
+            // VK-specialized identity helper for Poseidon S-box terms.
+            //
+            // Rust source shape:
+            //   circuits/src/hash/poseidon/poseidon_chip.rs::sbox
+            //   full_round_gate / partial_round_gate
+            //   circuits/src/hash/poseidon/round_skips.rs::RoundId
+            //
+            // The Rust verifier only sees this as an Expression tree from
+            // `vk.cs.gates`; the generator emits q_pow5 after recognizing five
+            // equal multiplicative factors. It is a codegen shortcut for x^5,
+            // not a separate verifier rule.
             function q_pow5(x) -> z {
                 let x2 := mulmod(x, x, FR_MODULUS)
                 z := mulmod(x, mulmod(x2, x2, FR_MODULUS), FR_MODULUS)
@@ -314,10 +322,17 @@ contract Halo2Verifier {
 
             {%- endif %}
             {%- if self.quotient_limb7_helper %}
-            // Fixed 7-limb packing linear combination used throughout
-            // the Keccak/IVC gate identities:
-            // x0 + 2^56*x1 + 2^112*x2 + 2^34*x3
-            //    + 2^90*x4 + 2^12*x5 + 2^68*x6.
+            // Compact evaluator for a recurring 7-limb foreign-field linear
+            // combination.
+            //
+            // Rust source shape:
+            //   circuits/src/field/foreign/params.rs::base_powers
+            //   foreign/gates/norm.rs::Foreign-field normalization
+            //   foreign/gates/mul.rs::Foreign-field multiplication
+            //
+            // This evaluates sum_i base_powers[i] * limb_i over Fr for this
+            // generated 7-limb basis. It is used for normalization and the
+            // sum_x/sum_y/sum_z pieces of multiplication.
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
                 z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
                 z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)
@@ -329,9 +344,16 @@ contract Halo2Verifier {
 
             {%- endif %}
             {%- if self.quotient_wide_limb7_helper %}
-            // Sibling 7-limb packing helper for the wider powers in the
-            // Keccak field/arithmetic gates. The last two constants are
-            // the Fr-reduced residues of the next limb weights.
+            // Wide helper for the pairwise-product side of foreign-field
+            // multiplication.
+            //
+            // Rust source shape:
+            //   foreign/gates/mul.rs::Foreign-field multiplication
+            //   xys = pair_wise_prod(xs, ys)
+            //   sum_exprs(double_base_powers, xys)
+            //
+            // Native multiplication callbacks group repeated 7-term slices of
+            // the double-base product-convolution basis into q_limb7_wide.
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
                 z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
                 z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)

@@ -530,6 +530,99 @@ shared local functions when the generator recognizes an exact pattern.
 
 Unrecognized expressions fall back to the compact VM or direct generated Yul.
 
+### Rust Gate Mapping
+
+The helper names are Solidity codegen names. The Rust verifier does not call
+`q_pow5`, `q_limb7`, or `q_limb7_wide`. Instead,
+`mod.rs::partially_evaluate_identities` walks `vk.cs.gates`, evaluates each
+gate polynomial, and returns the resulting `(Option<selector>, F)` items. The
+Solidity generator sees those same expression trees and replaces a few common
+subexpressions with helpers.
+
+`q_pow5(x)` is the Poseidon S-box shape:
+
+```text
+q_pow5(x) = x^5 mod Fr = x * (x^2)^2 mod Fr
+```
+
+Rust source:
+
+```text
+circuits/src/hash/poseidon/poseidon_chip.rs::sbox
+circuits/src/hash/poseidon/poseidon_chip.rs::full_round_gate
+circuits/src/hash/poseidon/poseidon_chip.rs::partial_round_gate
+circuits/src/hash/poseidon/round_skips.rs::RoundId::to_expression
+```
+
+Those gates use quintic Poseidon terms either directly or through skipped-round
+linear combinations. When the lowered expression contains five identical
+multiplicative factors, the generator emits `q_pow5(base)` instead of repeating
+the multiplication chain at every site. The same helper may appear in the trash
+suffix when trash identities compress expressions that originated from
+Poseidon-like constraints.
+
+`q_limb7(x0, ..., x6)` is the compact form of a 7-limb foreign-field linear
+combination using `FieldEmulationParams::base_powers()`:
+
+```text
+q_limb7(x0..x6)
+  = x0
+  + c1*x1
+  + c2*x2
+  + c3*x3
+  + c4*x4
+  + c5*x5
+  + c6*x6
+  mod Fr
+```
+
+Rust source:
+
+```text
+circuits/src/field/foreign/params.rs::base_powers
+circuits/src/field/foreign/gates/norm.rs::Foreign-field normalization
+circuits/src/field/foreign/gates/mul.rs::Foreign-field multiplication
+```
+
+In normalization, this corresponds to terms such as:
+
+```text
+sum_exprs(base_powers, shifted_x) - sum_exprs(base_powers, zs)
+```
+
+In multiplication, it corresponds to the `sum_x`, `sum_y`, and `sum_z` limb
+packing terms:
+
+```text
+sum_exprs(base_powers, xs)
+sum_exprs(base_powers, ys)
+sum_exprs(base_powers, zs)
+```
+
+The constants in `q_limb7` are the generated Fr residues for this verifier's
+7-limb foreign-field basis. They are not dynamic proof inputs.
+
+`q_limb7_wide(x0, ..., x6)` is the analogous helper for the product-convolution
+side of the foreign-field multiplication gate. Rust computes all pairwise limb
+products and weights them with `FieldEmulationParams::double_base_powers()`:
+
+```text
+xys = pair_wise_prod(xs, ys)
+sum_exprs(double_base_powers, xys)
+```
+
+The generated native gate code groups repeated 7-term slices of this wide basis
+into calls to `q_limb7_wide`. This is why the native multiplication callbacks
+contain many terms of the form `q_limb7_wide(a_i * b_0, ..., a_i * b_6)`.
+
+These helpers therefore relate to these specific Rust circuit gates:
+
+| Helper | Rust gate source | Meaning |
+|---|---|---|
+| `q_pow5` | Poseidon full/partial/skipped-round gates | Poseidon S-box `x^5` |
+| `q_limb7` | foreign-field normalization and multiplication | base-power limb packing |
+| `q_limb7_wide` | foreign-field multiplication | double-base pairwise-product packing |
+
 ## Failure Modes
 
 The evaluator reverts if:

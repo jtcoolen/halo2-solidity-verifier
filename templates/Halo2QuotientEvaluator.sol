@@ -102,8 +102,16 @@ contract Halo2QuotientEvaluator {
 
             {%- if self.quotient_pow5_helper %}
             // Reusable x^5 helper for recurring Midfall custom-gate terms.
-            // This is only emitted when the generated native quotient blocks
-            // actually reference it.
+            //
+            // Rust source shape:
+            //   circuits/src/hash/poseidon/poseidon_chip.rs::sbox
+            //   full_round_gate / partial_round_gate
+            //   circuits/src/hash/poseidon/round_skips.rs::RoundId
+            //
+            // The Rust verifier only sees this as an Expression tree from
+            // `vk.cs.gates`; the generator emits q_pow5 after recognizing five
+            // equal multiplicative factors. It is a codegen shortcut for the
+            // Poseidon S-box x^5, not a separate verifier rule.
             function q_pow5(x) -> z {
                 let q_r := FR_MODULUS
                 let x2 := mulmod(x, x, q_r)
@@ -113,9 +121,17 @@ contract Halo2QuotientEvaluator {
 
             {%- if self.quotient_limb7_helper %}
             // Compact evaluator for a recurring 7-limb linear combination.
-            // It is a codegen helper, not an extra protocol rule: the
-            // generator emits calls to this helper only after recognizing the
-            // exact arithmetic chain in the lowered identity expression.
+            //
+            // Rust source shape:
+            //   circuits/src/field/foreign/params.rs::base_powers
+            //   foreign/gates/norm.rs::Foreign-field normalization
+            //   foreign/gates/mul.rs::Foreign-field multiplication
+            //
+            // This is the Fr evaluation of sum_i base_powers[i] * limb_i for
+            // the generated 7-limb foreign-field basis. It is used for the
+            // normalization gate and the sum_x/sum_y/sum_z pieces of the
+            // multiplication gate. The constants are VK/codegen constants,
+            // never proof-selected values.
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
                 z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
@@ -128,8 +144,18 @@ contract Halo2QuotientEvaluator {
             {%- endif %}
 
             {%- if self.quotient_wide_limb7_helper %}
-            // Wide variant of q_limb7 for the second recurring limb basis used
-            // by the generated Midfall identities.
+            // Wide variant for the pairwise-product side of foreign-field
+            // multiplication.
+            //
+            // Rust source shape:
+            //   foreign/gates/mul.rs::Foreign-field multiplication
+            //   xys = pair_wise_prod(xs, ys)
+            //   sum_exprs(double_base_powers, xys)
+            //
+            // The native multiplication callbacks group repeated 7-term slices
+            // of the double-base product-convolution basis into q_limb7_wide.
+            // This keeps the lowered quotient expression smaller while
+            // computing the same gate polynomial over Fr.
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
                 z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
