@@ -15,8 +15,8 @@ mod transcript;
 mod test;
 
 pub use codegen::{
-    encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, ProofEvaluationCounts,
-    SolidityGenerator,
+    encode_calldata_bls_padded, AccumulatorEncoding, BatchOpenScheme, GeneratorError,
+    ProofEvaluationCounts, SolidityGenerator,
 };
 pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF};
 pub use transcript::Keccak256Transcript;

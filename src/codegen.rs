@@ -88,6 +88,41 @@ impl AccumulatorEncoding {
     }
 }
 
+/// Errors returned when a constraint system is outside the currently
+/// supported Midfall Solidity verifier shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratorError {
+    /// A verifier with no advice commitments has no proof commitment phase to
+    /// bind into the Fiat-Shamir transcript.
+    NoAdviceColumns,
+    /// The current proof layout supports at most one committed and one
+    /// non-committed instance column.
+    TooManyInstanceColumns { actual: usize, max: usize },
+    /// Instance columns are read as direct public inputs and locally
+    /// Lagrange-interpolated only at the current row.
+    RotatedInstanceQuery { column: usize, rotation: i32 },
+}
+
+impl fmt::Display for GeneratorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAdviceColumns => {
+                write!(f, "at least one advice column is required")
+            }
+            Self::TooManyInstanceColumns { actual, max } => write!(
+                f,
+                "too many instance columns: got {actual}, maximum supported is {max}"
+            ),
+            Self::RotatedInstanceQuery { column, rotation } => write!(
+                f,
+                "rotated instance query is not supported: column {column}, rotation {rotation}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GeneratorError {}
+
 /// Field-evaluation counts for the proof layout consumed by the generated
 /// Solidity verifier.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1852,27 +1887,48 @@ impl<'a> SolidityGenerator<'a> {
         scheme: BatchOpenScheme,
         num_instances: usize,
     ) -> Self {
-        assert_ne!(vk.cs().num_advice_columns(), 0);
+        Self::try_new(params, vk, scheme, num_instances)
+            .unwrap_or_else(|err| panic!("unsupported Solidity verifier shape: {err}"))
+    }
+
+    /// Try to construct a new `SolidityGenerator`, returning a typed error
+    /// when the supplied constraint system is outside the currently supported
+    /// Midfall verifier shape.
+    pub fn try_new(
+        params: &'a ParamsKZG<Bls12>,
+        vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
+        scheme: BatchOpenScheme,
+        num_instances: usize,
+    ) -> Result<Self, GeneratorError> {
+        if vk.cs().num_advice_columns() == 0 {
+            return Err(GeneratorError::NoAdviceColumns);
+        }
         // midnight-proofs ZkStdLib always allocates two instance columns
         // (one committed, one non-committed), so the v0.4 `<= 1`
         // tightness no longer applies. We accept up to 2 here and let
         // `set_num_committed_instances` handle the split.
-        assert!(
-            vk.cs().num_instance_columns() <= 2,
-            "More than two instance columns is not yet implemented"
-        );
-        assert!(
-            !vk.cs()
-                .instance_queries()
-                .iter()
-                .any(|(_, rotation)| *rotation != Rotation::cur()),
-            "Rotated query to instance column is not yet implemented"
-        );
+        if vk.cs().num_instance_columns() > 2 {
+            return Err(GeneratorError::TooManyInstanceColumns {
+                actual: vk.cs().num_instance_columns(),
+                max: 2,
+            });
+        }
+        if let Some((column, rotation)) = vk
+            .cs()
+            .instance_queries()
+            .iter()
+            .find(|(_, rotation)| *rotation != Rotation::cur())
+        {
+            return Err(GeneratorError::RotatedInstanceQuery {
+                column: column.index(),
+                rotation: rotation.0,
+            });
+        }
 
         let num_committed_instances = 0;
         let meta = ConstraintSystemMeta::new(vk.cs(), num_committed_instances);
 
-        Self {
+        Ok(Self {
             params,
             vk,
             scheme,
@@ -1880,7 +1936,7 @@ impl<'a> SolidityGenerator<'a> {
             num_committed_instances,
             acc_encoding: None,
             meta,
-        }
+        })
     }
 
     /// Set `AccumulatorEncoding`.
@@ -5067,6 +5123,27 @@ mod tests {
                 "{name} should not claim memory-safe assembly while using low-memory transcript/scratch buffers"
             );
         }
+    }
+
+    #[test]
+    fn generator_restriction_errors_are_typed() {
+        assert_eq!(
+            GeneratorError::TooManyInstanceColumns { actual: 3, max: 2 }.to_string(),
+            "too many instance columns: got 3, maximum supported is 2"
+        );
+        assert_eq!(
+            GeneratorError::RotatedInstanceQuery {
+                column: 1,
+                rotation: -1,
+            }
+            .to_string(),
+            "rotated instance query is not supported: column 1, rotation -1"
+        );
+        let stale = ["not", " yet ", "implemented"].concat();
+        assert!(
+            !include_str!("codegen.rs").contains(&stale),
+            "unsupported verifier shapes should be surfaced as GeneratorError values"
+        );
     }
 
     #[test]
