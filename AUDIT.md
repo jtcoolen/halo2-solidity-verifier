@@ -1303,6 +1303,12 @@ acc_expected_words = acc_offset + lhs_point + lhs_scalar + rhs_point + rhs_scala
 
 For the current fully-collapsed IVC layout, `fixed_tail_len == 0`.
 
+This does not mean the decider proof has no fixed bases anywhere. The final
+KZG pairing check still uses fixed, permutation, quotient, advice, lookup, and
+accumulator commitments as verifier-key/proof bases in the PCS MSM. The
+clarification is narrower: those bases are not encoded as an extra
+public-input scalar tail on `ACC_RHS_MPTR` for the carried proof accumulator.
+
 ### F-2. Challenge truncation looks inconsistent
 
 Severity: High / needs confirmation.
