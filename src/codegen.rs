@@ -279,11 +279,13 @@ const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 4;
 const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 
-// Spend a bounded slice of quotient-evaluator bytecode headroom on native VM callbacks.
-// After the direct prefix, the heaviest N remaining gate identities are emitted
-// as VM opcodes that call generated Yul blocks; everything else stays in the
-// compact interpreter. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
-const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 5;
+// Spend a bounded slice of quotient-evaluator bytecode headroom on native VM
+// callbacks. After the direct prefix, the heaviest N remaining gate identities
+// are emitted as VM opcodes that call generated Yul blocks; everything else
+// stays in the compact interpreter. The default is the gas-capped compact IVC
+// setting measured below 1.75M total gas while keeping the external quotient
+// evaluator below 23.5kB. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
+const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 4;
 const QUOTIENT_NATIVE_GATES_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES";
 const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 // The compact quotient VM path is the default size-oriented emitter: it stores
@@ -657,6 +659,10 @@ impl QuotientProgramBuilder {
     }
 
     fn fold_identity(&mut self, target: QuotientTarget) {
+        // Mirrors the Rust `compute_linearization_commitment` y-batch:
+        // every emitted identity is first absorbed into the same running
+        // power of y, then either accumulated into the fully-evaluated
+        // numerator or into the simple-selector bucket.
         match target {
             QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
             QuotientTarget::Selector(idx) => {
@@ -683,6 +689,9 @@ impl QuotientProgramBuilder {
             self.stack_depth, 0,
             "native identity expects empty VM stack"
         );
+        // Native identity callbacks are a bytecode/gas trade: recognized
+        // heavy gates stay as generated Yul kernels while the remaining gates
+        // fall back to the compact VM program stored in the VK payload.
         self.bytes.push(Q_OP_NATIVE_IDENTITY);
         self.u16(native_idx);
     }
@@ -4868,6 +4877,116 @@ mod tests {
         assert_eq!(frame.frame_len, 0x4e0);
         assert_eq!(frame.output_len, 0xa0);
         assert_eq!(frame.magic, QUOTIENT_EXTERNAL_MAGIC);
+    }
+
+    #[test]
+    fn compact_quotient_default_matches_gas_capped_ivc_setting() {
+        assert_eq!(DEFAULT_QUOTIENT_NATIVE_GATES, 4);
+
+        let docs = include_str!("../docs/QUOTIENT_NUMERATOR_EVALUATOR.md");
+        assert!(
+            docs.contains("total gas: `1,614,572`"),
+            "quotient evaluator docs should record the gas-capped compact default bench"
+        );
+        assert!(
+            docs.contains("quotient runtime: `21,774` bytes"),
+            "quotient evaluator docs should record the compact default runtime"
+        );
+        assert!(
+            docs.contains("HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N"),
+            "quotient evaluator docs should describe the experimental tuning hook"
+        );
+    }
+
+    #[test]
+    fn quotient_forward_y_batch_matches_rust_reverse_fold() {
+        let y = Fq::from(17u64);
+        let evals = [
+            Fq::from(3u64),
+            Fq::from(5u64),
+            Fq::from(7u64),
+            Fq::from(11u64),
+            Fq::from(13u64),
+        ];
+
+        let solidity_forward = evals.iter().fold(Fq::ZERO, |acc, eval| acc * y + eval);
+
+        let mut rust_reverse = Fq::ZERO;
+        let mut y_pow = Fq::ONE;
+        for eval in evals.iter().rev() {
+            rust_reverse += *eval * y_pow;
+            y_pow *= y;
+        }
+
+        assert_eq!(solidity_forward, rust_reverse);
+    }
+
+    #[test]
+    fn quotient_selector_inverse_fold_matches_final_scale() {
+        let y = Fq::from(19u64);
+        let y_inv = y.invert().unwrap();
+        let evals = [
+            Fq::from(2u64),
+            Fq::from(0u64),
+            Fq::from(23u64),
+            Fq::from(29u64),
+        ];
+        let selector_positions = [true, false, true, true];
+
+        let mut scale = Fq::ONE;
+        let mut inv_scale = Fq::ONE;
+        let mut selector_acc = Fq::ZERO;
+        for (eval, selected) in evals.iter().zip(selector_positions) {
+            scale *= y;
+            inv_scale *= y_inv;
+            if selected {
+                selector_acc += *eval * inv_scale;
+            }
+        }
+        let solidity_selector_acc = selector_acc * scale;
+
+        let mut rust_selector_acc = Fq::ZERO;
+        let mut y_pow = Fq::ONE;
+        for (eval, selected) in evals.iter().zip(selector_positions).rev() {
+            if selected {
+                rust_selector_acc += *eval * y_pow;
+            }
+            y_pow *= y;
+        }
+
+        assert_eq!(solidity_selector_acc, rust_selector_acc);
+    }
+
+    #[test]
+    fn limb7_linear_chain_is_recognized_as_native_helper_call() {
+        let lines = [
+            "let c0 := 0x100000000000000",
+            "let m0 := mulmod(c0, x1, r)",
+            "let a0 := addmod(x0, m0, r)",
+            "let m1 := mulmod(0x10000000000000000000000000000, x2, r)",
+            "let a1 := addmod(a0, m1, r)",
+            "let m2 := mulmod(0x400000000, x3, r)",
+            "let a2 := addmod(a1, m2, r)",
+            "let m3 := mulmod(0x40000000000000000000000, x4, r)",
+            "let a3 := addmod(a2, m3, r)",
+            "let m4 := mulmod(0x1000, x5, r)",
+            "let a4 := addmod(a3, m4, r)",
+            "let m5 := mulmod(0x100000000000000000, x6, r)",
+            "let a5 := addmod(a4, m5, r)",
+        ]
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+        let specialized = SolidityGenerator::specialize_limb7_chains(&lines);
+
+        assert_eq!(
+            specialized,
+            vec![
+                "let c0 := 0x100000000000000".to_string(),
+                "let a5 := q_limb7(x0, x1, x2, x3, x4, x5, x6)".to_string(),
+            ]
+        );
     }
 
     #[test]

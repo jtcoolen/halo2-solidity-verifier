@@ -521,6 +521,11 @@
                     }
                     {%- endif %}
                     {%- if quotient_native_identity_computations.len() > 0 %}
+                    // Native callbacks are generated only for the heaviest
+                    // recognized Midfall gate identities. All other gate,
+                    // lookup, and non-native identity arithmetic remains in
+                    // the compact q_program VM above, preserving the Rust
+                    // `partially_evaluate_identities` order.
                     case 0x1b {
                         let q_native_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -541,6 +546,9 @@
                     case 0x0a {
                         let q_eval := q_top
                         q_has_top := 0
+                        // Fully-evaluated identity: qn = qn*y + eval.
+                        // This matches the reverse y-power fold in Rust
+                        // linearization once all identities have been read.
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
                         q_sel_scale := mulmod(q_sel_scale, y, r)
@@ -553,6 +561,10 @@
                         q_pc := add(q_pc, 2)
                         let q_eval := q_top
                         q_has_top := 0
+                        // Simple-selector identity: keep the same y-batch
+                        // position as main identities, but defer the final
+                        // y^m scaling so equal selector commitments are
+                        // grouped like Rust's BTreeMap accumulator.
                         quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
                         {%- if simple_selector_cols.len() > 0 %}
                         q_sel_scale := mulmod(q_sel_scale, y, r)

@@ -6,6 +6,10 @@ pragma solidity ^0.8.24;
 // QUOTIENT_FRAME_BASE as raw calldata. This contract copies it back to the
 // same memory addresses, runs the generated quotient numerator block, and
 // returns a compact fixed frame consumed by the verifier.
+//
+// This contract reconstructs the Rust verifier's y-batched identity numerator
+// nu_y(x) and returns the linearization expected scalar -nu_y(x). It does not
+// evaluate or trust a quotient scalar h(x).
 contract Halo2QuotientEvaluator {
     uint256 internal constant FR_MODULUS =
         0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
