@@ -53,6 +53,32 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 > [!NOTE]
 > The workspace is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml).
 
+### IVC detailed bench
+
+Run the Keccak IVC Solidity verifier bench with per-section gas checkpoints:
+
+```bash
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+scripts/run_ivc_bench.sh
+```
+
+This prints the detailed checkpoint table, deployed runtime sizes, total
+transaction gas, and real checkpointed section work.
+
+### IVC full trace equivalence
+
+Run the full native Rust/Solidity trace-equivalence check for the IVC example:
+
+```bash
+SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+cargo test --release \
+  --features evm,rust-verifier-trace,truncated-challenges,in-circuit-fewer-point-sets \
+  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+  -- --ignored --nocapture
+```
+
+The expected success signal includes a native Rust/Solidity trace match and the
+final Keccak IVC proof being accepted on-chain.
 
 ## Limitations & Caveats
 
