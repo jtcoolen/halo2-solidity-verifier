@@ -1,5 +1,5 @@
 use crate::codegen::{
-    artifact::{PayloadSectionKind, VkPayloadLayout},
+    artifact::{PackedProgramCodec, PayloadSectionKind, VkPayloadLayout},
     evaluator::Evaluator,
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
@@ -2985,7 +2985,8 @@ impl<'a> SolidityGenerator<'a> {
         let (pre_quotient_program_build, _) =
             self.compact_quotient_program_for(&pre_meta, &pre_data);
         let quotient_const_words = pre_quotient_program_build.consts.len();
-        let quotient_program_words = Self::program_chunks(&pre_quotient_program_build.bytes).len();
+        let quotient_program_words =
+            PackedProgramCodec::word_len_for_bytes(pre_quotient_program_build.bytes.len());
         let payload_layout = VkPayloadLayout::for_vk(
             vk.constants.len(),
             quotient_const_words,
@@ -3025,7 +3026,8 @@ impl<'a> SolidityGenerator<'a> {
 
         let (meta, data) = self.meta_data_for_vk(&vk, vk_mptr, proof_cptr);
         let (quotient_program_build, _) = self.compact_quotient_program_for(&meta, &data);
-        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+        let quotient_program_chunks =
+            PackedProgramCodec::encode_words(&quotient_program_build.bytes);
         assert_eq!(
             quotient_program_build.consts.len(),
             quotient_const_words,
@@ -4500,7 +4502,8 @@ impl<'a> SolidityGenerator<'a> {
             (selector_acc_mptr + sorted_simple.len() * 0x20).next_multiple_of(0x20);
 
         let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
-        let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+        let quotient_program_chunks =
+            PackedProgramCodec::encode_words(&quotient_program_build.bytes);
         let quotient_const_words = vk.quotient_const_words;
         let quotient_program_words = vk.quotient_program_words;
         let quotient_const_offset_words = vk
@@ -4699,7 +4702,8 @@ impl<'a> SolidityGenerator<'a> {
         let (quotient_program, quotient_stack_mptr) = if let Some(quotient_program_build) =
             quotient_program_build
         {
-            let quotient_program_chunks = Self::program_chunks(&quotient_program_build.bytes);
+            let quotient_program_chunks =
+                PackedProgramCodec::encode_words(&quotient_program_build.bytes);
             let quotient_const_words = vk.quotient_const_words;
             let quotient_program_words = vk.quotient_program_words;
             let quotient_const_offset_words = vk
@@ -5039,15 +5043,6 @@ impl<'a> SolidityGenerator<'a> {
         }
 
         builder.finish(quotient_program_encoding())
-    }
-
-    fn program_chunks(bytes: &[u8]) -> Vec<U256> {
-        let mut padded = bytes.to_vec();
-        padded.resize(padded.len().next_multiple_of(32), 0);
-        padded
-            .chunks(32)
-            .map(U256::from_be_slice)
-            .collect::<Vec<_>>()
     }
 
     /// Repack a midnight-proofs proof from the on-the-wire compressed
