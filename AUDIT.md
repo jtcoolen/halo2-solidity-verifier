@@ -1267,7 +1267,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | Resolved / debug-only | Gas logging is live in production path | Production renders do not emit `gas_checkpoint()` and keep `verifyProof` as `external view`. Checkpoints are available only through the `solidity-gas-checkpoints` feature or explicit gas-checkpoint render helpers. |
 | Clarified / integration requirement | Raw `verifyProof` does not bind application semantics | The raw generated verifier intentionally checks only "this proof is valid for these public instances under this VK." Generated NatSpec now requires wrappers to bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
 | Resolved / deployment guard | Precompile assumptions should be explicit | Constructors now run a deployment-time smoke test for EIP-2537 G1ADD, G1MSM, and pairing using identity inputs, and generated comments state the Solidity/EVM target requirement. |
-| Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
+| Resolved / fail-fast | Malformed calldata and failed `success` states keep executing expensive work | ABI/proof/instance shape failures now revert before transcript parsing, Lagrange failures revert before quotient reconstruction, and EIP-2537 calls are guarded with `if success` instead of `and(success, staticcall(...))`. |
 | Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
 
 ### F-1. Accumulator fixed-base terms look omitted
@@ -1428,7 +1428,7 @@ than the subgroup order.
 
 ### F-6. Make failed parsing fail earlier
 
-Severity: Low / hardening.
+Status: Resolved / fail-fast.
 
 Malformed ABI/proof length sets `success`, but parsing can continue:
 
@@ -1438,15 +1438,17 @@ success := and(success, eq(0x1e60, calldataload(PROOF_LEN_CPTR)))
 if iszero(success) { revert(0, 0) }
 ```
 
-For bad calldata, the verifier can still perform many transcript reads before
-reverting. Later, failed states can still evaluate expensive `staticcall`
+For bad calldata, the verifier could still perform many transcript reads before
+reverting. Later, failed states could still evaluate expensive `staticcall`
 expressions because Yul builtins are not short-circuiting.
 
-Recommendation:
+Resolution:
 
-- After ABI length, proof length, instance count, and calldata size checks,
-  immediately revert.
-- Around precompile calls, use:
+- After VK header, proof length, instance count, and calldata size checks, the
+  verifier now immediately reverts.
+- If Lagrange/common-polynomial setup fails, the verifier now reverts before
+  external quotient reconstruction.
+- EIP-2537 calls in the PCS and accumulator paths now use:
 
 ```solidity
 if success {
@@ -1459,6 +1461,9 @@ instead of:
 ```solidity
 success := and(success, staticcall(...))
 ```
+
+This prevents already-failed verifier states from entering G1MSM/G1ADD/pairing
+precompiles.
 
 ### F-7. Add targeted negative tests
 

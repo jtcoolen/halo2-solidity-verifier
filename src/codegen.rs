@@ -5601,6 +5601,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_success_paths_do_not_enter_ec_precompiles() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+        let pcs_codegen = include_str!("codegen/pcs/gwc19.rs");
+
+        assert!(
+            verifier_template.contains("if iszero(success) { revert(0, 0) }\n            }\n\n            {%- if self.gas_checkpoints %}\n            gas_checkpoint(2)"),
+            "ABI/proof length/instance shape checks should fail before transcript parsing"
+        );
+        assert!(
+            verifier_template.contains(
+                "if iszero(success) { revert(0, 0) }\n\n            {%- match quotient_external %}"
+            ),
+            "failed Lagrange/common-polynomial setup should fail before quotient reconstruction"
+        );
+        for source in [verifier_template, pcs_codegen] {
+            assert!(
+                !source.contains("and(success, staticcall"),
+                "Yul does not short-circuit and(success, staticcall(...)); guard precompile calls with if success"
+            );
+            assert!(
+                !source.contains("and(\n                            success,\n                            staticcall"),
+                "multi-line and(success, staticcall(...)) must not reappear"
+            );
+        }
+        assert!(
+            verifier_template.contains("ret := success\n                if iszero(ret) { leave }"),
+            "ec_pairing should leave before staging/calling the pairing precompile when success is false"
+        );
+        assert!(
+            pcs_codegen.contains("if success {")
+                && pcs_codegen.contains("success := staticcall(g1msm_gas_cap")
+                && pcs_codegen.contains("success := staticcall(g1add_gas_cap"),
+            "PCS emitter should guard final MSM/add precompile calls with if success"
+        );
+    }
+
+    #[test]
     fn verifier_constructor_smoke_tests_eip2537_precompiles() {
         let verifier_template = include_str!("../templates/Halo2Verifier.sol");
 

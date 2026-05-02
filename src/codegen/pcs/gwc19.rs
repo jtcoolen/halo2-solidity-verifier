@@ -1152,12 +1152,14 @@ pub(super) fn computations(
         pair_idx += 1;
         debug_assert_eq!(pair_idx, final_msm_terms);
 
+        lines.push("if success {".to_string());
         lines.push(format!(
-            "success := and(success, staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80))",
+            "    success := staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80)",
             final_msm_terms * 0xa0,
             final_msm_terms * 0xa0
         ));
-        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("}".to_string());
         lines.push(format!(
             "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, 0x80)"
         ));
@@ -1192,31 +1194,39 @@ pub(super) fn computations(
         // tmp = (-v) * G  =>  load G into 0x00, scale by (r - v).
         lines.push("mcopy(0x0, G1_BASE_MPTR, 0x80)".to_string());
         lines.push("mstore(0x80, sub(r, mload(V_MPTR)))".to_string());
+        lines.push("if success {".to_string());
         lines.push(
-            "success := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x00, 0xa0, 0x00, 0x80))".to_string(),
+            "    success := staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x00, 0xa0, 0x00, 0x80)"
+                .to_string(),
         );
-        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("}".to_string());
 
         // tmp += final_com.
         lines.push("mcopy(0x80, FINAL_COM_MPTR, 0x80)".to_string());
+        lines.push("if success {".to_string());
         lines.push(
-            "success := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80))"
-                .to_string(),
+            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80)".to_string(),
         );
-        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("}".to_string());
 
         // tmp += x3 * pi.
         lines.push("mcopy(0x80, PI_MPTR, 0x80)".to_string());
         lines.push("mstore(0x100, mload(X3_MPTR))".to_string());
+        lines.push("if success {".to_string());
         lines.push(
-            "success := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x80, 0xa0, 0x80, 0x80))".to_string(),
-        );
-        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
-        lines.push(
-            "success := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80))"
+            "    success := staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x80, 0xa0, 0x80, 0x80)"
                 .to_string(),
         );
-        lines.push("success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("}".to_string());
+        lines.push("if success {".to_string());
+        lines.push(
+            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, 0x100, 0x00, 0x80)".to_string(),
+        );
+        lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
+        lines.push("}".to_string());
 
         // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
         lines.push("mcopy(PAIRING_RHS_MPTR, 0x0, 0x80)".to_string());
