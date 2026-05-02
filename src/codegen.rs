@@ -2077,6 +2077,46 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output, quotient_output))
     }
 
+    /// Render a trace-enabled `Halo2Verifier.sol`, `Halo2VerifyingKey.sol`,
+    /// and linked `Halo2QuotientEvaluator.sol`.
+    ///
+    /// This mirrors [`render_separately_with_quotient_into`] while forcing
+    /// trace output regardless of the crate-level `solidity-trace` feature.
+    pub fn render_trace_separately_with_quotient_into(
+        &self,
+        verifier_writer: &mut impl fmt::Write,
+        vk_writer: &mut impl fmt::Write,
+        quotient_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_verifier(
+            true,
+            true,
+            crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED,
+            true,
+            None,
+        )
+        .render(verifier_writer)?;
+        self.generate_vk().render(vk_writer)?;
+        self.generate_quotient_evaluator().render(quotient_writer)?;
+        Ok(())
+    }
+
+    /// Render a trace-enabled split verifier/VK/quotient trio and return
+    /// them as `String`s.
+    pub fn render_trace_separately_with_quotient(
+        &self,
+    ) -> Result<(String, String, String), fmt::Error> {
+        let mut verifier_output = String::new();
+        let mut vk_output = String::new();
+        let mut quotient_output = String::new();
+        self.render_trace_separately_with_quotient_into(
+            &mut verifier_output,
+            &mut vk_output,
+            &mut quotient_output,
+        )?;
+        Ok((verifier_output, vk_output, quotient_output))
+    }
+
     /// Render only `Halo2QuotientEvaluator.sol`. Production deployment
     /// tooling can compile/deploy this first, compute its runtime length and
     /// codehash, then render a verifier with

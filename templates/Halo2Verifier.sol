@@ -1193,6 +1193,11 @@ contract Halo2Verifier {
             gas_checkpoint(14) // after PCS computation block (= sub-block 6)
             {%- endif %}
 
+            {%- if self.trace %}
+            trace_point(27, PAIRING_LHS_MPTR)
+            trace_point(28, PAIRING_RHS_MPTR)
+            {%- endif %}
+
             // Rebuild the public IVC accumulator from `instances` and batch
             // its pairing equation into the final KZG pairing.
             //
@@ -1408,8 +1413,6 @@ contract Halo2Verifier {
             trace_u256(31, mload(F_EVAL_MPTR))
             trace_u256(32, mload(V_MPTR))
             trace_point(33, FINAL_COM_MPTR)
-            trace_point(27, PAIRING_LHS_MPTR)
-            trace_point(28, PAIRING_RHS_MPTR)
             if mload(HAS_ACCUMULATOR_MPTR) {
                 trace_point(29, ACC_LHS_MPTR)
                 trace_point(30, ACC_RHS_MPTR)

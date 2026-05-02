@@ -44,6 +44,17 @@
 //!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
 //!     -- --ignored --nocapture
 //! ```
+//!
+//! Enable full native-Rust/Solidity trace equivalence for this same IVC
+//! example with:
+//!
+//! ```text
+//! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+//!   cargo test --release \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,rust-verifier-trace \
+//!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+//!     -- --ignored --nocapture
+//! ```
 
 #![cfg(all(
     feature = "evm",
@@ -960,6 +971,10 @@ fn ivc_final_keccak_solidity_e2e() {
         final_proof.len()
     );
 
+    // Public input vector exactly mirrors `IvcTreeDeciderCircuit::format_instance`.
+    let pi: Vec<F> =
+        IvcTreeDeciderCircuit::format_instance(&decider_instance).expect("format_instance");
+
     // Sanity: native verifier must accept the final Keccak decider proof.
     let t0 = Instant::now();
     midnight_zk_stdlib::verify::<IvcTreeDeciderCircuit, sha3::Keccak256>(
@@ -974,14 +989,17 @@ fn ivc_final_keccak_solidity_e2e() {
         "[ivc-keccak-solidity] native tree decider verify: OK ({:.2?})",
         t0.elapsed()
     );
+    #[cfg(feature = "rust-verifier-trace")]
+    let rust_trace = collect_native_midfall_trace(
+        &decider_srs.verifier_params(),
+        &decider_vk,
+        &pi,
+        &final_proof,
+    );
 
     // ----------------------------------------------------------
     // Render Halo2Verifier.sol + Halo2VerifyingKey.sol.
     // ----------------------------------------------------------
-    // Public input vector exactly mirrors `IvcTreeDeciderCircuit::format_instance`.
-    let pi: Vec<F> =
-        IvcTreeDeciderCircuit::format_instance(&decider_instance).expect("format_instance");
-
     // ZkStdLib creates 2 instance columns (one committed, one
     // non-committed). num_instances counts the non-committed slots.
     //
@@ -999,9 +1017,16 @@ fn ivc_final_keccak_solidity_e2e() {
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
-    let (verifier_solidity, vk_solidity, quotient_solidity) = generator
-        .render_separately_with_quotient()
-        .expect("render_separately_with_quotient should succeed");
+    let (verifier_solidity, vk_solidity, quotient_solidity) =
+        if cfg!(feature = "rust-verifier-trace") {
+            generator
+                .render_trace_separately_with_quotient()
+                .expect("render_trace_separately_with_quotient should succeed")
+        } else {
+            generator
+                .render_separately_with_quotient()
+                .expect("render_separately_with_quotient should succeed")
+        };
     println!(
         "[ivc-keccak-solidity] rendered Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes, Halo2QuotientEvaluator.sol = {} bytes (took {:.2?})",
         verifier_solidity.len(),
@@ -1142,6 +1167,8 @@ fn ivc_final_keccak_solidity_e2e() {
             if gas_checkpoints_enabled {
                 dump_gas_checkpoints(&logs, gas_used);
             }
+            #[cfg(feature = "rust-verifier-trace")]
+            assert_ivc_trace_matches_native_midfall(&rust_trace, &logs);
             let expected: Vec<u8> = [vec![0u8; 31], vec![1]].concat();
             assert_eq!(
                 output,
@@ -1163,6 +1190,139 @@ fn ivc_final_keccak_solidity_e2e() {
             panic!("verifier halted at gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn collect_native_midfall_trace(
+    params_verifier: &ParamsVerifierKZG<E>,
+    vk: &MidnightVK,
+    pi: &[F],
+    proof: &[u8],
+) -> Vec<midnight_proofs::plonk::solidity_trace::SolidityTraceEvent> {
+    use midnight_proofs::poly::commitment::Guard as _;
+
+    plonk::solidity_trace::start();
+
+    let committed_pi = [C::identity()];
+    let committed_columns: [&[C]; 1] = [&committed_pi];
+    let public_columns: [&[F]; 1] = [pi];
+    let public_inputs: [&[&[F]]; 1] = [&public_columns];
+    let mut transcript = CircuitTranscript::<sha3::Keccak256>::init_from_bytes(proof);
+
+    let guard = plonk::prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<sha3::Keccak256>>(
+        vk.vk(),
+        &committed_columns,
+        &public_inputs,
+        &mut transcript,
+    )
+    .expect("native prepare succeeds while collecting trace");
+    transcript
+        .assert_empty()
+        .expect("native transcript consumes proof while collecting trace");
+    guard
+        .verify(params_verifier)
+        .expect("native guard verifies while collecting trace");
+
+    plonk::solidity_trace::take()
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_ivc_trace_matches_native_midfall(
+    rust_trace: &[midnight_proofs::plonk::solidity_trace::SolidityTraceEvent],
+    logs: &[halo2_solidity_verifier::revm::primitives::Log],
+) {
+    let solidity_trace = parse_solidity_trace_logs(logs);
+    let mut rust_by_id = BTreeMap::new();
+    for event in rust_trace {
+        assert!(
+            rust_by_id
+                .insert(event.id, (event.name, event.data.clone()))
+                .is_none(),
+            "duplicate Rust trace id {}",
+            event.id
+        );
+    }
+
+    let missing = rust_by_id
+        .keys()
+        .filter(|&&id| !solidity_trace.contains_key(&id))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "Solidity trace is missing native Rust trace ids: {missing:?}"
+    );
+
+    // The generator may emit accumulator-only diagnostics. Those are outside
+    // the native midfall PLONK verifier, whose source-of-truth trace ends at
+    // the KZG pairing inputs.
+    let allowed_generator_only = [29u64, 30u64];
+    let unexpected = solidity_trace
+        .keys()
+        .filter(|&&id| !rust_by_id.contains_key(&id) && !allowed_generator_only.contains(&id))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "Solidity trace emitted ids without native Rust oracle: {unexpected:?}"
+    );
+
+    for (id, (name, rust_data)) in rust_by_id {
+        let solidity_data = solidity_trace
+            .get(&id)
+            .expect("missing Solidity trace id was checked above");
+        assert_eq!(
+            &rust_data,
+            solidity_data,
+            "trace mismatch id={id} name={name}: rust=0x{} solidity=0x{}",
+            hex::encode(&rust_data),
+            hex::encode(solidity_data),
+        );
+    }
+
+    let generator_only = allowed_generator_only
+        .into_iter()
+        .filter(|id| solidity_trace.contains_key(id))
+        .collect::<Vec<_>>();
+    println!(
+        "[ivc-keccak-solidity][trace] matched {} native Rust/Solidity trace points{}",
+        rust_trace.len(),
+        if generator_only.is_empty() {
+            String::new()
+        } else {
+            format!("; generator-only accumulator trace ids: {generator_only:?}")
+        }
+    );
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn parse_solidity_trace_logs(
+    logs: &[halo2_solidity_verifier::revm::primitives::Log],
+) -> BTreeMap<u64, Vec<u8>> {
+    let mut trace = BTreeMap::new();
+
+    for log in logs {
+        let data = log.data.data.as_ref().to_vec();
+        if data.is_empty() {
+            continue;
+        }
+
+        let topics = log.data.topics();
+        assert_eq!(topics.len(), 1, "trace log must have one topic");
+        let id = trace_topic_id(topics[0]);
+        assert!(
+            trace.insert(id, data).is_none(),
+            "duplicate Solidity trace id {id}"
+        );
+    }
+
+    trace
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn trace_topic_id(topic: halo2_solidity_verifier::revm::primitives::B256) -> u64 {
+    let bytes = topic.as_slice();
+    u64::from_be_bytes(bytes[24..32].try_into().expect("topic is 32 bytes"))
 }
 
 /// Parse LOG1 checkpoint events emitted by `--features solidity-gas-checkpoints`
