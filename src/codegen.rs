@@ -5626,6 +5626,18 @@ mod tests {
             verifier_template.contains("eq(mload(NUM_INSTANCES_MPTR), acc_expected_words)"),
             "accumulator verifier must reject extra or missing accumulator tail words"
         );
+        assert!(
+            verifier_template.contains("RHS layout for this generated verifier is fully collapsed"),
+            "no-tail accumulator renders must explicitly document that no fixed-base scalar tail exists"
+        );
+        assert!(
+            verifier_template.contains("RHS layout for this generated verifier is partially"),
+            "tail accumulator renders must explicitly document fixed-base scalar tail semantics"
+        );
+        assert!(
+            verifier_template.contains("{%- if acc_fixed_bases.len() > 0 %}"),
+            "fixed-base scalar tail parsing should only render when generated bases exist"
+        );
     }
 
     #[test]

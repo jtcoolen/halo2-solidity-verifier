@@ -1272,9 +1272,18 @@ contract Halo2Verifier {
                     }
                 }
 
-                // RHS layout: point limbs (x,y), scalar, then fixed-base
+                {%- if acc_fixed_bases.len() == 0 %}
+                // RHS layout for this generated verifier is fully collapsed:
+                // point limbs (x,y), scalar. There is no fixed-base scalar
+                // tail; fixed-base contributions were already folded into
+                // ACC_RHS by the circuit/native accumulator construction.
+                {%- else %}
+                // RHS layout for this generated verifier is partially
+                // collapsed: point limbs (x,y), scalar, then fixed-base
                 // scalars in BTreeMap key order (`-G`, fixed_i, perm_i
-                // lexicographically by name).
+                // lexicographically by name). Each tail scalar is consumed
+                // below and appended to the RHS MSM with its generated base.
+                {%- endif %}
                 let rhs_instance_ptr := add(lhs_scalar_ptr, 0x20)
                 let rhs_scalar_ptr := add(rhs_instance_ptr, mul(mul(2, coord_words), 0x20))
                 let rhs_ok, rhs_is_id := load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
@@ -1304,6 +1313,7 @@ contract Halo2Verifier {
                         acc_pair_ptr := add(acc_pair_ptr, 0xa0)
                     }
                 }
+                {%- if acc_fixed_bases.len() > 0 %}
                 let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
                 {%- for (base_mptr, negate_scalar) in acc_fixed_bases %}
                 let fixed_scalar_{{ loop.index0 }} := calldataload(fixed_scalar_ptr)
@@ -1317,6 +1327,7 @@ contract Halo2Verifier {
                 }
                 fixed_scalar_ptr := add(fixed_scalar_ptr, 0x20)
                 {%- endfor %}
+                {%- endif %}
                 let acc_msm_len := sub(acc_pair_ptr, acc_scratch)
                 if acc_msm_len {
                     success := and(
