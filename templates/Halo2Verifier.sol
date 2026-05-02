@@ -470,6 +470,12 @@ contract Halo2Verifier {
             // outside Fp. Normalizing those bytes before hashing would
             // make multiple calldata encodings share one transcript.
             //
+            // This helper does not run an independent curve/subgroup
+            // check. Instead, ProtocolPlan::validate rejects generated
+            // plans where an absorbed proof commitment would not later be
+            // consumed by an EIP-2537 G1MSM or pairing path, and those
+            // precompiles perform the curve/subgroup validation.
+            //
             // The point's uncompressed form remains in calldata; the
             // call site is responsible for `calldatacopy`-ing it into
             // memory afterwards if it needs the on-curve coordinates.

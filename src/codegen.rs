@@ -5815,6 +5815,39 @@ mod tests {
     }
 
     #[test]
+    fn point_validation_boundary_is_documented_and_plan_checked() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+        let protocol_source = include_str!("codegen/protocol.rs");
+        let test_source = include_str!("test.rs");
+
+        assert!(
+            verifier_template.contains("This helper does not run an independent curve/subgroup"),
+            "common_uncompressed_g1 should document that curve/subgroup checks are delegated"
+        );
+        assert!(
+            verifier_template.contains("consumed by an EIP-2537 G1MSM or pairing path"),
+            "generated comments should name the subgroup-checking precompile paths"
+        );
+        assert!(
+            protocol_source.contains("Every proof G1 commitment absorbed into Fiat-Shamir"),
+            "ProtocolPlan validation should document absorbed-point PCS/precompile coverage"
+        );
+        assert!(
+            protocol_source.contains("absorbed but never opened by PCS"),
+            "ProtocolPlan validation should reject absorbed unopened advice commitments"
+        );
+        for required_test in [
+            "every_proof_g1_rejects_noncanonical_coordinates",
+            "every_proof_g1_rejects_off_curve_coordinates",
+        ] {
+            assert!(
+                test_source.contains(required_test),
+                "negative proof-G1 mutation coverage should include {required_test}"
+            );
+        }
+    }
+
+    #[test]
     fn batch_invert_handles_empty_and_singleton_ranges() {
         let verifier_template = include_str!("../templates/Halo2Verifier.sol");
 

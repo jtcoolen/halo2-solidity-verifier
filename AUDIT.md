@@ -1268,7 +1268,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | Clarified / integration requirement | Raw `verifyProof` does not bind application semantics | The raw generated verifier intentionally checks only "this proof is valid for these public instances under this VK." Generated NatSpec now requires wrappers to bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
 | Resolved / deployment guard | Precompile assumptions should be explicit | Constructors now run a deployment-time smoke test for EIP-2537 G1ADD, G1MSM, and pairing using identity inputs, and generated comments state the Solidity/EVM target requirement. |
 | Resolved / fail-fast | Malformed calldata and failed `success` states keep executing expensive work | ABI/proof/instance shape failures now revert before transcript parsing, Lagrange failures revert before quotient reconstruction, and EIP-2537 calls are guarded with `if success` instead of `and(success, staticcall(...))`. |
-| Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
+| Clarified / plan-enforced | Point validation is indirect | `common_uncompressed_g1` checks canonical Fp encoding before transcript absorption, while curve/subgroup validation is delegated to EIP-2537 G1MSM/pairing. `ProtocolPlan::validate` rejects absorbed proof commitments that are not opened/consumed, and ignored negative tests mutate every proof G1 to non-canonical/off-curve encodings. |
 
 ### F-1. Accumulator fixed-base terms look omitted
 
@@ -1465,26 +1465,37 @@ success := and(success, staticcall(...))
 This prevents already-failed verifier states from entering G1MSM/G1ADD/pairing
 precompiles.
 
-### F-7. Add targeted negative tests
+### F-7. Point validation and targeted negative tests
 
-Severity: Low / hardening.
+Status: Clarified / plan-enforced, with remaining negative-test backlog.
 
-Recommended tests:
+`common_uncompressed_g1` validates canonical EIP-2537 Fp encoding before a proof
+point is absorbed into the transcript. It intentionally does not run a separate
+curve/subgroup precompile call at read time. Instead:
 
-1. Flip each proof G1 into an off-curve point; every mutation must revert.
-2. Flip each proof G1 into a wrong-subgroup point if one can be generated;
+- `ProtocolPlan::validate` enforces that absorbed proof advice commitments are
+  opened by PCS; the other absorbed proof commitment categories are generated
+  into the PCS or accumulator MSM/pairing paths.
+- EIP-2537 G1MSM and pairing perform the actual curve/subgroup validation for
+  those consumed points.
+- Ignored EVM-heavy tests already mutate every proof G1 into non-canonical and
+  off-curve encodings and assert both native/Solidity rejection paths.
+
+Remaining useful negative tests:
+
+1. Flip each proof G1 into a wrong-subgroup point if one can be generated;
    every mutation must revert.
-3. Set every scalar, evaluation, and public instance once to `r`; each Fr value
+2. Set every public instance once to `r`; each Fr value
    must reject.
-4. Mutate high bits of `x1`/`x4`-power-dependent openings; the result must
+3. Mutate high bits of `x1`/`x4`-power-dependent openings; the result must
    disagree with Rust if masks are wrong.
-5. Malform accumulator identity encodings:
+4. Malform accumulator identity encodings:
    - x identity flag with nonzero y;
    - `p - 1` without identity flag;
    - unused high bits in packed limb words.
-6. Add a nonzero accumulator fixed-base tail test if the tail is part of the
+5. Add a nonzero accumulator fixed-base tail test if the tail is part of the
    real IVC relation.
-7. `staticcall` the production verifier; it should succeed once logging is
+6. `staticcall` the production verifier; it should succeed once logging is
    removed.
 
 The two items to resolve first are the accumulator RHS layout mismatch and the
