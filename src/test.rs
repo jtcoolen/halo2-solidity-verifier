@@ -207,7 +207,6 @@ fn malformed_embedded_calldata_variants_are_rejected() {
         instances_len_word_start,
         fixture.instances.len() as u64 + 1,
     );
-
     for (name, calldata) in [
         ("empty proof", empty_proof),
         ("truncated proof", truncated_proof),

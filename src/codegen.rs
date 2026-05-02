@@ -4904,6 +4904,20 @@ mod tests {
     }
 
     #[test]
+    fn verifier_checks_canonical_dynamic_abi_heads() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("eq(calldataload(0x04), 0x40)"),
+            "verifier must read the proof dynamic ABI head"
+        );
+        assert!(
+            verifier_template.contains("eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4))"),
+            "verifier must read the instances dynamic ABI head"
+        );
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();

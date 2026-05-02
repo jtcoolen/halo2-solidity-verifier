@@ -246,6 +246,13 @@ contract Halo2Verifier {
         bytes calldata proof,
         uint256[] calldata instances
     ) public {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
+        assembly ("memory-safe") {
+            if iszero(and(eq(calldataload(0x04), 0x40), eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4)))) {
+                mstore(0x00, 0)
+                return(0x00, 0x20)
+            }
+        }
+
         {%- match self.embedded_vk %}
         {%- when None %}
         address vk = AUTHORIZED_VK;

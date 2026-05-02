@@ -1205,6 +1205,23 @@ fn ivc_final_keccak_solidity_e2e() {
                 ),
                 CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => {}
             }
+
+            let mut bad_proof_head = calldata.clone();
+            overwrite_u256_word_for_test(&mut bad_proof_head, 0x04, 0x60);
+            let mut bad_instances_head = calldata.clone();
+            overwrite_u256_word_for_test(&mut bad_instances_head, 0x24, 0x20);
+            for (name, malformed_calldata) in [
+                ("wrong proof ABI head", bad_proof_head),
+                ("wrong instances ABI head", bad_instances_head),
+            ] {
+                match evm.try_call_with_gas(verifier_address, malformed_calldata, 5_000_000_000) {
+                    CallOutcome::Success { output, .. } => assert_ne!(
+                        output, expected,
+                        "verifier accepted malformed calldata: {name}"
+                    ),
+                    CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => {}
+                }
+            }
         }
         CallOutcome::Revert { gas_used, output } => {
             panic!(
@@ -1216,6 +1233,11 @@ fn ivc_final_keccak_solidity_e2e() {
             panic!("verifier halted at gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+fn overwrite_u256_word_for_test(bytes: &mut [u8], start: usize, value: u64) {
+    bytes[start..start + 32].fill(0);
+    bytes[start + 24..start + 32].copy_from_slice(&value.to_be_bytes());
 }
 
 #[cfg(feature = "rust-verifier-trace")]
