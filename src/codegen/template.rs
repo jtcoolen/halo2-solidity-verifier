@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
-use crate::codegen::{pcs::BatchOpenScheme, util::Ptr};
+use crate::codegen::{
+    artifact::{PayloadSectionKind, VkPayloadLayout},
+    pcs::BatchOpenScheme,
+    util::Ptr,
+};
 use askama::{Error, Template};
 use ruint::aliases::U256;
 use std::fmt;
@@ -54,6 +58,58 @@ pub(crate) struct Halo2VerifyingKey {
 }
 
 impl Halo2VerifyingKey {
+    pub(crate) fn payload_layout(&self) -> Result<VkPayloadLayout, String> {
+        let quotient_words = self.quotient_const_words + self.quotient_program_words;
+        let header_words = self
+            .constants
+            .len()
+            .checked_sub(quotient_words)
+            .ok_or_else(|| {
+                format!(
+                    "VK constant table too short: constants={} quotient_words={quotient_words}",
+                    self.constants.len()
+                )
+            })?;
+        let layout = VkPayloadLayout::for_vk(
+            header_words,
+            self.quotient_const_words,
+            self.quotient_program_words,
+            self.fixed_comms.len(),
+            self.permutation_comms.len(),
+        )?;
+
+        if let Some(offset) = self.quotient_const_offset_words {
+            let expected = layout.word_offset(PayloadSectionKind::QuotientConstants)?;
+            if offset != expected {
+                return Err(format!(
+                    "quotient const offset mismatch: got {offset:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+        if let Some(offset) = self.quotient_program_offset_words {
+            let expected = layout.word_offset(PayloadSectionKind::QuotientProgram)?;
+            if offset != expected {
+                return Err(format!(
+                    "quotient program offset mismatch: got {offset:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+
+        Ok(layout)
+    }
+
+    pub(crate) fn validate_payload_layout(&self) -> Result<(), String> {
+        let layout = self.payload_layout()?;
+        if layout.total_bytes() != self.len() {
+            return Err(format!(
+                "VK payload byte length mismatch: layout={} bytes rendered={} bytes",
+                layout.total_bytes(),
+                self.len()
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         // 32 bytes per scalar constant + 128 bytes per G1 point (EIP-2537 padded).
         (self.constants.len() * 0x20)
@@ -375,6 +431,7 @@ mod filters {
 #[cfg(test)]
 mod tests {
     use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
+    use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{pcs::BatchOpenScheme::Gwc19, util::Ptr};
     use ruint::aliases::U256;
 
@@ -536,6 +593,59 @@ mod tests {
             acc_fixed_bases: vec![],
             acc_msm_scratch: 0x7000,
         }
+    }
+
+    #[test]
+    fn verifying_key_payload_layout_matches_rendered_byte_order() {
+        let mut vk = synthetic_vk(2, 1);
+        let header_words = vk.constants.len();
+        vk.quotient_const_offset_words = Some(header_words);
+        vk.quotient_const_words = 2;
+        vk.quotient_program_offset_words = Some(header_words + 2);
+        vk.quotient_program_words = 3;
+        vk.constants
+            .extend((0..2).map(|_| ("quotient_const", U256::ZERO)));
+        vk.constants
+            .extend((0..3).map(|_| ("quotient_program", U256::ZERO)));
+
+        let layout = vk.payload_layout().unwrap();
+
+        assert_eq!(
+            layout
+                .word_offset(PayloadSectionKind::QuotientConstants)
+                .unwrap(),
+            header_words
+        );
+        assert_eq!(
+            layout
+                .word_offset(PayloadSectionKind::QuotientProgram)
+                .unwrap(),
+            header_words + 2
+        );
+        assert_eq!(
+            layout
+                .word_offset(PayloadSectionKind::FixedCommitments)
+                .unwrap(),
+            vk.constants.len()
+        );
+        assert_eq!(layout.total_bytes(), vk.len());
+        vk.validate_payload_layout().unwrap();
+    }
+
+    #[test]
+    fn verifying_key_payload_layout_rejects_stale_quotient_offsets() {
+        let mut vk = synthetic_vk(1, 1);
+        vk.quotient_const_offset_words = Some(vk.constants.len() + 1);
+        vk.quotient_const_words = 1;
+        vk.quotient_program_offset_words = Some(vk.constants.len() + 1);
+        vk.quotient_program_words = 0;
+        vk.constants.push(("quotient_const", U256::ZERO));
+
+        let err = vk
+            .validate_payload_layout()
+            .expect_err("stale quotient offset rejected");
+
+        assert!(err.contains("quotient const offset mismatch"));
     }
 
     #[test]

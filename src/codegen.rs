@@ -1,4 +1,5 @@
 use crate::codegen::{
+    artifact::{PayloadSectionKind, VkPayloadLayout},
     evaluator::Evaluator,
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
@@ -34,6 +35,7 @@ use std::{
     fmt::{self, Debug},
 };
 
+mod artifact;
 mod evaluator;
 mod pcs;
 mod protocol;
@@ -2972,6 +2974,8 @@ impl<'a> SolidityGenerator<'a> {
         let proof_cptr = Ptr::calldata(0x64);
         let mut vk = self.generate_base_vk();
         if quotient_inline_cse_enabled() || quotient_structured_loops_enabled() {
+            vk.validate_payload_layout()
+                .unwrap_or_else(|err| panic!("invalid generated VK payload layout: {err}"));
             return vk;
         }
 
@@ -2982,8 +2986,37 @@ impl<'a> SolidityGenerator<'a> {
             self.compact_quotient_program_for(&pre_meta, &pre_data);
         let quotient_const_words = pre_quotient_program_build.consts.len();
         let quotient_program_words = Self::program_chunks(&pre_quotient_program_build.bytes).len();
-        let quotient_const_offset_words = vk.constants.len();
-        let quotient_program_offset_words = quotient_const_offset_words + quotient_const_words;
+        let payload_layout = VkPayloadLayout::for_vk(
+            vk.constants.len(),
+            quotient_const_words,
+            quotient_program_words,
+            vk.fixed_comms.len(),
+            vk.permutation_comms.len(),
+        )
+        .unwrap_or_else(|err| panic!("invalid VK payload layout reservation: {err}"));
+        let quotient_const_offset_words = payload_layout
+            .word_offset(PayloadSectionKind::QuotientConstants)
+            .expect("quotient constants section");
+        let quotient_program_offset_words = payload_layout
+            .word_offset(PayloadSectionKind::QuotientProgram)
+            .expect("quotient program section");
+        assert_eq!(
+            payload_layout
+                .word_len(PayloadSectionKind::QuotientConstants)
+                .expect("quotient constants section length"),
+            quotient_const_words
+        );
+        assert_eq!(
+            payload_layout
+                .word_len(PayloadSectionKind::QuotientProgram)
+                .expect("quotient program section length"),
+            quotient_program_words
+        );
+        assert_eq!(
+            payload_layout.total_bytes(),
+            vk.len() + (quotient_const_words + quotient_program_words) * 0x20,
+            "typed VK payload layout must preserve the emitted byte length"
+        );
 
         vk.constants
             .extend((0..quotient_const_words).map(|_| ("quotient_const", U256::ZERO)));
@@ -3015,6 +3048,8 @@ impl<'a> SolidityGenerator<'a> {
         vk.quotient_const_words = quotient_const_words;
         vk.quotient_program_offset_words = Some(quotient_program_offset_words);
         vk.quotient_program_words = quotient_program_words;
+        vk.validate_payload_layout()
+            .unwrap_or_else(|err| panic!("invalid generated VK payload layout: {err}"));
         vk
     }
 
