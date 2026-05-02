@@ -5007,6 +5007,26 @@ mod tests {
     }
 
     #[test]
+    fn verifier_template_omits_dead_constants_and_ec_helpers() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        for stale in [
+            "FIRST_QUOTIENT_X_CPTR",
+            "LAST_QUOTIENT_X_CPTR",
+            "G1_SCALAR_MPTR",
+            "function ec_add_acc",
+            "function ec_mul_acc",
+            "function ec_add_tmp",
+            "function ec_mul_tmp",
+        ] {
+            assert!(
+                !verifier_template.contains(stale),
+                "production verifier template should not keep dead helper/constant: {stale}"
+            );
+        }
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();

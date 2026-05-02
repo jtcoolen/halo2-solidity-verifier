@@ -54,9 +54,6 @@ contract Halo2Verifier {
     uint256 internal constant NUM_INSTANCE_CPTR = {{ num_instance_cptr|hex_padded(2) }};
     uint256 internal constant     INSTANCE_CPTR = {{ instance_cptr|hex_padded(2) }};
 
-    uint256 internal constant FIRST_QUOTIENT_X_CPTR = {{ quotient_comm_cptr }};
-    uint256 internal constant  LAST_QUOTIENT_X_CPTR = {{ quotient_comm_cptr + 4 * (num_quotients - 1) }};
-
     // ----------------------------------------------------------------------
     // Verifying-key memory map. The VK header lives at VK_MPTR, followed
     // by the quotient VM payload and commitments. After the full VK
@@ -116,7 +113,6 @@ contract Halo2Verifier {
     // identity numerator reconstructed from the alleged evals at x.
     uint256 internal constant     QUOTIENT_EVAL_MPTR = {{ theta_mptr + 32 }};
     uint256 internal constant         QUOTIENT_MPTR = {{ theta_mptr + 33 }};   // 4 words
-    uint256 internal constant        G1_SCALAR_MPTR = {{ theta_mptr + 37 }};
     uint256 internal constant            F_EVAL_MPTR = {{ theta_mptr + 38 }};
     uint256 internal constant                 V_MPTR = {{ theta_mptr + 39 }};
     uint256 internal constant         FINAL_COM_MPTR = {{ theta_mptr + 40 }};   // 4 words
@@ -539,25 +535,6 @@ contract Halo2Verifier {
             function pairing_gas_cap(input_len) -> cap {
                 // Pairing inputs are 0x180 bytes per (G1, G2) pair.
                 cap := add(50000, mul(div(input_len, 0x180), 60000))
-            }
-
-            function ec_add_acc(success) -> ret {
-                ret := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x100, 0x100, 0x100, 0x80))
-                ret := and(ret, eq(returndatasize(), 0x80))
-            }
-            function ec_mul_acc(success, scalar) -> ret {
-                mstore(0x180, scalar)
-                ret := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x100, 0xa0, 0x100, 0x80))
-                ret := and(ret, eq(returndatasize(), 0x80))
-            }
-            function ec_add_tmp(success) -> ret {
-                ret := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x180, 0x100, 0x180, 0x80))
-                ret := and(ret, eq(returndatasize(), 0x80))
-            }
-            function ec_mul_tmp(success, scalar) -> ret {
-                mstore(0x200, scalar)
-                ret := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x180, 0xa0, 0x180, 0x80))
-                ret := and(ret, eq(returndatasize(), 0x80))
             }
 
             function ec_pairing(success, lhs_mptr, rhs_mptr) -> ret {
