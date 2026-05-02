@@ -492,22 +492,38 @@ contract Halo2Verifier {
                 mstore(second_mptr, inv_second)
             }
 
+            function g1add_gas_cap() -> cap {
+                cap := 50000
+            }
+
+            function g1msm_gas_cap(input_len) -> cap {
+                // Conservative no-discount cap: EIP-2537 G1MSM valid
+                // calls are below 14k gas per pair plus a fixed margin.
+                // Invalid inputs can burn only this bounded budget.
+                cap := add(50000, mul(div(input_len, 0xa0), 14000))
+            }
+
+            function pairing_gas_cap(input_len) -> cap {
+                // Pairing inputs are 0x180 bytes per (G1, G2) pair.
+                cap := add(50000, mul(div(input_len, 0x180), 60000))
+            }
+
             function ec_add_acc(success) -> ret {
-                ret := and(success, staticcall(gas(), 0x0b, 0x100, 0x100, 0x100, 0x80))
+                ret := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x100, 0x100, 0x100, 0x80))
                 ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_mul_acc(success, scalar) -> ret {
                 mstore(0x180, scalar)
-                ret := and(success, staticcall(gas(), 0x0c, 0x100, 0xa0, 0x100, 0x80))
+                ret := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x100, 0xa0, 0x100, 0x80))
                 ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_add_tmp(success) -> ret {
-                ret := and(success, staticcall(gas(), 0x0b, 0x180, 0x100, 0x180, 0x80))
+                ret := and(success, staticcall(g1add_gas_cap(), 0x0b, 0x180, 0x100, 0x180, 0x80))
                 ret := and(ret, eq(returndatasize(), 0x80))
             }
             function ec_mul_tmp(success, scalar) -> ret {
                 mstore(0x200, scalar)
-                ret := and(success, staticcall(gas(), 0x0c, 0x180, 0xa0, 0x180, 0x80))
+                ret := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, 0x180, 0xa0, 0x180, 0x80))
                 ret := and(ret, eq(returndatasize(), 0x80))
             }
 
@@ -523,7 +539,7 @@ contract Halo2Verifier {
                 mcopy(add(scratch, 0x80),   G2_BASE_MPTR,             0x100)
                 mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
                 mcopy(add(scratch, 0x200),  NEG_S_G2_BASE_MPTR,       0x100)
-                ret := and(success, staticcall(gas(), 0x0f, scratch, 0x300, scratch, 0x20))
+                ret := and(success, staticcall(pairing_gas_cap(0x300), 0x0f, scratch, 0x300, scratch, 0x20))
                 ret := and(ret, eq(returndatasize(), 0x20))
                 ret := and(ret, mload(scratch))
             }
@@ -1191,7 +1207,7 @@ contract Halo2Verifier {
                         mstore(add(acc_scratch, 0x80), lhs_scalar)
                         success := and(
                             success,
-                            staticcall(gas(), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
+                            staticcall(g1msm_gas_cap(0xa0), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
                         )
                         success := and(success, eq(returndatasize(), 0x80))
                     }
@@ -1247,7 +1263,7 @@ contract Halo2Verifier {
                     success := and(
                         success,
                         staticcall(
-                            gas(),
+                            g1msm_gas_cap(acc_msm_len),
                             0x0c,
                             acc_scratch,
                             acc_msm_len,
@@ -1279,19 +1295,19 @@ contract Halo2Verifier {
                     // PAIRING_RHS_MPTR += alpha * ACC_RHS_MPTR.
                     mcopy(batch_ptr, ACC_RHS_MPTR, 0x80)
                     mstore(add(batch_ptr, 0x80), acc_pair_alpha)
-                    success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    success := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
                     success := and(success, eq(returndatasize(), 0x80))
                     mcopy(add(batch_ptr, 0x80), PAIRING_RHS_MPTR, 0x80)
-                    success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_RHS_MPTR, 0x80))
+                    success := and(success, staticcall(g1add_gas_cap(), 0x0b, batch_ptr, 0x100, PAIRING_RHS_MPTR, 0x80))
                     success := and(success, eq(returndatasize(), 0x80))
 
                     // PAIRING_LHS_MPTR += alpha * ACC_LHS_MPTR.
                     mcopy(batch_ptr, ACC_LHS_MPTR, 0x80)
                     mstore(add(batch_ptr, 0x80), acc_pair_alpha)
-                    success := and(success, staticcall(gas(), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
+                    success := and(success, staticcall(g1msm_gas_cap(0xa0), 0x0c, batch_ptr, 0xa0, batch_ptr, 0x80))
                     success := and(success, eq(returndatasize(), 0x80))
                     mcopy(add(batch_ptr, 0x80), PAIRING_LHS_MPTR, 0x80)
-                    success := and(success, staticcall(gas(), 0x0b, batch_ptr, 0x100, PAIRING_LHS_MPTR, 0x80))
+                    success := and(success, staticcall(g1add_gas_cap(), 0x0b, batch_ptr, 0x100, PAIRING_LHS_MPTR, 0x80))
                     success := and(success, eq(returndatasize(), 0x80))
                 }
             }

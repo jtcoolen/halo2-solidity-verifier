@@ -4762,6 +4762,33 @@ mod tests {
     }
 
     #[test]
+    fn eip2537_calls_use_bounded_gas_helpers() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+        let pcs_codegen = include_str!("codegen/pcs/gwc19.rs");
+
+        for source in [verifier_template, pcs_codegen] {
+            assert!(
+                !source.contains("staticcall(gas(), 0x0b"),
+                "G1ADD calls must use bounded gas caps"
+            );
+            assert!(
+                !source.contains("staticcall(gas(), 0x0c"),
+                "G1MSM calls must use bounded gas caps"
+            );
+            assert!(
+                !source.contains("staticcall(gas(), 0x0f"),
+                "pairing calls must use bounded gas caps"
+            );
+        }
+
+        assert!(verifier_template.contains("function g1add_gas_cap()"));
+        assert!(verifier_template.contains("function g1msm_gas_cap(input_len)"));
+        assert!(verifier_template.contains("function pairing_gas_cap(input_len)"));
+        assert!(pcs_codegen.contains("g1msm_gas_cap"));
+        assert!(pcs_codegen.contains("g1add_gas_cap"));
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();
