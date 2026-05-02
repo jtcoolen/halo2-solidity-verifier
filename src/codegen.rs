@@ -5601,6 +5601,42 @@ mod tests {
     }
 
     #[test]
+    fn verifier_constructor_smoke_tests_eip2537_precompiles() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("function require_eip2537_precompiles() private view"),
+            "generated verifier should include a deployment-time EIP-2537 smoke test"
+        );
+        for required in [
+            "G1ADD(identity, identity) -> identity",
+            "G1MSM([(identity, 0)]) -> identity",
+            "PAIRING_CHECK([(identity_g1, identity_g2)]) -> true",
+            "staticcall(50000, 0x0b",
+            "staticcall(60000, 0x0c",
+            "staticcall(120000, 0x0f",
+            "eq(returndatasize(), 0x80)",
+            "eq(returndatasize(), 0x20)",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "constructor precompile smoke test missing expected check: {required}"
+            );
+        }
+        assert_eq!(
+            verifier_template
+                .matches("require_eip2537_precompiles();")
+                .count(),
+            4,
+            "every generated constructor shape should run the precompile smoke test"
+        );
+        assert!(
+            verifier_template.contains("support MCOPY and EIP-2537"),
+            "generated source should state the target-chain opcode/precompile requirement"
+        );
+    }
+
+    #[test]
     fn external_quotient_template_has_no_unpinned_fallback() {
         let verifier_template = include_str!("../templates/Halo2Verifier.sol");
 

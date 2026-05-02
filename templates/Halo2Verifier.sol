@@ -27,6 +27,9 @@ pragma solidity ^0.8.24;
 //       0x0b BLS12_G1ADD
 //       0x0c BLS12_G1MSM
 //       0x0f BLS12_PAIRING_CHECK
+//     Constructors run a deployment-time smoke test for the EIP-2537
+//     precompiles using identity inputs. Compile with Solidity >=0.8.24
+//     and deploy only on chains/forks that support MCOPY and EIP-2537.
 contract Halo2Verifier {
     error InvalidVerifierDependency();
 
@@ -181,11 +184,42 @@ contract Halo2Verifier {
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_0_WITH_ID_FLAG = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffbafeffffffffaaaa;
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_1 = 0x0000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd764774b84;
 
+    function require_eip2537_precompiles() private view {
+        assembly ("memory-safe") {
+            let scratch := 0x80
+            for { let off := 0 } lt(off, 0x180) { off := add(off, 0x20) } {
+                mstore(add(scratch, off), 0)
+            }
+
+            // G1ADD(identity, identity) -> identity, 128-byte return.
+            if iszero(staticcall(50000, 0x0b, scratch, 0x100, scratch, 0x80)) { revert(0, 0) }
+            if iszero(eq(returndatasize(), 0x80)) { revert(0, 0) }
+            if or(or(mload(scratch), mload(add(scratch, 0x20))), or(mload(add(scratch, 0x40)), mload(add(scratch, 0x60)))) {
+                revert(0, 0)
+            }
+
+            // G1MSM([(identity, 0)]) -> identity, 128-byte return.
+            if iszero(staticcall(60000, 0x0c, scratch, 0xa0, scratch, 0x80)) { revert(0, 0) }
+            if iszero(eq(returndatasize(), 0x80)) { revert(0, 0) }
+            if or(or(mload(scratch), mload(add(scratch, 0x20))), or(mload(add(scratch, 0x40)), mload(add(scratch, 0x60)))) {
+                revert(0, 0)
+            }
+
+            // PAIRING_CHECK([(identity_g1, identity_g2)]) -> true,
+            // 32-byte return. This catches absent pairing precompiles,
+            // short return data, and obviously incompatible semantics.
+            if iszero(staticcall(120000, 0x0f, scratch, 0x180, scratch, 0x20)) { revert(0, 0) }
+            if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }
+            if iszero(eq(mload(scratch), 1)) { revert(0, 0) }
+        }
+    }
+
     {%- match self.expected_vk_codehash %}
     {%- when Some with (_) %}
     {%- match quotient_external %}
     {%- when Some with (_) %}
     constructor(address authorizedVk, address authorizedQuotient) {
+        require_eip2537_precompiles();
         require(
             authorizedVk.code.length == EXPECTED_VK_LENGTH
                 && authorizedVk.codehash == EXPECTED_VK_CODEHASH,
@@ -209,6 +243,7 @@ contract Halo2Verifier {
     }
     {%- when None %}
     constructor(address authorizedVk) {
+        require_eip2537_precompiles();
         require(
             authorizedVk.code.length == EXPECTED_VK_LENGTH
                 && authorizedVk.codehash == EXPECTED_VK_CODEHASH,
@@ -221,6 +256,7 @@ contract Halo2Verifier {
     {%- match quotient_external %}
     {%- when Some with (_) %}
     constructor(address authorizedQuotient) {
+        require_eip2537_precompiles();
         {%- match self.expected_quotient_codehash %}
         {%- when Some with (_) %}
         require(
@@ -237,6 +273,9 @@ contract Halo2Verifier {
         {%- endmatch %}
     }
     {%- when None %}
+    constructor() {
+        require_eip2537_precompiles();
+    }
     {%- endmatch %}
     {%- endmatch %}
 

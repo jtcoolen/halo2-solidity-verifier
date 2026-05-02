@@ -47,38 +47,40 @@ fn function_signature() {
     );
 }
 
-/// Direct EIP-2537 BLS12_G1ADD precompile smoke test against the bundled
-/// Prague-spec revm. Exercises the runner path independently of the halo2
-/// codegen so a regression in `src/evm.rs` shows up here first.
+/// Direct EIP-2537 precompile smoke tests against the bundled Prague-spec
+/// revm. Exercises the runner path independently of the halo2 codegen so a
+/// regression in `src/evm.rs` shows up here first.
 #[test]
-fn prague_evm_runs_eip2537_g1add_to_identity() {
+fn prague_evm_runs_eip2537_identity_smoke_tests() {
     use crate::evm::test::Evm;
     use revm::primitives::Address;
 
-    let runtime: Vec<u8> = vec![
-        0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // calldatacopy(0, 0, calldatasize())
-        0x60, 0x80, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60, 0x0b, 0x5a, 0xfa, 0x50, 0x60, 0x80, 0x60,
-        0x00, 0xf3, // return(0, 0x80)
-    ];
-    let len = runtime.len() as u8;
-    let mut deployer = Vec::with_capacity(12 + runtime.len());
-    deployer.extend([0x60, len]);
-    deployer.extend([0x60, 0x0c]);
-    deployer.extend([0x60, 0x00]);
-    deployer.push(0x39);
-    deployer.extend([0x60, len]);
-    deployer.extend([0x60, 0x00]);
-    deployer.push(0xf3);
-    assert_eq!(
-        deployer.len(),
-        12,
-        "deployer prefix should be exactly 12 bytes"
-    );
-    deployer.extend(runtime);
-
     let mut evm = Evm::default();
-    let addr: Address = evm.create(deployer);
+    let deploy_proxy = |evm: &mut Evm, precompile: u8, output_len: u8| -> Address {
+        let runtime: Vec<u8> = vec![
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // calldatacopy(0, 0, calldatasize())
+            0x60, output_len, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60, precompile, 0x5a, 0xfa, 0x50,
+            0x60, output_len, 0x60, 0x00, 0xf3, // return(0, output_len)
+        ];
+        let len = runtime.len() as u8;
+        let mut deployer = Vec::with_capacity(12 + runtime.len());
+        deployer.extend([0x60, len]);
+        deployer.extend([0x60, 0x0c]);
+        deployer.extend([0x60, 0x00]);
+        deployer.push(0x39);
+        deployer.extend([0x60, len]);
+        deployer.extend([0x60, 0x00]);
+        deployer.push(0xf3);
+        assert_eq!(
+            deployer.len(),
+            12,
+            "deployer prefix should be exactly 12 bytes"
+        );
+        deployer.extend(runtime);
+        evm.create(deployer)
+    };
 
+    let g1add_addr = deploy_proxy(&mut evm, 0x0b, 0x80);
     let g1_x_hex = "0000000000000000000000000000000017f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
     let g1_y_hex = "0000000000000000000000000000000008b3f481e3aaa0f1a09e30ed741d8ae4fcf5e095d5d00af600db18cb2c04b3edd03cc744a2888ae40caa232946c5e7e1";
     let mut calldata = vec![];
@@ -87,13 +89,29 @@ fn prague_evm_runs_eip2537_g1add_to_identity() {
     }
     assert_eq!(calldata.len(), 256);
 
-    let (gas_used, output) = evm.call(addr, calldata);
+    let (gas_used, output) = evm.call(g1add_addr, calldata);
     assert_eq!(output.len(), 128, "EIP-2537 G1ADD must return 128 bytes");
     assert!(
         output.iter().any(|&b| b != 0),
         "G1ADD output is all zero; precompile did not run"
     );
     assert!(gas_used > 0);
+
+    let g1msm_addr = deploy_proxy(&mut evm, 0x0c, 0x80);
+    let (_, output) = evm.call(g1msm_addr, vec![0; 0xa0]);
+    assert_eq!(output.len(), 128, "EIP-2537 G1MSM must return 128 bytes");
+    assert!(
+        output.iter().all(|&b| b == 0),
+        "G1MSM(identity, 0) should return the identity encoding"
+    );
+
+    let pairing_addr = deploy_proxy(&mut evm, 0x0f, 0x20);
+    let (_, output) = evm.call(pairing_addr, vec![0; 0x180]);
+    assert_eq!(
+        output,
+        [vec![0; 31], vec![1]].concat(),
+        "EIP-2537 pairing identity input should return true"
+    );
 }
 
 #[test]

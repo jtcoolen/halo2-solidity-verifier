@@ -1266,6 +1266,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | Resolved / confirmed mirrored | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | Confirmed against Midfall `proofs/src/poly/kzg/mod.rs`: with `truncated-challenges`, Rust truncates x3 directly and uses `truncated_powers(x1)` / `truncated_powers(x4)` for PCS batching. Solidity intentionally mirrors this by masking stored powers, while keeping x1/x4 accumulators full precision. |
 | Resolved / debug-only | Gas logging is live in production path | Production renders do not emit `gas_checkpoint()` and keep `verifyProof` as `external view`. Checkpoints are available only through the `solidity-gas-checkpoints` feature or explicit gas-checkpoint render helpers. |
 | Clarified / integration requirement | Raw `verifyProof` does not bind application semantics | The raw generated verifier intentionally checks only "this proof is valid for these public instances under this VK." Generated NatSpec now requires wrappers to bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
+| Resolved / deployment guard | Precompile assumptions should be explicit | Constructors now run a deployment-time smoke test for EIP-2537 G1ADD, G1MSM, and pairing using identity inputs, and generated comments state the Solidity/EVM target requirement. |
 | Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
 | Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
 
@@ -1397,7 +1398,7 @@ for that application. The generated NatSpec now states this explicitly.
 
 ### F-5. Precompile assumptions should be explicit
 
-Severity: Low / hardening.
+Status: Resolved / deployment guard.
 
 The code depends on EIP-2537 addresses:
 
@@ -1408,9 +1409,18 @@ The code depends on EIP-2537 addresses:
 ```
 
 The EIP defines those addresses and the 64-byte Fp encoding rules, including
-canonical field-element validation. Add a constructor or deployment-time
-self-test for the target chain. Also ensure the Solidity compiler/EVM target
-supports the emitted opcodes, including `mcopy`.
+canonical field-element validation. The generated verifier constructor now runs
+a deployment-time smoke test:
+
+- `G1ADD(identity, identity)` must return the 128-byte identity encoding.
+- `G1MSM([(identity, 0)])` must return the 128-byte identity encoding.
+- `PAIRING_CHECK([(identity_g1, identity_g2)])` must return the 32-byte value
+  `1`.
+
+This catches absent precompile implementations, short return data, and obviously
+incompatible semantics before the verifier can be deployed. The source comments
+also state the compiler/chain requirement: Solidity `>=0.8.24` and a target EVM
+supporting MCOPY and EIP-2537.
 
 One item not flagged: using `sub(r, v)` as an MSM scalar can produce `r` when
 `v == 0`, but EIP-2537 scalars for multiplication are not required to be less
