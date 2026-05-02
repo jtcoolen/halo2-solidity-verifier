@@ -1171,6 +1171,8 @@ contract Halo2Verifier {
                 let limb_base := shl(bits, 1)
                 let limbs_per_word := 4
                 let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
+                let acc_expected_words := add(add(mload(ACC_OFFSET_MPTR), add(mul(4, coord_words), 2)), {{ acc_fixed_bases.len() }})
+                success := and(success, eq(mload(NUM_INSTANCES_MPTR), acc_expected_words))
                 let acc_instance_ptr := add(INSTANCE_CPTR, mul(mload(ACC_OFFSET_MPTR), 0x20))
 
                 // LHS layout: point limbs (x,y), scalar. The collapsed

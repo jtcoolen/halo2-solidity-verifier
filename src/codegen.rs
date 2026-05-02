@@ -4282,6 +4282,11 @@ impl<'a> SolidityGenerator<'a> {
                     ));
                 }
             }
+            debug_assert_eq!(
+                acc_fixed_bases.len(),
+                fixed_scalar_count,
+                "accumulator fixed-base scalar tail must match generated bases"
+            );
         }
         acc_fixed_bases.sort_by(|a, b| a.0.cmp(&b.0));
         let acc_fixed_bases: Vec<(usize, bool)> = acc_fixed_bases
@@ -4843,6 +4848,20 @@ mod tests {
         assert!(
             !verifier_template.contains("authorizedQuotient.code.length != 0"),
             "constructor must not pin whichever quotient address the deployer passed"
+        );
+    }
+
+    #[test]
+    fn accumulator_schema_is_checked_against_instance_count() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("let acc_expected_words :="),
+            "accumulator verifier must compute the generated public-input schema width"
+        );
+        assert!(
+            verifier_template.contains("eq(mload(NUM_INSTANCES_MPTR), acc_expected_words)"),
+            "accumulator verifier must reject extra or missing accumulator tail words"
         );
     }
 
