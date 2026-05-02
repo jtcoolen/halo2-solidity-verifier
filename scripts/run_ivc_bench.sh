@@ -43,7 +43,7 @@ Default behavior:
      on the first full run.
   2. Compile the ignored Solidity verifier bench.
   3. Run tests/ivc_keccak_solidity.rs::ivc_final_keccak_solidity_e2e with
-     evm,truncated-challenges,in-circuit-fewer-point-sets,solidity-gas-checkpoints.
+     evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints.
 
 Examples:
   scripts/run_ivc_bench.sh --check-only
@@ -146,7 +146,7 @@ ensure_srs_assets() {
 }
 
 cargo_features() {
-  local features="evm,truncated-challenges,in-circuit-fewer-point-sets"
+  local features="evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets"
   if [[ "$GAS_CHECKPOINTS" -eq 1 ]]; then
     features="$features,solidity-gas-checkpoints"
   fi

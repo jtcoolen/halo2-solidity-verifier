@@ -5,7 +5,7 @@ property-based test (PBT) suite shipped with this crate.
 
 The workspace is pinned to the toolchain in [`rust-toolchain.toml`](./rust-toolchain.toml)
 (currently Rust 1.90.0). Solidity-touching tests and examples additionally
-require `solc` on `PATH`; any 0.8.x release works.
+require `solc >=0.8.24` on `PATH`.
 
 Midnight crates resolve from the published midfall GitHub branch configured in
 `Cargo.toml`:
@@ -13,6 +13,11 @@ Midnight crates resolve from the published midfall GitHub branch configured in
 ```text
 https://github.com/EYBlockchain/midfall.git#keccak
 ```
+
+To test against a local Midfall checkout, copy
+[`.cargo/config.toml.example`](./.cargo/config.toml.example) to
+`.cargo/config.toml` and update the paths. The real `.cargo/config.toml` is
+ignored so machine-local overrides do not leak into commits.
 
 The ignored proving benches need local SRS files. `scripts/run_ivc_bench.sh`
 downloads the IVC bench assets into `.srs/` by default, or you can point
@@ -22,51 +27,26 @@ tree bench needs Midnight `midnight-srs-2p19` for the leaf IVC proofs and
 
 ```bash
 rustc --version    # should report 1.90.0
-solc --version     # should report 0.8.x
+solc --version     # should report 0.8.24 or newer
 ```
 
 ---
 
 ## Examples
 
-All three examples live under `examples/` and require the `evm` feature so that
-the embedded `revm` runner is available. Run them in `--release` to avoid a
-debug-only `revm` interpreter panic on newer Rust toolchains.
-
-### `separately` — render verifier and VK as two contracts
-
-Builds verifier + VK contracts for a `StandardPlonk` circuit across `k = 10..17`,
-deploys both via `revm`, and prints gas costs.
+`Cargo.toml` sets `autoexamples = false`, so stale pre-Midnight diagnostic
+programs under `examples/` are not built by default. The maintained registered
+example is the IVC replay harness:
 
 ```bash
-cargo run --release --all-features --example separately
+cargo run --release \
+  --features evm,truncated-challenges,fewer-point-sets \
+  --example ivc_replay
 ```
 
-Outputs:
-
-- `generated/Halo2Verifier.sol`
-- `generated/Halo2VerifyingKey-{10..16}.sol`
-
-### `trace` — render trace-enabled verifier and dump intermediate state
-
-Builds the trace-mode verifier (which emits `LOG1` events for challenges,
-evaluations and pairing inputs), runs it once, and pretty-prints the captured
-trace entries.
-
-```bash
-cargo run --release --all-features --example trace
-```
-
-### `compare_trace` — cross-check Solidity vs Rust verifier state
-
-Runs the trace-mode verifier and the in-tree Rust reference verifier on the
-same `(params, vk, proof, instances)`, then asserts every comparable trace
-entry (`vk_digest`, `theta`, `beta`, `gamma`, `y`, `x`, `zeta`, `nu`, `mu`,
-`x_n`, `l_last`, `l_blind`, `l_0`, `instance_eval`, ...) matches.
-
-```bash
-cargo run --release --all-features --example compare_trace
-```
+It loads contracts and calldata previously written by the ignored IVC bench at
+`target/ivc-keccak-solidity-dump/`, recompiles them with `solc`, deploys them
+in Prague-spec `revm`, and calls `verifyProof`.
 
 ---
 
@@ -175,7 +155,7 @@ scripts/run_ivc_bench.sh
 Use an existing SRS directory and also run the native Midfall final-proof twin:
 
 ```bash
-SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
   scripts/run_ivc_bench.sh --native-midfall
 ```
 

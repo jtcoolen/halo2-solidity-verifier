@@ -2,6 +2,7 @@
 name = "halo2_solidity_verifier"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 
 [dependencies]
 # Migration target: depend on midnight-proofs (the midfall fork of halo2 v0.4)
@@ -46,10 +47,8 @@ rand_chacha = "0.3.1"
 midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 # IVC final-step Keccak proof end-to-end test (tests/ivc_keccak_solidity.rs).
-# The aggregation crate is compiled with Keccak + truncated challenges. The
-# in-circuit/outer fewer-point-sets choices are split at this crate's feature
-# layer so the recursive verifier can use the dummy-query heuristic while the
-# final Solidity-facing proof can omit it.
+# The local aggregation crate currently builds in truncated mode, so ignored
+# Solidity tests that exercise it require this crate's matching feature too.
 midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = [
     "keccak-transcript",
     "truncated-challenges",
@@ -62,36 +61,24 @@ sha2 = "0.10"
 # dep can be re-enabled.
 # halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
 
-# Step 8 cross-crate Git patches.
-#
-# midnight-zk-stdlib + midnight-circuits depend on `midnight-proofs` /
-# `midnight-curves` / `midnight-circuits` from crates.io and on
-# `blake2b_halo2` from a Github source. We redirect each of those to the
-# published midfall branch so cargo resolves a single canonical copy of
-# every dep - otherwise `Hashable<G1Projective>` etc. become ambiguous
-# across two isomorphic-but-distinct crate copies.
+# Keep Midfall subcrates on the same published `keccak` branch without
+# committing machine-local path overrides. Local development overrides belong
+# in `.cargo/config.toml` (see `.cargo/config.toml.example`).
 [patch.crates-io]
-midnight-proofs = { path = "/Users/Julien.Coolen/midfall/proofs" }
-midnight-curves = { path = "/Users/Julien.Coolen/midfall/curves" }
-midnight-circuits = { path = "/Users/Julien.Coolen/midfall/circuits" }
-
-[patch."https://github.com/EYBlockchain/midfall.git"]
-midnight-proofs = { path = "/Users/Julien.Coolen/midfall/proofs" }
-midnight-curves = { path = "/Users/Julien.Coolen/midfall/curves" }
-midnight-circuits = { path = "/Users/Julien.Coolen/midfall/circuits" }
-midnight-zk-stdlib = { path = "/Users/Julien.Coolen/midfall/zk_stdlib" }
-midnight-aggregation = { path = "/Users/Julien.Coolen/midfall/aggregation" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [patch."https://github.com/midnightntwrk/midnight-zk"]
-midnight-proofs = { path = "/Users/Julien.Coolen/midfall/proofs" }
-midnight-curves = { path = "/Users/Julien.Coolen/midfall/curves" }
-midnight-circuits = { path = "/Users/Julien.Coolen/midfall/circuits" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [patch."https://github.com/eryxcoop/blake2b_halo2"]
-blake2b_halo2 = { path = "/Users/Julien.Coolen/midfall/vendor/blake2b_halo2" }
+blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [patch."https://github.com/eryxcoop/blake2b_halo2?rev=5f979f"]
-blake2b_halo2 = { path = "/Users/Julien.Coolen/midfall/vendor/blake2b_halo2" }
+blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
 
 [features]
 default = []
@@ -115,36 +102,25 @@ solidity-gas-checkpoints = []
 # Required for proofs from a midnight-proofs prover compiled with
 # matching feature settings; using the wrong setting on either side
 # silently produces invalid pairings.
-truncated-challenges = ["midnight-proofs/truncated-challenges"]
+truncated-challenges = [
+    "midnight-proofs/truncated-challenges",
+    "midnight-aggregation/truncated-challenges",
+]
 # Enables fewer-point-sets inside recursive verifier circuits and for the
 # leaf proofs they consume. The final Solidity-facing proof can still disable
 # proof-system dummy queries at runtime.
-in-circuit-fewer-point-sets = ["midnight-aggregation/in-circuit-fewer-point-sets"]
+in-circuit-fewer-point-sets = ["midnight-aggregation/fewer-point-sets"]
 # Enables fewer-point-sets for the final Solidity-facing proof layout.
 outer-fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
 # Backwards-compatible aggregate feature: old commands that pass
 # `fewer-point-sets` retain the previous "everything on" behavior.
 fewer-point-sets = ["in-circuit-fewer-point-sets", "outer-fewer-point-sets"]
-# Enables native midfall verifier trace hooks used by the Rust/Solidity
-# differential coverage test. This is diagnostic-only and should stay off for
-# production verifier generation.
+# Enables native Midfall verifier trace hooks used by the Rust/Solidity
+# differential coverage tests. This requires a Midfall checkout that exposes
+# `midnight-proofs/solidity-verifier-trace`; the ignored local
+# `.cargo/config.toml` override is the intended way to run it.
 rust-verifier-trace = ["midnight-proofs/solidity-verifier-trace", "truncated-challenges"]
 
 [[example]]
-name = "separately"
-required-features = ["evm"]
-
-[[example]]
-name = "trace"
-required-features = ["evm"]
-
-[[example]]
-name = "compare_trace"
-required-features = ["evm"]
-
-[[example]]
-name = "probe_revert"
-required-features = ["evm"]
-
-[[example]]
-name = "check_delta"
+name = "ivc_replay"
+required-features = ["evm", "truncated-challenges", "fewer-point-sets"]

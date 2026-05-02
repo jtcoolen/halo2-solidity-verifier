@@ -21,6 +21,8 @@ use std::{
     ops::{Add, Sub},
 };
 
+type LookupEvalSlots = (Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Word>);
+
 // ----------------------------------------------------------------------------
 // Migration note (Steps 1-3, 2026-04-26): the old `ConstraintSystemMeta` was
 // driven by halo2-proofs v0.4 backend types (`ConstraintSystemBack`,
@@ -484,11 +486,11 @@ impl Data {
         // `calldataload(proof_cptr)`.
         //
         // Memory layout:
-        //   theta_mptr + 208  G1_IDENTITY_MPTR (4 words)
+        //   theta_mptr + 209  G1_IDENTITY_MPTR (4 words)
         //   theta_mptr + 220  REVERSED_EVALS_MPTR (num_evals words)
         //   theta_mptr + 220 + num_evals  comms_mptr_base
         //
-        // The 8-word gap between G1_IDENTITY (212) and 220 is preserved
+        // The 7-word gap between G1_IDENTITY (213) and 220 is preserved
         // for alignment / future use.
         let reversed_evals_mptr = Ptr::memory((theta_words + 220) * 0x20);
         let eval_cptr = reversed_evals_mptr;
@@ -569,11 +571,11 @@ impl Data {
         let mut permutation_evals: HashMap<Column<Any>, Word> = HashMap::new();
         let mut permutation_z_slots: Vec<(Option<Word>, Option<Word>, Option<Word>)> =
             vec![(None, None, None); meta.num_permutation_zs];
-        let mut lookup_slots: Vec<(Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Word>)> =
-            meta.lookup_chunks
-                .iter()
-                .map(|&chunks| (None, vec![None; chunks], None, None))
-                .collect();
+        let mut lookup_slots: Vec<LookupEvalSlots> = meta
+            .lookup_chunks
+            .iter()
+            .map(|&chunks| (None, vec![None; chunks], None, None))
+            .collect();
         let mut trashcan_slots: Vec<Option<Word>> = vec![None; meta.num_trashcans];
 
         assert_eq!(
@@ -1173,7 +1175,7 @@ mod tests {
         let g1 = G1Projective::identity().to_affine();
         let g2 = G2Projective::identity().to_affine();
 
-        assert_eq!(g1_to_u256s(&g1), [U256::ZERO; 4]);
-        assert_eq!(g2_to_u256s(&g2), [U256::ZERO; 8]);
+        assert_eq!(g1_to_u256s(g1), [U256::ZERO; 4]);
+        assert_eq!(g2_to_u256s(g2), [U256::ZERO; 8]);
     }
 }

@@ -605,9 +605,9 @@ struct PropertyPoseidonFixture {
     vk_solidity: String,
     quotient_verifier_solidity: String,
     quotient_evaluator_solidity: String,
-    #[cfg_attr(not(feature = "rust-verifier-trace"), allow(dead_code))]
+    #[allow(dead_code)]
     trace_verifier_solidity: String,
-    #[cfg_attr(not(feature = "rust-verifier-trace"), allow(dead_code))]
+    #[allow(dead_code)]
     trace_vk_solidity: String,
 }
 
@@ -1232,9 +1232,8 @@ fn assert_native_poseidon_rejects(
         )
     }));
 
-    match result {
-        Ok(Ok(())) => panic!("native verifier accepted malformed proof: {context}"),
-        Ok(Err(_)) | Err(_) => {}
+    if let Ok(Ok(())) = result {
+        panic!("native verifier accepted malformed proof: {context}");
     }
 }
 

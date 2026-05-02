@@ -244,6 +244,7 @@ pub(crate) struct Halo2Verifier {
     ///   - x3 is masked to 128 bits immediately after squeeze
     ///   - x1 / x4 powers are masked to 128 bits at use, with the
     ///     internal full-precision accumulator preserved
+    ///
     /// Driven by `cfg!(feature = "truncated-challenges")` in
     /// `SolidityGenerator::generate_verifier`.
     pub(crate) truncated_challenges: bool,
@@ -335,9 +336,9 @@ impl Halo2VerifyingKey {
 impl Halo2Verifier {
     pub(crate) fn validate_layout(&self) -> Result<(), String> {
         const ROT_POINTS_CAP_WORDS: usize = 80 - 52;
-        const X1_POWERS_CAP_WORDS: usize = 144 - 80;
-        const Q_COM_CAP_WORDS: usize = 144 - 144;
-        const Q_EVAL_SET_CAP_WORDS: usize = 200 - 144;
+        const X1_POWERS_CAP_WORDS: usize = 145 - 80;
+        const Q_COM_CAP_WORDS: usize = 0;
+        const Q_EVAL_SET_CAP_WORDS: usize = 201 - 145;
 
         let proof_cptr = self.proof_cptr.value().as_usize();
         if proof_cptr + self.proof_len != self.num_instance_cptr {
@@ -765,10 +766,10 @@ mod tests {
         );
 
         let mut verifier = synthetic_verifier();
-        verifier.pcs_scratch_requirements.x1_powers_words = 65;
+        verifier.pcs_scratch_requirements.x1_powers_words = 66;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
-            err.contains("X1_POWERS_MPTR needs 65 word"),
+            err.contains("X1_POWERS_MPTR needs 66 word"),
             "unexpected layout error: {err}"
         );
 

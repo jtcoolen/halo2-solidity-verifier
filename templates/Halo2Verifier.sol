@@ -128,19 +128,19 @@ contract Halo2Verifier {
     // Q_COM materialization is currently fused into the final MSM scratch,
     // so this marker intentionally aliases Q_EVAL_SET_MPTR and has zero
     // reserved capacity until a future emitter starts writing Q_COM_MPTR.
-    uint256 internal constant            Q_COM_MPTR = {{ theta_mptr + 144 }};
-    uint256 internal constant      Q_EVAL_SET_MPTR = {{ theta_mptr + 144 }};
+    uint256 internal constant            Q_COM_MPTR = {{ theta_mptr + 145 }};
+    uint256 internal constant      Q_EVAL_SET_MPTR = {{ theta_mptr + 145 }};
 
     // Q_EVAL_CPTR is set at runtime once the verifier reaches the q_evals
     // block of the proof; we keep it as a memory slot for symmetry.
-    uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ theta_mptr + 200 }};
+    uint256 internal constant         Q_EVAL_CPTR_MPTR = {{ theta_mptr + 201 }};
 
     // Reserved 4-word slot for the G1 identity (point at infinity) in
     // EIP-2537 padded form. EVM memory is zero-initialised, and we
     // never write to this region, so the four `mload`s below produce
     // 0,0,0,0 which is exactly the identity encoding the EIP-2537
     // ec_add / ec_mul precompiles accept.
-    uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 208 }};
+    uint256 internal constant       G1_IDENTITY_MPTR = {{ theta_mptr + 209 }};
 
     // Decoded polynomial-eval buffer (Optimisation H3). The off-chain
     // Solidity proof shim rewrites proof scalars into canonical BE words,
@@ -601,10 +601,142 @@ contract Halo2Verifier {
             }
 
             function g1msm_gas_cap(input_len) -> cap {
-                // Conservative no-discount cap: EIP-2537 G1MSM valid
-                // calls are below 14k gas per pair plus a fixed margin.
-                // Invalid inputs can burn only this bounded budget.
-                cap := add(50000, mul(div(input_len, 0xa0), 14000))
+                let k := div(input_len, 0xa0)
+                let discount := 519
+                switch k
+                case 0 { discount := 0 }
+                case 1 { discount := 1000 }
+                case 2 { discount := 949 }
+                case 3 { discount := 848 }
+                case 4 { discount := 797 }
+                case 5 { discount := 764 }
+                case 6 { discount := 750 }
+                case 7 { discount := 738 }
+                case 8 { discount := 728 }
+                case 9 { discount := 719 }
+                case 10 { discount := 712 }
+                case 11 { discount := 705 }
+                case 12 { discount := 698 }
+                case 13 { discount := 692 }
+                case 14 { discount := 687 }
+                case 15 { discount := 682 }
+                case 16 { discount := 677 }
+                case 17 { discount := 673 }
+                case 18 { discount := 669 }
+                case 19 { discount := 665 }
+                case 20 { discount := 661 }
+                case 21 { discount := 658 }
+                case 22 { discount := 654 }
+                case 23 { discount := 651 }
+                case 24 { discount := 648 }
+                case 25 { discount := 645 }
+                case 26 { discount := 642 }
+                case 27 { discount := 640 }
+                case 28 { discount := 637 }
+                case 29 { discount := 635 }
+                case 30 { discount := 632 }
+                case 31 { discount := 630 }
+                case 32 { discount := 627 }
+                case 33 { discount := 625 }
+                case 34 { discount := 623 }
+                case 35 { discount := 621 }
+                case 36 { discount := 619 }
+                case 37 { discount := 617 }
+                case 38 { discount := 615 }
+                case 39 { discount := 613 }
+                case 40 { discount := 611 }
+                case 41 { discount := 609 }
+                case 42 { discount := 608 }
+                case 43 { discount := 606 }
+                case 44 { discount := 604 }
+                case 45 { discount := 603 }
+                case 46 { discount := 601 }
+                case 47 { discount := 599 }
+                case 48 { discount := 598 }
+                case 49 { discount := 596 }
+                case 50 { discount := 595 }
+                case 51 { discount := 593 }
+                case 52 { discount := 592 }
+                case 53 { discount := 591 }
+                case 54 { discount := 589 }
+                case 55 { discount := 588 }
+                case 56 { discount := 586 }
+                case 57 { discount := 585 }
+                case 58 { discount := 584 }
+                case 59 { discount := 582 }
+                case 60 { discount := 581 }
+                case 61 { discount := 580 }
+                case 62 { discount := 579 }
+                case 63 { discount := 577 }
+                case 64 { discount := 576 }
+                case 65 { discount := 575 }
+                case 66 { discount := 574 }
+                case 67 { discount := 573 }
+                case 68 { discount := 572 }
+                case 69 { discount := 570 }
+                case 70 { discount := 569 }
+                case 71 { discount := 568 }
+                case 72 { discount := 567 }
+                case 73 { discount := 566 }
+                case 74 { discount := 565 }
+                case 75 { discount := 564 }
+                case 76 { discount := 563 }
+                case 77 { discount := 562 }
+                case 78 { discount := 561 }
+                case 79 { discount := 560 }
+                case 80 { discount := 559 }
+                case 81 { discount := 558 }
+                case 82 { discount := 557 }
+                case 83 { discount := 556 }
+                case 84 { discount := 555 }
+                case 85 { discount := 554 }
+                case 86 { discount := 553 }
+                case 87 { discount := 552 }
+                case 88 { discount := 551 }
+                case 89 { discount := 550 }
+                case 90 { discount := 549 }
+                case 91 { discount := 548 }
+                case 92 { discount := 547 }
+                case 93 { discount := 547 }
+                case 94 { discount := 546 }
+                case 95 { discount := 545 }
+                case 96 { discount := 544 }
+                case 97 { discount := 543 }
+                case 98 { discount := 542 }
+                case 99 { discount := 541 }
+                case 100 { discount := 540 }
+                case 101 { discount := 540 }
+                case 102 { discount := 539 }
+                case 103 { discount := 538 }
+                case 104 { discount := 537 }
+                case 105 { discount := 536 }
+                case 106 { discount := 536 }
+                case 107 { discount := 535 }
+                case 108 { discount := 534 }
+                case 109 { discount := 533 }
+                case 110 { discount := 532 }
+                case 111 { discount := 532 }
+                case 112 { discount := 531 }
+                case 113 { discount := 530 }
+                case 114 { discount := 529 }
+                case 115 { discount := 528 }
+                case 116 { discount := 528 }
+                case 117 { discount := 527 }
+                case 118 { discount := 526 }
+                case 119 { discount := 525 }
+                case 120 { discount := 525 }
+                case 121 { discount := 524 }
+                case 122 { discount := 523 }
+                case 123 { discount := 522 }
+                case 124 { discount := 522 }
+                case 125 { discount := 521 }
+                case 126 { discount := 520 }
+                case 127 { discount := 520 }
+                case 128 { discount := 519 }
+                // EIP-2537 G1MSM gas: k * discount[k] * 12000 / 1000.
+                // The generated call sites pass input_len constants derived
+                // from the circuit/VK-specific MSM term counts.
+                cap := add(50000, div(mul(mul(k, discount), 12000), 1000))
             }
 
             function pairing_gas_cap(input_len) -> cap {
@@ -764,11 +896,19 @@ contract Halo2Verifier {
                 }
             }
 
-            {%- if self.trace %}
+            // Quotient arithmetic emits this hook in both production and
+            // trace builds so solc via-IR sees the same arithmetic shape.
+            // Production keeps it logless; trace builds emit the value.
             function trace_u256(id, value) {
+                {%- if self.trace %}
                 mstore(0x5e00, value)
                 log1(0x5e00, 0x20, id)
+                {%- else %}
+                pop(id)
+                mstore(0x5e00, value)
+                {%- endif %}
             }
+            {%- if self.trace %}
             function trace_point(id, mptr) {
                 log1(mptr, 0x80, id)
             }
@@ -1297,8 +1437,9 @@ contract Halo2Verifier {
             }
 
             {%- if self.trace %}
-            // Diagnostic-only materialization of the linearization commitment.
-            // The production path fuses these terms into the final PCS MSM.
+            // Materialize the linearization commitment for trace comparison.
+            // The production path expands the same terms directly into the
+            // fused final PCS MSM below.
             {
                 let lin_scratch := add(SELECTOR_ACC_MPTR, {{ (simple_selector_cols.len() * 0x20)|hex() }})
                 let lin_pair := lin_scratch

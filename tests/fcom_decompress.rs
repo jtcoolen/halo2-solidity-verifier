@@ -7,6 +7,7 @@ use group::{prime::PrimeCurveAffine, GroupEncoding};
 use midnight_curves::G1Affine;
 
 #[test]
+#[ignore = "diagnostic-only compressed point probe; captured bytes are not part of CI acceptance"]
 fn fcom_decompress() {
     let bytes_hex = "e910f0d3fc7d02235d9c7953d44923684ef8a25ba83e8c80e345f7c2b4827257cabfb6830aa5aefacb690f81404d0b2d";
     let bytes: [u8; 48] = hex::decode(bytes_hex).unwrap().try_into().unwrap();
@@ -20,12 +21,13 @@ fn fcom_decompress() {
     eprintln!("is_identity: {}", bool::from(p.is_identity()));
     let bytes2 = p.to_bytes();
     eprintln!("re-serialized hex: {}", hex::encode(bytes2.as_ref()));
-    eprintln!("matches: {}", bytes2.as_ref() == &bytes);
+    eprintln!("matches: {}", bytes2.as_ref() == bytes);
 }
 
 /// Decompress one of the quotient limb compressed bytes captured by the
 /// Yul probe and dump the resulting (x, y) for cross-check.
 #[test]
+#[ignore = "diagnostic-only compressed point probe; captured bytes are not part of CI acceptance"]
 fn quotient_limb_decompress() {
     // Captured from the Yul `return(0x500, 0xc0)` probe in the previous run.
     let compressed_hex = "8c0b3ee2ff547acc7650d83ad9bbe7ccc82f4563026996f058831e9555a9b99ebbfdd23a31fd4d6f71983ba017bb87fc";

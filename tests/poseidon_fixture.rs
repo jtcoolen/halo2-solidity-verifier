@@ -103,9 +103,10 @@ fn srs_dir() -> String {
 /// Step 8 end-to-end smoke. Marked `#[ignore]` because it depends on
 /// the Filecoin SRS asset, solc, and Prague EIP-2537 precompile
 /// support. Run explicitly via
-///   cargo test --features evm --test poseidon_fixture -- --ignored --nocapture
+///   cargo test --features evm,truncated-challenges --test poseidon_fixture -- --ignored --nocapture
 /// Enable Solidity trace logs with:
-///   cargo test --features evm,solidity-trace --test poseidon_fixture -- --ignored --nocapture
+///   cargo test --features evm,truncated-challenges,solidity-trace --test poseidon_fixture -- --ignored --nocapture
+#[cfg(feature = "truncated-challenges")]
 #[test]
 #[ignore = "requires local midfall assets and Prague EIP-2537 precompiles"]
 fn poseidon_renders_compiles_and_verifies() {
@@ -176,7 +177,7 @@ fn poseidon_renders_compiles_and_verifies() {
     std::fs::write(format!("{dump_dir}/proof.bin"), &proof).ok();
     std::fs::write(
         format!("{dump_dir}/instance.be"),
-        &<F as ff::PrimeField>::to_repr(&instance).as_ref(),
+        <F as ff::PrimeField>::to_repr(&instance).as_ref(),
     )
     .ok();
     eprintln!(
@@ -258,6 +259,9 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
         let topic = log.data.topics()[0];
         let id = u64::from_be_bytes(topic.as_slice()[24..32].try_into().unwrap());
         let data = log.data.data.as_ref();
+        if data.is_empty() {
+            continue;
+        }
         let name = match id {
             1 => "vk_digest",
             2 => "num_instances",
@@ -407,9 +411,11 @@ fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log],
     // numbers reflect "real" section work, not measurement overhead.
     const CHECKPOINT_COST: u64 = 750;
 
-    let total_billed = (events[events.len() - 1].1 < events[0].1)
-        .then(|| events[0].1.saturating_sub(events[events.len() - 1].1))
-        .unwrap_or(0);
+    let total_billed = if events[events.len() - 1].1 < events[0].1 {
+        events[0].1.saturating_sub(events[events.len() - 1].1)
+    } else {
+        0
+    };
     let total_real_work = total_billed.saturating_sub(events.len() as u64 * CHECKPOINT_COST);
 
     let mut prev_gas = events[0].1;
@@ -472,7 +478,7 @@ fn format_u64(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);

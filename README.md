@@ -2,35 +2,25 @@
 
 > ⚠️ This repo has NOT been audited and is NOT intended for a production environment yet.
 
-Solidity verifier generator for [`halo2`](http://github.com/privacy-scaling-explorations/halo2) proof with KZG polynomial commitment scheme on BN254.
+Solidity verifier generator for `midnight-proofs` / Midfall Halo2 proofs with
+the KZG polynomial commitment scheme on BLS12-381. Generated verifiers target
+Solidity `>=0.8.24` and the EIP-2537 BLS12-381 precompiles.
 
 For audited solidity verifier generator and proof aggregation toolkits, please refer to [`snark-verifier`](http://github.com/axiom-crypto/snark-verifier).
 
 ## Usage
 
-### Generate verifier and verifying key separately as 2 solidity contracts
+### Generate verifier and verifying key separately as 2 Solidity contracts
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, Bdfg21, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, BatchOpenScheme::Gwc19, num_instances);
 let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
-```
-
-Check [`examples/separately.rs`](./examples/separately.rs) for more details.
-
-> [!NOTE]
-> The example is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml).
-> Running it in `--release` mode avoids a debug-only `revm` interpreter panic on newer Rust toolchains.
-
-Run example with the following command:
-
-```bash
-cargo run --release --all-features --example separately
 ```
 
 ### Generate verifier and verifying key in a single solidity contract
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, Bdfg21, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, BatchOpenScheme::Gwc19, num_instances);
 let verifier_solidity = generator.render().unwrap();
 ```
 
@@ -51,43 +41,39 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 ```
 
 > [!NOTE]
-> The workspace is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml).
+> The workspace is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml)
+> and Solidity-touching checks require `solc >=0.8.24`.
+
+Only maintained examples are registered in `Cargo.toml`; stale pre-Midnight
+diagnostic examples under `examples/` are kept out of default builds by
+`autoexamples = false`.
 
 ### IVC detailed bench
 
 Run the Keccak IVC Solidity verifier bench with per-section gas checkpoints:
 
 ```bash
-SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 scripts/run_ivc_bench.sh
 ```
 
 This prints the detailed checkpoint table, deployed runtime sizes, total
 transaction gas, and real checkpointed section work.
 
-### IVC full trace equivalence
-
-Run the full native Rust/Solidity trace-equivalence check for the IVC example:
-
-```bash
-SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
-cargo test --release \
-  --features evm,rust-verifier-trace,truncated-challenges,in-circuit-fewer-point-sets \
-  --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  -- --ignored --nocapture
-```
-
-The expected success signal includes a native Rust/Solidity trace match and the
-final Keccak IVC proof being accepted on-chain.
+Native Rust/Solidity trace equivalence is currently local-checkout diagnostic
+coverage only: the published Midfall branch used by default does not expose the
+native `solidity_trace` hook.
 
 ## Limitations & Caveats
 
-- It only allows circuit with **less or equal than 1 instance column** and **no rotated query to this instance column**.
+- It currently supports the Midfall verifier shape used by this repo: at most
+  two instance columns, no rotated instance queries, and KZG on BLS12-381.
 - Currently even the `configure` is same, the [selector compression](https://github.com/privacy-scaling-explorations/halo2/blob/7a2165617195d8baa422ca7b2b364cef02380390/halo2_proofs/src/plonk/circuit/compress_selectors.rs#L51) might lead to different configuration when selector assignments are different. To avoid this, please use [`keygen_vk_custom`](https://github.com/privacy-scaling-explorations/halo2/blob/6fc6d7ca018f3899b030618cb18580249b1e7c82/halo2_proofs/src/plonk/keygen.rs#L223) with `compress_selectors: false` to do key generation without selector compression.
 
 ## Compatibility
 
-The [`Keccak256Transcript`](./src/transcript.rs#L19) behaves exactly same as the `EvmTranscript` in `snark-verifier`.
+The [`Keccak256Transcript`](./src/transcript.rs#L19) follows the Midfall
+Keccak transcript shape used by the generated Solidity verifier.
 
 ## Design Rationale
 

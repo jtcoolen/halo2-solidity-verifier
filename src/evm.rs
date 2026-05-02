@@ -173,6 +173,7 @@ pub(crate) mod test {
     /// are routed to revm's bundled implementations. The runner keeps an
     /// `InMemoryDB` across calls so tests can deploy once and call many
     /// times.
+    #[derive(Default)]
     pub struct Evm {
         db: InMemoryDB,
     }
@@ -180,14 +181,6 @@ pub(crate) mod test {
     impl Debug for Evm {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             f.debug_struct("Evm").finish_non_exhaustive()
-        }
-    }
-
-    impl Default for Evm {
-        fn default() -> Self {
-            Self {
-                db: InMemoryDB::default(),
-            }
         }
     }
 

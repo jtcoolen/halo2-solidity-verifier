@@ -10,10 +10,8 @@
 //!      the result over the fixed IVC VK bases.
 //!   4. Prove that decider circuit under Keccak-256, render
 //!      `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the decider
-//!      VK with `truncated-challenges` enabled. The recursive verifier uses
-//!      fewer point sets for the leaf proofs, while the final Solidity-facing
-//!      proof omits the dummy-query layout unless `outer-fewer-point-sets`
-//!      is explicitly enabled.
+//!      VK with `truncated-challenges` and the fewer-point-set proof layout
+//!      enabled.
 //!   5. Compile the Solidity, deploy on Prague-spec revm (EIP-2537
 //!      precompiles routed through blst), repack the proof off-chain
 //!      via `SolidityGenerator::repack_compressed_proof`, encode
@@ -21,16 +19,16 @@
 //!   6. Assert success and dump gas.
 //!
 //! Required features: `evm`, `truncated-challenges`,
-//! `in-circuit-fewer-point-sets`.
+//! `in-circuit-fewer-point-sets`, `outer-fewer-point-sets`.
 //! Midnight crates are pulled from the published midfall `keccak` branch
 //! configured in `Cargo.toml`; `SRS_DIR` still needs to point at local SRS
 //! assets.
 //! Run:
 //!
 //! ```text
-//! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+//! SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets \
 //!     --test ivc_keccak_solidity \
 //!     -- --ignored --nocapture
 //! ```
@@ -38,28 +36,21 @@
 //! Enable the detailed gas benchmark with:
 //!
 //! ```text
-//! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+//! SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,solidity-gas-checkpoints \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints \
 //!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! Enable full native-Rust/Solidity trace equivalence for this same IVC
-//! example with:
-//!
-//! ```text
-//! SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
-//!   cargo test --release \
-//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,rust-verifier-trace \
-//!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-//!     -- --ignored --nocapture
-//! ```
+//! Native Rust/Solidity trace equivalence needs a local Midfall checkout that
+//! exposes `midnight_proofs::plonk::solidity_trace`.
 
 #![cfg(all(
     feature = "evm",
     feature = "truncated-challenges",
     feature = "in-circuit-fewer-point-sets",
+    feature = "outer-fewer-point-sets",
 ))]
 
 use std::{collections::BTreeMap, time::Instant};
@@ -695,7 +686,7 @@ impl Relation for IvcTreeDeciderCircuit {
             let proof_acc = verifier_gadget.prepare(
                 layouter,
                 &assigned_ivc_vk,
-                &[id_point.clone()],
+                std::slice::from_ref(&id_point),
                 &[&leaf_pi],
                 witness
                     .as_ref()
@@ -944,17 +935,15 @@ fn ivc_final_keccak_solidity_e2e() {
         start.elapsed()
     );
 
-    let _outer_fewer_point_sets_guard = if cfg!(feature = "outer-fewer-point-sets") {
+    if cfg!(feature = "outer-fewer-point-sets") {
         println!(
             "[ivc-keccak-solidity] outer proof fewer-point-sets: enabled (dummy query evals expected)"
         );
-        None
     } else {
         println!(
-            "[ivc-keccak-solidity] outer proof fewer-point-sets: disabled (recursive leaf proofs still use it)"
+            "[ivc-keccak-solidity] outer proof fewer-point-sets: disabled (published Midfall uses cargo feature state)"
         );
-        Some(midnight_proofs::poly::kzg::scoped_fewer_point_sets(false))
-    };
+    }
 
     let t0 = Instant::now();
     let final_proof = midnight_zk_stdlib::prove::<IvcTreeDeciderCircuit, sha3::Keccak256>(
@@ -1291,6 +1280,7 @@ fn assert_ivc_trace_matches_native_midfall(
     logs: &[halo2_solidity_verifier::revm::primitives::Log],
 ) {
     let solidity_trace = parse_solidity_trace_logs(logs);
+    let external_quotient_trace_id = |id: u64| (30_000..40_000).contains(&id);
     let mut rust_by_id = BTreeMap::new();
     for event in rust_trace {
         assert!(
@@ -1302,9 +1292,14 @@ fn assert_ivc_trace_matches_native_midfall(
         );
     }
 
+    // The IVC verifier uses a pinned external quotient evaluator in trace and
+    // production builds. The evaluator is reached through STATICCALL, so it
+    // cannot emit LOG records for native quotient-arithmetic trace ids.
+    // Transcript, proof, PCS, and pairing trace ids are still emitted by the
+    // main verifier and compared below.
     let missing = rust_by_id
         .keys()
-        .filter(|&&id| !solidity_trace.contains_key(&id))
+        .filter(|&&id| !external_quotient_trace_id(id) && !solidity_trace.contains_key(&id))
         .copied()
         .collect::<Vec<_>>();
     assert!(
@@ -1326,7 +1321,11 @@ fn assert_ivc_trace_matches_native_midfall(
         "Solidity trace emitted ids without native Rust oracle: {unexpected:?}"
     );
 
+    let mut matched = 0usize;
     for (id, (name, rust_data)) in rust_by_id {
+        if external_quotient_trace_id(id) {
+            continue;
+        }
         let solidity_data = solidity_trace
             .get(&id)
             .expect("missing Solidity trace id was checked above");
@@ -1337,6 +1336,7 @@ fn assert_ivc_trace_matches_native_midfall(
             hex::encode(&rust_data),
             hex::encode(solidity_data),
         );
+        matched += 1;
     }
 
     let generator_only = allowed_generator_only
@@ -1345,7 +1345,7 @@ fn assert_ivc_trace_matches_native_midfall(
         .collect::<Vec<_>>();
     println!(
         "[ivc-keccak-solidity][trace] matched {} native Rust/Solidity trace points{}",
-        rust_trace.len(),
+        matched,
         if generator_only.is_empty() {
             String::new()
         } else {
@@ -1418,7 +1418,7 @@ fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log],
         .iter()
         .filter_map(|(id, _)| (*id >= 17).then_some(*id))
         .max()
-        .and_then(|max_id| max_id.checked_sub(20));
+        .and_then(|max_id| max_id.checked_sub(21));
 
     println!();
     println!("=== IVC Keccak Solidity gas-checkpoint breakdown ===");
@@ -1520,9 +1520,12 @@ fn checkpoint_name(id: u8, pcs_set_count: Option<u8>) -> String {
                     return format!("PCS block 3 set {idx} (q_eval fold)");
                 }
                 if idx == n {
-                    return "PCS block 4 (f_eval Lagrange interpolation)".to_string();
+                    return "PCS block 3 (q_com input materialization)".to_string();
                 }
                 if idx == n + 1 {
+                    return "PCS block 4 (f_eval Lagrange interpolation)".to_string();
+                }
+                if idx == n + 2 {
                     return "PCS block 5 (final_com x4-power MSM + v)".to_string();
                 }
             }
@@ -1537,7 +1540,7 @@ fn format_u64(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);

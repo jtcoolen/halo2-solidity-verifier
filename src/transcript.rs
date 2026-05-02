@@ -1,8 +1,9 @@
 //! Keccak256 transcript matching `midnight_proofs::transcript::CircuitTranscript<Keccak256>`
 //! byte-for-byte. The previous BN254-era implementation in this crate
 //! used a different scheme (raw byte concatenation with a `0x01`
-//! continuation marker, mod-r reduction of the 32-byte digest); this
-//! file is a complete rewrite for the midnight-proofs migration.
+//! continuation marker, mod-r reduction of a 32-byte digest); this file
+//! follows the local Midfall `keccak` transcript used by the Solidity
+//! verifier trace/bench tests.
 //!
 //! Reference Rust implementation:
 //!   * `midfall/proofs/src/transcript/mod.rs::CircuitTranscript`
@@ -10,21 +11,21 @@
 //!
 //! Behaviour summary:
 //!
-//!   * `init`: transcript data starts empty.
-//!   * `common(input)`: append `input` to the transcript data.
+//!   * `init`: Keccak state starts empty.
+//!   * `common(input)`: absorb `input`.
 //!     For G1, `input` is the **EIP-2537 padded 128-byte uncompressed
 //!     form** (`x_hi || x_lo || y_hi || y_lo`, 64 bytes per coord = 16
 //!     zero pad bytes + 48 BE bytes of the BLS12-381 base-field
-//!     element; identity = 128 zero bytes). This matches the patched
+//!     element; identity = 128 zero bytes). This matches the published
 //!     `Hashable<Keccak256> for G1Projective::to_input` in
 //!     `midnight-proofs` and lets the EVM verifier hash the calldata
 //!     uncompressed bytes verbatim instead of running a 384-bit
 //!     sign-bit ladder to derive the 48-byte compressed encoding.
 //!     For Fq scalars, `input` is the canonical big-endian 32-byte repr.
-//!   * `squeeze`: produces one 32-byte Keccak digest over the current
-//!     transcript data, then resets the transcript data to that digest.
-//!   * `sample::<Fq>(out32)`: interpret the 32-byte digest as a
-//!     big-endian integer and reduce it modulo the scalar-field modulus.
+//!   * `squeeze`: produce one 32-byte Keccak digest over the current state,
+//!     then reseed the Keccak state with that digest.
+//!   * `sample::<Fq>(out32)`: interpret the digest as a big-endian integer
+//!     and reduce it modulo the scalar-field modulus.
 //!
 //! The Solidity verifier (`templates/Halo2Verifier.sol`) ports this exactly:
 //! see Step 6 in MIGRATION.md for the planned Yul translation.
@@ -40,7 +41,7 @@ use sha3::{Digest, Keccak256};
 /// In-memory Keccak256 transcript matching `CircuitTranscript<Keccak256>`.
 #[derive(Clone, Debug)]
 pub struct Keccak256Transcript<S> {
-    transcript_data: Vec<u8>,
+    state: Keccak256,
     stream: S,
 }
 
@@ -54,34 +55,31 @@ impl<S> Keccak256Transcript<S> {
     /// Construct a new transcript wrapping `stream` with empty transcript
     /// data.
     pub fn new(stream: S) -> Self {
-        Self {
-            transcript_data: Vec::new(),
-            stream,
-        }
+        let state = Keccak256::new();
+        Self { state, stream }
     }
 
     /// Absorb input bytes into the running transcript data.
     fn absorb_bytes(&mut self, input: &[u8]) {
-        self.transcript_data.extend_from_slice(input);
+        self.state.update(input);
     }
 
-    /// Squeeze one 32-byte digest, then reset the transcript data to the
-    /// squeezed digest.
+    /// Squeeze one 32-byte output, then reset the transcript state to the
+    /// squeezed output.
     fn squeeze_bytes(&mut self) -> [u8; 32] {
-        let out0 = Keccak256::digest(&self.transcript_data);
-
+        let digest = self.state.clone().finalize();
         let mut out = [0u8; 32];
-        out.copy_from_slice(&out0);
+        out.copy_from_slice(&digest);
 
-        self.transcript_data = out0.to_vec();
-
+        let mut state = Keccak256::new();
+        state.update(out);
+        self.state = state;
         out
     }
 
     /// Squeeze a Fq challenge using BE digest modulo-r semantics.
     pub fn squeeze_challenge(&mut self) -> Fq {
-        let digest = self.squeeze_bytes();
-        fq_from_be_digest_mod_r(digest)
+        fq_from_be_digest_mod_r(self.squeeze_bytes())
     }
 
     /// Absorb a Fq scalar in its canonical 32-byte BE transcript repr.
@@ -93,7 +91,7 @@ impl<S> Keccak256Transcript<S> {
     }
 
     /// Absorb a G1 point in its EIP-2537 padded 128-byte uncompressed
-    /// form (matches the patched `Hashable<Keccak256> for
+    /// form (matches the published `Hashable<Keccak256> for
     /// G1Projective::to_input` in midnight-proofs).
     ///
     /// Layout: `x_hi (32) || x_lo (32) || y_hi (32) || y_lo (32)` where
@@ -117,25 +115,9 @@ fn fq_from_be_digest_mod_r(digest: [u8; 32]) -> Fq {
     Option::from(Fq::from_repr(repr)).expect("reduced Keccak challenge must be canonical")
 }
 
-/// Encode a `G1Projective` as the 128-byte EIP-2537 padded uncompressed
-/// form used by the Fiat-Shamir transcript and the EVM verifier
-/// calldata. Mirrors `Hashable<Keccak256> for G1Projective::to_input`
-/// in midnight-proofs.
-fn g1_to_uncompressed_eip2537(point: &G1Projective) -> [u8; 128] {
-    let aff = G1Affine::from(point);
-    let mut out = [0u8; 128];
-    if !bool::from(aff.is_identity()) {
-        let raw = <G1Affine as UncompressedEncoding>::to_uncompressed(&aff);
-        let bytes: &[u8] = raw.as_ref();
-        out[16..64].copy_from_slice(&bytes[0..48]);
-        out[80..128].copy_from_slice(&bytes[48..96]);
-    }
-    out
-}
-
 impl<R: Read> Keccak256Transcript<R> {
-    /// Read a canonical-LE Fq scalar from the stream, absorb its
-    /// canonical-BE transcript representation, and decode it.
+    /// Read a canonical Fq scalar from the stream, absorb its transcript
+    /// representation, and decode it.
     pub fn read_scalar(&mut self) -> io::Result<Fq> {
         let mut bytes = [0u8; 32];
         self.stream.read_exact(&mut bytes)?;
@@ -162,6 +144,22 @@ impl<R: Read> Keccak256Transcript<R> {
         self.common_g1(&point)?;
         Ok(point)
     }
+}
+
+/// Encode a `G1Projective` as the 128-byte EIP-2537 padded uncompressed
+/// form used by the Fiat-Shamir transcript and the EVM verifier
+/// calldata. Mirrors `Hashable<Keccak256> for G1Projective::to_input`
+/// in midnight-proofs.
+fn g1_to_uncompressed_eip2537(point: &G1Projective) -> [u8; 128] {
+    let aff = G1Affine::from(point);
+    let mut out = [0u8; 128];
+    if !bool::from(aff.is_identity()) {
+        let raw = <G1Affine as UncompressedEncoding>::to_uncompressed(&aff);
+        let bytes: &[u8] = raw.as_ref();
+        out[16..64].copy_from_slice(&bytes[0..48]);
+        out[80..128].copy_from_slice(&bytes[48..96]);
+    }
+    out
 }
 
 impl Keccak256Transcript<Cursor<Vec<u8>>> {
@@ -204,7 +202,7 @@ mod tests {
 
     /// Round-trip equivalence test against `midnight_proofs::transcript::CircuitTranscript<Keccak256>`.
     /// Squeeze a challenge from an empty transcript on both sides; the
-    /// 64-byte intermediate hash and the resulting Fq sample must agree.
+    /// 32-byte intermediate hash and the resulting Fq sample must agree.
     #[test]
     fn empty_squeeze_matches_midnight_proofs() {
         let mut ours = Keccak256Transcript::new(Cursor::new(Vec::<u8>::new()));

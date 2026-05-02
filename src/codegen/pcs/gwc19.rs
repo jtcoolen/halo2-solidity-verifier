@@ -8,15 +8,15 @@
 //!      assigns each commitment to a point set (sorted by ascending
 //!      cardinality with original-order tiebreak).
 //!   3. Emit Yul that:
-//!        a. Pre-computes rotation points `x * omega^rot` for every
-//!           distinct rotation appearing in any query.
-//!        b. Pre-computes `x1` powers up to `max_set_size - 1`.
-//!        c. Computes `q_com[s]` and `q_eval_set[s]` per set.
-//!        d. Computes `f_eval` via Horner over reverse(point_sets) using
-//!           Lagrange interpolation at `x3`.
-//!        e. Builds the final commitment via `msm_inner_product` with
-//!           `x4` powers, plus `f_com` at the highest power.
-//!        f. Emits the pairing inputs `(pi, final_com - v*G + x3*pi)`.
+//!      - Pre-computes rotation points `x * omega^rot` for every distinct
+//!        rotation appearing in any query.
+//!      - Pre-computes `x1` powers up to `max_set_size - 1`.
+//!      - Computes `q_com[s]` and `q_eval_set[s]` per set.
+//!      - Computes `f_eval` via Horner over reverse(point_sets) using
+//!        Lagrange interpolation at `x3`.
+//!      - Builds the final commitment via `msm_inner_product` with `x4`
+//!        powers, plus `f_com` at the highest power.
+//!      - Emits the pairing inputs `(pi, final_com - v*G + x3*pi)`.
 //!
 //! Notes:
 //!
@@ -460,6 +460,7 @@ pub(super) fn static_working_memory_size(_meta: &ConstraintSystemMeta, _data: &D
 /// Emit the multi-prepare Yul body. The output is the same vec-of-vec-of-strings
 /// shape the rest of the codegen uses; each inner Vec<String> is a discrete
 /// Yul code block (rendered between `{` and `}` in the template).
+#[allow(clippy::vec_init_then_push)]
 pub(super) fn computations(
     meta: &ConstraintSystemMeta,
     data: &Data,
@@ -748,7 +749,7 @@ pub(super) fn computations(
                 //    count and gives solc-via-ir a single basic block to
                 //    schedule.
                 let n_rot_stride = n_rot * 0x20;
-                lines.push(format!("let pow_p := add(X1_POWERS_MPTR, 0x20)"));
+                lines.push("let pow_p := add(X1_POWERS_MPTR, 0x20)".to_string());
                 lines.push(format!(
                     "let eval_p := add({:#x}, {:#x})",
                     eval_src_table_mptr, n_rot_stride
@@ -813,14 +814,14 @@ pub(super) fn computations(
         }
     }
 
-    if trace {
+    {
         let mut lines: Vec<String> = Vec::new();
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
         let linearization_comm = data.computed_quotient_comm;
         let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         let linearization_term_count = meta.num_quotients + simple_selector_cols.len();
         let trace_scratch = pcs_scratch_mptr;
-        lines.push("// trace per-set q_com commitments".to_string());
+        lines.push("// materialize per-set q_com inputs before the fused final MSM".to_string());
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let non_identity_terms = commitments_in_set
                 .iter()
@@ -836,10 +837,12 @@ pub(super) fn computations(
                 .sum::<usize>();
             if non_identity_terms == 0 {
                 lines.push(format!("mcopy({trace_scratch:#x}, G1_IDENTITY_MPTR, 0x80)"));
-                lines.push(format!(
-                    "trace_point({}, {trace_scratch:#x})",
-                    40000 + set_idx
-                ));
+                if trace {
+                    lines.push(format!(
+                        "trace_point({}, {trace_scratch:#x})",
+                        40000 + set_idx
+                    ));
+                }
                 continue;
             }
 
@@ -900,22 +903,23 @@ pub(super) fn computations(
                 }
             }
             debug_assert_eq!(pair_idx, non_identity_terms);
-            lines.push(format!(
-                "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({:#x}), 0x0c, {trace_scratch:#x}, {:#x}, {trace_scratch:#x}, 0x80)",
-                non_identity_terms * 0xa0,
-                non_identity_terms * 0xa0
-            ));
-            lines.push(format!(
-                "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), 0x80))"
-            ));
-            lines.push(format!(
-                "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, 0x20) }}",
-                40000 + set_idx
-            ));
-            lines.push(format!(
-                "trace_point({}, {trace_scratch:#x})",
-                40000 + set_idx
-            ));
+            let msm_len = non_identity_terms * 0xa0;
+            if trace {
+                lines.push(format!(
+                    "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, 0x80)"
+                ));
+                lines.push(format!(
+                    "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), 0x80))"
+                ));
+                lines.push(format!(
+                    "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, 0x20) }}",
+                    40000 + set_idx
+                ));
+                lines.push(format!(
+                    "trace_point({}, {trace_scratch:#x})",
+                    40000 + set_idx
+                ));
+            }
         }
         blocks.push(lines);
     }
@@ -1041,19 +1045,19 @@ pub(super) fn computations(
             // The reference computes lagrange interpolation directly via
             // full polynomial construction; here we collapse the
             // evaluation at x3 directly using the identity above.
-            for j in 0..m {
-                let pt = rot_pt_ref(points[j]);
+            for (j, point) in points.iter().enumerate().take(m) {
+                let pt = rot_pt_ref(*point);
                 lines.push(format!("let dx_{j} := addmod(x3, sub(r, {pt}), r)"));
             }
             // For each j: lagrange_basis_inv_j = inv(prod_{k!=j} (p_j - p_k))
-            for j in 0..m {
-                let pj = rot_pt_ref(points[j]);
+            for (j, point_j) in points.iter().enumerate().take(m) {
+                let pj = rot_pt_ref(*point_j);
                 lines.push(format!("let lbasis_{j} := 1"));
-                for k in 0..m {
+                for (k, point_k) in points.iter().enumerate().take(m) {
                     if k == j {
                         continue;
                     }
-                    let pk = rot_pt_ref(points[k]);
+                    let pk = rot_pt_ref(*point_k);
                     lines.push(format!(
                         "lbasis_{j} := mulmod(lbasis_{j}, addmod({pj}, sub(r, {pk}), r), r)"
                     ));
@@ -1076,11 +1080,11 @@ pub(super) fn computations(
             //   bp_i     = bp_{i-1} * batch_inputs[i]
             // Last one (bp_{n-1}) is the total product.
             lines.push(format!("let bp_0 := {}", batch_inputs[0]));
-            for i in 1..n {
+            for (i, batch_input) in batch_inputs.iter().enumerate().take(n).skip(1) {
                 lines.push(format!(
                     "let bp_{i} := mulmod(bp_{}, {}, r)",
                     i - 1,
-                    batch_inputs[i]
+                    batch_input
                 ));
             }
 
@@ -1177,9 +1181,13 @@ pub(super) fn computations(
             })
             .sum::<usize>()
             + 1; // f_com
+        let final_msm_len = final_msm_terms * 0xa0;
         let final_msm_scratch = pcs_scratch_mptr;
 
         lines.push("// build final_com and v (KZG single-opening proof, fused MSM)".to_string());
+        lines.push(format!(
+            "// final MSM input length from circuit/VK shape: {final_msm_terms} term(s)"
+        ));
         lines.push("let x4 := mload(X4_MPTR)".to_string());
         lines.push("let lin_x_split := mload(QUOTIENT_MPTR)".to_string());
         lines.push("let lin_one_minus_x_n := mload(add(QUOTIENT_MPTR, 0x20))".to_string());
@@ -1298,8 +1306,8 @@ pub(super) fn computations(
         lines.push("if success {".to_string());
         lines.push(format!(
             "    success := staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, 0x80)",
-            final_msm_terms * 0xa0,
-            final_msm_terms * 0xa0
+            final_msm_len,
+            final_msm_len
         ));
         lines.push("    success := and(success, eq(returndatasize(), 0x80))".to_string());
         lines.push("}".to_string());

@@ -299,7 +299,7 @@ impl<'a> Evaluator<'a> {
 
             // left = z_next * ∏ (eval(c) + β * s_eval(c) + γ)
             let left = self.fresh_var();
-            lines.push(format!("let {left} := {}", z_next.to_string()));
+            lines.push(format!("let {left} := {z_next}"));
             for col in chunk_cols {
                 let col_eval = self.eval_at(col, 0);
                 let s_eval = self
@@ -328,7 +328,7 @@ impl<'a> Evaluator<'a> {
                 u256_string(initial_delta_u256)
             ));
             let right = self.fresh_var();
-            lines.push(format!("let {right} := {}", z_cur.to_string()));
+            lines.push(format!("let {right} := {z_cur}"));
             for col in chunk_cols {
                 let col_eval = self.eval_at(col, 0);
                 let term = self.fresh_var();
@@ -394,10 +394,7 @@ impl<'a> Evaluator<'a> {
                 let l_sum = self.fresh_var();
                 lines.push(format!("let {l_sum} := addmod({l_0}, {l_last}, r)"));
                 let bnd = self.fresh_var();
-                lines.push(format!(
-                    "let {bnd} := mulmod({l_sum}, {}, r)",
-                    z_eval.to_string()
-                ));
+                lines.push(format!("let {bnd} := mulmod({l_sum}, {z_eval}, r)"));
                 out.push((lines, bnd));
             }
 
@@ -508,10 +505,7 @@ impl<'a> Evaluator<'a> {
 
                 // helper_constraint = h_eval * P - sum
                 let h_p = self.fresh_var();
-                lines.push(format!(
-                    "let {h_p} := mulmod({}, {p}, r)",
-                    h_eval.to_string()
-                ));
+                lines.push(format!("let {h_p} := mulmod({h_eval}, {p}, r)"));
                 let helper_c = self.fresh_var();
                 lines.push(format!(
                     "let {helper_c} := addmod({h_p}, sub(r, {sum_var}), r)"
@@ -548,9 +542,9 @@ impl<'a> Evaluator<'a> {
 
                 // Σ_h h_eval[c]
                 let sum_h = self.fresh_var();
-                lines.push(format!("let {sum_h} := {}", h_evals[0].to_string()));
+                lines.push(format!("let {sum_h} := {}", h_evals[0]));
                 for h in &h_evals[1..] {
-                    lines.push(format!("{sum_h} := addmod({sum_h}, {}, r)", h.to_string()));
+                    lines.push(format!("{sum_h} := addmod({sum_h}, {h}, r)"));
                 }
 
                 // selector eval (full Expression; not necessarily a
@@ -566,8 +560,7 @@ impl<'a> Evaluator<'a> {
                 let diff = self.fresh_var();
                 lines.push(format!(
                     "let {diff} := addmod({}, sub(r, addmod({}, {s_sum_h}, r)), r)",
-                    z_next_eval.to_string(),
-                    z_eval.to_string()
+                    z_next_eval, z_eval
                 ));
 
                 // compressed_table = θ-fold-compress(table_expressions)
@@ -581,7 +574,7 @@ impl<'a> Evaluator<'a> {
                 let core = self.fresh_var();
                 lines.push(format!(
                     "let {core} := addmod(mulmod({diff}, {t_plus_beta}, r), {}, r)",
-                    m_eval.to_string()
+                    m_eval
                 ));
 
                 let acc_c = self.fresh_var();
@@ -840,10 +833,10 @@ impl<'a> Evaluator<'a> {
     ) -> Option<(Vec<String>, String)> {
         let mut terms = Vec::new();
         let mut constant = Fq::ZERO;
-        self.collect_sum_terms(expression, Fq::ONE, &mut constant, &mut terms);
+        Self::collect_sum_terms(expression, Fq::ONE, &mut constant, &mut terms);
 
-        terms.retain(|(coeff, _)| !bool::from(coeff.is_zero_vartime()));
-        let has_constant = !bool::from(constant.is_zero_vartime());
+        terms.retain(|(coeff, _)| !coeff.is_zero_vartime());
+        let has_constant = !constant.is_zero_vartime();
         let should_fuse = has_constant
             || terms.len() > 1
             || terms.first().is_some_and(|(coeff, _)| *coeff != Fq::ONE);
@@ -882,7 +875,6 @@ impl<'a> Evaluator<'a> {
     }
 
     fn collect_sum_terms<'b>(
-        &self,
         expression: &'b Expression<Fq>,
         coeff: Fq,
         constant: &mut Fq,
@@ -893,14 +885,14 @@ impl<'a> Evaluator<'a> {
                 *constant += coeff * value;
             }
             Expression::Negated(inner) => {
-                self.collect_sum_terms(inner, -coeff, constant, terms);
+                Self::collect_sum_terms(inner, -coeff, constant, terms);
             }
             Expression::Sum(lhs, rhs) => {
-                self.collect_sum_terms(lhs, coeff, constant, terms);
-                self.collect_sum_terms(rhs, coeff, constant, terms);
+                Self::collect_sum_terms(lhs, coeff, constant, terms);
+                Self::collect_sum_terms(rhs, coeff, constant, terms);
             }
             Expression::Scaled(inner, scale) => {
-                self.collect_sum_terms(inner, coeff * scale, constant, terms);
+                Self::collect_sum_terms(inner, coeff * scale, constant, terms);
             }
             _ => terms.push((coeff, expression)),
         }
