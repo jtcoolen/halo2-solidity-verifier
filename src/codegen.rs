@@ -33,6 +33,7 @@ use std::{
 
 mod evaluator;
 mod pcs;
+mod protocol;
 mod template;
 pub(crate) mod util;
 
@@ -1830,7 +1831,7 @@ impl<'a> SolidityGenerator<'a> {
             false,
             None,
         )
-            .render(verifier_writer)
+        .render(verifier_writer)
     }
 
     /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded and return it as a
@@ -2003,7 +2004,7 @@ impl<'a> SolidityGenerator<'a> {
             false,
             None,
         )
-            .render(verifier_writer)?;
+        .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
         Ok(())
     }
@@ -2416,6 +2417,27 @@ impl<'a> SolidityGenerator<'a> {
                 target: QuotientTarget::Main,
             });
         }
+
+        assert_eq!(
+            gates.len(),
+            meta.protocol.quotient.gates,
+            "gate identity count must match protocol plan"
+        );
+        assert_eq!(
+            permutation.len(),
+            meta.protocol.quotient.permutation,
+            "permutation identity count must match protocol plan"
+        );
+        assert_eq!(
+            lookup.len(),
+            meta.protocol.quotient.lookup,
+            "lookup identity count must match protocol plan"
+        );
+        assert_eq!(
+            trash.len(),
+            meta.protocol.quotient.trash,
+            "trash identity count must match protocol plan"
+        );
 
         QuotientIdentityParts {
             gates,

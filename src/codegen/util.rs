@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use crate::codegen::{
+    protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
     BatchOpenScheme::{self, Gwc19},
 };
@@ -59,6 +60,7 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConstraintSystemMeta {
+    pub(crate) protocol: ProtocolPlan,
     pub(crate) num_fixeds: usize,
     pub(crate) permutation_columns: Vec<Column<Any>>,
     pub(crate) permutation_chunk_len: usize,
@@ -114,159 +116,57 @@ impl ConstraintSystemMeta {
     /// via Lagrange interpolation). For the poseidon example this is 0;
     /// for IVC-style fixtures with committed inputs it would be > 0.
     pub(crate) fn new(cs: &ConstraintSystem<Fq>, nb_committed_instances: usize) -> Self {
-        let cs_degree = cs.degree();
-        let num_fixeds = cs.num_fixed_columns();
-        let permutation_columns = cs.permutation().get_columns();
-        let permutation_chunk_len = cs_degree - 2;
-
-        let num_permutation_zs = if permutation_columns.is_empty() {
-            0
-        } else {
-            permutation_columns.len().div_ceil(permutation_chunk_len)
-        };
-
-        // For each batched lookup, midnight-proofs commits to one
-        // multiplicity polynomial, `num_chunks` helper polynomials
-        // (degree-bounded chunking of the parallel-lookups), and one
-        // accumulator polynomial. See `midnight_proofs::plonk::logup`.
-        let lookup_chunks: Vec<usize> = cs
-            .lookups()
-            .iter()
-            .map(|l| l.chunk_by_degree(cs_degree).num_chunks())
-            .collect();
-        let num_lookups = cs.lookups().len();
-
-        let num_trashcans = cs.trashcans().len();
-
-        // The quotient polynomial has degree `(d - 1) * (n - 1)` for a
-        // CS of degree `d`. Without the `single-h-commitment` feature we
-        // commit one limb per `(d - 1)`.
-        let num_quotients = cs_degree.saturating_sub(1);
-
-        let advice_queries = cs
-            .advice_queries()
-            .iter()
-            .map(|(column, rotation)| (column.index(), rotation.0))
-            .collect_vec();
-        let fixed_queries = cs
-            .fixed_queries()
-            .iter()
-            .map(|(column, rotation)| (column.index(), rotation.0))
-            .collect_vec();
-        let instance_queries = cs
-            .instance_queries()
-            .iter()
-            .map(|(column, rotation)| (column.index(), rotation.0))
-            .collect_vec();
-
-        let num_simple_selectors = cs.num_simple_selectors();
-        let simple_selector_cols: BTreeSet<usize> = (0..num_fixeds)
-            .filter(|&idx| cs.has_simple_selector_col(idx))
-            .collect();
-
-        // Total number of evaluations the verifier reads from the proof
-        // transcript. See `midnight_proofs::plonk::verifier::verify_algebraic_constraints`.
-        //
-        //   committed_instance reads:
-        //     #{ (col, _) in instance_queries : col.index() < nb_committed_instances }
-        //   advice reads:        advice_queries.len()
-        //   fixed-non-simple:    num_fixed_columns - num_simple_selectors
-        //   perm common:         permutation_columns.len()
-        //   perm sets:           per set, (cur, next) + (last for all but the final set)
-        //                        => 3 * num_permutation_zs - 1 if > 0, else 0
-        //   lookup evals:        per lookup, m + helpers + acc + acc_next
-        //                        => sum(num_chunks) + 3 * num_lookups
-        //   trash evals:         num_trashcans
-        let num_committed_instance_reads = cs
-            .instance_queries()
-            .iter()
-            .filter(|(col, _)| col.index() < nb_committed_instances)
-            .count();
-        let perm_set_evals = if num_permutation_zs == 0 {
-            0
-        } else {
-            3 * num_permutation_zs - 1
-        };
-        let lookup_helper_total: usize = lookup_chunks.iter().sum();
-        let lookup_evals_total = lookup_helper_total + 3 * num_lookups;
-        let num_evals = num_committed_instance_reads
-            + advice_queries.len()
-            + (num_fixeds - num_simple_selectors)
-            + permutation_columns.len()
-            + perm_set_evals
-            + lookup_evals_total
-            + num_trashcans;
-
-        let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
-        let remapping = |phase: Vec<u8>| {
-            let nums = phase.iter().fold(vec![0usize; num_phase], |mut nums, p| {
-                nums[*p as usize] += 1;
-                nums
-            });
-            let offsets = nums
-                .iter()
-                .take(num_phase - 1)
-                .fold(vec![0usize], |mut offsets, n| {
-                    offsets.push(offsets.last().unwrap() + n);
-                    offsets
-                });
-            let index = phase
-                .iter()
-                .scan(offsets, |state, p| {
-                    let i = state[*p as usize];
-                    state[*p as usize] += 1;
-                    Some(i)
-                })
-                .collect::<Vec<_>>();
-            (nums, index)
-        };
-        let (num_user_advices, advice_indices) = remapping(cs.advice_column_phase());
-        let (num_user_challenges, challenge_indices) = remapping(cs.challenge_phase());
-
-        let rotation_last = -(cs.blinding_factors() as i32 + 1);
-        let num_rotations = chain![
-            advice_queries.iter().map(|q| q.1),
-            fixed_queries.iter().map(|q| q.1),
-            instance_queries
-                .iter()
-                .filter(|(col, _)| *col < nb_committed_instances)
-                .map(|q| q.1),
-            (num_permutation_zs > 0)
-                .then_some([0, 1])
-                .into_iter()
-                .flatten(),
-            (num_permutation_zs > 1).then_some(rotation_last),
-            (num_lookups > 0).then_some([0, 1]).into_iter().flatten(),
-            (num_trashcans > 0).then_some(0),
-        ]
-        .unique()
-        .count();
+        let protocol = ProtocolPlan::from_constraint_system(cs, nb_committed_instances);
 
         Self {
-            num_fixeds,
-            permutation_columns,
-            permutation_chunk_len,
-            num_lookups,
-            lookup_chunks,
-            num_trashcans,
-            num_permutation_zs,
-            num_quotients,
-            advice_queries,
-            fixed_queries,
-            instance_queries,
-            num_simple_selectors,
-            simple_selector_cols,
-            num_committed_instances: nb_committed_instances,
-            num_evals,
+            protocol: protocol.clone(),
+            num_fixeds: protocol.num_fixeds,
+            permutation_columns: protocol.permutation_columns.clone(),
+            permutation_chunk_len: protocol.permutation_chunk_len,
+            num_lookups: protocol.num_lookups,
+            lookup_chunks: protocol.lookup_chunks.clone(),
+            num_trashcans: protocol.num_trashcans,
+            num_permutation_zs: protocol.num_permutation_zs,
+            num_quotients: protocol.num_quotients,
+            advice_queries: protocol.advice_queries.iter().map(|q| q.tuple()).collect(),
+            fixed_queries: protocol.fixed_queries.iter().map(|q| q.tuple()).collect(),
+            instance_queries: protocol
+                .instance_queries
+                .iter()
+                .map(|q| q.tuple())
+                .collect(),
+            num_simple_selectors: protocol.num_simple_selectors,
+            simple_selector_cols: protocol.simple_selector_cols.clone(),
+            num_committed_instances: protocol.num_committed_instances,
+            num_evals: protocol.num_main_evals(),
             num_dummy_evals: 0,
-            num_rotations,
+            num_rotations: protocol.num_rotations,
             num_point_sets: 0,
-            num_user_advices,
-            num_user_challenges,
-            advice_indices,
-            challenge_indices,
-            rotation_last,
+            num_user_advices: protocol.num_user_advices.clone(),
+            num_user_challenges: protocol.num_user_challenges.clone(),
+            advice_indices: protocol.advice_indices.clone(),
+            challenge_indices: protocol.challenge_indices.clone(),
+            rotation_last: protocol.rotation_last,
         }
+    }
+
+    pub(crate) fn validate_against_protocol(&self) -> Result<(), String> {
+        self.protocol.validate()?;
+        let planned_g1s = self.protocol.num_commitments();
+        let scheduled_g1s = self.num_advices().iter().sum::<usize>();
+        if planned_g1s != scheduled_g1s {
+            return Err(format!(
+                "proof G1 read schedule mismatch: protocol={planned_g1s} metadata={scheduled_g1s}"
+            ));
+        }
+        if self.protocol.num_main_evals() != self.num_main_evals() {
+            return Err(format!(
+                "proof eval read schedule mismatch: protocol={} metadata={}",
+                self.protocol.num_main_evals(),
+                self.num_main_evals()
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the number of advice / advice-like commitments emitted in
@@ -354,6 +254,8 @@ impl ConstraintSystemMeta {
     }
 
     pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
+        self.validate_against_protocol()
+            .expect("constraint-system metadata must match protocol plan before proof sizing");
         // Each G1 commitment in the proof is 128 bytes (uncompressed,
         // EIP-2537 padded form: 4 words = x_hi, x_lo, y_hi, y_lo). Each
         // Fq evaluation is 32 bytes. The off-chain prover's compressed
@@ -661,92 +563,124 @@ impl Data {
             .collect_vec();
         let instance_eval = Ptr::memory("INSTANCE_EVAL_MPTR").into();
 
-        // The first `num_committed_instances`-many evals in calldata
-        // are the committed-instance evals (one per (col, rot) pair in
-        // `instance_queries` whose col_idx < nb_committed_instances). We
-        // store the calldata word for each so that the PCS query list
-        // can reference them; the actual eval value for a committed
-        // instance is 0 (since committed_pi = G1::identity in midnight)
-        // but the *MSM position* matters for x1-power scaling.
-        let committed_instance_evals: HashMap<(usize, i32), Word> = meta
-            .instance_queries
-            .iter()
-            .filter(|(col, _)| *col < meta.num_committed_instances)
-            .zip(Word::range(eval_cptr))
-            .map(|(q, w)| (*q, w))
-            .collect();
-        let mut eval_walk = eval_cptr + meta.num_committed_instances;
-        let advice_evals = izip!(meta.advice_queries.iter().cloned(), Word::range(eval_walk))
-            .take(meta.advice_queries.len())
-            .collect::<HashMap<_, _>>();
-        eval_walk = eval_walk + meta.advice_queries.len();
-
-        // fixed-non-simple evals. The proof byte stream contains
-        //   `num_fixed_columns - num_simple_selectors`
-        // evals; the verifier inserts `F::ONE` for simple-selector
-        // columns. We mirror that by skipping those columns entirely
-        // here (they are absent from `fixed_evals`); the evaluator emits
-        // a literal `0x1` whenever it sees a fixed-query for a column
-        // in `meta.simple_selector_cols`.
+        // Main proof evaluations are assigned by the typed protocol plan.
+        // This replaces the old category-by-category cursor walk with a
+        // single checked schedule shared with the PCS query construction.
+        let mut committed_instance_evals: HashMap<(usize, i32), Word> = HashMap::new();
+        let mut advice_evals: HashMap<(usize, i32), Word> = HashMap::new();
         let mut fixed_evals: HashMap<(usize, i32), Word> = HashMap::new();
-        let mut fixed_walk = eval_walk;
-        for query in &meta.fixed_queries {
-            if meta.simple_selector_cols.contains(&query.0) {
-                continue;
+        let mut permutation_evals: HashMap<Column<Any>, Word> = HashMap::new();
+        let mut permutation_z_slots: Vec<(Option<Word>, Option<Word>, Option<Word>)> =
+            vec![(None, None, None); meta.num_permutation_zs];
+        let mut lookup_slots: Vec<(Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Word>)> =
+            meta.lookup_chunks
+                .iter()
+                .map(|&chunks| (None, vec![None; chunks], None, None))
+                .collect();
+        let mut trashcan_slots: Vec<Option<Word>> = vec![None; meta.num_trashcans];
+
+        assert_eq!(
+            meta.protocol.proof.evals.len(),
+            meta.num_main_evals(),
+            "protocol proof eval plan must match main eval count"
+        );
+        for (read, word) in meta
+            .protocol
+            .proof
+            .evals
+            .iter()
+            .copied()
+            .zip(Word::range(eval_cptr))
+        {
+            match read {
+                EvalRead::CommittedInstance(q) => {
+                    committed_instance_evals.insert(q.tuple(), word);
+                }
+                EvalRead::Advice(q) => {
+                    advice_evals.insert(q.tuple(), word);
+                }
+                EvalRead::Fixed(q) => {
+                    fixed_evals.insert(q.tuple(), word);
+                }
+                EvalRead::PermutationCommon { column } => {
+                    permutation_evals.insert(column, word);
+                }
+                EvalRead::PermutationZ { set, kind } => {
+                    let slot = permutation_z_slots
+                        .get_mut(set)
+                        .expect("permutation z eval set in bounds");
+                    match kind {
+                        PermutationZEval::Cur => slot.0 = Some(word),
+                        PermutationZEval::Next => slot.1 = Some(word),
+                        PermutationZEval::Last => slot.2 = Some(word),
+                    }
+                }
+                EvalRead::LookupMultiplicity { lookup } => {
+                    lookup_slots
+                        .get_mut(lookup)
+                        .expect("lookup multiplicity in bounds")
+                        .0 = Some(word);
+                }
+                EvalRead::LookupHelper { lookup, chunk } => {
+                    lookup_slots
+                        .get_mut(lookup)
+                        .and_then(|(_, helpers, _, _)| helpers.get_mut(chunk))
+                        .expect("lookup helper eval in bounds")
+                        .replace(word);
+                }
+                EvalRead::LookupAccumulator { lookup, rotation } => {
+                    let slot = lookup_slots
+                        .get_mut(lookup)
+                        .expect("lookup accumulator in bounds");
+                    match rotation {
+                        0 => slot.2 = Some(word),
+                        1 => slot.3 = Some(word),
+                        _ => panic!("unsupported lookup accumulator rotation {rotation}"),
+                    }
+                }
+                EvalRead::Trash { index } => {
+                    trashcan_slots
+                        .get_mut(index)
+                        .expect("trash eval in bounds")
+                        .replace(word);
+                }
             }
-            fixed_evals.insert(*query, fixed_walk.into());
-            fixed_walk = fixed_walk + 1;
-        }
-        eval_walk = fixed_walk;
-
-        let permutation_evals = izip!(
-            meta.permutation_columns.iter().cloned(),
-            Word::range(eval_walk)
-        )
-        .collect::<HashMap<_, _>>();
-        eval_walk = eval_walk + meta.permutation_columns.len();
-
-        let perm_set_count = if meta.num_permutation_zs == 0 {
-            0
-        } else {
-            3 * meta.num_permutation_zs - 1
-        };
-        // Layout: [z_0_cur, z_0_next, z_0_last,
-        //          z_1_cur, z_1_next, z_1_last,
-        //          ...,
-        //          z_{n-1}_cur, z_{n-1}_next]   (no last_eval for the last set)
-        let perm_words: Vec<Word> = Word::range(eval_walk).take(perm_set_count).collect();
-        let mut permutation_z_evals: Vec<(Word, Word, Option<Word>)> =
-            Vec::with_capacity(meta.num_permutation_zs);
-        let mut walk = perm_words.into_iter();
-        for set_idx in 0..meta.num_permutation_zs {
-            let cur = walk.next().expect("permutation z cur");
-            let next = walk.next().expect("permutation z next");
-            let last = if set_idx + 1 == meta.num_permutation_zs {
-                None
-            } else {
-                Some(walk.next().expect("permutation z last"))
-            };
-            permutation_z_evals.push((cur, next, last));
-        }
-        eval_walk = eval_walk + perm_set_count;
-
-        // lookup evals: per lookup, m + helpers + acc + acc_next
-        let mut lookup_evals: Vec<(Word, Vec<Word>, Word, Word)> =
-            Vec::with_capacity(meta.num_lookups);
-        for &chunks in &meta.lookup_chunks {
-            let m = eval_walk.into();
-            eval_walk = eval_walk + 1;
-            let helpers: Vec<Word> = Word::range(eval_walk).take(chunks).collect();
-            eval_walk = eval_walk + chunks;
-            let z = eval_walk.into();
-            eval_walk = eval_walk + 1;
-            let z_next = eval_walk.into();
-            eval_walk = eval_walk + 1;
-            lookup_evals.push((m, helpers, z, z_next));
         }
 
-        let trashcan_evals: Vec<Word> = Word::range(eval_walk).take(meta.num_trashcans).collect();
+        let permutation_z_evals: Vec<(Word, Word, Option<Word>)> = permutation_z_slots
+            .into_iter()
+            .enumerate()
+            .map(|(set_idx, (cur, next, last))| {
+                let cur = cur.unwrap_or_else(|| panic!("missing permutation z[{set_idx}] cur"));
+                let next = next.unwrap_or_else(|| panic!("missing permutation z[{set_idx}] next"));
+                (cur, next, last)
+            })
+            .collect();
+        let lookup_evals: Vec<(Word, Vec<Word>, Word, Word)> = lookup_slots
+            .into_iter()
+            .enumerate()
+            .map(|(lookup_idx, (m, helpers, z, z_next))| {
+                let m = m.unwrap_or_else(|| panic!("missing lookup[{lookup_idx}] multiplicity"));
+                let helpers = helpers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(chunk, helper)| {
+                        helper.unwrap_or_else(|| {
+                            panic!("missing lookup[{lookup_idx}] helper[{chunk}]")
+                        })
+                    })
+                    .collect();
+                let z = z.unwrap_or_else(|| panic!("missing lookup[{lookup_idx}] accumulator"));
+                let z_next = z_next
+                    .unwrap_or_else(|| panic!("missing lookup[{lookup_idx}] next accumulator"));
+                (m, helpers, z, z_next)
+            })
+            .collect();
+        let trashcan_evals: Vec<Word> = trashcan_slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| word.unwrap_or_else(|| panic!("missing trash eval[{index}]")))
+            .collect();
 
         let computed_quotient_eval = Ptr::memory("QUOTIENT_EVAL_MPTR").into();
 

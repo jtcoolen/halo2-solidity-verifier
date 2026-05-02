@@ -36,7 +36,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::codegen::util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word};
+use crate::codegen::{
+    protocol::{PcsQuerySource, PermutationZEval},
+    util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word},
+};
 
 // ---------------------------------------------------------------------------
 // Verifier query list.
@@ -71,100 +74,81 @@ impl Query {
 /// excluding committed-instance queries (the codegen path supports only
 /// `nb_committed_instances == 0` for now).
 pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
-    let mut out: Vec<Query> = Vec::new();
+    meta.protocol
+        .pcs_queries
+        .iter()
+        .copied()
+        .map(|source| query_from_plan(source, meta, data))
+        .collect()
+}
 
-    // Per-proof queries (we only support num_proofs = 1 in the codegen).
-    // Order matches `verify_algebraic_constraints` in
-    // `midfall/proofs/src/plonk/verifier.rs`.
-
-    // 1. Advice commitments at advice_query rotations.
-    for q in &meta.advice_queries {
-        let comm = data.advice_comms[q.0];
-        let eval = *data
-            .advice_evals
-            .get(q)
-            .expect("advice eval present for every advice query");
-        out.push(Query::new(comm, q.1, eval));
-    }
-
-    // 1b. Committed-instance queries (col_idx < num_committed_instances).
-    //    All committed-instance commitments point at the G1 identity in
-    //    memory.
-    for q in &meta.instance_queries {
-        if q.0 >= meta.num_committed_instances {
-            continue;
+fn query_from_plan(source: PcsQuerySource, meta: &ConstraintSystemMeta, data: &Data) -> Query {
+    match source {
+        PcsQuerySource::Advice(q) => Query::new(
+            data.advice_comms[q.column],
+            q.rotation,
+            *data
+                .advice_evals
+                .get(&q.tuple())
+                .expect("advice eval present for every advice query"),
+        ),
+        PcsQuerySource::CommittedInstance(q) => Query::new(
+            data.committed_instance_comms[q.column],
+            q.rotation,
+            *data
+                .committed_instance_evals
+                .get(&q.tuple())
+                .expect("committed instance eval present for every committed instance query"),
+        ),
+        PcsQuerySource::PermutationZ { set, kind } => {
+            let (z_cur, z_next, z_last) = data.permutation_z_evals[set];
+            let (rotation, eval) = match kind {
+                PermutationZEval::Cur => (0, z_cur),
+                PermutationZEval::Next => (1, z_next),
+                PermutationZEval::Last => (
+                    meta.rotation_last,
+                    z_last.expect("permutation last eval present for planned query"),
+                ),
+            };
+            Query::new(data.permutation_z_comms[set], rotation, eval)
         }
-        let comm = data.committed_instance_comms[q.0];
-        let eval = *data
-            .committed_instance_evals
-            .get(q)
-            .expect("committed instance eval present for every committed instance query");
-        out.push(Query::new(comm, q.1, eval));
-    }
-
-    // 2. Permutation product set queries: (cur, next) at each set, plus
-    //    (last) for all but the final set.
-    for (set_idx, (z_cur, z_next, z_last)) in data.permutation_z_evals.iter().enumerate() {
-        let comm = data.permutation_z_comms[set_idx];
-        out.push(Query::new(comm, 0, *z_cur));
-        out.push(Query::new(comm, 1, *z_next));
-        if let Some(last) = z_last {
-            out.push(Query::new(comm, meta.rotation_last, *last));
+        PcsQuerySource::LookupMultiplicity { lookup } => {
+            let (m_eval, _, _, _) = &data.lookup_evals[lookup];
+            Query::new(data.lookup_m_comms[lookup], 0, *m_eval)
+        }
+        PcsQuerySource::LookupHelper { lookup, chunk } => {
+            let (_, h_evals, _, _) = &data.lookup_evals[lookup];
+            Query::new(data.lookup_helper_comms[lookup][chunk], 0, h_evals[chunk])
+        }
+        PcsQuerySource::LookupAccumulator { lookup, rotation } => {
+            let (_, _, z_eval, z_next_eval) = &data.lookup_evals[lookup];
+            let eval = match rotation {
+                0 => *z_eval,
+                1 => *z_next_eval,
+                _ => panic!("unsupported lookup accumulator rotation {rotation}"),
+            };
+            Query::new(data.lookup_z_comms[lookup], rotation, eval)
+        }
+        PcsQuerySource::Trash { index } => {
+            Query::new(data.trashcan_comms[index], 0, data.trashcan_evals[index])
+        }
+        PcsQuerySource::Fixed(q) => Query::new(
+            data.fixed_comms[q.column],
+            q.rotation,
+            *data
+                .fixed_evals
+                .get(&q.tuple())
+                .expect("fixed eval present"),
+        ),
+        PcsQuerySource::PermutationCommon { column } => Query::new(
+            data.permutation_comms[&column],
+            0,
+            data.permutation_evals[&column],
+        ),
+        PcsQuerySource::Linearization => {
+            Query::new(data.computed_quotient_comm, 0, data.computed_quotient_eval)
         }
     }
-
-    // 3. Lookup queries: m, h_i, z at rotation 0; z at rotation 1.
-    for (lookup_idx, (m_eval, h_evals, z_eval, z_next_eval)) in data.lookup_evals.iter().enumerate()
-    {
-        let m_comm = data.lookup_m_comms[lookup_idx];
-        let z_comm = data.lookup_z_comms[lookup_idx];
-        out.push(Query::new(m_comm, 0, *m_eval));
-        for (h_eval, h_comm) in h_evals
-            .iter()
-            .zip(data.lookup_helper_comms[lookup_idx].iter())
-        {
-            out.push(Query::new(*h_comm, 0, *h_eval));
-        }
-        out.push(Query::new(z_comm, 0, *z_eval));
-        out.push(Query::new(z_comm, 1, *z_next_eval));
-    }
-
-    // 4. Trashcan queries: trash_commitment at rotation 0.
-    for (idx, t_eval) in data.trashcan_evals.iter().enumerate() {
-        out.push(Query::new(data.trashcan_comms[idx], 0, *t_eval));
-    }
-
-    // 5. Fixed (non-simple-selector) queries.
-    for q in &meta.fixed_queries {
-        if meta.simple_selector_cols.contains(&q.0) {
-            continue;
-        }
-        let comm = data.fixed_comms[q.0];
-        let eval = *data.fixed_evals.get(q).expect("fixed eval present");
-        out.push(Query::new(comm, q.1, eval));
-    }
-
-    // 6. Permutation common (vk perm) queries at rotation 0.
-    for col in &meta.permutation_columns {
-        let comm = data.permutation_comms[col];
-        let eval = data.permutation_evals[col];
-        out.push(Query::new(comm, 0, eval));
-    }
-
-    // 7. Linearization query at rotation 0. Despite the historical
-    //    `computed_quotient_*` names, this is the PCS query for the
-    //    linearized commitment. Its eval is the expected opening scalar
-    //    `-nu_y(x)`, reconstructed from the alleged component evals. The
-    //    commitment side includes `(1 - x^n) * Σ_i x_split^i * Q_i`, so
-    //    the verifier does not divide by `(x^n - 1)` or accept an
-    //    alleged `h(x)` scalar.
-    out.push(Query::new(
-        data.computed_quotient_comm,
-        0,
-        data.computed_quotient_eval,
-    ));
-
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,8 +1019,7 @@ pub(super) fn computations(
         let mut lines: Vec<String> = Vec::new();
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
         let linearization_comm = data.computed_quotient_comm;
-        let simple_selector_cols: Vec<usize> =
-            meta.simple_selector_cols.iter().copied().collect();
+        let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         let final_msm_terms: usize = by_set
             .iter()
             .flat_map(|commitments| commitments.iter())
@@ -1117,9 +1100,7 @@ pub(super) fn computations(
                 if c.comm == linearization_comm {
                     let lin_query_var = format!("lin_query_scalar_{pair_idx}");
                     let lin_cur_var = format!("lin_cur_scalar_{pair_idx}");
-                    lines.push(format!(
-                        "let {lin_query_var} := {scalar}"
-                    ));
+                    lines.push(format!("let {lin_query_var} := {scalar}"));
                     lines.push(format!(
                         "let {lin_cur_var} := mulmod({lin_query_var}, lin_one_minus_x_n, r)"
                     ));
@@ -1130,10 +1111,7 @@ pub(super) fn computations(
                             "mcopy({pair_base:#x}, add(QUOTIENT_LIMB_COMMS_MPTR_BASE, {:#x}), 0x80)",
                             q_idx * 0x80
                         ));
-                        lines.push(format!(
-                            "mstore({:#x}, {lin_cur_var})",
-                            pair_base + 0x80,
-                        ));
+                        lines.push(format!("mstore({:#x}, {lin_cur_var})", pair_base + 0x80,));
                         pair_idx += 1;
                         if q_idx + 1 != meta.num_quotients {
                             lines.push(format!(
