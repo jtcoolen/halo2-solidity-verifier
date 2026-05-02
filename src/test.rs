@@ -239,6 +239,39 @@ fn mutated_separate_vk_contract_is_rejected() {
 
 #[test]
 #[ignore = "solidity/EVM-heavy; run explicitly"]
+fn vk_payload_section_mutations_are_rejected() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let sections = [
+        ("header", "vk_digest"),
+        ("quotient constants", "quotient_const"),
+        ("quotient program", "quotient_program"),
+        ("fixed commitments", "fixed_comms[0].x_hi"),
+        ("permutation commitments", "permutation_comms[0].x_hi"),
+    ];
+
+    for (section, marker) in sections {
+        assert!(
+            fixture.vk_solidity.contains(marker),
+            "fixture VK source missing {section} marker `{marker}`"
+        );
+        let mutated_vk_solidity =
+            mutate_value_hex_literal_on_line_containing(&fixture.vk_solidity, marker);
+        let output = call_separate_verifier(
+            &fixture.separate_verifier_solidity,
+            &mutated_vk_solidity,
+            &fixture.proof,
+            &fixture.instances,
+        );
+        assert_solidity_rejects(output, &format!("mutated VK payload section: {section}"));
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn pinned_quotient_verifier_rejects_wrong_quotient_runtime() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -1099,8 +1132,13 @@ fn mutate_first_large_hex_literal(solidity: &str, ordinal_seed: usize) -> String
 }
 
 fn mutate_vk_digest_literal_only(solidity: &str) -> String {
-    let marker = "// vk_digest";
-    let marker_idx = solidity.find(marker).expect("vk_digest marker not found");
+    mutate_value_hex_literal_on_line_containing(solidity, "vk_digest")
+}
+
+fn mutate_value_hex_literal_on_line_containing(solidity: &str, marker: &str) -> String {
+    let marker_idx = solidity
+        .find(marker)
+        .unwrap_or_else(|| panic!("line marker not found: {marker}"));
     let line_start = solidity[..marker_idx]
         .rfind('\n')
         .map(|pos| pos + 1)
@@ -1113,13 +1151,16 @@ fn mutate_vk_digest_literal_only(solidity: &str) -> String {
     let value_start = line
         .find(',')
         .and_then(|idx| line[idx..].find("0x").map(|off| idx + off))
-        .expect("vk_digest line missing value hex literal");
+        .unwrap_or_else(|| panic!("line `{marker}` missing value hex literal"));
     let abs_hex_start = line_start + value_start + 2;
     let hex_len = solidity[abs_hex_start..]
         .chars()
         .take_while(|ch| ch.is_ascii_hexdigit())
         .count();
-    assert!(hex_len >= 64, "vk_digest literal shorter than expected");
+    assert!(
+        hex_len >= 64,
+        "line `{marker}` literal shorter than expected"
+    );
 
     let mut mutated = solidity.as_bytes().to_vec();
     let last = abs_hex_start + hex_len - 1;
