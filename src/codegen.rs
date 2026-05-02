@@ -5786,6 +5786,25 @@ mod tests {
     }
 
     #[test]
+    fn verify_proof_natspec_requires_application_binding() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        for required in [
+            "checks only that `proof` verifies for the supplied public",
+            "Application contracts must",
+            "state roots",
+            "program",
+            "expected IVC outputs",
+            "chain/domain separation",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "verifyProof NatSpec must document application binding requirement: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn production_verifier_entrypoint_is_external_view() {
         let verifier_template = include_str!("../templates/Halo2Verifier.sol");
 

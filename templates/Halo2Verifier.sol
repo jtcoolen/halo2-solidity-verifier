@@ -241,6 +241,11 @@ contract Halo2Verifier {
     {%- endmatch %}
 
     /// @notice Verify a Halo2/Midfall proof for the generated verifying key.
+    /// @dev This checks only that `proof` verifies for the supplied public
+    /// `instances` under this pinned VK/protocol. Application contracts must
+    /// bind the meaning of those instances separately: state roots, program
+    /// identifiers, expected IVC outputs, chain/domain separation, and any
+    /// protocol-specific authorization are outside this raw verifier ABI.
     /// @dev Production renders are success-or-revert: accepted proofs return
     /// `true`, while malformed calldata, invalid proof material, failed
     /// precompiles, or mismatched pinned dependency code revert. Trace renders

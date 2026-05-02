@@ -1265,7 +1265,7 @@ check a different statement than the native Midnight/Halo2 verifier.
 | Resolved / clarified | Accumulator RHS fixed-base tail appears documented but not verified | The current IVC verifier fully collapses the carried proof accumulator, so no fixed-base scalar tail remains in public instances. The generator now renders the no-tail layout explicitly and emits `fixed_scalar_ptr` only for future non-collapsed layouts with generated fixed bases. |
 | Resolved / confirmed mirrored | `x1` and `x4` powers are truncated to 128 bits, not just `x3` | Confirmed against Midfall `proofs/src/poly/kzg/mod.rs`: with `truncated-challenges`, Rust truncates x3 directly and uses `truncated_powers(x1)` / `truncated_powers(x4)` for PCS batching. Solidity intentionally mirrors this by masking stored powers, while keeping x1/x4 accumulators full precision. |
 | Resolved / debug-only | Gas logging is live in production path | Production renders do not emit `gas_checkpoint()` and keep `verifyProof` as `external view`. Checkpoints are available only through the `solidity-gas-checkpoints` feature or explicit gas-checkpoint render helpers. |
-| Medium / integration | Raw `verifyProof` does not bind application semantics | It verifies "this proof is valid for these public instances," but does not check what the first non-accumulator instances mean. A wrapper must bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
+| Clarified / integration requirement | Raw `verifyProof` does not bind application semantics | The raw generated verifier intentionally checks only "this proof is valid for these public instances under this VK." Generated NatSpec now requires wrappers to bind state roots, program ID, expected IVC output, chain/domain, and related application semantics. |
 | Low / hardening | Malformed calldata and failed `success` states keep executing expensive work | Many checks set `success := 0`, but execution continues until a later revert. Yul `and(success, staticcall(...))` is not short-circuiting, so precompiles may still be called after failure. EIP-2537 errors burn the supplied gas. |
 | Low / hardening | Point validation is indirect | `common_uncompressed_g1` checks Fp canonical encoding but not curve/subgroup membership. Later MSM/pairing precompiles validate used points, which is okay only if every absorbed proof point is guaranteed to be used in a subgroup-checking precompile. EIP-2537 MSM and pairing check subgroup membership; G1ADD does not. |
 
@@ -1380,7 +1380,22 @@ Live checkpoint logs would have three production problems:
 The production ABI remains `external view returns (bool)` unless trace or gas
 checkpoint output is intentionally enabled.
 
-### F-4. Precompile assumptions should be explicit
+### F-4. Raw `verifyProof` does not bind application semantics
+
+Status: Clarified / integration requirement.
+
+The generated `verifyProof(bytes,uint256[])` ABI verifies only that the supplied
+proof is valid for the supplied public instances under this pinned verifier key
+and protocol layout. It does not know what a particular application's first
+non-accumulator instance means.
+
+This is intentional for a reusable generated verifier, but it must be handled by
+the application wrapper. The wrapper must bind the expected state roots, program
+identifier, expected IVC output, chain/domain separation, and any
+protocol-specific authorization before treating a successful proof as meaningful
+for that application. The generated NatSpec now states this explicitly.
+
+### F-5. Precompile assumptions should be explicit
 
 Severity: Low / hardening.
 
@@ -1401,7 +1416,7 @@ One item not flagged: using `sub(r, v)` as an MSM scalar can produce `r` when
 `v == 0`, but EIP-2537 scalars for multiplication are not required to be less
 than the subgroup order.
 
-### F-5. Make failed parsing fail earlier
+### F-6. Make failed parsing fail earlier
 
 Severity: Low / hardening.
 
@@ -1435,7 +1450,7 @@ instead of:
 success := and(success, staticcall(...))
 ```
 
-### F-6. Add targeted negative tests
+### F-7. Add targeted negative tests
 
 Severity: Low / hardening.
 
