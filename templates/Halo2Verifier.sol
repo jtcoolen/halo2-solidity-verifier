@@ -250,7 +250,7 @@ contract Halo2Verifier {
         bytes calldata proof,
         uint256[] calldata instances
     ) external {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
-        assembly {
+        assembly ("memory-safe") {
             if iszero(and(eq(calldataload(0x04), 0x40), eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4)))) {
                 revert(0, 0)
             }
@@ -279,7 +279,7 @@ contract Halo2Verifier {
         {%- endmatch %}
         {%- when None %}
         {%- endmatch %}
-        assembly {
+        assembly ("memory-safe") {
             // ===============================================================
             // Helpers: modexp, transcript, EIP-2537 calls
             // ===============================================================

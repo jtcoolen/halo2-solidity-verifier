@@ -38,7 +38,7 @@ contract Halo2QuotientEvaluator {
     uint256 internal constant QUOTIENT_MAGIC = {{ quotient_external.magic|hex_padded(64) }};
 
     fallback() external {
-        assembly {
+        assembly ("memory-safe") {
             if iszero(eq(calldatasize(), QUOTIENT_FRAME_LEN)) { revert(0, 0) }
             calldatacopy(QUOTIENT_FRAME_BASE, 0, QUOTIENT_FRAME_LEN)
 

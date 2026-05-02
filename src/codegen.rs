@@ -5116,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_heavy_assemblies_do_not_claim_memory_safe() {
+    fn generated_heavy_assemblies_keep_memory_safe_for_via_ir() {
         for (name, source) in [
             (
                 "Halo2Verifier.sol",
@@ -5128,8 +5128,8 @@ mod tests {
             ),
         ] {
             assert!(
-                !source.contains("assembly (\"memory-safe\")"),
-                "{name} should not claim memory-safe assembly while using low-memory transcript/scratch buffers"
+                source.contains("assembly (\"memory-safe\")"),
+                "{name} needs memory-safe assembly annotations for solc via-IR stack allocation"
             );
         }
     }
