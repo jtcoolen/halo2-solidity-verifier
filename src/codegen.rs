@@ -1722,6 +1722,10 @@ fn u256_string(value: U256) -> String {
     }
 }
 
+fn fr_delta_literal() -> String {
+    u256_string(fe_to_u256::<Fq>(&Fq::DELTA))
+}
+
 fn parse_u32_literal(value: &str) -> Option<u32> {
     if !is_literal(value) {
         return None;
@@ -3289,13 +3293,11 @@ impl<'a> SolidityGenerator<'a> {
         let delta_base_mptr = z_last_mptr + num_sets.saturating_sub(1) * 0x20;
         let delta_chunk = Fq::DELTA.pow_vartime([chunk_len as u64]);
         let delta_chunk = u256_string(fe_to_u256::<Fq>(&delta_chunk));
+        let delta = fr_delta_literal();
 
         let mut block = Vec::new();
         block.push("{".to_string());
-        block.push(
-            "let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999"
-                .to_string(),
-        );
+        block.push(format!("let delta := {delta}"));
         block.push(format!("let q_perm_vals := {vals_mptr:#x}"));
         block.push(format!("let q_perm_sigmas := {sigmas_mptr:#x}"));
         block.push(format!("let q_perm_z_cur := {z_cur_mptr:#x}"));
@@ -4986,6 +4988,17 @@ mod tests {
         assert!(
             !verifier_template.contains("return false;"),
             "generated verifier should not mix false returns with revert-on-invalid semantics"
+        );
+    }
+
+    #[test]
+    fn permutation_delta_literal_is_computed_from_field_constant() {
+        let computed = u256_string(fe_to_u256::<Fq>(&Fq::DELTA));
+
+        assert_eq!(fr_delta_literal(), computed);
+        assert!(
+            !include_str!("codegen.rs").contains(&computed),
+            "codegen source should not hard-code the current Fr::DELTA decimal/hex literal"
         );
     }
 
