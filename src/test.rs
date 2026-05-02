@@ -266,6 +266,40 @@ fn pinned_quotient_verifier_rejects_wrong_quotient_runtime() {
 
 #[test]
 #[ignore = "solidity/EVM-heavy; run explicitly"]
+fn production_renders_do_not_emit_gas_checkpoints() {
+    if crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED {
+        return;
+    }
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    for (name, source) in [
+        ("embedded", fixture.embedded_verifier_solidity.as_str()),
+        ("separate", fixture.separate_verifier_solidity.as_str()),
+        (
+            "quotient-separated",
+            fixture.quotient_verifier_solidity.as_str(),
+        ),
+    ] {
+        assert!(
+            !source.contains("function gas_checkpoint"),
+            "{name} production render unexpectedly defines gas_checkpoint"
+        );
+        assert!(
+            !source.contains("log1("),
+            "{name} production render unexpectedly emits LOG1"
+        );
+        assert!(
+            source.contains(") public view returns (bool)"),
+            "{name} production render should keep verifyProof view"
+        );
+    }
+}
+
+#[test]
+#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn standard_plonk_render_is_deterministic_for_same_seed() {
     if !poseidon_inputs_available_for_evm() {
         return;
