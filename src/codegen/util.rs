@@ -181,7 +181,7 @@ impl ConstraintSystemMeta {
     ///   - quotient limbs (after y)
     ///
     /// We surface the per-phase counts so the Yul template can emit the
-    /// matching `read_g1_compressed` loops.
+    /// matching EIP-2537-padded G1 read loops.
     pub(crate) fn num_advices(&self) -> Vec<usize> {
         let mut out = self.num_user_advices.clone();
         // theta is squeezed *between* the user phases and the lookup
@@ -256,14 +256,12 @@ impl ConstraintSystemMeta {
     pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
         self.validate_against_protocol()
             .expect("constraint-system metadata must match protocol plan before proof sizing");
-        // Each G1 commitment in the proof is 128 bytes (uncompressed,
+        // Each G1 commitment in verifier calldata is 128 bytes (uncompressed,
         // EIP-2537 padded form: 4 words = x_hi, x_lo, y_hi, y_lo). Each
-        // Fq evaluation is 32 bytes. The off-chain prover's compressed
-        // 48-byte zcash-encoding is decompressed by the test-side
-        // `repack_proof_uncompressed` helper before being passed to
-        // `verifyProof`. The Yul verifier reconstructs the compressed
-        // 48-byte form on the fly inside `common_uncompressed_g1` for
-        // transcript hashing only.
+        // Fq evaluation is 32 bytes. The off-chain proof shim repacks
+        // midnight-proofs' native 48-byte compressed commitments into this
+        // padded form before calling `verifyProof`, and the Yul transcript
+        // hashes those padded bytes directly.
         let g1_count: usize =
             self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count(scheme);
         g1_count * 0x80 + self.num_evals * 0x20 + self.batch_open_extra_evals(scheme) * 0x20
@@ -374,10 +372,10 @@ pub(crate) struct Data {
     pub(crate) computed_quotient_eval: Word,
 
     /// Word offset (in the verifier's static memory map) of the start of
-    /// the per-category decompressed-commitment region. See the
+    /// the per-category EIP-2537-padded commitment region. See the
     /// `KNOWN BUG` block in `Data::new` for the layout convention.
     pub(crate) comms_mptr_base: Ptr,
-    /// Calldata pointer to the first compressed quotient G1 in the proof
+    /// Calldata pointer to the first EIP-2537-padded quotient G1 in the proof
     /// stream. Used by the quotient-fold loop in the template.
     pub(crate) quotient_limb_cptr: Ptr,
     /// Memory base of the decoded-evals buffer (Optimisation H3). The
@@ -413,12 +411,11 @@ impl Data {
         // ------------------------------------------------------------
         // Step 8 layout (2026-04-26):
         //
-        // The proof stream emits BLS12-381 G1 commitments in zcash
-        // *compressed* form (48 bytes per G1). The PCS / quotient-fold
-        // emitters consume points as 4 contiguous words (EIP-2537
-        // *padded*, 128 bytes per G1) via `EcPoint::words()`. The
-        // template therefore decompresses every G1 inline during proof
-        // reading and stores the padded form at a fixed memory MPTR.
+        // The Solidity proof stream carries BLS12-381 G1 commitments as
+        // EIP-2537 padded 128-byte points. The PCS / quotient-fold emitters
+        // consume points as 4 contiguous words via `EcPoint::words()`, so
+        // the template validates and copies each padded G1 into its fixed
+        // memory MPTR during proof reading.
         //
         // The seven per-category memory bases below match the constants
         // emitted in `templates/Halo2Verifier.sol`. Each base anchors a
@@ -450,7 +447,7 @@ impl Data {
         let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
         let w_cptr = Ptr::calldata(eval_cd) + meta.num_evals;
 
-        // -- memory bases for decompressed commitments (4 words each) --
+        // -- memory bases for EIP-2537-padded commitments (4 words each) --
         // The template emits a named Solidity constant for each base so
         // the hand-written proof-reading loops can use friendly
         // identifiers like `ADVICE_COMMS_MPTR_BASE`. The PCS code

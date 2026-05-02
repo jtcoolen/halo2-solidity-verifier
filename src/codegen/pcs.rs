@@ -49,8 +49,8 @@
 //!
 //! The Step 6 template rewrite is responsible for:
 //!   * squeezing x1..x4 into the corresponding MPTRs
-//!   * decompressing f_com / pi from the 48-byte BLS-compressed calldata
-//!     into EIP-2537 padded form at `F_COM_MPTR` / `PI_MPTR`
+//!   * validating and copying f_com / pi from EIP-2537-padded calldata
+//!     into `F_COM_MPTR` / `PI_MPTR`
 //!   * exposing the q_eval calldata block via `Q_EVAL_CPTR`
 //!
 //! For Step 5 we only emit the algebraic body; the template that

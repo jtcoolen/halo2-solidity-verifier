@@ -115,9 +115,8 @@ pub(crate) struct Halo2Verifier {
     /// Calldata byte offset of the `num_instances` length-prefix word
     /// that ABI-encodes the `instances` array. Equals
     /// `proof_cptr + proof_len` (in bytes). Materialised as a separate
-    /// field because `proof_len` is not always a multiple of 32 once
-    /// G1 commitments are 48-byte compressed; computing it via Ptr
-    /// arithmetic in Askama would word-align and silently drop bytes.
+    /// field because this is an ABI byte offset used directly by the
+    /// hand-rolled calldata parser, while `Ptr` values are word-oriented.
     pub(crate) num_instance_cptr: usize,
     /// Calldata byte offset of the first instance value (immediately
     /// after `num_instance_cptr`).
@@ -144,7 +143,7 @@ pub(crate) struct Halo2Verifier {
     /// so the proof-reading loop iterates this vector to dispatch each
     /// G1 to its correct MPTR.
     pub(crate) lookup_chunks: Vec<usize>,
-    /// Word offset (relative to memory base) of the first decompressed
+    /// Word offset (relative to memory base) of the first EIP-2537-padded
     /// advice commitment. The remaining categories (lookup_m, perm_z,
     /// lookup_helper, lookup_z, trashcan, quotient_limb) are laid out
     /// contiguously after this base with a 4-word stride per G1.

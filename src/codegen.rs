@@ -4918,6 +4918,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_comments_describe_padded_g1_calldata() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        for stale in [
+            "zcash-compressed form",
+            "decompressed inline",
+            "Helpers: modexp, decompress",
+            "Each compressed G1 absorbed",
+            "Per-category bases for decompressed G1 commitments",
+        ] {
+            assert!(
+                !verifier_template.contains(stale),
+                "generated verifier comments must not describe the old compressed-G1 calldata path: {stale}"
+            );
+        }
+
+        assert!(
+            verifier_template
+                .contains("proof shim repacks midnight-proofs' native compressed stream"),
+            "generated verifier comments should document the off-chain repacking boundary"
+        );
+        assert!(
+            verifier_template.contains("validates and absorbs that 128-byte form"),
+            "generated verifier comments should describe the current EIP-2537-padded G1 path"
+        );
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();

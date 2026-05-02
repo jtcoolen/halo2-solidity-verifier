@@ -94,7 +94,7 @@ contract Halo2Verifier {
     uint256 internal constant               X3_MPTR = {{ theta_mptr + 8 }};
     uint256 internal constant               X4_MPTR = {{ theta_mptr + 9 }};
 
-    // Decompressed batch-open commitments live in 4-word slots.
+    // Batch-open commitments live in 4-word EIP-2537 padded slots.
     uint256 internal constant             F_COM_MPTR = {{ theta_mptr + 10 }};
     uint256 internal constant                PI_MPTR = {{ theta_mptr + 14 }};
 
@@ -149,10 +149,10 @@ contract Halo2Verifier {
     uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ batch_invert_scratch_mptr|hex() }};
 
     // ----------------------------------------------------------------------
-    // Per-category bases for decompressed G1 commitments. The proof emits
-    // G1 commitments in zcash-compressed form (48 bytes each); this region
-    // holds the decompressed EIP-2537 padded form (4 words = 128 bytes
-    // each) used by the PCS / quotient-fold sections.
+    // Per-category bases for EIP-2537 padded G1 commitments. The proof
+    // calldata carries 128-byte uncompressed/padded G1s after the off-chain
+    // proof shim repacks midnight-proofs' native compressed stream; this
+    // region stores the 4-word slots used by PCS / quotient-fold sections.
     //
     // Cumulative offsets (in words from `comms_mptr_base`):
     //   ADVICE_COMMS_MPTR_BASE          + 0
@@ -278,7 +278,7 @@ contract Halo2Verifier {
         {%- endmatch %}
         assembly ("memory-safe") {
             // ===============================================================
-            // Helpers: modexp, decompress, transcript
+            // Helpers: modexp, transcript, EIP-2537 calls
             // ===============================================================
 
             // Inverse of a Fr scalar via modexp(x, r-2, r). The verifier
@@ -794,10 +794,10 @@ contract Halo2Verifier {
             // ===============================================================
             // Per-user-phase reads + challenge squeezes.
             //
-            // Each compressed G1 absorbed into the transcript is also
-            // decompressed inline and stored at the corresponding
-            // per-category MPTR (4-word EIP-2537 padded form). The PCS
-            // / quotient-fold blocks below dereference those MPTRs.
+            // Each proof G1 is already EIP-2537 padded in calldata. The
+            // verifier validates and absorbs that 128-byte form, then copies
+            // it into the corresponding per-category MPTR. The PCS /
+            // quotient-fold blocks below dereference those MPTRs.
             // ===============================================================
             let proof_cptr := PROOF_CPTR
             let advice_walk := ADVICE_COMMS_MPTR_BASE
