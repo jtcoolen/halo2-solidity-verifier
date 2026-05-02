@@ -4866,6 +4866,21 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_limb_packing_is_checked_before_decoding() {
+        let verifier_template = include_str!("../templates/Halo2Verifier.sol");
+
+        assert!(
+            verifier_template.contains("function check_acc_coord_packing"),
+            "accumulator decoder must reject unused high bits in packed limb words"
+        );
+        assert!(
+            verifier_template
+                .contains("ok := check_acc_coord_packing(src, bits, n, limbs_per_word)"),
+            "accumulator coordinate decoding must apply packing canonicality before masking limbs"
+        );
+    }
+
+    #[test]
     fn expression_lowering_matches_quotient_vm_eval() {
         let mut cs = ConstraintSystem::default();
         let advice = cs.advice_column();

@@ -1169,7 +1169,7 @@ fn ivc_final_keccak_solidity_e2e() {
     // (k=19, ~20+ advice columns); the Poseidon-fixture default
     // (50M) is too tight for this circuit shape.
     // ----------------------------------------------------------
-    match evm.try_call_with_gas(verifier_address, calldata, 5_000_000_000) {
+    match evm.try_call_with_gas(verifier_address, calldata.clone(), 5_000_000_000) {
         CallOutcome::Success {
             gas_used,
             output,
@@ -1190,6 +1190,21 @@ fn ivc_final_keccak_solidity_e2e() {
             println!(
                 "[ivc-keccak-solidity] PASS: IVC final Keccak proof accepted on-chain in {gas_used} gas"
             );
+
+            let mut bad_accumulator_packing = calldata.clone();
+            let first_acc_word = 4 + 0x40 + 0x20 + repacked.len() + 0x20 + final_acc_offset * 0x20;
+            // Accumulator limbs are packed into 56-bit chunks. The first
+            // word uses 224 bits, so byte 3 is the lowest unused high byte
+            // in the big-endian ABI word. Setting it keeps the value below
+            // Fr but must be rejected by the accumulator packing check.
+            bad_accumulator_packing[first_acc_word + 3] ^= 0x01;
+            match evm.try_call_with_gas(verifier_address, bad_accumulator_packing, 5_000_000_000) {
+                CallOutcome::Success { output, .. } => assert_ne!(
+                    output, expected,
+                    "verifier accepted non-canonical accumulator limb packing"
+                ),
+                CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => {}
+            }
         }
         CallOutcome::Revert { gas_used, output } => {
             panic!(

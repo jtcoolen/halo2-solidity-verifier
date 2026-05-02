@@ -580,8 +580,24 @@ contract Halo2Verifier {
                 )
             }
 
-            function load_acc_coord(src, allow_id, bits, n, base, limbs_per_word) -> ok, hi, lo, is_id {
+            function check_acc_coord_packing(src, bits, n, limbs_per_word) -> ok {
                 ok := 1
+                let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
+                for { let word_idx := 0 } lt(word_idx, coord_words) { word_idx := add(word_idx, 1) } {
+                    let remaining := sub(n, mul(word_idx, limbs_per_word))
+                    let limbs_in_word := limbs_per_word
+                    if lt(remaining, limbs_per_word) {
+                        limbs_in_word := remaining
+                    }
+                    let used_bits := mul(limbs_in_word, bits)
+                    if lt(used_bits, 256) {
+                        ok := and(ok, lt(calldataload(add(src, mul(word_idx, 0x20))), shl(used_bits, 1)))
+                    }
+                }
+            }
+
+            function load_acc_coord(src, allow_id, bits, n, base, limbs_per_word) -> ok, hi, lo, is_id {
+                ok := check_acc_coord_packing(src, bits, n, limbs_per_word)
                 if and(allow_id, iszero(lt(calldataload(src), base))) {
                     let adj_hi, adj_lo := load_acc_coord_shifted(src, bits, n, base, limbs_per_word, base)
                     is_id := is_bls_p_minus_one(adj_hi, adj_lo)
