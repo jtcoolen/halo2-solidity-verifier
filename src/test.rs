@@ -9,7 +9,7 @@ use midnight_circuits::{
 };
 use midnight_proofs::{
     circuit::{Layouter, Value},
-    plonk::{ConstraintSystem, Error},
+    plonk::Error,
 };
 use midnight_zk_stdlib::{
     setup_vk, utils::plonk_api::srs_for_test, MidnightVK, Relation, ZkStdLib, ZkStdLibArch,
@@ -20,8 +20,10 @@ use proptest::{
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use revm::primitives::B256;
 use sha3::Digest;
 use std::{
+    collections::BTreeMap,
     env,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -30,6 +32,8 @@ use std::{
 
 type F = midnight_curves::Fq;
 type PoseidonParams = midnight_proofs::poly::kzg::params::ParamsKZG<midnight_curves::Bls12>;
+type PoseidonVerifierParams =
+    midnight_proofs::poly::kzg::params::ParamsVerifierKZG<midnight_curves::Bls12>;
 
 const POSEIDON_K: u32 = 6;
 
@@ -269,6 +273,120 @@ fn compile_solidity_is_deterministic_for_same_source() {
     assert_eq!(bytecode_a, bytecode_b);
 }
 
+#[cfg(feature = "rust-verifier-trace")]
+#[test]
+#[ignore = "solidity/EVM-heavy differential trace; run explicitly"]
+fn native_midfall_verifier_trace_matches_solidity_trace() {
+    use group::Group;
+    use midnight_curves::{Bls12, G1Projective};
+    use midnight_proofs::{
+        plonk::{prepare, solidity_trace},
+        poly::{commitment::Guard, kzg::KZGCommitmentScheme},
+        transcript::{CircuitTranscript, Transcript},
+    };
+
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+
+    solidity_trace::start();
+    let mut transcript =
+        CircuitTranscript::<sha3::Keccak256>::init_from_bytes(&fixture.compressed_proof);
+    let committed_pi = vec![G1Projective::identity()];
+    let public_columns: [&[F]; 1] = [&fixture.instances];
+    let guard = prepare::<F, KZGCommitmentScheme<Bls12>, CircuitTranscript<sha3::Keccak256>>(
+        fixture.vk.vk(),
+        &[&committed_pi],
+        &[&public_columns],
+        &mut transcript,
+    )
+    .expect("native prepare succeeds");
+    transcript
+        .assert_empty()
+        .expect("native transcript consumes proof");
+    guard
+        .verify(&fixture.params_verifier)
+        .expect("native guard verifies");
+    let rust_trace = solidity_trace::take();
+
+    let mut evm = Evm::default();
+    let vk_address = evm.create(compile_solidity(&fixture.trace_vk_solidity));
+    let verifier_address = evm.create_with_address_arg(
+        compile_solidity(&fixture.trace_verifier_solidity),
+        vk_address,
+    );
+    let (_gas, output, logs) = evm.call_with_logs(
+        verifier_address,
+        encode_calldata(&fixture.proof, &fixture.instances),
+    );
+    let solidity_returned_success = output == [vec![0; 31], vec![1]].concat();
+    let solidity_trace = parse_solidity_trace_logs(&logs);
+
+    let mut rust_by_id = BTreeMap::new();
+    for event in rust_trace {
+        assert!(
+            rust_by_id
+                .insert(event.id, (event.name, event.data))
+                .is_none(),
+            "duplicate Rust trace id {}",
+            event.id
+        );
+    }
+
+    assert_eq!(
+        rust_by_id.keys().copied().collect::<Vec<_>>(),
+        solidity_trace.keys().copied().collect::<Vec<_>>(),
+        "Rust/Solidity trace ID sets differ"
+    );
+
+    for (id, solidity_data) in solidity_trace {
+        let (name, rust_data) = rust_by_id.get(&id).expect("Rust trace id present");
+        assert_eq!(
+            rust_data,
+            &solidity_data,
+            "trace mismatch id={id} name={name}: rust=0x{} solidity=0x{}",
+            hex::encode(rust_data),
+            hex::encode(&solidity_data),
+        );
+    }
+
+    assert!(
+        solidity_returned_success,
+        "trace verifier returned failure after matching Rust trace"
+    );
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn parse_solidity_trace_logs(logs: &[revm::primitives::Log]) -> BTreeMap<u64, Vec<u8>> {
+    let mut trace = BTreeMap::new();
+
+    for log in logs {
+        let topics = log.data.topics();
+        assert_eq!(topics.len(), 1, "trace log must have one topic");
+
+        let data = log.data.data.as_ref().to_vec();
+        if data.is_empty() {
+            continue;
+        }
+
+        let id = trace_topic_id(topics[0]);
+        assert!(
+            trace.insert(id, data).is_none(),
+            "duplicate Solidity trace id {id}"
+        );
+    }
+
+    trace
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn trace_topic_id(topic: B256) -> u64 {
+    let bytes = topic.as_slice();
+    u64::from_be_bytes(bytes[24..32].try_into().expect("topic is 32 bytes"))
+}
+
 #[derive(Clone, Debug)]
 struct PoseidonExample;
 
@@ -311,11 +429,16 @@ impl Relation for PoseidonExample {
 
 #[derive(Clone, Debug)]
 struct PropertyPoseidonFixture {
+    compressed_proof: Vec<u8>,
     proof: Vec<u8>,
     instances: Vec<F>,
+    params_verifier: PoseidonVerifierParams,
+    vk: MidnightVK,
     embedded_verifier_solidity: String,
     separate_verifier_solidity: String,
     vk_solidity: String,
+    trace_verifier_solidity: String,
+    trace_vk_solidity: String,
 }
 
 fn create_property_poseidon_fixture() -> PropertyPoseidonFixture {
@@ -338,14 +461,22 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
     let embedded_verifier_solidity = generator.render().expect("embedded render");
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
-    let proof = repack_proof_uncompressed(vk.vk().cs(), &compressed_proof);
+    let (trace_verifier_solidity, trace_vk_solidity) =
+        generator.render_trace_separately().expect("trace render");
+    let proof = generator.repack_compressed_proof(&compressed_proof);
+    let params_verifier = srs.verifier_params();
 
     PropertyPoseidonFixture {
+        compressed_proof,
         proof,
         instances: vec![instance],
+        params_verifier,
+        vk,
         embedded_verifier_solidity,
         separate_verifier_solidity,
         vk_solidity,
+        trace_verifier_solidity,
+        trace_vk_solidity,
     }
 }
 
@@ -633,129 +764,12 @@ fn solc_available() -> bool {
 }
 
 fn srs_dir() -> String {
+    if let Ok(dir) = env::var("SRS_DIR") {
+        return dir;
+    }
+
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../midfall/zk_stdlib/examples/assets")
         .to_string_lossy()
         .into_owned()
-}
-
-fn repack_proof_uncompressed(cs: &ConstraintSystem<F>, proof: &[u8]) -> Vec<u8> {
-    let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
-    let mut g1_groups: Vec<usize> = Vec::new();
-
-    let advice_phase = cs.advice_column_phase();
-    let max_phase = *advice_phase.iter().max().unwrap_or(&0);
-    for phase in 0..=max_phase {
-        let n = advice_phase.iter().filter(|p| **p == phase).count();
-        if n != 0 {
-            g1_groups.push(n);
-        }
-    }
-    if !cs.lookups().is_empty() {
-        g1_groups.push(cs.lookups().len());
-    }
-    if perm_chunks != 0 {
-        g1_groups.push(perm_chunks);
-    }
-    for lookup in cs.lookups().iter() {
-        let nb_chunks = lookup.chunk_by_degree(cs.degree()).num_chunks();
-        g1_groups.push(nb_chunks);
-        g1_groups.push(1);
-    }
-    if !cs.trashcans().is_empty() {
-        g1_groups.push(cs.trashcans().len());
-    }
-    g1_groups.push(cs.degree() - 1);
-
-    let nb_committed_instances = 1usize;
-    let num_committed_instance_evals = cs
-        .instance_queries()
-        .iter()
-        .filter(|(col, _)| col.index() < nb_committed_instances)
-        .count();
-    let num_fixed_non_simple = cs.num_fixed_columns() - cs.num_simple_selectors();
-    let perm_set_count = if perm_chunks == 0 {
-        0
-    } else {
-        3 * perm_chunks - 1
-    };
-    let lookup_eval_count: usize = cs
-        .lookups()
-        .iter()
-        .map(|lookup| 1 + lookup.chunk_by_degree(cs.degree()).num_chunks() + 1 + 1)
-        .sum();
-    let num_evals = num_committed_instance_evals
-        + cs.advice_queries().len()
-        + num_fixed_non_simple
-        + cs.permutation().columns.len()
-        + perm_set_count
-        + lookup_eval_count
-        + cs.trashcans().len();
-
-    let prefix_g1_count: usize = g1_groups.iter().sum();
-    let prefix_compressed_len = prefix_g1_count * 48 + num_evals * 32;
-    let trailing_compressed_len = 48 + 48;
-    let q_evals_len = proof
-        .len()
-        .checked_sub(prefix_compressed_len + trailing_compressed_len)
-        .expect("proof too short for declared groups");
-    assert_eq!(
-        q_evals_len % 32,
-        0,
-        "q_evals tail must be a multiple of 32 bytes"
-    );
-    let num_point_sets = q_evals_len / 32;
-
-    let mut out: Vec<u8> = Vec::with_capacity(
-        prefix_g1_count * 128 + num_evals * 32 + 128 + num_point_sets * 32 + 128,
-    );
-    let mut cursor = 0usize;
-    for &n in &g1_groups {
-        for _ in 0..n {
-            push_uncompressed_g1(proof, &mut cursor, &mut out);
-        }
-    }
-    out.extend_from_slice(&proof[cursor..cursor + num_evals * 32]);
-    cursor += num_evals * 32;
-    push_uncompressed_g1(proof, &mut cursor, &mut out);
-    out.extend_from_slice(&proof[cursor..cursor + num_point_sets * 32]);
-    cursor += num_point_sets * 32;
-    push_uncompressed_g1(proof, &mut cursor, &mut out);
-    assert_eq!(cursor, proof.len(), "proof not fully consumed");
-    out
-}
-
-fn push_uncompressed_g1(proof: &[u8], cursor: &mut usize, out: &mut Vec<u8>) {
-    use group::{prime::PrimeCurveAffine, GroupEncoding};
-
-    let mut compressed = <midnight_curves::G1Affine as GroupEncoding>::Repr::default();
-    compressed
-        .as_mut()
-        .copy_from_slice(&proof[*cursor..*cursor + 48]);
-    let cur = *cursor;
-    *cursor += 48;
-    let point: midnight_curves::G1Affine = Option::from(
-        <midnight_curves::G1Affine as GroupEncoding>::from_bytes(&compressed),
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "decompress failed at proof[{cur}..{}]: bytes = 0x{}",
-            cur + 48,
-            hex::encode(compressed.as_ref())
-        )
-    });
-
-    if bool::from(point.is_identity()) {
-        out.extend_from_slice(&[0u8; 128]);
-        return;
-    }
-
-    let x_be = point.x().to_bytes_be();
-    let y_be = point.y().to_bytes_be();
-    out.extend_from_slice(&[0u8; 16]);
-    out.extend_from_slice(&x_be[0..16]);
-    out.extend_from_slice(&x_be[16..48]);
-    out.extend_from_slice(&[0u8; 16]);
-    out.extend_from_slice(&y_be[0..16]);
-    out.extend_from_slice(&y_be[16..48]);
 }

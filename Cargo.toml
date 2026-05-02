@@ -125,6 +125,10 @@ outer-fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
 # Backwards-compatible aggregate feature: old commands that pass
 # `fewer-point-sets` retain the previous "everything on" behavior.
 fewer-point-sets = ["in-circuit-fewer-point-sets", "outer-fewer-point-sets"]
+# Enables native midfall verifier trace hooks used by the Rust/Solidity
+# differential coverage test. This is diagnostic-only and should stay off for
+# production verifier generation.
+rust-verifier-trace = ["midnight-proofs/solidity-verifier-trace"]
 
 [[example]]
 name = "separately"

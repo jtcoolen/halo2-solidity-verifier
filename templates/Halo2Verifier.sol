@@ -1400,6 +1400,8 @@ contract Halo2Verifier {
             trace_u256(21, mload(L_0_MPTR))
             trace_u256(22, mload(INSTANCE_EVAL_MPTR))
             trace_u256(23, mload(QUOTIENT_EVAL_MPTR))
+            mstore(add(QUOTIENT_MPTR, 0x40), 0)
+            mstore(add(QUOTIENT_MPTR, 0x60), 0)
             trace_point(24, QUOTIENT_MPTR)
             trace_point(25, F_COM_MPTR)
             trace_point(26, PI_MPTR)
