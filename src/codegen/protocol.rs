@@ -629,6 +629,93 @@ impl ProtocolPlan {
             return Err("PCS query schedule must end with linearization query".to_string());
         }
 
+        // Every proof G1 commitment absorbed into Fiat-Shamir must either be
+        // opened by PCS or consumed by a generated EIP-2537 MSM/pairing path.
+        // Advice commitments are the only category whose read set can be
+        // wider than the opened query set for a malformed/unsupported circuit.
+        // Reject those plans at codegen time rather than paying a precompile
+        // validation call for every absorbed proof point.
+        let opened_advice_cols = self
+            .advice_queries
+            .iter()
+            .map(|query| query.column)
+            .collect::<BTreeSet<_>>();
+        for column in 0..self.advice_indices.len() {
+            if !opened_advice_cols.contains(&column) {
+                return Err(format!(
+                    "advice commitment column {column} is absorbed but never opened by PCS"
+                ));
+            }
+        }
+
+        let pcs_lookup_multiplicities = self
+            .pcs_queries
+            .iter()
+            .filter(|query| matches!(query, PcsQuerySource::LookupMultiplicity { .. }))
+            .count();
+        if pcs_lookup_multiplicities != self.num_lookups {
+            return Err(format!(
+                "lookup multiplicity PCS coverage mismatch: pcs={pcs_lookup_multiplicities} expected={}",
+                self.num_lookups
+            ));
+        }
+
+        let pcs_lookup_helpers = self
+            .pcs_queries
+            .iter()
+            .filter(|query| matches!(query, PcsQuerySource::LookupHelper { .. }))
+            .count();
+        let expected_lookup_helpers = self.lookup_chunks.iter().sum::<usize>();
+        if pcs_lookup_helpers != expected_lookup_helpers {
+            return Err(format!(
+                "lookup helper PCS coverage mismatch: pcs={pcs_lookup_helpers} expected={expected_lookup_helpers}"
+            ));
+        }
+
+        let pcs_lookup_accumulators = self
+            .pcs_queries
+            .iter()
+            .filter_map(|query| match query {
+                PcsQuerySource::LookupAccumulator { lookup, .. } => Some(*lookup),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if pcs_lookup_accumulators.len() != self.num_lookups {
+            return Err(format!(
+                "lookup accumulator PCS coverage mismatch: pcs={} expected={}",
+                pcs_lookup_accumulators.len(),
+                self.num_lookups
+            ));
+        }
+
+        let pcs_permutation_sets = self
+            .pcs_queries
+            .iter()
+            .filter_map(|query| match query {
+                PcsQuerySource::PermutationZ { set, .. } => Some(*set),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if pcs_permutation_sets.len() != self.num_permutation_zs {
+            return Err(format!(
+                "permutation product PCS coverage mismatch: pcs={} expected={}",
+                pcs_permutation_sets.len(),
+                self.num_permutation_zs
+            ));
+        }
+
+        let pcs_trash = self
+            .pcs_queries
+            .iter()
+            .filter(|query| matches!(query, PcsQuerySource::Trash { .. }))
+            .count();
+        if pcs_trash != self.num_trashcans {
+            return Err(format!(
+                "trashcan PCS coverage mismatch: pcs={pcs_trash} expected={}",
+                self.num_trashcans
+            ));
+        }
+
         if self.quotient_trace_ids.len() != self.quotient.total() {
             return Err(format!(
                 "quotient trace id count mismatch: ids={} identities={}",
@@ -827,6 +914,23 @@ mod tests {
         plan.proof.evals.push(EvalRead::Fixed(QueryKey::new(0, 0)));
         let err = plan.validate().unwrap_err();
         assert!(err.contains("simple selector"));
+    }
+
+    #[test]
+    fn validation_rejects_absorbed_unopened_advice_commitments() {
+        let mut plan = ProtocolPlan::from_constraint_system(&simple_cs(), 0);
+        plan.advice_queries.retain(|query| query.column != 1);
+        plan.proof
+            .evals
+            .retain(|eval| !matches!(eval, EvalRead::Advice(query) if query.column == 1));
+        plan.pcs_queries
+            .retain(|query| !matches!(query, PcsQuerySource::Advice(query) if query.column == 1));
+
+        let err = plan.validate().unwrap_err();
+        assert!(
+            err.contains("absorbed but never opened by PCS"),
+            "unexpected validation error: {err}"
+        );
     }
 
     proptest! {
