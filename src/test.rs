@@ -2203,24 +2203,48 @@ fn mutate_value_hex_literal_on_line_containing(solidity: &str, marker: &str) -> 
         .find(|(_, _, line)| line.contains("mstore(") && line.contains(marker))
         .unwrap_or_else(|| panic!("mstore line marker not found: {marker}"));
     let line = &solidity[line_start..line_end];
-    let value_start = line
-        .find(',')
-        .and_then(|idx| line[idx..].find("0x").map(|off| idx + off))
-        .unwrap_or_else(|| panic!("line `{marker}` missing value hex literal"));
-    let abs_hex_start = line_start + value_start + 2;
-    let hex_len = solidity[abs_hex_start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_hexdigit())
-        .count();
-    assert!(
-        hex_len >= 64,
-        "line `{marker}` literal shorter than expected"
-    );
+    let line_before_comment = line.split_once("//").map(|(code, _)| code).unwrap_or(line);
+    let bytes = line_before_comment.as_bytes();
+    let mut value_literal = None;
+    for start in 0..bytes.len().saturating_sub(1) {
+        if bytes[start] != b'0' || bytes[start + 1] != b'x' {
+            continue;
+        }
+        let mut end = start + 2;
+        while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        if end - (start + 2) >= 64 {
+            value_literal = Some((start + 2, end - (start + 2)));
+        }
+    }
+    let (rel_hex_start, hex_len) =
+        value_literal.unwrap_or_else(|| panic!("line `{marker}` missing value hex literal"));
+    let abs_hex_start = line_start + rel_hex_start;
 
     let mut mutated = solidity.as_bytes().to_vec();
     let last = abs_hex_start + hex_len - 1;
     mutated[last] = if mutated[last] == b'0' { b'1' } else { b'0' };
     String::from_utf8(mutated).unwrap()
+}
+
+#[test]
+fn vk_payload_mutator_targets_mstore_value_not_payload_offset() {
+    let value = format!("0x{:064x}", 0u8);
+    let old_shape = format!("mstore(0x0000, {value}) // vk_digest");
+    let new_shape = format!("mstore(add(payload, 0x0000), {value}) // vk_digest");
+
+    for source in [old_shape, new_shape] {
+        let mutated = mutate_value_hex_literal_on_line_containing(&source, "vk_digest");
+        assert!(
+            mutated.contains("0x0000"),
+            "payload offset should be left intact: {mutated}"
+        );
+        assert!(
+            mutated.ends_with("0001) // vk_digest"),
+            "mstore value should be mutated: {mutated}"
+        );
+    }
 }
 
 fn replace_required_precompile_staticcall(
