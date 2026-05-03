@@ -28,9 +28,9 @@ pub(super) struct QuotientProgramBuild {
     pub(super) bytes: Vec<u8>,
     // Deduplicated Fr constants addressed by PUSH_CONST and fused opcodes.
     pub(super) consts: Vec<U256>,
-    // Maximum operand-stack depth of the pure interpreted bytecode. Native
-    // callbacks may need additional scratch; the generator must size that
-    // separately when such callbacks share the VM stack base.
+    // Maximum operand-stack depth of the pure interpreted bytecode. The
+    // generator folds native-callback scratch into the allocated stack region
+    // when such callbacks share the same base pointer.
     pub(super) max_stack: usize,
     pub(super) packed32: bool,
     // Number of temporary words addressed by PUSH_TEMP/STORE_TEMP when VM CSE
@@ -951,9 +951,9 @@ impl QuotientProgramBuilder {
     }
 
     pub(super) fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
-        // `max_stack` is the pure VM operand stack high-water mark. Do not use
-        // it as a proxy for callback scratch requirements; callbacks can share
-        // the same base pointer while needing a different word count.
+        // `max_stack` is the pure VM operand-stack high-water mark. The memory
+        // planner adds callback scratch requirements when callbacks share the
+        // same base pointer.
         let cse_temps = self.cse_temps();
         if encoding == QuotientProgramEncoding::Packed32
             && quotient_program_uses_limb_ops(&self.bytes)

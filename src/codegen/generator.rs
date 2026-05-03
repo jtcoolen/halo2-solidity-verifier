@@ -227,6 +227,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn quotient_stack_words_cover_native_permutation_scratch() {
+        let build = QuotientProgramBuild {
+            bytes: Vec::new(),
+            consts: Vec::new(),
+            max_stack: 3,
+            packed32: false,
+            cse_temps: 0,
+        };
+
+        assert_eq!(
+            SolidityGenerator::quotient_stack_words_for_build(&build, 0),
+            3
+        );
+        assert_eq!(
+            SolidityGenerator::quotient_stack_words_for_build(&build, 2),
+            3
+        );
+        assert_eq!(
+            SolidityGenerator::quotient_stack_words_for_build(&build, 8),
+            8
+        );
+    }
 }
 
 impl<'a> SolidityGenerator<'a> {
@@ -881,6 +905,16 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_program_build = self.build_quotient_program_items(&plan.items);
         let _quotient_max_stack = quotient_program_build.max_stack;
         (quotient_program_build, sorted_simple)
+    }
+
+    fn quotient_stack_words_for_build(
+        build: &QuotientProgramBuild,
+        native_permutation_scratch_words: usize,
+    ) -> usize {
+        // `build.max_stack` only describes the interpreted operand stack. Some
+        // native callbacks share `quotient_stack_mptr` as a scratch base, so
+        // the registered memory region must cover both possible users.
+        build.max_stack.max(native_permutation_scratch_words)
     }
 
     fn quotient_program_plan(
@@ -2442,19 +2476,21 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
-        // FIXME(audit): `quotient_stack_words` only reserves the interpreted
-        // VM operand stack. When the plan contains a native permutation
-        // callback, that callback also writes
-        // `structured_permutation_scratch_words(meta)` words starting at the
-        // same `quotient_stack_mptr`. The reserved region must be the max of
-        // both requirements, or the callback needs a dedicated scratch region.
+        let native_permutation_scratch_words = quotient_plan
+            .has_native_permutation
+            .then(|| Self::structured_permutation_scratch_words(&meta))
+            .unwrap_or(0);
+        let quotient_stack_words = Self::quotient_stack_words_for_build(
+            &quotient_program_build,
+            native_permutation_scratch_words,
+        );
         let memory = self.memory_layout_for(
             &meta,
             &vk,
             vk_mptr,
             VerifierMemoryLayoutConfig {
                 quotient_cse_temps: quotient_program_build.cse_temps + Self::QUOTIENT_STATE_WORDS,
-                quotient_stack_words: quotient_program_build.max_stack,
+                quotient_stack_words,
                 ..VerifierMemoryLayoutConfig::default()
             },
         );
@@ -2674,13 +2710,14 @@ impl<'a> SolidityGenerator<'a> {
             .unwrap_or(0);
         let quotient_stack_words = quotient_program_build
             .as_ref()
-            .map(|build| build.max_stack)
+            .map(|build| {
+                let native_permutation_scratch_words = quotient_plan
+                    .has_native_permutation
+                    .then(|| Self::structured_permutation_scratch_words(&meta))
+                    .unwrap_or(0);
+                Self::quotient_stack_words_for_build(build, native_permutation_scratch_words)
+            })
             .unwrap_or(0);
-        // FIXME(audit): this monolithic compact-VM path has the same memory
-        // invariant as the external evaluator above. If native permutation is
-        // enabled, `quotient_stack_mptr` is reused as callback scratch and must
-        // be sized for `structured_permutation_scratch_words(meta)`, not only
-        // for `build.max_stack`.
         let memory = self.memory_layout_for(
             &meta,
             &vk,

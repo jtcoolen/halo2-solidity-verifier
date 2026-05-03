@@ -479,7 +479,9 @@ pub(crate) struct VerifierMemoryLayoutConfig {
     pub(crate) num_instances: usize,
     /// Compact quotient VM common-subexpression temp count.
     pub(crate) quotient_cse_temps: usize,
-    /// Maximum compact quotient VM stack words.
+    /// Maximum compact quotient VM stack/scratch words. Native quotient
+    /// callbacks may share the VM stack base, so callers must include those
+    /// callback-specific scratch requirements in this count.
     pub(crate) quotient_stack_words: usize,
     /// Number of `(G1, scalar)` pairs in the public-accumulator MSM.
     pub(crate) acc_msm_terms: usize,
