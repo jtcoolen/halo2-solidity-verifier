@@ -73,7 +73,7 @@ impl PcsPlan {
         queries: &[Query],
         sets: &IntermediateSets,
     ) -> Self {
-        let memory = pcs::memory_requirements(meta, data);
+        let memory = pcs::memory_requirements_from_intermediate_sets(meta, data, sets);
         let dummy_query_count = data.dummy_eval_words.len();
         let by_set = pcs::commitments_by_set(sets, sets.point_sets.len());
         let point_sets = sets

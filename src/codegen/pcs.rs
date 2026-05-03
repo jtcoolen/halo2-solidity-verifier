@@ -551,12 +551,20 @@ pub(super) fn memory_requirements(
     data: &Data,
 ) -> PcsMemoryRequirements {
     let sets = intermediate_sets(meta, data);
+    memory_requirements_from_intermediate_sets(meta, data, &sets)
+}
+
+pub(crate) fn memory_requirements_from_intermediate_sets(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    sets: &IntermediateSets,
+) -> PcsMemoryRequirements {
     let n_sets = sets.point_sets.len();
     if n_sets == 0 {
         return PcsMemoryRequirements::default();
     }
 
-    let by_set = commitments_by_set(&sets, n_sets);
+    let by_set = commitments_by_set(sets, n_sets);
     let commitments_per_set = by_set.iter().map(Vec::len);
 
     let mut distinct_rotations: Vec<i32> = sets
