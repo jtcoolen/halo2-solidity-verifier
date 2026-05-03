@@ -61,12 +61,6 @@ const ACCUMULATOR_PAIRING_BATCH_BYTES: usize =
 //   40..44      final_com G1
 //   44..48      pairing lhs G1
 //   48..52      pairing rhs G1
-const HISTORICAL_ROT_POINTS_CAP_WORDS: usize = 28;
-const HISTORICAL_X1_POWERS_CAP_WORDS: usize = 65;
-const HISTORICAL_Q_EVAL_SET_CAP_WORDS: usize = 56;
-const HISTORICAL_Q_EVAL_CPTR_PADDING_WORDS: usize = 7;
-const HISTORICAL_G1_IDENTITY_PADDING_WORDS: usize = 7;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ThetaWindowLayout {
     pub(crate) rot_points_word: usize,
@@ -85,13 +79,13 @@ pub(crate) struct ThetaWindowLayout {
 impl ThetaWindowLayout {
     pub(crate) fn compatibility() -> Self {
         let rot_points_word = ThetaSlot::PairingRhs.word() + G1_WORDS;
-        let x1_powers_word = rot_points_word + HISTORICAL_ROT_POINTS_CAP_WORDS;
-        let q_com_word = x1_powers_word + HISTORICAL_X1_POWERS_CAP_WORDS;
+        let x1_powers_word = rot_points_word + theta_window::ROT_POINTS_CAP_WORDS;
+        let q_com_word = x1_powers_word + theta_window::X1_POWERS_CAP_WORDS;
         let q_eval_set_word = q_com_word;
-        let q_eval_cptr_word = q_eval_set_word + HISTORICAL_Q_EVAL_SET_CAP_WORDS;
-        let g1_identity_word = q_eval_cptr_word + 1 + HISTORICAL_Q_EVAL_CPTR_PADDING_WORDS;
+        let q_eval_cptr_word = q_eval_set_word + theta_window::Q_EVAL_SET_CAP_WORDS;
+        let g1_identity_word = q_eval_cptr_word + 1 + theta_window::Q_EVAL_CPTR_PADDING_WORDS;
         let reversed_evals_word =
-            g1_identity_word + G1_WORDS + HISTORICAL_G1_IDENTITY_PADDING_WORDS;
+            g1_identity_word + G1_WORDS + theta_window::G1_IDENTITY_PADDING_WORDS;
 
         debug_assert_eq!(rot_points_word, theta_window::ROT_POINTS_WORD);
         debug_assert_eq!(x1_powers_word, theta_window::X1_POWERS_WORD);
@@ -109,10 +103,10 @@ impl ThetaWindowLayout {
             q_eval_cptr_word,
             g1_identity_word,
             reversed_evals_word,
-            rot_points_cap_words: HISTORICAL_ROT_POINTS_CAP_WORDS,
-            x1_powers_cap_words: HISTORICAL_X1_POWERS_CAP_WORDS,
-            q_com_cap_words: q_eval_set_word - q_com_word,
-            q_eval_set_cap_words: HISTORICAL_Q_EVAL_SET_CAP_WORDS,
+            rot_points_cap_words: theta_window::ROT_POINTS_CAP_WORDS,
+            x1_powers_cap_words: theta_window::X1_POWERS_CAP_WORDS,
+            q_com_cap_words: theta_window::Q_COM_CAP_WORDS,
+            q_eval_set_cap_words: theta_window::Q_EVAL_SET_CAP_WORDS,
         }
     }
 }

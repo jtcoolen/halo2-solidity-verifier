@@ -50,19 +50,28 @@ pub(crate) const G1ADD_INPUT_BYTES: usize = 2 * G1_BYTES;
 /// EVM modexp frame for 32-byte base, exponent, and modulus.
 ///
 /// Layout: three 32-byte length words followed by base, exponent, modulus.
-pub(crate) const MODEXP_FRAME_BYTES: usize = 0xc0;
+pub(crate) const MODEXP_FRAME_WORDS: usize = 6;
+pub(crate) const MODEXP_FRAME_BYTES: usize = MODEXP_FRAME_WORDS * WORD_BYTES;
 /// Historical low-memory reservation used by scalar inversion helpers near
 /// `VK_MPTR`. It is larger than the frame because older code treated the
 /// surrounding 0x100-byte window as scratch; keep the same distance from
 /// `VK_MPTR` when checking overlaps.
-pub(crate) const MODEXP_SCRATCH_BYTES: usize = 0x100;
+pub(crate) const MODEXP_SCRATCH_WORDS: usize = 8;
+pub(crate) const MODEXP_SCRATCH_BYTES: usize = MODEXP_SCRATCH_WORDS * WORD_BYTES;
 /// EIP-2537 pairing precompile input for one `(G1, G2)` pair.
 pub(crate) const PAIRING_PAIR_BYTES: usize = G1_BYTES + G2_BYTES;
 /// Two-pair KZG pairing input: `(rhs, G2)` and `(lhs, -sG2)`.
 pub(crate) const PAIRING_TWO_PAIR_BYTES: usize = 2 * PAIRING_PAIR_BYTES;
 /// Historical floor for the accumulator MSM input buffer.
+///
+/// This is deliberately not derived from the current proof shape: smaller
+/// circuits keep the same generated addresses as the compatibility template.
 pub(crate) const ACC_MSM_MIN_SCRATCH_BYTES: usize = 0x7000;
 /// Static low-memory working set required by the PCS pairing helpers.
+///
+/// The final pairing frame needs 25 words (two `(G1, G2)` pairs plus one return
+/// word); production PCS code rounds this up to leave room for intermediate
+/// in-Yul accumulators.
 pub(crate) const PCS_STATIC_WORKING_WORDS: usize = 32;
 /// Static two-pair KZG pairing scratch plus one return word.
 pub(crate) const PAIRING_STATIC_WORKING_WORDS: usize = PAIRING_TWO_PAIR_BYTES / WORD_BYTES + 1;
@@ -77,17 +86,25 @@ pub(crate) mod precompile {
     //! template call sites wired through these names so future fork changes are
     //! not hidden in hand-written Yul literals.
 
+    /// EIP-198 modexp precompile.
     pub(crate) const MODEXP_ADDRESS: usize = 0x05;
+    /// Prague/EIP-2537 BLS12-381 G1ADD precompile.
     pub(crate) const G1ADD_ADDRESS: usize = 0x0b;
+    /// Prague/EIP-2537 BLS12-381 G1MSM precompile.
     pub(crate) const G1MSM_ADDRESS: usize = 0x0c;
+    /// Prague/EIP-2537 BLS12-381 pairing precompile.
     pub(crate) const PAIRING_ADDRESS: usize = 0x0f;
 
+    /// Deployment smoke-test gas caps. They are intentionally above the single
+    /// operation costs, but still bounded enough to catch missing precompiles.
     pub(crate) const G1ADD_GAS_CAP: usize = 50_000;
     pub(crate) const G1MSM_SMOKE_GAS_CAP: usize = 60_000;
     pub(crate) const PAIRING_SMOKE_GAS_CAP: usize = 120_000;
+    /// EIP-2537 G1MSM gas formula: base + k * discount[k] * mul_cost / 1000.
     pub(crate) const G1MSM_BASE_GAS: usize = 50_000;
     pub(crate) const G1MSM_SCALAR_MULTIPLICATION_COST: usize = 12_000;
     pub(crate) const G1MSM_DISCOUNT_DENOMINATOR: usize = 1_000;
+    /// EIP-2537 pairing gas formula: base + pair_count * pair_cost.
     pub(crate) const PAIRING_BASE_GAS: usize = 50_000;
     pub(crate) const PAIRING_PAIR_GAS: usize = 60_000;
 }
@@ -111,12 +128,18 @@ pub(crate) mod accumulator {
 
     use super::{G1_BYTES, WORD_BYTES};
 
+    /// `AssignedField::as_public_input` uses seven radix-2^56 limbs for one
+    /// BLS12-381 base-field coordinate.
     pub(crate) const LIMB_BITS: usize = 56;
     pub(crate) const LIMBS: usize = 7;
+    /// Four 56-bit limbs fit in one scalar word with unused high bits.
     pub(crate) const LIMBS_PER_WORD: usize = 4;
     pub(crate) const POINT_COORDS: usize = 2;
     pub(crate) const CARRIED_SCALARS: usize = 2;
+    /// Low-memory hash frame for batching the accumulator pairing with KZG:
+    /// domain tag word, KZG rhs/lhs G1s, then accumulator rhs/lhs G1s.
     pub(crate) const PAIRING_BATCH_PTR: usize = 0x100;
+    /// ASCII `"pairing-batch-acc-kzg"` right-padded to one EVM word.
     pub(crate) const PAIRING_BATCH_DOMAIN_TAG_HEX: &str =
         "0x70616972696e672d62617463682d6163632d6b7a670000000000000000";
     pub(crate) const PAIRING_BATCH_RHS_OFFSET: usize = WORD_BYTES;
@@ -129,9 +152,13 @@ pub(crate) mod accumulator {
 pub(crate) mod quotient_limb {
     //! Foreign-field limb-specialized quotient VM shapes.
 
+    /// Matches the accumulator/public-input BLS12-381 base-field limb packing.
     pub(crate) const LIMBS: usize = 7;
+    /// Linear reduction coefficients for limbs 1..6 after keeping limb 0 raw.
     pub(crate) const LIN_COEFFS: usize = LIMBS - 1;
+    /// Full 7x7 schoolbook multiplication grid.
     pub(crate) const PAIRWISE_TERMS: usize = LIMBS * LIMBS;
+    /// Output diagonals for a 7-limb by 7-limb product.
     pub(crate) const PAIRWISE_COEFFS: usize = 2 * LIMBS - 1;
 }
 
@@ -149,8 +176,10 @@ pub(crate) mod transcript {
 pub(crate) mod abi {
     /// Solidity selector length before ABI-encoded arguments.
     pub(crate) const SELECTOR_BYTES: usize = 0x04;
+    /// `verifyProof(bytes,uint256[])` has two ABI head words after the selector.
+    pub(crate) const VERIFY_PROOF_HEAD_WORDS: usize = 2;
     /// `verifyProof(bytes,uint256[])` ABI head size after the selector.
-    pub(crate) const VERIFY_PROOF_HEAD_BYTES: usize = 0x40;
+    pub(crate) const VERIFY_PROOF_HEAD_BYTES: usize = VERIFY_PROOF_HEAD_WORDS * super::WORD_BYTES;
     /// Calldata byte offset where the dynamic `proof` byte payload starts:
     /// selector (0x04) + two ABI head words (0x40) + proof length word (0x20).
     pub(crate) const VERIFY_PROOF_PROOF_CPTR: usize =
@@ -158,6 +187,11 @@ pub(crate) mod abi {
     /// Expected first ABI head word: offset to `proof`.
     pub(crate) const VERIFY_PROOF_PROOF_HEAD_OFFSET: usize = VERIFY_PROOF_HEAD_BYTES;
 }
+
+const VK_HEADER_SCALAR_WORDS: usize = 11;
+const VK_HEADER_G1_BASE_WORD: usize = VK_HEADER_SCALAR_WORDS;
+const VK_HEADER_G2_BASE_WORD: usize = VK_HEADER_G1_BASE_WORD + G1_WORDS;
+const VK_HEADER_NEG_S_G2_BASE_WORD: usize = VK_HEADER_G2_BASE_WORD + G2_WORDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -173,9 +207,9 @@ pub(crate) enum VkHeaderSlot {
     AccOffset = 8,
     NumAccLimbs = 9,
     NumAccLimbBits = 10,
-    G1Base = 11,
-    G2Base = 15,
-    NegSG2Base = 23,
+    G1Base = VK_HEADER_G1_BASE_WORD,
+    G2Base = VK_HEADER_G2_BASE_WORD,
+    NegSG2Base = VK_HEADER_NEG_S_G2_BASE_WORD,
 }
 
 impl VkHeaderSlot {
@@ -184,7 +218,7 @@ impl VkHeaderSlot {
     }
 }
 
-pub(crate) const VK_HEADER_WORDS: usize = 31;
+pub(crate) const VK_HEADER_WORDS: usize = VK_HEADER_NEG_S_G2_BASE_WORD + G2_WORDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VkHeaderFieldSpec {
@@ -434,16 +468,39 @@ impl ThetaSlot {
 }
 
 pub(crate) mod theta_window {
-    pub(crate) const ROT_POINTS_WORD: usize = 52;
-    pub(crate) const X1_POWERS_WORD: usize = 80;
-    pub(crate) const Q_COM_WORD: usize = 145;
-    pub(crate) const Q_EVAL_SET_WORD: usize = 145;
-    pub(crate) const Q_EVAL_CPTR_WORD: usize = 201;
-    pub(crate) const G1_IDENTITY_WORD: usize = 209;
-    pub(crate) const REVERSED_EVALS_WORD: usize = 220;
+    //! Historical word offsets from `THETA_MPTR` for the fixed PCS windows.
+    //!
+    //! The first 52 words are covered by `ThetaSlot`: ten challenge/scalar words,
+    //! four G1 slots, more scalar state, a historical padding word, and three
+    //! final G1 slots. The windows below preserve the old generated layout while
+    //! making their capacities explicit.
+
+    use super::{ThetaSlot, G1_WORDS};
+
+    pub(crate) const ROT_POINTS_CAP_WORDS: usize = 28;
+    pub(crate) const X1_POWERS_CAP_WORDS: usize = 65;
+    pub(crate) const Q_EVAL_SET_CAP_WORDS: usize = 56;
+    pub(crate) const Q_EVAL_CPTR_PADDING_WORDS: usize = 7;
+    pub(crate) const G1_IDENTITY_PADDING_WORDS: usize = 7;
+
+    pub(crate) const ROT_POINTS_WORD: usize = ThetaSlot::PairingRhs.word() + G1_WORDS;
+    pub(crate) const X1_POWERS_WORD: usize = ROT_POINTS_WORD + ROT_POINTS_CAP_WORDS;
+    pub(crate) const Q_COM_WORD: usize = X1_POWERS_WORD + X1_POWERS_CAP_WORDS;
+    pub(crate) const Q_EVAL_SET_WORD: usize = Q_COM_WORD;
+    pub(crate) const Q_COM_CAP_WORDS: usize = Q_EVAL_SET_WORD - Q_COM_WORD;
+    pub(crate) const Q_EVAL_CPTR_WORD: usize = Q_EVAL_SET_WORD + Q_EVAL_SET_CAP_WORDS;
+    pub(crate) const G1_IDENTITY_WORD: usize = Q_EVAL_CPTR_WORD + 1 + Q_EVAL_CPTR_PADDING_WORDS;
+    pub(crate) const REVERSED_EVALS_WORD: usize =
+        G1_IDENTITY_WORD + G1_WORDS + G1_IDENTITY_PADDING_WORDS;
 }
 
 pub(crate) mod trace {
+    //! LOG topic namespaces used by trace-enabled builds.
+    //!
+    //! The gaps are intentional: they keep broad event families visually
+    //! separated in traces and preserve historical IDs consumed by tests and
+    //! external comparison scripts.
+
     pub(crate) const PCS_QUERY_BASE: u64 = 2_000;
     pub(crate) const PROOF_COMMIT_BASE: usize = 10_000;
     pub(crate) const PROOF_EVAL_BASE: usize = 20_000;
