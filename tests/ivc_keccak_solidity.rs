@@ -999,8 +999,7 @@ fn ivc_final_keccak_solidity_e2e() {
     // final accumulator pairing check, so pass its starting instance offset.
     let num_instances = pi.len();
     let final_acc_offset = TREE_LEAVES;
-    let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), num_instances)
-        .set_num_committed_instances(1)
+    let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), num_instances, 1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
     let proof_evaluation_counts = generator.proof_evaluation_counts();
     print_proof_evaluation_counts(&proof_evaluation_counts);

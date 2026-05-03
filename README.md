@@ -13,14 +13,14 @@ For audited solidity verifier generator and proof aggregation toolkits, please r
 ### Generate verifier and verifying key separately as 2 Solidity contracts
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, num_instances, 1);
 let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 ```
 
 ### Generate verifier and verifying key in a single solidity contract
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, num_instances, 1);
 let verifier_solidity = generator.render().unwrap();
 ```
 
@@ -66,8 +66,9 @@ native `solidity_trace` hook.
 
 ## Limitations & Caveats
 
-- It currently supports the Midfall verifier shape used by this repo: at most
-  two instance columns, no rotated instance queries, and KZG on BLS12-381.
+- It currently supports the Midfall verifier shape used by this repo: exactly
+  one committed identity instance column and one non-committed public-input
+  column, no rotated instance queries, and KZG on BLS12-381.
 - Currently even the `configure` is same, the [selector compression](https://github.com/privacy-scaling-explorations/halo2/blob/7a2165617195d8baa422ca7b2b364cef02380390/halo2_proofs/src/plonk/circuit/compress_selectors.rs#L51) might lead to different configuration when selector assignments are different. To avoid this, please use [`keygen_vk_custom`](https://github.com/privacy-scaling-explorations/halo2/blob/6fc6d7ca018f3899b030618cb18580249b1e7c82/halo2_proofs/src/plonk/keygen.rs#L223) with `compress_selectors: false` to do key generation without selector compression.
 
 ## Compatibility

@@ -158,8 +158,7 @@ fn poseidon_renders_compiles_and_verifies() {
     // same VK. ZkStdLib creates two instance columns (one committed,
     // one non-committed); set num_committed_instances accordingly.
     let num_instances = 1;
-    let generator =
-        SolidityGenerator::new(&srs, vk.vk(), num_instances).set_num_committed_instances(1);
+    let generator = SolidityGenerator::new(&srs, vk.vk(), num_instances, 1);
     let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
     let (verifier_solidity, vk_solidity) = generator

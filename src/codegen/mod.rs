@@ -104,9 +104,15 @@ pub enum GeneratorError {
     /// A verifier with no advice commitments has no proof commitment phase to
     /// bind into the Fiat-Shamir transcript.
     NoAdviceColumns,
-    /// The current proof layout supports at most one committed and one
-    /// non-committed instance column.
-    TooManyInstanceColumns { actual: usize, max: usize },
+    /// The generated transcript and instance-evaluation path currently
+    /// supports exactly one committed identity column and one non-committed
+    /// public-input column.
+    UnsupportedInstanceColumnShape {
+        total: usize,
+        committed: usize,
+        expected_committed: usize,
+        expected_non_committed: usize,
+    },
     /// Instance columns are read as direct public inputs and locally
     /// Lagrange-interpolated only at the current row.
     RotatedInstanceQuery { column: usize, rotation: i32 },
@@ -118,10 +124,21 @@ impl fmt::Display for GeneratorError {
             Self::NoAdviceColumns => {
                 write!(f, "at least one advice column is required")
             }
-            Self::TooManyInstanceColumns { actual, max } => write!(
-                f,
-                "too many instance columns: got {actual}, maximum supported is {max}"
-            ),
+            Self::UnsupportedInstanceColumnShape {
+                total,
+                committed,
+                expected_committed,
+                expected_non_committed,
+            } => {
+                let non_committed = total.checked_sub(*committed).map_or_else(
+                    || format!("invalid: committed {committed} exceeds total {total}"),
+                    |n| n.to_string(),
+                );
+                write!(
+                    f,
+                    "unsupported instance column shape: got total={total}, committed={committed}, non_committed={non_committed}; expected exactly {expected_committed} committed and {expected_non_committed} non-committed"
+                )
+            }
             Self::RotatedInstanceQuery { column, rotation } => write!(
                 f,
                 "rotated instance query is not supported: column {column}, rotation {rotation}"
@@ -917,8 +934,24 @@ mod tests {
     #[test]
     fn generator_restriction_errors_are_typed() {
         assert_eq!(
-            GeneratorError::TooManyInstanceColumns { actual: 3, max: 2 }.to_string(),
-            "too many instance columns: got 3, maximum supported is 2"
+            GeneratorError::UnsupportedInstanceColumnShape {
+                total: 2,
+                committed: 0,
+                expected_committed: 1,
+                expected_non_committed: 1,
+            }
+            .to_string(),
+            "unsupported instance column shape: got total=2, committed=0, non_committed=2; expected exactly 1 committed and 1 non-committed"
+        );
+        assert_eq!(
+            GeneratorError::UnsupportedInstanceColumnShape {
+                total: 1,
+                committed: 2,
+                expected_committed: 1,
+                expected_non_committed: 1,
+            }
+            .to_string(),
+            "unsupported instance column shape: got total=1, committed=2, non_committed=invalid: committed 2 exceeds total 1; expected exactly 1 committed and 1 non-committed"
         );
         assert_eq!(
             GeneratorError::RotatedInstanceQuery {

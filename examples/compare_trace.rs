@@ -30,7 +30,7 @@ fn main() {
 
     let vk = keygen_vk(&params, &circuit).unwrap();
     let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
-    let generator = SolidityGenerator::new(&params, &vk, instances.len());
+    let generator = SolidityGenerator::new(&params, &vk, instances.len(), 1);
     let (verifier_solidity, vk_solidity) = generator.render_trace_separately().unwrap();
 
     let proof = create_proof_checked(&params, &pk, circuit, &instances, &mut rng);

@@ -1,13 +1,17 @@
 use super::*;
 
 impl<'a> SolidityGenerator<'a> {
+    const SUPPORTED_COMMITTED_INSTANCE_COLUMNS: usize = 1;
+    const SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS: usize = 1;
+
     /// Return a new `SolidityGenerator`.
     pub fn new(
         params: &'a ParamsKZG<Bls12>,
         vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
         num_instances: usize,
+        num_committed_instances: usize,
     ) -> Self {
-        Self::try_new(params, vk, num_instances)
+        Self::try_new(params, vk, num_instances, num_committed_instances)
             .unwrap_or_else(|err| panic!("unsupported Solidity verifier shape: {err}"))
     }
 
@@ -18,20 +22,15 @@ impl<'a> SolidityGenerator<'a> {
         params: &'a ParamsKZG<Bls12>,
         vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
         num_instances: usize,
+        num_committed_instances: usize,
     ) -> Result<Self, GeneratorError> {
         if vk.cs().num_advice_columns() == 0 {
             return Err(GeneratorError::NoAdviceColumns);
         }
-        // midnight-proofs ZkStdLib always allocates two instance columns
-        // (one committed, one non-committed), so the v0.4 `<= 1`
-        // tightness no longer applies. We accept up to 2 here and let
-        // `set_num_committed_instances` handle the split.
-        if vk.cs().num_instance_columns() > 2 {
-            return Err(GeneratorError::TooManyInstanceColumns {
-                actual: vk.cs().num_instance_columns(),
-                max: 2,
-            });
-        }
+        Self::validate_instance_column_shape(
+            vk.cs().num_instance_columns(),
+            num_committed_instances,
+        )?;
         if let Some((column, rotation)) = vk
             .cs()
             .instance_queries()
@@ -44,7 +43,6 @@ impl<'a> SolidityGenerator<'a> {
             });
         }
 
-        let num_committed_instances = 0;
         let meta = ConstraintSystemMeta::new(vk.cs(), num_committed_instances);
 
         Ok(Self {
@@ -68,10 +66,41 @@ impl<'a> SolidityGenerator<'a> {
     /// value here so that downstream callers (drivers, debugging
     /// examples) can configure committed-instance proofs without having
     /// to plumb through a constructor argument.
+    ///
+    /// Prefer passing the committed-column count to [`Self::new`] /
+    /// [`Self::try_new`]. This setter is retained for older call sites, but
+    /// it validates the exact same supported protocol shape before updating
+    /// metadata.
     pub fn set_num_committed_instances(mut self, n: usize) -> Self {
+        Self::validate_instance_column_shape(self.vk.cs().num_instance_columns(), n)
+            .unwrap_or_else(|err| panic!("unsupported Solidity verifier shape: {err}"));
         self.num_committed_instances = n;
         self.meta = ConstraintSystemMeta::new(self.vk.cs(), n);
         self
+    }
+
+    fn validate_instance_column_shape(
+        total_instance_columns: usize,
+        num_committed_instances: usize,
+    ) -> Result<(), GeneratorError> {
+        let supported_committed = Self::SUPPORTED_COMMITTED_INSTANCE_COLUMNS;
+        let supported_non_committed = Self::SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS;
+        let non_committed = total_instance_columns
+            .checked_sub(num_committed_instances)
+            .unwrap_or(usize::MAX);
+
+        if num_committed_instances != supported_committed
+            || non_committed != supported_non_committed
+        {
+            return Err(GeneratorError::UnsupportedInstanceColumnShape {
+                total: total_instance_columns,
+                committed: num_committed_instances,
+                expected_committed: supported_committed,
+                expected_non_committed: supported_non_committed,
+            });
+        }
+
+        Ok(())
     }
 
     /// Return the exact field-evaluation counts for the proof layout consumed
@@ -116,6 +145,26 @@ impl<'a> SolidityGenerator<'a> {
             "proof evaluation count accounting must match verifier proof layout"
         );
         counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_column_shape_validation_is_exact() {
+        assert!(SolidityGenerator::validate_instance_column_shape(2, 1).is_ok());
+
+        for (total, committed) in [(2, 0), (2, 2), (1, 1), (3, 1)] {
+            assert!(
+                matches!(
+                    SolidityGenerator::validate_instance_column_shape(total, committed),
+                    Err(GeneratorError::UnsupportedInstanceColumnShape { .. })
+                ),
+                "shape total={total}, committed={committed} should be rejected"
+            );
+        }
     }
 }
 

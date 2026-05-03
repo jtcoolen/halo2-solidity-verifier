@@ -20,7 +20,7 @@ fn main() {
 
         let vk = keygen_vk(&params[&k], &circuit).unwrap();
         let pk = keygen_pk(&params[&k], vk, &circuit).unwrap();
-        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), num_instances);
+        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), num_instances, 1);
         let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
         // Each (k, circuit) yields a distinct authorized VK, and the verifier
         // pins that VK by codehash, so we save one Halo2Verifier per k too.

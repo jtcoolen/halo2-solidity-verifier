@@ -632,7 +632,7 @@ fn load_poseidon_vk_sources_fixture() -> PoseidonVkSourcesFixture {
     let vk = setup_vk(&srs, &relation);
     assert_eq!(vk.k() as u32, POSEIDON_K, "unexpected Poseidon VK k");
 
-    let generator = SolidityGenerator::new(&srs, vk.vk(), 1).set_num_committed_instances(1);
+    let generator = SolidityGenerator::new(&srs, vk.vk(), 1, 1);
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
 
@@ -658,7 +658,7 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
 
     let (compressed_proof, instance) = generate_poseidon_proof(&srs, &relation, &vk);
 
-    let generator = SolidityGenerator::new(&srs, vk.vk(), 1).set_num_committed_instances(1);
+    let generator = SolidityGenerator::new(&srs, vk.vk(), 1, 1);
     let embedded_verifier_solidity = generator.render().expect("embedded render");
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
