@@ -8,7 +8,7 @@ generator, especially:
 - `templates/Halo2Verifier.sol`
 - `src/codegen.rs`
 - `src/codegen/evaluator.rs`
-- `src/codegen/pcs/gwc19.rs`
+- `src/codegen/pcs.rs`
 
 This pass focuses on generated verifier soundness, transcript equivalence with
 native Midnight verification, memory layout safety, and trace-mode behavior.
@@ -38,9 +38,9 @@ and q_eval_set:
 
 The PCS emitter then writes circuit-dependent lengths into those fixed windows:
 
-- `src/codegen/pcs/gwc19.rs`: `distinct_rotations`
-- `src/codegen/pcs/gwc19.rs`: `nb_x1_powers`
-- `src/codegen/pcs/gwc19.rs`: q_eval_set persistence under
+- `src/codegen/pcs.rs`: `distinct_rotations`
+- `src/codegen/pcs.rs`: `nb_x1_powers`
+- `src/codegen/pcs.rs`: q_eval_set persistence under
   `Q_EVAL_SET_MPTR`
 
 There is no capacity check in `Halo2Verifier::validate_layout`; it validates
@@ -170,7 +170,7 @@ result is then folded into production `success`.
 
 Relevant code:
 
-- `src/codegen/pcs/gwc19.rs`: trace per-set q_com materialization
+- `src/codegen/pcs.rs`: trace per-set q_com materialization
 - `templates/Halo2Verifier.sol`: trace linearization commitment
   materialization
 
@@ -205,7 +205,7 @@ Scope: current Halo2/Midnight Solidity verifier generator, especially:
 - `templates/Halo2Verifier.sol`
 - `templates/Halo2QuotientEvaluator.sol`
 - `src/codegen.rs`
-- `src/codegen/pcs/gwc19.rs`
+- `src/codegen/pcs.rs`
 - `src/transcript.rs`
 
 This pass focuses on verifier soundness, fail-closed behavior, transcript
@@ -299,7 +299,7 @@ Relevant code:
 - `templates/Halo2Verifier.sol`: `ec_add_tmp`
 - `templates/Halo2Verifier.sol`: `ec_mul_tmp`
 - `templates/Halo2Verifier.sol`: `ec_pairing`
-- `src/codegen/pcs/gwc19.rs`: generated final MSM and pairing-input calls
+- `src/codegen/pcs.rs`: generated final MSM and pairing-input calls
 
 Impact:
 
@@ -329,7 +329,7 @@ Relevant code:
 
 - `templates/Halo2Verifier.sol`: `common_uncompressed_g1`
 - `templates/Halo2Verifier.sol`: proof commitment read loops
-- `src/codegen/pcs/gwc19.rs`: query construction and final MSM staging
+- `src/codegen/pcs.rs`: query construction and final MSM staging
 
 The query builder includes advice commitments only when they appear in the
 verifier query list. A circuit with a committed column that is transcript-
@@ -409,7 +409,7 @@ Relevant code:
 - `templates/Halo2Verifier.sol`: `scalar_inv`
 - `templates/Halo2Verifier.sol`: Lagrange batch inversion around
   `x_n_minus_1`
-- `src/codegen/pcs/gwc19.rs`: PCS interpolation at `x3`
+- `src/codegen/pcs.rs`: PCS interpolation at `x3`
 
 Examples:
 
@@ -775,7 +775,7 @@ The current `templates/Halo2Verifier.sol` blocks this path via `AUTHORIZED_VK` +
 
    Halo2 BLS12-381 Solidity Verifier - Security Audit (informal)
 
-   Scope: src/codegen.rs, src/codegen/{template.rs, util.rs, pcs.rs, pcs/gwc19.rs, evaluator.rs}, src/transcript.rs, src/evm.rs, templates/Halo2Verifier.sol, 
+   Scope: src/codegen.rs, src/codegen/{template.rs, util.rs, pcs.rs, evaluator.rs}, src/transcript.rs, src/evm.rs, templates/Halo2Verifier.sol, 
    templates/Halo2VerifyingKey.sol, generated/Halo2Verifier-*.sol.
    Curve: BLS12-381 via EIP-2537 precompiles (0x0b / 0x0c / 0x0f).
    Out of scope: halo2 prover correctness (vendored vendor/halo2/), revm/Prague EVM precompile implementations, the underlying KZG security assumption.
@@ -1750,7 +1750,7 @@ Relevant code:
 - `templates/Halo2Verifier.sol`: unconditional `committed_pi =
   G1Affine::identity()` absorption
 - `src/codegen/util.rs`: `committed_instance_comms`
-- `src/codegen/pcs/gwc19.rs`: committed-instance PCS query construction
+- `src/codegen/pcs.rs`: committed-instance PCS query construction
 - `src/codegen.rs`: `set_num_committed_instances`
 
 The Solidity transcript always absorbs exactly one identity commitment, and the

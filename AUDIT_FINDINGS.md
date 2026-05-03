@@ -6,7 +6,7 @@ codegen and emitted Yul.
 **Files reviewed (deep read):**
 
 - `src/codegen/util.rs`, `memory.rs`, `protocol.rs`, `transcript.rs`,
-  `generator.rs`, `pcs/gwc19.rs`, `quotient/mod.rs`, `evaluator.rs`
+  `generator.rs`, `pcs.rs`, `quotient/mod.rs`, `evaluator.rs`
 - `templates/Halo2Verifier.sol`, `templates/QuotientNumeratorBlock.yul`
 - `docs/MEMORY_LAYOUT.md`, `docs/QUOTIENT_NUMERATOR_EVALUATOR.md`
 
@@ -65,7 +65,7 @@ break:
   (`if iszero(gp) { ret := 0; leave }`) and short-circuits the
   singleton case via `if iszero(x) { ret := 0; leave }`. With the
   current call sites (Lagrange denominators + the GWC dummy/Lagrange
-  basis Montgomery batch in `gwc19.rs`) every input is provably
+  basis Montgomery batch in `pcs.rs`) every input is provably
   non-zero by Fiat–Shamir, so the product check is sufficient.
 - **EIP-2537 precompile constants.** Constructor smoke test (line 192)
   exercises `0x0b` G1ADD, `0x0c` G1MSM and `0x0f` PAIRING_CHECK at
@@ -275,7 +275,7 @@ self-documenting:
 
 ### S3. `compute_dummy_queries` panics on duplicate `(comm, rotation)` pairs
 
-**File:** `src/codegen/pcs/gwc19.rs:194–201`
+**File:** `src/codegen/pcs.rs:194–201`
 
 ```rust
 Some(_) => {
@@ -300,8 +300,8 @@ typed `Err(...)` return, threaded through `try_new`. Same for the
 
 ### S4. `f_eval` / `v` Horner direction relies on undocumented prover convention
 
-**File:** `src/codegen/pcs/gwc19.rs:~1100–1230` (Block 4),
-`src/codegen/pcs/gwc19.rs:~1290–1320` (Block 5)
+**File:** `src/codegen/pcs.rs:~1100–1230` (Block 4),
+`src/codegen/pcs.rs:~1290–1320` (Block 5)
 
 The Block 4 reverse-Horner accumulator emits
 
@@ -418,7 +418,7 @@ auditor can skip the hot paths I already burned time on:
   (`util.rs:439–520`). Total byte count agrees with
   `transcript_buffer_words_bound` (`generator.rs:2965–3022`).
 - **`construct_intermediate_sets` deduplication**
-  (`gwc19.rs:~270–360`). Sets are deduplicated by the underlying
+  (`pcs.rs:~270–360`). Sets are deduplicated by the underlying
   `EcPoint` memory pointer, so the dummy-query logic that depends on
   pointer equality is well-defined.
 - **EVM identity convention.** `G1_IDENTITY_MPTR` is reserved as a

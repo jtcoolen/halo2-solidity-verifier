@@ -45,7 +45,7 @@ use rand_chacha::ChaCha8Rng;
 use sha3::Keccak256;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, Evm, SolidityGenerator,
 };
 
 type F = Fq;
@@ -159,7 +159,7 @@ fn poseidon_renders_compiles_and_verifies() {
     // one non-committed); set num_committed_instances accordingly.
     let num_instances = 1;
     let generator =
-        SolidityGenerator::new(&srs, vk.vk(), Gwc19, num_instances).set_num_committed_instances(1);
+        SolidityGenerator::new(&srs, vk.vk(), num_instances).set_num_committed_instances(1);
     let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
     let (verifier_solidity, vk_solidity) = generator

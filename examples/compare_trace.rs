@@ -6,8 +6,7 @@ use halo2_proofs::{
     transcript::{Transcript, TranscriptRead},
 };
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, Keccak256Transcript,
-    SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, Evm, Keccak256Transcript, SolidityGenerator,
 };
 use itertools::{chain, Itertools};
 use ruint::aliases::U256;
@@ -31,7 +30,7 @@ fn main() {
 
     let vk = keygen_vk(&params, &circuit).unwrap();
     let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
-    let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
+    let generator = SolidityGenerator::new(&params, &vk, instances.len());
     let (verifier_solidity, vk_solidity) = generator.render_trace_separately().unwrap();
 
     let proof = create_proof_checked(&params, &pk, circuit, &instances, &mut rng);

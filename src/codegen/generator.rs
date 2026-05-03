@@ -5,10 +5,9 @@ impl<'a> SolidityGenerator<'a> {
     pub fn new(
         params: &'a ParamsKZG<Bls12>,
         vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
-        scheme: BatchOpenScheme,
         num_instances: usize,
     ) -> Self {
-        Self::try_new(params, vk, scheme, num_instances)
+        Self::try_new(params, vk, num_instances)
             .unwrap_or_else(|err| panic!("unsupported Solidity verifier shape: {err}"))
     }
 
@@ -18,7 +17,6 @@ impl<'a> SolidityGenerator<'a> {
     pub fn try_new(
         params: &'a ParamsKZG<Bls12>,
         vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
-        scheme: BatchOpenScheme,
         num_instances: usize,
     ) -> Result<Self, GeneratorError> {
         if vk.cs().num_advice_columns() == 0 {
@@ -52,7 +50,6 @@ impl<'a> SolidityGenerator<'a> {
         Ok(Self {
             params,
             vk,
-            scheme,
             num_instances,
             num_committed_instances,
             acc_encoding: None,
@@ -672,7 +669,7 @@ impl<'a> SolidityGenerator<'a> {
         let raw_data = Data::new(&self.meta, vk, proof_cptr, &raw_memory);
         let mut meta = self.meta.clone();
         let n_dummy = if cfg!(feature = "outer-fewer-point-sets") {
-            BatchOpenScheme::num_dummy_queries(&meta, &raw_data)
+            pcs::num_dummy_queries(&meta, &raw_data)
         } else {
             0
         };
@@ -685,7 +682,7 @@ impl<'a> SolidityGenerator<'a> {
             data.set_dummy_eval_words(main_evals, n_dummy);
         }
 
-        meta.set_num_point_sets(BatchOpenScheme::num_point_sets(&meta, &data));
+        meta.set_num_point_sets(pcs::num_point_sets(&meta, &data));
         let memory =
             self.memory_layout_for(&meta, vk, vk_mptr, VerifierMemoryLayoutConfig::default());
         (meta, data, memory)
@@ -2348,7 +2345,7 @@ impl<'a> SolidityGenerator<'a> {
                 fixed_scalar_count + 1
             })
             .unwrap_or(0);
-        let pcs_memory_requirements = self.scheme.memory_requirements(&meta, &data);
+        let pcs_memory_requirements = pcs::memory_requirements(&meta, &data);
         let quotient_cse_temps = quotient_program_build
             .as_ref()
             .map(|build| build.cse_temps)
@@ -2538,7 +2535,7 @@ impl<'a> SolidityGenerator<'a> {
                 .flat_map(|block| block.iter())
                 .any(|line| line.contains("q_limb7_wide("));
 
-        let pcs_computations = self.scheme.computations(
+        let pcs_computations = pcs::computations(
             &meta,
             &data,
             &memory,
@@ -2638,7 +2635,6 @@ impl<'a> SolidityGenerator<'a> {
         let acc_msm_scratch = memory.acc_msm_scratch;
 
         let verifier = Halo2Verifier {
-            scheme: self.scheme,
             trace,
             gas_checkpoints,
             quotient_yul_helpers,
@@ -2672,10 +2668,10 @@ impl<'a> SolidityGenerator<'a> {
             expected_quotient_len,
             expected_quotient_codehash,
             proof_cptr,
-            num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme),
-            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(self.scheme) + WORD_BYTES,
+            num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(),
+            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len() + WORD_BYTES,
             quotient_comm_cptr: data.quotient_comm_cptr,
-            proof_len: meta.proof_len(self.scheme),
+            proof_len: meta.proof_len(),
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
             quotient_inline_computations,
@@ -2933,7 +2929,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
-        let pcs_computation = self.scheme.static_working_memory_size();
+        let pcs_computation = pcs::static_working_memory_size();
         let transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
 
         itertools::max([

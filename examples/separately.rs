@@ -2,8 +2,7 @@ use application::StandardPlonk;
 use prelude::*;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, Evm, Keccak256Transcript,
-    SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, Evm, Keccak256Transcript, SolidityGenerator,
 };
 
 const K_RANGE: Range<u32> = 10..17;
@@ -21,7 +20,7 @@ fn main() {
 
         let vk = keygen_vk(&params[&k], &circuit).unwrap();
         let pk = keygen_pk(&params[&k], vk, &circuit).unwrap();
-        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), Gwc19, num_instances);
+        let generator = SolidityGenerator::new(&params[&k], pk.get_vk(), num_instances);
         let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
         // Each (k, circuit) yields a distinct authorized VK, and the verifier
         // pins that VK by codehash, so we save one Halo2Verifier per k too.

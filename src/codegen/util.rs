@@ -8,7 +8,6 @@ use crate::codegen::{
     memory::{VerifierMemoryLayout, G1_BYTES, G1_WORDS, WORD_BYTES},
     protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
-    BatchOpenScheme::{self, Gwc19},
 };
 use ff::PrimeField;
 use itertools::{chain, izip, Itertools};
@@ -97,7 +96,7 @@ pub(crate) struct ConstraintSystemMeta {
     /// `fewer-point-sets` path appends to the raw query list. Each
     /// dummy is read as one extra Fr at the end of the main eval
     /// block. Populated lazily by `SolidityGenerator::generate_verifier`
-    /// after running `BatchOpenScheme::num_dummy_queries`.
+    /// after running the PCS dummy-query planner.
     pub(crate) num_dummy_evals: usize,
     /// Number of distinct point sets returned by the codegen-side
     /// `construct_intermediate_sets` simulation. Populated lazily by
@@ -256,7 +255,7 @@ impl ConstraintSystemMeta {
         self.permutation_columns.len()
     }
 
-    pub(crate) fn proof_len(&self, scheme: BatchOpenScheme) -> usize {
+    pub(crate) fn proof_len(&self) -> usize {
         self.validate_against_protocol()
             .expect("constraint-system metadata must match protocol plan before proof sizing");
         // Each G1 commitment in verifier calldata is 128 bytes (uncompressed,
@@ -265,36 +264,31 @@ impl ConstraintSystemMeta {
         // midnight-proofs' native 48-byte compressed commitments into this
         // padded form before calling `verifyProof`, and the Yul transcript
         // hashes those padded bytes directly.
-        let g1_count: usize =
-            self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count(scheme);
+        let g1_count: usize = self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count();
         g1_count * G1_BYTES
             + self.num_evals * WORD_BYTES
-            + self.batch_open_extra_evals(scheme) * WORD_BYTES
+            + self.batch_open_extra_evals() * WORD_BYTES
     }
 
-    pub(crate) fn batch_open_proof_len(&self, scheme: BatchOpenScheme) -> usize {
-        match scheme {
-            // Trailing G1 points are: f_com (1) + pi (1) = 2.
-            // Plus the per-set q_evals (handled separately as scalars).
-            Gwc19 => self.batch_open_g1_count(scheme) * G1_BYTES,
-        }
+    pub(crate) fn batch_open_proof_len(&self) -> usize {
+        // Trailing G1 points are: f_com (1) + pi (1) = 2.
+        // Plus the per-set q_evals (handled separately as scalars).
+        self.batch_open_g1_count() * G1_BYTES
     }
 
     /// G1 commitments emitted *after* the evaluation block in the proof
     /// stream by `KZGCommitmentScheme::multi_open` (midnight-proofs):
     ///   `f_com` (the proof of the polynomial-commitment-degree
     ///   reduction) and `pi` (the final KZG opening). 2 G1 in total.
-    pub(crate) fn batch_open_g1_count(&self, scheme: BatchOpenScheme) -> usize {
-        match scheme {
-            Gwc19 => 2,
-        }
+    pub(crate) fn batch_open_g1_count(&self) -> usize {
+        2
     }
 
     /// Extra Fq scalars in the multi-open block: one `q_eval` per
     /// distinct point set (read at `x_3`). Computed from the simulated
     /// `construct_intermediate_sets` run; populated by the caller after
     /// `ConstraintSystemMeta` is constructed.
-    pub(crate) fn batch_open_extra_evals(&self, _scheme: BatchOpenScheme) -> usize {
+    pub(crate) fn batch_open_extra_evals(&self) -> usize {
         self.num_point_sets
     }
 
@@ -305,7 +299,7 @@ impl ConstraintSystemMeta {
     }
 
     /// Setter used by `SolidityGenerator` after running
-    /// `BatchOpenScheme::num_dummy_queries` over the raw query list.
+    /// the PCS dummy-query planner over the raw query list.
     /// Bumps `num_evals` by `n` so that the memory layout of `Data`
     /// (REVERSED_EVALS_MPTR buffer + downstream `comms_mptr_base`) and
     /// the transcript-loop iteration count in the rendered template
@@ -697,7 +691,7 @@ impl Data {
             reversed_evals_mptr,
             // Default: no dummy queries (fewer-point-sets disabled).
             // The caller can populate this via `set_dummy_eval_words`
-            // after running `BatchOpenScheme::num_dummy_queries` to
+            // after running the PCS dummy-query planner to
             // size the buffer.
             dummy_eval_words: Vec::new(),
         }
@@ -709,7 +703,7 @@ impl Data {
     ///
     /// Wiring: `SolidityGenerator::generate_verifier` builds `Data`
     /// twice. The first build (with `num_dummy_evals = 0`) lets us
-    /// run `BatchOpenScheme::num_dummy_queries` over the raw query
+    /// run the PCS dummy-query planner over the raw query
     /// list. The second build is against a `ConstraintSystemMeta`
     /// whose `num_evals` already includes the dummies (see
     /// [`ConstraintSystemMeta::set_num_dummy_evals`]); this method

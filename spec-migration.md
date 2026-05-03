@@ -54,7 +54,7 @@ I'll deliver the migration in N self-contained steps, committing each so we can 
 - Gate emitter unchanged shape, but now reads through midnight-proofs `Expression`.
 
 ### Step 5 - PCS emitter rewrite
-- Replace `src/codegen/pcs/gwc19.rs` (and bdfg21.rs) with a `multi_prepare` emitter:
+- Replace `src/codegen/pcs.rs` with a `multi_prepare` emitter:
   - `construct_intermediate_sets`: bucket queries by point sets (in order: advice rotations, perm cur/next/last, lookup x/x_next, trashcan x, fixed rotations, perm common at x, lin com at x).
   - `q_coms`: per set, MSM-fold commitments by `x1` powers
   - `q_eval_sets`: per set, eval_set inner product with `x1` powers

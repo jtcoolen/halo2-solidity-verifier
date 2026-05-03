@@ -3,7 +3,6 @@
 use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
-    pcs::BatchOpenScheme,
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -151,8 +150,6 @@ pub(crate) struct UserPhase {
 #[derive(Template)]
 #[template(path = "Halo2Verifier.sol")]
 pub(crate) struct Halo2Verifier {
-    #[allow(dead_code)]
-    pub(crate) scheme: BatchOpenScheme,
     pub(crate) trace: bool,
     /// When true, the rendered verifier emits LOG1 gas() checkpoints at
     /// section boundaries. See SOLIDITY_GAS_CHECKPOINTS_ENABLED.
@@ -448,7 +445,6 @@ mod tests {
             PcsMemoryRequirements, VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES,
             WORD_BYTES,
         },
-        pcs::BatchOpenScheme::Gwc19,
         util::{ConstraintSystemMeta, Ptr},
     };
     use ruint::aliases::U256;
@@ -560,7 +556,6 @@ mod tests {
         let acc_msm_scratch = memory.acc_msm_scratch;
 
         Halo2Verifier {
-            scheme: Gwc19,
             trace: false,
             gas_checkpoints: false,
             quotient_yul_helpers: false,

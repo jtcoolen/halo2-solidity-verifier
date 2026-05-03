@@ -82,8 +82,8 @@ use rand::{rngs::OsRng, Rng};
 use sha2::Digest;
 
 use halo2_solidity_verifier::{
-    compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding,
-    BatchOpenScheme::Gwc19, CallOutcome, Evm, ProofEvaluationCounts, SolidityGenerator,
+    compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding, CallOutcome, Evm,
+    ProofEvaluationCounts, SolidityGenerator,
 };
 
 type S = BlstrsEmulation;
@@ -999,7 +999,7 @@ fn ivc_final_keccak_solidity_e2e() {
     // final accumulator pairing check, so pass its starting instance offset.
     let num_instances = pi.len();
     let final_acc_offset = TREE_LEAVES;
-    let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), Gwc19, num_instances)
+    let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), num_instances)
         .set_num_committed_instances(1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
     let proof_evaluation_counts = generator.proof_evaluation_counts();

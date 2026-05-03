@@ -48,7 +48,6 @@ mod template;
 pub(crate) mod util;
 
 use config::*;
-pub use pcs::BatchOpenScheme;
 #[cfg(test)]
 pub(crate) use quotient::RepackedProofScalarLayout;
 use quotient::*;
@@ -66,7 +65,6 @@ use quotient::*;
 pub struct SolidityGenerator<'a> {
     params: &'a ParamsKZG<Bls12>,
     vk: &'a VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
-    scheme: BatchOpenScheme,
     num_instances: usize,
     /// Number of instance columns whose values are *committed* in the
     /// proof transcript rather than read directly from `instances` and
@@ -421,7 +419,7 @@ mod tests {
     #[test]
     fn eip2537_calls_use_bounded_gas_helpers() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
-        let pcs_codegen = include_str!("pcs/gwc19.rs");
+        let pcs_codegen = include_str!("pcs.rs");
 
         for source in [verifier_template, pcs_codegen] {
             assert!(
@@ -448,7 +446,7 @@ mod tests {
     #[test]
     fn failed_success_paths_do_not_enter_ec_precompiles() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
-        let pcs_codegen = include_str!("pcs/gwc19.rs");
+        let pcs_codegen = include_str!("pcs.rs");
 
         assert!(
             verifier_template.contains("if iszero(success) { revert(0, 0) }\n            }\n\n            {%- if self.gas_checkpoints %}\n            gas_checkpoint(2)"),
@@ -783,7 +781,7 @@ mod tests {
 
     #[test]
     fn final_msm_pair_count_is_a_codegen_assertion() {
-        let source = include_str!("pcs/gwc19.rs");
+        let source = include_str!("pcs.rs");
 
         assert!(
             source.contains("pair_idx, final_msm_terms"),
@@ -865,7 +863,7 @@ mod tests {
     #[test]
     fn truncated_challenge_comments_cover_x1_x4_power_masks() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
-        let gwc19_codegen = include_str!("pcs/gwc19.rs");
+        let pcs_codegen = include_str!("pcs.rs");
 
         assert!(
             verifier_template.contains("x1 and x4 remain full squeezed Fr words"),
@@ -876,23 +874,23 @@ mod tests {
             "verifier template should document the PCS power truncation rule"
         );
         assert!(
-            gwc19_codegen.contains("proofs/src/poly/kzg/mod.rs computes"),
+            pcs_codegen.contains("proofs/src/poly/kzg/mod.rs computes"),
             "x1 power generation should point back to the Rust verifier source"
         );
         assert!(
-            gwc19_codegen.contains("power[i] = truncate(x1^i)"),
+            pcs_codegen.contains("power[i] = truncate(x1^i)"),
             "x1 power generation should document truncated_powers(x1)"
         );
         assert!(
-            gwc19_codegen.contains("truncated_powers(x4)[i] = truncate(x4^i)"),
+            pcs_codegen.contains("truncated_powers(x4)[i] = truncate(x4^i)"),
             "x4 power generation should document truncated_powers(x4)"
         );
         assert!(
-            gwc19_codegen.contains("mstore(p, and(acc, {TRUNC_MASK_128}))"),
+            pcs_codegen.contains("mstore(p, and(acc, {TRUNC_MASK_128}))"),
             "x1 emitted powers must be masked under truncated-challenges"
         );
         assert!(
-            gwc19_codegen.contains("let x4_pow_{s} := and(x4_pow_full, {TRUNC_MASK_128})"),
+            pcs_codegen.contains("let x4_pow_{s} := and(x4_pow_full, {TRUNC_MASK_128})"),
             "x4 emitted powers must be masked under truncated-challenges"
         );
     }

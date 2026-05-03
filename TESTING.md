@@ -54,20 +54,13 @@ in Prague-spec `revm`, and calls `verifyProof`.
 
 ### Default suite (render + EVM smoke tests)
 
-These compile and run the verifier end-to-end on `HugeCircuit` and
-`MainGateWithRange` for both `Bdfg21` and `Gwc19`. They are not `#[ignore]`d
-and run as part of the default test invocation:
+These compile and run the verifier end-to-end with the default multi-prepare
+KZG PCS emitter. They are not `#[ignore]`d and run as part of the default test
+invocation:
 
 ```bash
 cargo test --workspace --all-features --all-targets -- --nocapture
 ```
-
-Covers:
-
-- `render_bdfg21_huge`, `render_bdfg21_maingate`
-- `render_gwc19_huge`, `render_gwc19_maingate`
-- `render_separately_bdfg21_huge`, `render_separately_bdfg21_maingate`
-- `render_separately_gwc19_huge`, `render_separately_gwc19_maingate`
 
 ### Property-based tests (PBT)
 

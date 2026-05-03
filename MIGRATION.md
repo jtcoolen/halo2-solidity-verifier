@@ -58,7 +58,7 @@ Step 4. src/codegen/evaluator.rs: implement permutation_computations,
         midnight-proofs argument expressions
         (proofs/src/plonk/{permutation,logup,trash}.rs::expressions).
         The gate emitter is already ported.
-Step 5. src/codegen/pcs.rs + pcs/gwc19.rs: replace the rotation-set
+Step 5. src/codegen/pcs.rs: replace the rotation-set
         emitter with the multi_prepare flow:
           * read x1, x2 from squeeze
           * read f_com (1 G1)
@@ -132,7 +132,7 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
   return projective; we `.to_affine()` before EIP-2537 packing.
   `set_num_committed_instances(n)` exposes the `nb_committed_instances`
   knob (defaults to 0 for poseidon).
-* `src/codegen/pcs.rs` and `src/codegen/pcs/gwc19.rs` — stubbed empty.
+* `src/codegen/pcs.rs` — stubbed empty.
   Their previous halo2-era emitters did not map to multi-prepare.
 * `src/codegen/template.rs::Halo2Verifier` — gains `num_lookups`,
   `num_trashcans` fields so Step 6 templates can reference them.
@@ -160,18 +160,17 @@ Step 9. tests/: PBT + soundness tests against the rendered verifier.
 
 ### Step 5 (2026-04-26)
 
-* `src/codegen/pcs.rs` — module-level rewrite. Single `BatchOpenScheme::Gwc19`
-  variant kept for migration continuity; semantics now refer to the
-  midnight-proofs `KZGCommitmentScheme::multi_prepare` flow.
-* `src/codegen/pcs/gwc19.rs::queries()` — builds the verifier query list
+* `src/codegen/pcs.rs` — module-level rewrite for the midnight-proofs
+  `KZGCommitmentScheme::multi_prepare` flow.
+* `src/codegen/pcs.rs::queries()` — builds the verifier query list
   mirroring `verify_algebraic_constraints`: advice queries, permutation product
   cur/next/last, lookup m/h/z/z_next, trashcan, fixed (non-simple), perm common,
   linearization (= computed quotient).
-* `src/codegen/pcs/gwc19.rs::construct_intermediate_sets_impl()` — codegen-time
+* `src/codegen/pcs.rs::construct_intermediate_sets_impl()` — codegen-time
   port of the Rust algorithm. Buckets queries by `(commitment_id, point_set)`
   and assigns `set_index`. `sort_sets()` then orders sets by ascending
   cardinality (tiebreaker: original index).
-* `src/codegen/pcs/gwc19.rs::computations()` — emits Yul for the multi-prepare
+* `src/codegen/pcs.rs::computations()` — emits Yul for the multi-prepare
   body in six blocks:
     1. Pre-compute `x * ω^rot` for every distinct rotation
     2. Pre-compute `x1` powers
@@ -328,7 +327,7 @@ The `cargo test --lib` suite now stands at 7/7 green:
   always allocates two instance columns (one committed, one
   non-committed), so the v0.4 tightness no longer applies.
   Callers select the split via `set_num_committed_instances`.
-* `src/codegen/pcs/gwc19.rs` — fixed two emitter bugs surfaced by
+* `src/codegen/pcs.rs` — fixed two emitter bugs surfaced by
   the first end-to-end render:
     * Block 4 / Block 5 now bind `let Q_EVAL_CPTR :=
       mload(Q_EVAL_CPTR_MPTR)` at the top so the in-block
@@ -380,7 +379,7 @@ The `cargo test --lib` suite now stands at 7/7 green:
   * `Data::new` (in `src/codegen/util.rs`) advances its calldata
     cursors with a 4-word stride (`+ 4 * count`, i.e. 128 bytes
     per G1) instead of the correct 48-byte stride.
-  * The PCS emitter (`src/codegen/pcs/gwc19.rs`) loads each
+  * The PCS emitter (`src/codegen/pcs.rs`) loads each
     commitment with `c.comm.words()`, which expands to four
     `calldataload(...)` calls at consecutive 32-byte offsets.
     Against compressed proof bytes this returns garbage (or the
@@ -471,7 +470,7 @@ The `cargo test --lib` suite now stands at 7/7 green:
     tests: the lib suite + the Step 8 fixture.
 
   No changes are needed in
-  `src/codegen/pcs/gwc19.rs::commitment_map` or the PCS Yul
+  `src/codegen/pcs.rs::commitment_map` or the PCS Yul
   emission; the abstraction over `EcPoint` already works.
 
 ## Pending work (Step 8 follow-up + Step 9)
@@ -489,8 +488,8 @@ $ cargo check --lib
 
 $ cargo test --lib --features evm
 running 7 tests
-test codegen::pcs::gwc19::tests::intermediate_sets_dedups_commitments ... ok
-test codegen::pcs::gwc19::tests::intermediate_sets_partitions_by_rotation_set ... ok
+test codegen::pcs::tests::intermediate_sets_dedups_commitments ... ok
+test codegen::pcs::tests::intermediate_sets_partitions_by_rotation_set ... ok
 test codegen::template::tests::vk_layout_byte_consistency ... ok
 test codegen::template::tests::vk_renders_and_returns_correct_length ... ok
 test transcript::tests::common_g1_then_squeeze_matches ... ok

@@ -13,14 +13,14 @@ For audited solidity verifier generator and proof aggregation toolkits, please r
 ### Generate verifier and verifying key separately as 2 Solidity contracts
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, BatchOpenScheme::Gwc19, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, num_instances);
 let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 ```
 
 ### Generate verifier and verifying key in a single solidity contract
 
 ```rust
-let generator = SolidityGenerator::new(&params, &vk, BatchOpenScheme::Gwc19, num_instances);
+let generator = SolidityGenerator::new(&params, &vk, num_instances);
 let verifier_solidity = generator.render().unwrap();
 ```
 

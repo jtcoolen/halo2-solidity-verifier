@@ -15,8 +15,8 @@ use halo2_proofs::{
     poly::{kzg::commitment::ParamsKZG, Rotation},
 };
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, BatchOpenScheme::Gwc19, CallOutcome, Evm,
-    Keccak256Transcript, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, CallOutcome, Evm, Keccak256Transcript,
+    SolidityGenerator,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -34,7 +34,7 @@ fn main() {
 
             let vk = keygen_vk(&params, &circuit).unwrap();
             let pk = keygen_pk(&params, vk.clone(), &circuit).unwrap();
-            let generator = SolidityGenerator::new(&params, &vk, Gwc19, instances.len());
+            let generator = SolidityGenerator::new(&params, &vk, instances.len());
             let (verifier_solidity, vk_solidity) = generator.render_separately().unwrap();
 
             let mut evm = Evm::default();

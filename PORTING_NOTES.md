@@ -21,7 +21,7 @@ than reviewing its shape -- there are open ends.
 | `templates/Halo2VerifyingKey.sol`      | Rewritten for 4-word G1 / EIP-2537 layout               |
 | `src/codegen/template.rs`              | `G1Words = (U256;4)`; VK length doubled                 |
 | `src/codegen/util.rs`                  | EcPoint{base: Ptr} 4-word stride; Value signed offsets  |
-| `src/codegen/pcs/{bdfg21,gwc19}.rs`    | Rewritten as EIP-2537 Yul emitters (commit 947a877)     |
+| `src/codegen/pcs.rs`                   | Rewritten as an EIP-2537 Yul emitter                    |
 | `src/codegen.rs`                       | Emits BLS-shape constants + `proof_to_bls_padded`        |
 | `src/evm.rs`                           | revm 19, Prague spec, EIP-2537 precompiles (commit f028b99) |
 | `src/codegen.rs::encode_calldata_bls_padded` | New crate-root export (commit c041bcb)             |
@@ -96,7 +96,7 @@ backend is wired in:
   points aren't on the BLS curve. **This is expected** until we have a
   real BLS prover.
 
-### 2. In-EVM Fp arithmetic in `pcs/{bdfg21,gwc19}.rs` is broken
+### 2. In-EVM Fp arithmetic in `pcs.rs` is broken
 
 The BN254 verifier did some Fp arithmetic inline in EVM (e.g. computing the
 quotient commitment via `mulmod`, evaluating PCS opening polynomials in
@@ -107,7 +107,7 @@ quotient commitment via `mulmod`, evaluating PCS opening polynomials in
   calls plus modular helpers expressed over (hi, lo) splits.
 * `EcPoint` in `src/codegen/util.rs` still tracks only `x` and `y` as single
   u256 words. We bumped its stride to 4 (so memory layout is correct), but
-  the actual Yul emitters in `pcs/bdfg21.rs` and `pcs/gwc19.rs` still treat
+  the actual Yul emitter in `pcs.rs` still treats
   points as `(x, y)` of single u256 each.
 
 The pcs blocks therefore emit Yul that **won't compile cleanly** against the
@@ -163,7 +163,7 @@ above are closed we should regenerate it.
    the BLS prover swap is done, and add a deterministic-render snapshot test.
 5. **Reactivate `#[ignore]` tests.** As each layer is ported the
    corresponding render / pbt tests should be re-enabled. `function_signature`,
-   `render_smoke_bls_bdfg21_and_gwc19_codegen`, and
+   the BLS codegen smoke tests, and
    `prague_evm_runs_eip2537_g1add_to_identity` already pass; `render_*`
    require a working BLS prover; `pbt_*` require `cargo test --release`.
 

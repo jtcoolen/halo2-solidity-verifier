@@ -74,7 +74,7 @@ let v = inner_product([q_evals..., f_eval], powers(x4));
 The Solidity codegen for this is in:
 
 ```text
-src/codegen/pcs/gwc19.rs
+src/codegen/pcs.rs
 ```
 
 around the generated `build final_com and v` block.

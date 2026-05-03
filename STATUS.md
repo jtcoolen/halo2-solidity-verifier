@@ -6,7 +6,7 @@ I read through the Rust verifier (`midfall/proofs/src/plonk/verifier.rs` plus
 `KZGCommitmentScheme::multi_prepare` / `DualMSM::check`), then walked the
 Solidity templates (`templates/Halo2Verifier.sol`) and the codegen
 (`src/codegen.rs`, `codegen/util.rs`, `codegen/evaluator.rs`,
-`codegen/pcs/gwc19.rs`).
+`codegen/pcs.rs`).
 
 Short answer: **the Solidity verifier mirrors the high-level shape of the
 Rust one and re-derives the same algebraic identity / linearization / KZG
@@ -27,7 +27,7 @@ today.**
 | Canonical scalar bound on every Fq read | `success := and(success, lt(eval, r))` for every instance / eval / q_eval |
 | `partially_evaluate_identities` (gates → permutation → logup → trash) | `Evaluator::{gate_computations_tagged, permutation_computations, lookup_computations, trashcan_computations}` Horner-folded with `y` |
 | `compute_linearization_commitment`: quotient limbs scaled by `(1-x^n)·x^(k(n-1))` + simple-selector fixed comms with `Σ y^k·eval_k`, eval target `-Σ eval_k` | Quotient-fold block + simple-selector loop, `quotient_eval := sub(r, quotient_eval_numer)` |
-| `construct_intermediate_sets` (BTreeSet of point indices, sort by `(len, i)`) | `pcs/gwc19.rs::construct_intermediate_sets_impl` + `sort_sets` |
+| `construct_intermediate_sets` (BTreeSet of point indices, sort by `(len, i)`) | `pcs.rs::construct_intermediate_sets_impl` + `sort_sets` |
 | `multi_prepare`: `q_com[s]=Σx1^i·c_i`, `q_eval_set[s]=Σx1^i·evals_i`, `f_eval` via Lagrange at `x3`, `final_com = Σ x4^s·q_com[s] + x4^N·f_com`, `v` analogous, `DualMSM(left=π, right=final_com − v·G + x3·π)` | Six emitted Yul blocks producing exactly that decomposition |
 | Pairing `e(π, [s]_2) = e(final_com − v·G + x3·π, [1]_2)` | `ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)` against `G2_BASE` and `NEG_S_G2_BASE` |
 | Trailing-bytes rejection (Rust transcript errors on extra reads) | `eq(calldatasize(), add(INSTANCE_CPTR, mul(0x20, num_instances)))` and `eq(proof_len, calldataload(PROOF_LEN_CPTR))` |

@@ -402,7 +402,7 @@ let prod_inv := scalar_inv(prod)
 Saves 13 modexp calls (~13 × 1.4 kg = ~18 kg) at the cost of ~28 muls
 (~280 gas). Net ~17 kg.
 
-**Files:** `src/codegen/pcs/gwc19.rs` (the emitter that lays out the
+**Files:** `src/codegen/pcs.rs` (the emitter that lays out the
 14 `let _ := scalar_inv(_)` lines in the PCS block). Probably a
 dedicated `batch_scalar_inv` helper in the Yul prelude.
 
@@ -451,7 +451,7 @@ each repeat a 4-line `mstore(0x180, mload(...))` chain to copy
 one `mcopy(dst, src, 0x80)`.
 
 **Files:** `templates/Halo2Verifier.sol` and the `pcs_computations`
-emitter in `src/codegen/pcs/gwc19.rs`.
+emitter in `src/codegen/pcs.rs`.
 
 **Risk:** none. EVM target is already Cancun.
 
@@ -616,6 +616,6 @@ the floor is dominated by EIP-2537 pricing and the cryptographic work.
   section (modulo the 750-gas overhead per checkpoint, which is
   subtracted by `dump_gas_checkpoints`).
 - For tighter attribution within the 631 kg PCS block, add additional
-  checkpoints inside `src/codegen/pcs/gwc19.rs::computations()` at the
+  checkpoints inside `src/codegen/pcs.rs::computations()` at the
   per-set boundaries. Currently every set's three sub-stages (point
   set group, batch invert, MSM) coalesce into the same 631 kg bucket.
