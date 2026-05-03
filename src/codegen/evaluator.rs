@@ -161,7 +161,7 @@ impl<'a> Evaluator<'a> {
     /// `directly_convert_selectors_to_fixed`, a simple selector's
     /// `index()` equals the fixed column index of its replacement
     /// (selector indices were shifted by `nr_fixed_columns`).
-    pub fn gate_computations_tagged(&self) -> Vec<(Vec<String>, String, Option<usize>)> {
+    pub(crate) fn gate_computations_tagged(&self) -> Vec<(Vec<String>, String, Option<usize>)> {
         self.cs
             .gates()
             .iter()
@@ -201,7 +201,7 @@ impl<'a> Evaluator<'a> {
     // permutation cosets).
     // ----------------------------------------------------------------
 
-    pub fn permutation_computations(&self) -> Vec<(Vec<String>, String)> {
+    pub(crate) fn permutation_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_permutation_zs == 0 {
             return Vec::new();
         }
@@ -328,17 +328,20 @@ impl<'a> Evaluator<'a> {
             ));
             let right = self.fresh_var();
             lines.push(format!("let {right} := {z_cur}"));
-            for col in chunk_cols {
+            let last_col_idx = chunk_cols.len().saturating_sub(1);
+            for (col_pos, col) in chunk_cols.iter().enumerate() {
                 let col_eval = self.eval_at(col, 0);
                 let term = self.fresh_var();
                 lines.push(format!(
                     "let {term} := addmod(addmod({col_eval}, {delta_pow}, r), {gamma}, r)"
                 ));
                 lines.push(format!("{right} := mulmod({right}, {term}, r)"));
-                lines.push(format!(
-                    "{delta_pow} := mulmod({delta_pow}, {}, r)",
-                    u256_string(delta)
-                ));
+                if col_pos != last_col_idx {
+                    lines.push(format!(
+                        "{delta_pow} := mulmod({delta_pow}, {}, r)",
+                        u256_string(delta)
+                    ));
+                }
             }
 
             let diff = self.fresh_var();
@@ -370,7 +373,7 @@ impl<'a> Evaluator<'a> {
     //       all multiplied by active_rows = 1 - (l_last + l_blind)
     // ----------------------------------------------------------------
 
-    pub fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
+    pub(crate) fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_lookups == 0 {
             return Vec::new();
         }
@@ -397,26 +400,16 @@ impl<'a> Evaluator<'a> {
                 out.push((lines, bnd));
             }
 
-            // Pre-evaluate selector once (used by accumulator
-            // constraint). We stash its var name across iterations.
+            // Cached selector expression for the accumulator constraint
+            // below. Re-evaluated there because each constraint resets
+            // the per-emitter var cache; vars cannot leak between
+            // `(Vec<String>, String)` entries.
             let selector_expr = chunked.selector_expression();
 
-            // Per-chunk helper constraints.
-            let mut sum_helpers_var: Option<String> = None;
-
-            // Re-emit selector inside each block (the var cache is reset
-            // per-constraint). To avoid emitting it twice, we evaluate it
-            // *once* here and inline its value into the eventual
-            // accumulator constraint.
-            //
-            // Memo: each constraint resets self.var_cache, so vars do not
-            // leak between (Vec<String>, String) entries.
-
-            for (chunk_idx, (input_chunk, h_eval)) in chunked
+            for (input_chunk, h_eval) in chunked
                 .input_expression_chunks()
                 .iter()
                 .zip(h_evals.iter())
-                .enumerate()
             {
                 self.reset();
                 let mut lines = Vec::new();
@@ -510,15 +503,6 @@ impl<'a> Evaluator<'a> {
                     "let {helper_c} := addmod({h_p}, sub(r, {sum_var}), r)"
                 ));
                 out.push((lines, helper_c));
-
-                // Sum of helper evals (used by accumulator constraint).
-                // Build incrementally outside this loop. We track the
-                // running symbolic name; since the accumulator constraint
-                // resets `self`, we just remember the *Word* values and
-                // re-emit later.
-                let _ = chunk_idx;
-                let _ = h_eval;
-                let _ = sum_helpers_var.take(); // explicit reset
             }
 
             // Accumulator constraint:
@@ -602,7 +586,7 @@ impl<'a> Evaluator<'a> {
     // squeezing and storing it before the quotient eval block.
     // ----------------------------------------------------------------
 
-    pub fn trashcan_computations(&self) -> Vec<(Vec<String>, String)> {
+    pub(crate) fn trashcan_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_trashcans == 0 {
             return Vec::new();
         }
@@ -613,23 +597,31 @@ impl<'a> Evaluator<'a> {
             self.reset();
             let mut lines = Vec::new();
 
-            let trash_challenge = self.fresh_var();
-            lines.push(format!(
-                "let {trash_challenge} := mload(TRASH_CHALLENGE_MPTR)"
-            ));
-
             // compressed = fold((acc, e) -> acc * τ + e) over
             // argument.constraint_expressions(). Note this is the same
             // recipe as the logup θ-compression, but with the trash
-            // challenge as the variable.
+            // challenge as the variable. The challenge is loaded lazily
+            // so an empty constraint list does not emit an unused let.
+            let constraint_exprs = argument.constraint_expressions();
+            let trash_challenge = if constraint_exprs.is_empty() {
+                None
+            } else {
+                let var = self.fresh_var();
+                lines.push(format!("let {var} := mload(TRASH_CHALLENGE_MPTR)"));
+                Some(var)
+            };
+
             let mut compressed_var: Option<String> = None;
-            for expr in argument.constraint_expressions() {
+            for expr in constraint_exprs {
                 let (mut e_lines, e_var) = self.evaluate(expr);
                 lines.append(&mut e_lines);
                 let next = self.fresh_var();
                 let prev = compressed_var.unwrap_or_else(|| "0".to_string());
+                let tau = trash_challenge
+                    .as_deref()
+                    .expect("trash_challenge present when expressions non-empty");
                 lines.push(format!(
-                    "let {next} := addmod(mulmod({prev}, {trash_challenge}, r), {e_var}, r)"
+                    "let {next} := addmod(mulmod({prev}, {tau}, r), {e_var}, r)"
                 ));
                 compressed_var = Some(next);
             }
@@ -679,6 +671,10 @@ impl<'a> Evaluator<'a> {
         &self,
         expressions: &[Expression<Fq>],
     ) -> (Vec<String>, String) {
+        if expressions.is_empty() {
+            return self.init_var("0x0", None);
+        }
+
         let mut lines = Vec::new();
         let theta = self.fresh_var();
         lines.push(format!("let {theta} := mload(THETA_MPTR)"));
@@ -765,13 +761,9 @@ impl<'a> Evaluator<'a> {
             return None;
         }
 
-        let first_key = format!("{:?}", factors[0]);
-        if factors
-            .iter()
-            .skip(1)
-            .all(|factor| format!("{factor:?}") == first_key)
-        {
-            Some(factors[0])
+        let base = factors[0];
+        if factors.iter().skip(1).all(|factor| *factor == base) {
+            Some(base)
         } else {
             None
         }
