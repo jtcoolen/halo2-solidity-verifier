@@ -130,7 +130,7 @@ impl<'a> SolidityGenerator<'a> {
     /// Return the exact field-evaluation counts for the proof layout consumed
     /// by the generated Solidity verifier.
     pub fn proof_evaluation_counts(&self) -> ProofEvaluationCounts {
-        let proof_cptr = Ptr::calldata(0x64);
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let vk = self.generate_vk();
         let (_, meta, _, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
 
@@ -632,6 +632,11 @@ impl<'a> SolidityGenerator<'a> {
                 ("neg_s_g2_y_c1_hi", neg_s_g2[6]),
                 ("neg_s_g2_y_c1_lo", neg_s_g2[7]),
             ]);
+            assert_eq!(
+                constants.len(),
+                layout::VK_HEADER_WORDS,
+                "VK header layout constants must match layout::VK_HEADER_WORDS"
+            );
         }
 
         // Convert each commitment from G1Projective to G1Affine before
@@ -659,7 +664,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn generate_vk(&self) -> Halo2VerifyingKey {
-        let proof_cptr = Ptr::calldata(0x64);
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let mut vk = self.generate_base_vk();
         if quotient_inline_cse_enabled() || quotient_structured_loops_enabled() {
             vk.validate_payload_layout()
@@ -2341,7 +2346,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn generate_quotient_evaluator(&self) -> Halo2QuotientEvaluator {
-        let proof_cptr = Ptr::calldata(0x64);
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
 
         let vk = self.generate_vk();
         let vk_len = vk.len();
@@ -2502,6 +2507,9 @@ impl<'a> SolidityGenerator<'a> {
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,
+            limb7_yul_coeffs: LIMB7_YUL_COEFFS,
+            wide_limb7_yul_coeffs: WIDE_LIMB7_YUL_COEFFS,
+            fr_delta: fr_delta_literal(),
             memory,
             vk_mptr,
             challenge_mptr: data.challenge_mptr,
@@ -2523,6 +2531,7 @@ impl<'a> SolidityGenerator<'a> {
             quotient_native_trash_computation,
             quotient_program,
             simple_selector_cols: sorted_simple,
+            quotient_identity_trace_base: layout::trace::QUOTIENT_IDENTITY_BASE,
         }
     }
 
@@ -2543,7 +2552,7 @@ impl<'a> SolidityGenerator<'a> {
             "external quotient evaluator render requires a generated runtime length/codehash; \
              render the quotient evaluator first and use the pinned quotient render API"
         );
-        let proof_cptr = Ptr::calldata(0x64);
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
 
         let vk = self.generate_vk();
         let (vk_mptr, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
@@ -2805,7 +2814,9 @@ impl<'a> SolidityGenerator<'a> {
         // the template struct.
         let fixed_comm_mptr_byte = (vk_mptr + vk.constants.len()).value().as_usize();
         let permutation_comm_mptr_byte = fixed_comm_mptr_byte + vk.fixed_comms.len() * G1_BYTES;
-        let g1_base_mptr_byte = (vk_mptr + 11).value().as_usize();
+        let g1_base_mptr_byte = (vk_mptr + layout::VkHeaderSlot::G1Base.word())
+            .value()
+            .as_usize();
 
         let mut acc_fixed_bases: Vec<(String, usize, bool)> = Vec::new();
         if let Some(acc_encoding) = self.acc_encoding {
@@ -2876,10 +2887,14 @@ impl<'a> SolidityGenerator<'a> {
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,
+            limb7_yul_coeffs: LIMB7_YUL_COEFFS,
+            wide_limb7_yul_coeffs: WIDE_LIMB7_YUL_COEFFS,
+            fr_delta: fr_delta_literal(),
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,
             memory,
+            vk_header: Default::default(),
             vk_mptr,
             num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
             user_phases,
@@ -2903,6 +2918,9 @@ impl<'a> SolidityGenerator<'a> {
             expected_quotient_len,
             expected_quotient_codehash,
             proof_cptr,
+            abi_selector_bytes: layout::abi::SELECTOR_BYTES,
+            abi_proof_head_offset: layout::abi::VERIFY_PROOF_PROOF_HEAD_OFFSET,
+            abi_instances_head_cptr: layout::abi::SELECTOR_BYTES + WORD_BYTES,
             num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(),
             instance_cptr: proof_cptr.value().as_usize() + meta.proof_len() + WORD_BYTES,
             quotient_comm_cptr: data.quotient_comm_cptr,
@@ -2922,6 +2940,10 @@ impl<'a> SolidityGenerator<'a> {
             },
             pcs_computations,
             simple_selector_cols: sorted_simple.clone(),
+            proof_commit_trace_base: layout::trace::PROOF_COMMIT_BASE,
+            proof_eval_trace_base: layout::trace::PROOF_EVAL_BASE,
+            quotient_identity_trace_base: layout::trace::QUOTIENT_IDENTITY_BASE,
+            selector_trace_base: layout::trace::SELECTOR_FOLD_BASE,
             fixed_comm_mptr: fixed_comm_mptr_byte,
             truncated_challenges: cfg!(feature = "truncated-challenges"),
             fewer_point_sets: cfg!(feature = "outer-fewer-point-sets"),
@@ -3001,77 +3023,31 @@ impl<'a> SolidityGenerator<'a> {
         use group::prime::PrimeCurveAffine;
         use group::GroupEncoding;
 
-        // ----------------------------------------------------------
-        // Re-run the same num_dummy_evals / num_point_sets simulation
-        // `generate_verifier` runs, so the repack walks the **exact**
-        // proof layout the rendered Solidity body reads.
-        // ----------------------------------------------------------
-        let proof_cptr = Ptr::calldata(0x64);
-        let vk = self.generate_vk();
-        let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
-        let n_point_sets = meta.num_point_sets;
-
-        // ----------------------------------------------------------
-        // Build the prefix-G1 group counts in transcript order.
-        // (Mirrors the ordering used by the codegen and tested in
-        // `tests/poseidon_fixture.rs`.)
-        // ----------------------------------------------------------
-        let cs = self.vk.cs();
-        let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
-        let mut g1_groups: Vec<usize> = Vec::new();
-
-        // User phases: each phase contributes its advice columns.
-        let advice_phase = cs.advice_column_phase();
-        let max_phase = *advice_phase.iter().max().unwrap_or(&0);
-        for phase in 0..=max_phase {
-            let n = advice_phase.iter().filter(|p| **p == phase).count();
-            if n != 0 {
-                g1_groups.push(n);
-            }
-        }
-        if !cs.lookups().is_empty() {
-            g1_groups.push(cs.lookups().len());
-        }
-        if perm_chunks != 0 {
-            g1_groups.push(perm_chunks);
-        }
-        for l in cs.lookups().iter() {
-            let nb_chunks = l.chunk_by_degree(cs.degree()).num_chunks();
-            g1_groups.push(nb_chunks);
-            g1_groups.push(1);
-        }
-        if !cs.trashcans().is_empty() {
-            g1_groups.push(cs.trashcans().len());
-        }
-        let num_quotients = cs.degree() - 1;
-        g1_groups.push(num_quotients);
-        let prefix_g1_count: usize = g1_groups.iter().sum();
-
-        let total_evals = meta.num_evals; // already includes dummy evals
-        let expected_compressed_len =
-            prefix_g1_count * 48 + total_evals * 32 + 48 + n_point_sets * 32 + 48;
+        let plan = self.repacked_proof_layout_plan();
+        let prefix_g1_count = plan.prefix_g1_count();
+        let expected_compressed_len = plan.compressed_len();
         assert_eq!(
             compressed.len(),
             expected_compressed_len,
-            "compressed proof length mismatch: expected {expected_compressed_len} bytes (prefix_g1={prefix_g1_count}, num_evals={total_evals}, num_point_sets={n_point_sets}, +f_com+pi), got {}",
+            "compressed proof length mismatch: expected {expected_compressed_len} bytes (prefix_g1={prefix_g1_count}, num_evals={}, num_point_sets={}, +f_com+pi), got {}",
+            plan.num_evals,
+            plan.num_point_sets,
             compressed.len()
         );
 
-        let mut out: Vec<u8> = Vec::with_capacity(
-            prefix_g1_count * 128 + total_evals * 32 + 128 + n_point_sets * 32 + 128,
-        );
+        let mut out: Vec<u8> = Vec::with_capacity(plan.repacked_len());
         let mut cursor = 0usize;
         let push_g1 = |cursor: &mut usize, out: &mut Vec<u8>| {
             let mut comp = <G1Affine as GroupEncoding>::Repr::default();
             comp.as_mut()
-                .copy_from_slice(&compressed[*cursor..*cursor + 48]);
+                .copy_from_slice(&compressed[*cursor..*cursor + layout::G1_COMPRESSED_BYTES]);
             let cur = *cursor;
-            *cursor += 48;
+            *cursor += layout::G1_COMPRESSED_BYTES;
             let pt: G1Affine = Option::from(<G1Affine as GroupEncoding>::from_bytes(&comp))
                 .unwrap_or_else(|| {
                     panic!(
                         "decompress failed at compressed[{cur}..{}]: bytes = 0x{}",
-                        cur + 48,
+                        cur + layout::G1_COMPRESSED_BYTES,
                         hex::encode(comp.as_ref())
                     )
                 });
@@ -3089,23 +3065,25 @@ impl<'a> SolidityGenerator<'a> {
             out.extend_from_slice(&y_be[16..48]);
         };
         let push_scalar_be = |cursor: &mut usize, out: &mut Vec<u8>| {
-            out.extend_from_slice(&scalar_le_to_be_word(&compressed[*cursor..*cursor + 32]));
-            *cursor += 32;
+            out.extend_from_slice(&scalar_le_to_be_word(
+                &compressed[*cursor..*cursor + layout::WORD_BYTES],
+            ));
+            *cursor += layout::WORD_BYTES;
         };
-        for &n in &g1_groups {
+        for &n in &plan.g1_groups {
             for _ in 0..n {
                 push_g1(&mut cursor, &mut out);
             }
         }
         // evals (Fr 32-byte LE in native proof) -> BE calldata words
         // (incl. dummy slots).
-        for _ in 0..total_evals {
+        for _ in 0..plan.num_evals {
             push_scalar_be(&mut cursor, &mut out);
         }
         // f_com
         push_g1(&mut cursor, &mut out);
         // q_evals (Fr 32-byte LE in native proof) -> BE calldata words.
-        for _ in 0..n_point_sets {
+        for _ in 0..plan.num_point_sets {
             push_scalar_be(&mut cursor, &mut out);
         }
         // pi
@@ -3120,10 +3098,13 @@ impl<'a> SolidityGenerator<'a> {
 
     #[cfg(test)]
     pub(crate) fn repacked_proof_scalar_layout_for_test(&self) -> RepackedProofScalarLayout {
-        let proof_cptr = Ptr::calldata(0x64);
+        self.repacked_proof_layout_plan().scalar_layout()
+    }
+
+    fn repacked_proof_layout_plan(&self) -> RepackedProofLayoutPlan {
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let vk = self.generate_vk();
         let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
-        let num_point_sets = meta.num_point_sets;
 
         let cs = self.vk.cs();
         let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
@@ -3152,14 +3133,10 @@ impl<'a> SolidityGenerator<'a> {
         }
         g1_groups.push(cs.degree() - 1);
 
-        let prefix_g1_count: usize = g1_groups.iter().sum();
-        let eval_offset = prefix_g1_count * G1_BYTES;
-        let q_eval_offset = eval_offset + meta.num_evals * WORD_BYTES + G1_BYTES;
-        RepackedProofScalarLayout {
-            eval_offset,
+        RepackedProofLayoutPlan {
+            g1_groups,
             num_evals: meta.num_evals,
-            q_eval_offset,
-            num_point_sets,
+            num_point_sets: meta.num_point_sets,
         }
     }
 
@@ -3176,13 +3153,12 @@ impl<'a> SolidityGenerator<'a> {
             transcript_words,
             // PCS computation scratch
             pcs_computation,
-            // Pairing: 2 G1 points (4 words each) + 2 G2 points (8 words each)
-            // = 24 words, plus 1-word output buffer.
-            25,
+            // Pairing: 2 G1 points + 2 G2 points, plus 1-word output buffer.
+            layout::PAIRING_STATIC_WORKING_WORDS,
             // Modexp scratch for decompression (240 bytes input + 48
             // bytes output = 9 words; we round up to 16 to leave room
             // for separate scratch areas).
-            16,
+            layout::MODEXP_DECOMPRESSION_WORKING_WORDS,
         ])
         .unwrap()
             * WORD_BYTES

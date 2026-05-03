@@ -55,7 +55,7 @@
                 // After all identities, this is nu_y(x) for the `None`
                 // identity group.
                 mstore({{ program.eval_numer_mptr|hex() }}, 0)
-                mstore({{ program.trace_id_mptr|hex() }}, 30000)
+                mstore({{ program.trace_id_mptr|hex() }}, {{ quotient_identity_trace_base }})
                 {%- if simple_selector_cols.len() > 0 %}
                 // Simple selectors are grouped into separate linearization
                 // buckets. They start at zero for every proof.
@@ -117,8 +117,7 @@
                 //   0x0c..0x11 add/mul const or memory into top
                 //   0x12..0x16 fused add-mul runs
                 //   0x17/0x18 load/store CSE temp
-                //   0x19 native permutation    0x1a native trash
-                //   0x1b native heavy identity
+                //   0x19 native permutation    0x1b native heavy identity
                 //   0x1c LIN7                 0x1d BILIN7_ROW
                 //   0x1e BILIN7_PAIRWISE
                 //
@@ -298,18 +297,6 @@
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
                         {%- for line in quotient_native_permutation_computation %}
-                        {{ line }}
-                        {%- endfor %}
-                    }
-                    {%- endif %}
-                    {%- if quotient_native_trash_computation.len() > 0 %}
-                    // Native trash callback. Currently unused by the default
-                    // IVC path, but kept for the structured/native experiment.
-                    case 0x1a {
-                        q_top := 0
-                        q_has_top := 0
-                        q_sp := {{ program.stack_mptr|hex() }}
-                        {%- for line in quotient_native_trash_computation %}
                         {{ line }}
                         {%- endfor %}
                     }
@@ -709,18 +696,6 @@
                         {%- endfor %}
                     }
                     {%- endif %}
-                    {%- if quotient_native_trash_computation.len() > 0 %}
-                    // Native trash callback. Currently unused by the default
-                    // IVC path, but kept for the structured/native experiment.
-                    case 0x1a {
-                        q_top := 0
-                        q_has_top := 0
-                        q_sp := {{ program.stack_mptr|hex() }}
-                        {%- for line in quotient_native_trash_computation %}
-                        {{ line }}
-                        {%- endfor %}
-                    }
-                    {%- endif %}
                     {%- if quotient_native_identity_computations.len() > 0 %}
                     // Native callbacks are generated only for the heaviest
                     // recognized Midfall gate identities. All other gate,
@@ -814,9 +789,9 @@
                 // Legacy/direct mode. This path emits the numerator
                 // reconstruction directly instead of interpreting q_program.
                 // It is used for monolithic/experimental generation modes.
-                let delta := 3793952369011177517951424454785176000433849974408744014172535497121832470999 // BLS12-381 Fr::DELTA
+                let delta := {{ fr_delta }} // BLS12-381 Fr::DELTA
                 let y := mload(Y_MPTR)
-                let q_trace_id := 30000
+                let q_trace_id := {{ quotient_identity_trace_base }}
 
                 {%- for code_block in quotient_eval_numer_computations %}
                 {%- for line in code_block %}

@@ -36,6 +36,49 @@ pub(crate) struct RepackedProofScalarLayout {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RepackedProofLayoutPlan {
+    pub(crate) g1_groups: Vec<usize>,
+    pub(crate) num_evals: usize,
+    pub(crate) num_point_sets: usize,
+}
+
+impl RepackedProofLayoutPlan {
+    pub(crate) fn prefix_g1_count(&self) -> usize {
+        self.g1_groups.iter().sum()
+    }
+
+    pub(crate) fn compressed_len(&self) -> usize {
+        self.prefix_g1_count() * crate::codegen::layout::G1_COMPRESSED_BYTES
+            + self.num_evals * crate::codegen::layout::WORD_BYTES
+            + crate::codegen::layout::G1_COMPRESSED_BYTES
+            + self.num_point_sets * crate::codegen::layout::WORD_BYTES
+            + crate::codegen::layout::G1_COMPRESSED_BYTES
+    }
+
+    pub(crate) fn repacked_len(&self) -> usize {
+        self.prefix_g1_count() * crate::codegen::layout::G1_BYTES
+            + self.num_evals * crate::codegen::layout::WORD_BYTES
+            + crate::codegen::layout::G1_BYTES
+            + self.num_point_sets * crate::codegen::layout::WORD_BYTES
+            + crate::codegen::layout::G1_BYTES
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scalar_layout(&self) -> RepackedProofScalarLayout {
+        let eval_offset = self.prefix_g1_count() * crate::codegen::layout::G1_BYTES;
+        let q_eval_offset = eval_offset
+            + self.num_evals * crate::codegen::layout::WORD_BYTES
+            + crate::codegen::layout::G1_BYTES;
+        RepackedProofScalarLayout {
+            eval_offset,
+            num_evals: self.num_evals,
+            q_eval_offset,
+            num_point_sets: self.num_point_sets,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct QuotientIdentityParts {
     pub(super) gates: Vec<QuotientIdentity>,
     pub(super) permutation: Vec<QuotientIdentity>,
@@ -141,6 +184,57 @@ pub(super) const Q_MEM_X: u8 = 0x06;
 pub(super) const Q_MEM_THETA: u8 = 0x07;
 pub(super) const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
 pub(super) const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
+
+#[cfg(test)]
+pub(super) const QUOTIENT_OPCODE_TABLE: &[(&str, u8)] = &[
+    ("push_const", Q_OP_PUSH_CONST),
+    ("push_mem_literal", Q_OP_PUSH_MEM_LITERAL),
+    ("push_mem_token", Q_OP_PUSH_MEM_TOKEN),
+    ("push_mem_token_offset", Q_OP_PUSH_MEM_TOKEN_OFFSET),
+    ("push_mem_u16", Q_OP_PUSH_MEM_U16),
+    ("add", Q_OP_ADD),
+    ("mul", Q_OP_MUL),
+    ("neg", Q_OP_NEG),
+    ("push_const_u8", Q_OP_PUSH_CONST_U8),
+    ("fold_main", Q_OP_FOLD_MAIN),
+    ("fold_selector", Q_OP_FOLD_SELECTOR),
+    ("add_const_u8", Q_OP_ADD_CONST_U8),
+    ("mul_const_u8", Q_OP_MUL_CONST_U8),
+    ("add_const", Q_OP_ADD_CONST),
+    ("mul_const", Q_OP_MUL_CONST),
+    ("add_mem_u16", Q_OP_ADD_MEM_U16),
+    ("mul_mem_u16", Q_OP_MUL_MEM_U16),
+    ("add_mul_mem_mem_const_u8", Q_OP_ADD_MUL_MEM_MEM_CONST_U8),
+    ("add_mul_const_u8_mem_u16", Q_OP_ADD_MUL_CONST_U8_MEM_U16),
+    ("add_mul_mem_mem", Q_OP_ADD_MUL_MEM_MEM),
+    (
+        "run_add_mul_mem_mem_const_u8",
+        Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8,
+    ),
+    (
+        "run_add_mul_const_u8_mem_u16",
+        Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
+    ),
+    ("push_temp", Q_OP_PUSH_TEMP),
+    ("store_temp", Q_OP_STORE_TEMP),
+    ("native_permutation", Q_OP_NATIVE_PERMUTATION),
+    ("native_identity", Q_OP_NATIVE_IDENTITY),
+    ("lin7", Q_OP_LIN7),
+    ("bilin7_row", Q_OP_BILIN7_ROW),
+    ("bilin7_pairwise", Q_OP_BILIN7_PAIRWISE),
+];
+
+pub(super) const QUOTIENT_MEM_TOKEN_TABLE: &[(&str, u8)] = &[
+    ("L_0_MPTR", Q_MEM_L0),
+    ("L_LAST_MPTR", Q_MEM_L_LAST),
+    ("L_BLIND_MPTR", Q_MEM_L_BLIND),
+    ("BETA_MPTR", Q_MEM_BETA),
+    ("GAMMA_MPTR", Q_MEM_GAMMA),
+    ("X_MPTR", Q_MEM_X),
+    ("THETA_MPTR", Q_MEM_THETA),
+    ("TRASH_CHALLENGE_MPTR", Q_MEM_TRASH_CHALLENGE),
+    ("INSTANCE_EVAL_MPTR", Q_MEM_INSTANCE_EVAL),
+];
 
 pub(super) fn scalar_le_to_be_word(bytes: &[u8]) -> [u8; 32] {
     assert_eq!(bytes.len(), 32, "scalar proof element must be 32 bytes");
@@ -1453,33 +1547,16 @@ pub(super) fn quotient_mem_ptr_expr(mem: QuotientMem) -> String {
 }
 
 pub(super) fn quotient_mem_token_name(token: u8) -> &'static str {
-    match token {
-        Q_MEM_L0 => "L_0_MPTR",
-        Q_MEM_L_LAST => "L_LAST_MPTR",
-        Q_MEM_L_BLIND => "L_BLIND_MPTR",
-        Q_MEM_BETA => "BETA_MPTR",
-        Q_MEM_GAMMA => "GAMMA_MPTR",
-        Q_MEM_X => "X_MPTR",
-        Q_MEM_THETA => "THETA_MPTR",
-        Q_MEM_TRASH_CHALLENGE => "TRASH_CHALLENGE_MPTR",
-        Q_MEM_INSTANCE_EVAL => "INSTANCE_EVAL_MPTR",
-        _ => panic!("unknown quotient memory token {token:#x}"),
-    }
+    QUOTIENT_MEM_TOKEN_TABLE
+        .iter()
+        .find_map(|(name, value)| (*value == token).then_some(*name))
+        .unwrap_or_else(|| panic!("unknown quotient memory token {token:#x}"))
 }
 
 pub(super) fn quotient_mem_token_from_name(name: &str) -> Option<u8> {
-    match name {
-        "L_0_MPTR" => Some(Q_MEM_L0),
-        "L_LAST_MPTR" => Some(Q_MEM_L_LAST),
-        "L_BLIND_MPTR" => Some(Q_MEM_L_BLIND),
-        "BETA_MPTR" => Some(Q_MEM_BETA),
-        "GAMMA_MPTR" => Some(Q_MEM_GAMMA),
-        "X_MPTR" => Some(Q_MEM_X),
-        "THETA_MPTR" => Some(Q_MEM_THETA),
-        "TRASH_CHALLENGE_MPTR" => Some(Q_MEM_TRASH_CHALLENGE),
-        "INSTANCE_EVAL_MPTR" => Some(Q_MEM_INSTANCE_EVAL),
-        _ => None,
-    }
+    QUOTIENT_MEM_TOKEN_TABLE
+        .iter()
+        .find_map(|(token_name, value)| (*token_name == name).then_some(*value))
 }
 
 pub(super) trait QuotientExpressionEnv {
@@ -2017,18 +2094,7 @@ pub(super) fn parse_usize_literal(value: &str) -> Option<usize> {
 }
 
 pub(super) fn mem_token(name: &str) -> Option<u8> {
-    Some(match name {
-        "L_0_MPTR" => Q_MEM_L0,
-        "L_LAST_MPTR" => Q_MEM_L_LAST,
-        "L_BLIND_MPTR" => Q_MEM_L_BLIND,
-        "BETA_MPTR" => Q_MEM_BETA,
-        "GAMMA_MPTR" => Q_MEM_GAMMA,
-        "X_MPTR" => Q_MEM_X,
-        "THETA_MPTR" => Q_MEM_THETA,
-        "TRASH_CHALLENGE_MPTR" => Q_MEM_TRASH_CHALLENGE,
-        "INSTANCE_EVAL_MPTR" => Q_MEM_INSTANCE_EVAL,
-        _ => return None,
-    })
+    quotient_mem_token_from_name(name)
 }
 
 pub(super) fn yul_let_assignment(line: &str) -> Option<(String, String)> {

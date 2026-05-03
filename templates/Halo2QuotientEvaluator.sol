@@ -151,12 +151,13 @@ contract Halo2QuotientEvaluator {
             // never proof-selected values.
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
-                z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, q_r), q_r)
-                z := addmod(z, mulmod(0x400000000, x3, q_r), q_r)
-                z := addmod(z, mulmod(0x40000000000000000000000, x4, q_r), q_r)
-                z := addmod(z, mulmod(0x1000, x5, q_r), q_r)
-                z := addmod(z, mulmod(0x100000000000000000, x6, q_r), q_r)
+                {%- for coeff in limb7_yul_coeffs %}
+                {%- if loop.first %}
+                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
+                {%- else %}
+                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
+                {%- endif %}
+                {%- endfor %}
             }
             {%- endif %}
 
@@ -178,12 +179,13 @@ contract Halo2QuotientEvaluator {
             // can evaluate the same gate polynomial with addmod/mulmod.
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
                 let q_r := FR_MODULUS
-                z := addmod(x0, mulmod(0x100000000000000, x1, q_r), q_r)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, q_r), q_r)
-                z := addmod(z, mulmod(0x1000000000000000000000000000000000000000000, x3, q_r), q_r)
-                z := addmod(z, mulmod(0x100000000000000000000000000000000000000000000000000000000, x4, q_r), q_r)
-                z := addmod(z, mulmod(0x6bc66e553973f396854f5626172ba135587d41e37a68209402355093fdcaaf6c, x5, q_r), q_r)
-                z := addmod(z, mulmod(0x63f31e3f446953960c9d6964474300df43ab29179970f642a28e39d6c883c74b, x6, q_r), q_r)
+                {%- for coeff in wide_limb7_yul_coeffs %}
+                {%- if loop.first %}
+                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
+                {%- else %}
+                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
+                {%- endif %}
+                {%- endfor %}
             }
             {%- endif %}
 

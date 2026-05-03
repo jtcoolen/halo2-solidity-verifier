@@ -15,6 +15,8 @@ use itertools::Itertools;
 use midnight_curves::Fq;
 use midnight_proofs::plonk::{Any, Column, ConstraintSystem, Expression};
 
+use crate::codegen::layout::trace;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct QueryKey {
     pub(crate) column: usize,
@@ -129,8 +131,8 @@ impl QuotientIdentityPlan {
     }
 }
 
-pub(crate) const TRACE_QUOTIENT_IDENTITY_BASE: u64 = 30_000;
-pub(crate) const TRACE_PCS_QUERY_BASE: u64 = 2_000;
+pub(crate) const TRACE_QUOTIENT_IDENTITY_BASE: u64 = trace::QUOTIENT_IDENTITY_BASE;
+pub(crate) const TRACE_PCS_QUERY_BASE: u64 = trace::PCS_QUERY_BASE;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UsedQueries {

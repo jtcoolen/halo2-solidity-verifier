@@ -45,12 +45,13 @@
 use std::collections::BTreeMap;
 
 use crate::codegen::{
+    layout::trace,
     memory::{
         FinalMsmShape, PcsMemoryRequirements, VerifierMemoryLayout, G1ADD_INPUT_BYTES, G1_BYTES,
         G1_MSM_PAIR_BYTES, PCS_STATIC_WORKING_WORDS, WORD_BYTES,
     },
     protocol::{PcsQuerySource, PermutationZEval},
-    util::{ConstraintSystemMeta, Data, EcPoint, Ptr, Word},
+    util::{ConstraintSystemMeta, Data, EcPoint, Location, Ptr, Word},
 };
 
 // ---------------------------------------------------------------------------
@@ -496,7 +497,37 @@ fn final_msm_shape(
     FinalMsmShape::from_terms(terms)
 }
 
-const ROLL_THRESHOLD: usize = 4;
+pub(super) const Q_EVAL_ROLL_THRESHOLD: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QEvalStrategy {
+    Rolled,
+    Unrolled,
+}
+
+fn q_eval_strategy(commitments: &[&CommitmentEntry]) -> QEvalStrategy {
+    let Some(first) = commitments.first() else {
+        return QEvalStrategy::Unrolled;
+    };
+    if commitments.len() < Q_EVAL_ROLL_THRESHOLD {
+        return QEvalStrategy::Unrolled;
+    }
+
+    let n_rot = first.evals.len();
+    let can_roll = commitments.iter().all(|commitment| {
+        commitment.evals.len() == n_rot
+            && commitment
+                .evals
+                .iter()
+                .all(|eval| matches!(eval.loc(), Location::Memory))
+    });
+
+    if can_roll {
+        QEvalStrategy::Rolled
+    } else {
+        QEvalStrategy::Unrolled
+    }
+}
 
 pub(super) fn memory_requirements(
     meta: &ConstraintSystemMeta,
@@ -522,7 +553,7 @@ pub(super) fn memory_requirements(
     let q_eval_source_table_words = by_set
         .iter()
         .zip(sets.point_sets.iter())
-        .filter(|(commitments, _)| commitments.len() >= ROLL_THRESHOLD)
+        .filter(|(commitments, _)| q_eval_strategy(commitments) == QEvalStrategy::Rolled)
         .map(|(commitments, rotations)| commitments.len() * rotations.len())
         .max()
         .unwrap_or(0);
@@ -689,7 +720,7 @@ pub(super) fn computations(
                 lines.push(format!(
                     "log1(Q_EVAL_SET_MPTR, {:#x}, {})",
                     points.len() * WORD_BYTES,
-                    41_000 + set_idx
+                    trace::PCS_SERIALIZED_POINT_SET_BASE + set_idx as u64
                 ));
             }
         }
@@ -769,7 +800,7 @@ pub(super) fn computations(
         // ------------------------------------------------------------------
         // Memory layout for Block 3 (rolled q_eval).
         //
-        // For "wide" sets (m >= ROLL_THRESHOLD), the `m * n_rot`
+        // For "wide" memory-backed sets (m >= Q_EVAL_ROLL_THRESHOLD), the `m * n_rot`
         // straight-line addmod block is collapsed into a single Yul `for`
         // loop. The loop body indexes a pre-staged scratch table holding
         // per-rotation eval addresses for each commitment.
@@ -781,10 +812,10 @@ pub(super) fn computations(
         // the same scratch region for the fused final MSM after the q_eval
         // folds have been persisted to Q_EVAL_SET_MPTR.
         //
-        // Sets with m < ROLL_THRESHOLD keep the unrolled emission (faster
-        // for tiny m where loop overhead dominates).
+        // Sets with m < Q_EVAL_ROLL_THRESHOLD, ragged rotation rows, or
+        // calldata-backed evals keep the unrolled emission. That preserves
+        // correctness if a future proof layout stops spilling evals to memory.
         // ------------------------------------------------------------------
-        const ROLL_THRESHOLD: usize = 4;
         let eval_src_table_mptr: usize = memory.pcs_q_eval_source_table_mptr;
 
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
@@ -810,10 +841,10 @@ pub(super) fn computations(
                 .map(|s| s.len())
                 .sum::<usize>();
 
-            if m >= ROLL_THRESHOLD {
+            if q_eval_strategy(commitments_in_set) == QEvalStrategy::Rolled {
                 // -------- Rolled path (Opt I + Opt J merged) ----------
                 lines.push(format!(
-                    "// q_eval_set[{set_idx}]: {m} commitment(s) (rolled, m>={ROLL_THRESHOLD})"
+                    "// q_eval_set[{set_idx}]: {m} commitment(s) (rolled, m>={Q_EVAL_ROLL_THRESHOLD})"
                 ));
 
                 // 1. Pre-stage source-eval addresses at EVAL_SRC_TABLE_MPTR.
@@ -823,16 +854,7 @@ pub(super) fn computations(
                 for (i, c) in commitments_in_set.iter().enumerate() {
                     debug_assert_eq!(c.evals.len(), n_rot);
                     for (k, ev) in c.evals.iter().enumerate() {
-                        // Each ev is a Word; for memory-anchored evals
-                        // (which is the case after H3) `ev.ptr()` renders
-                        // to the bare address. For calldata-anchored
-                        // evals we'd have to fall back to the unrolled
-                        // path; the default test fixtures all go through
-                        // REVERSED_EVALS_MPTR so this branch is hot.
-                        debug_assert!(
-                            matches!(ev.loc(), crate::codegen::util::Location::Memory),
-                            "rolled q_eval emission requires memory-anchored evals"
-                        );
+                        debug_assert!(matches!(ev.loc(), Location::Memory));
                         lines.push(format!(
                             "mstore({:#x}, {})",
                             eval_src_table_mptr + (i * n_rot + k) * WORD_BYTES,
@@ -895,7 +917,7 @@ pub(super) fn computations(
                     ));
                 }
             } else {
-                // -------- Unrolled path (preserved for m < ROLL_THRESHOLD) --
+                // -------- Unrolled path (preserved for non-rolled sets) --
                 lines.push(format!("// q_eval_set[{set_idx}]: {m} commitment(s)"));
 
                 // Fr-only eval accumulation in stack locals.
@@ -1574,6 +1596,49 @@ mod tests {
     }
     fn ev(off: usize) -> Word {
         Word::from(Ptr::memory(off))
+    }
+    fn calldata_ev(off: usize) -> Word {
+        Word::from(Ptr::calldata(off))
+    }
+
+    #[test]
+    fn q_eval_roll_strategy_is_single_source_for_planning_and_emission() {
+        assert_eq!(Q_EVAL_ROLL_THRESHOLD, 4);
+
+        let rolled = vec![
+            CommitmentEntry {
+                set_index: 0,
+                comm: pt(0x100),
+                evals: vec![ev(0x200), ev(0x220)],
+            },
+            CommitmentEntry {
+                set_index: 0,
+                comm: pt(0x180),
+                evals: vec![ev(0x240), ev(0x260)],
+            },
+            CommitmentEntry {
+                set_index: 0,
+                comm: pt(0x200),
+                evals: vec![ev(0x280), ev(0x2a0)],
+            },
+            CommitmentEntry {
+                set_index: 0,
+                comm: pt(0x280),
+                evals: vec![ev(0x2c0), ev(0x2e0)],
+            },
+        ];
+        let refs = rolled.iter().collect::<Vec<_>>();
+        assert_eq!(q_eval_strategy(&refs), QEvalStrategy::Rolled);
+
+        let mut calldata_backed = rolled.clone();
+        calldata_backed[3].evals[1] = calldata_ev(0x40);
+        let refs = calldata_backed.iter().collect::<Vec<_>>();
+        assert_eq!(q_eval_strategy(&refs), QEvalStrategy::Unrolled);
+
+        let mut ragged = rolled;
+        ragged[3].evals.pop();
+        let refs = ragged.iter().collect::<Vec<_>>();
+        assert_eq!(q_eval_strategy(&refs), QEvalStrategy::Unrolled);
     }
 
     #[test]

@@ -147,6 +147,47 @@ pub(crate) struct UserPhase {
     pub(crate) challenge_offset: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VkHeaderTemplateSlots {
+    pub(crate) vk_digest: usize,
+    pub(crate) num_instances: usize,
+    pub(crate) k: usize,
+    pub(crate) n_inv: usize,
+    pub(crate) omega: usize,
+    pub(crate) omega_inv: usize,
+    pub(crate) omega_inv_to_l: usize,
+    pub(crate) has_accumulator: usize,
+    pub(crate) acc_offset: usize,
+    pub(crate) num_acc_limbs: usize,
+    pub(crate) num_acc_limb_bits: usize,
+    pub(crate) g1_base: usize,
+    pub(crate) g2_base: usize,
+    pub(crate) neg_s_g2_base: usize,
+}
+
+impl Default for VkHeaderTemplateSlots {
+    fn default() -> Self {
+        use crate::codegen::layout::VkHeaderSlot as Slot;
+
+        Self {
+            vk_digest: Slot::VkDigest.word(),
+            num_instances: Slot::NumInstances.word(),
+            k: Slot::K.word(),
+            n_inv: Slot::NInv.word(),
+            omega: Slot::Omega.word(),
+            omega_inv: Slot::OmegaInv.word(),
+            omega_inv_to_l: Slot::OmegaInvToL.word(),
+            has_accumulator: Slot::HasAccumulator.word(),
+            acc_offset: Slot::AccOffset.word(),
+            num_acc_limbs: Slot::NumAccLimbs.word(),
+            num_acc_limb_bits: Slot::NumAccLimbBits.word(),
+            g1_base: Slot::G1Base.word(),
+            g2_base: Slot::G2Base.word(),
+            neg_s_g2_base: Slot::NegSG2Base.word(),
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "Halo2Verifier.sol")]
 pub(crate) struct Halo2Verifier {
@@ -158,15 +199,22 @@ pub(crate) struct Halo2Verifier {
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
+    pub(crate) limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) wide_limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) fr_delta: String,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
     pub(crate) proof_len: usize,
     pub(crate) memory: VerifierMemoryLayout,
+    pub(crate) vk_header: VkHeaderTemplateSlots,
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
     pub(crate) proof_cptr: Ptr,
+    pub(crate) abi_selector_bytes: usize,
+    pub(crate) abi_proof_head_offset: usize,
+    pub(crate) abi_instances_head_cptr: usize,
     /// Calldata byte offset of the `num_instances` length-prefix word
     /// that ABI-encodes the `instances` array. Equals
     /// `proof_cptr + proof_len` (in bytes). Materialised as a separate
@@ -236,6 +284,10 @@ pub(crate) struct Halo2Verifier {
     /// into a Yul snippet that adds `S_i_com * sel_acc_i` to the
     /// linearization commitment after Q_folded is scaled by (1-x^n).
     pub(crate) simple_selector_cols: Vec<usize>,
+    pub(crate) proof_commit_trace_base: usize,
+    pub(crate) proof_eval_trace_base: usize,
+    pub(crate) quotient_identity_trace_base: u64,
+    pub(crate) selector_trace_base: usize,
     /// Memory pointer base for the embedded VK fixed commitments. Used
     /// to resolve per-column G1 offsets in the simple-selector MSM.
     pub(crate) fixed_comm_mptr: usize,
@@ -294,6 +346,9 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
+    pub(crate) limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) wide_limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) fr_delta: String,
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
@@ -309,6 +364,7 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) quotient_native_trash_computation: Vec<String>,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) simple_selector_cols: Vec<usize>,
+    pub(crate) quotient_identity_trace_base: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -533,7 +589,7 @@ mod tests {
     }
 
     fn synthetic_verifier() -> Halo2Verifier {
-        let proof_cptr = 0x64usize;
+        let proof_cptr = crate::codegen::layout::abi::VERIFY_PROOF_PROOF_CPTR;
         let total_advices = 2usize;
         let num_lookups = 1usize;
         let num_permutation_zs = 1usize;
@@ -567,15 +623,22 @@ mod tests {
             quotient_pow5_helper: false,
             quotient_limb7_helper: false,
             quotient_wide_limb7_helper: false,
+            limb7_yul_coeffs: crate::codegen::quotient::LIMB7_YUL_COEFFS,
+            wide_limb7_yul_coeffs: crate::codegen::quotient::WIDE_LIMB7_YUL_COEFFS,
+            fr_delta: crate::codegen::quotient::fr_delta_literal(),
             embedded_vk: None,
             expected_vk_codehash: Some(U256::from(1u64)),
             vk_len: 0,
             proof_len,
             memory,
+            vk_header: Default::default(),
             vk_mptr: Ptr::memory(0x1000),
             challenge_mptr: Ptr::memory(0x1200),
             theta_mptr: Ptr::memory(0x1300),
             proof_cptr: Ptr::calldata(proof_cptr),
+            abi_selector_bytes: crate::codegen::layout::abi::SELECTOR_BYTES,
+            abi_proof_head_offset: crate::codegen::layout::abi::VERIFY_PROOF_PROOF_HEAD_OFFSET,
+            abi_instances_head_cptr: crate::codegen::layout::abi::SELECTOR_BYTES + WORD_BYTES,
             num_instance_cptr: proof_cptr + proof_len,
             instance_cptr: proof_cptr + proof_len + WORD_BYTES,
             quotient_comm_cptr: Ptr::calldata(proof_cptr + non_quotient_g1s * G1_BYTES),
@@ -609,6 +672,10 @@ mod tests {
             quotient_program: None,
             pcs_computations: vec![],
             simple_selector_cols: vec![],
+            proof_commit_trace_base: crate::codegen::layout::trace::PROOF_COMMIT_BASE,
+            proof_eval_trace_base: crate::codegen::layout::trace::PROOF_EVAL_BASE,
+            quotient_identity_trace_base: crate::codegen::layout::trace::QUOTIENT_IDENTITY_BASE,
+            selector_trace_base: crate::codegen::layout::trace::SELECTOR_FOLD_BASE,
             fixed_comm_mptr: 0,
             truncated_challenges: false,
             fewer_point_sets: false,

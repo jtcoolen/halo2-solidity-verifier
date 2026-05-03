@@ -38,6 +38,7 @@ mod artifact;
 mod config;
 mod evaluator;
 mod generator;
+mod layout;
 mod memory;
 mod pcs;
 mod protocol;
@@ -772,11 +773,15 @@ mod tests {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 
         assert!(
-            verifier_template.contains("eq(calldataload(0x04), 0x40)"),
+            verifier_template.contains(
+                "eq(calldataload({{ abi_selector_bytes|hex() }}), {{ abi_proof_head_offset|hex() }})"
+            ),
             "verifier must read the proof dynamic ABI head"
         );
         assert!(
-            verifier_template.contains("eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4))"),
+            verifier_template.contains(
+                "eq(calldataload({{ abi_instances_head_cptr|hex() }}), sub(NUM_INSTANCE_CPTR, {{ abi_selector_bytes|hex() }}))"
+            ),
             "verifier must read the instances dynamic ABI head"
         );
     }
@@ -880,7 +885,7 @@ mod tests {
             ("pairing lhs input", "trace_point(27,"),
             ("pairing rhs input", "trace_point(28,"),
             ("final result", "trace_u256(35,"),
-            ("selector folds", "60000 + loop.index0"),
+            ("selector folds", "selector_trace_base + loop.index0"),
         ] {
             assert!(
                 verifier_template.contains(needle),
@@ -889,12 +894,40 @@ mod tests {
         }
 
         for (name, needle) in [
-            ("serialized PCS point sets", "41_000 + set_idx"),
+            (
+                "serialized PCS point sets",
+                "trace::PCS_SERIALIZED_POINT_SET_BASE + set_idx as u64",
+            ),
             ("PCS q_com commitments", "40000 + set_idx"),
         ] {
             assert!(
                 pcs_source.contains(needle),
                 "PCS emitter missing {name} trace hook"
+            );
+        }
+    }
+
+    #[test]
+    fn quotient_vm_opcode_and_token_tables_match_template_cases() {
+        let quotient_template = include_str!("../../templates/QuotientNumeratorBlock.yul");
+
+        for (name, opcode) in QUOTIENT_OPCODE_TABLE {
+            let needle = format!("case {opcode:#04x}");
+            assert!(
+                quotient_template.contains(&needle),
+                "quotient VM template missing opcode {name} ({opcode:#04x})"
+            );
+        }
+        assert!(
+            !quotient_template.contains("case 0x1a"),
+            "stale native-trash opcode must not remain in quotient VM template"
+        );
+
+        for (name, token) in QUOTIENT_MEM_TOKEN_TABLE {
+            let needle = format!("case {token:#04x} {{ q_ptr := {name}");
+            assert!(
+                quotient_template.contains(&needle),
+                "quotient VM template missing memory token {name} ({token:#04x})"
             );
         }
     }

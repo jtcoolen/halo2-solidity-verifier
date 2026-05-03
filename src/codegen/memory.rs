@@ -18,49 +18,17 @@
 //! rules for changing it.
 
 use crate::codegen::{
+    layout::{theta_window, ThetaSlot},
     template::Halo2VerifyingKey,
     util::{ConstraintSystemMeta, Ptr},
 };
 use std::collections::BTreeMap;
 
-/// EVM word size. BLS12-381 Fr values are rendered as one canonical
-/// big-endian EVM word in calldata/memory.
-pub(crate) const WORD_BYTES: usize = 0x20;
-/// Number of EVM words in one Fr scalar.
-pub(crate) const FR_WORDS: usize = 1;
-/// EIP-2537 padded G1 encoding: x_hi, x_lo, y_hi, y_lo.
-pub(crate) const G1_WORDS: usize = 4;
-/// EIP-2537 padded G2 encoding: four Fp2 coordinates, two words each.
-pub(crate) const G2_WORDS: usize = 8;
-pub(crate) const FR_BYTES: usize = FR_WORDS * WORD_BYTES;
-pub(crate) const G1_BYTES: usize = G1_WORDS * WORD_BYTES;
-pub(crate) const G2_BYTES: usize = G2_WORDS * WORD_BYTES;
-/// EIP-2537 G1MSM input tuple: one padded G1 plus one scalar.
-pub(crate) const G1_MSM_PAIR_BYTES: usize = G1_BYTES + FR_BYTES;
-/// EIP-2537 G1ADD input tuple: two padded G1 points.
-pub(crate) const G1ADD_INPUT_BYTES: usize = 2 * G1_BYTES;
-/// EVM modexp frame for 32-byte base, exponent, and modulus.
-///
-/// Layout: three 32-byte length words followed by base, exponent, modulus.
-pub(crate) const MODEXP_FRAME_BYTES: usize = 0xc0;
-/// Historical low-memory reservation used by scalar inversion helpers near
-/// `VK_MPTR`. It is larger than the frame because older code treated the
-/// surrounding 0x100-byte window as scratch; keep the same distance from
-/// `VK_MPTR` when checking overlaps.
-pub(crate) const MODEXP_SCRATCH_BYTES: usize = 0x100;
-/// EIP-2537 pairing precompile input for one `(G1, G2)` pair.
-pub(crate) const PAIRING_PAIR_BYTES: usize = G1_BYTES + G2_BYTES;
-/// Two-pair KZG pairing input: `(rhs, G2)` and `(lhs, -sG2)`.
-pub(crate) const PAIRING_TWO_PAIR_BYTES: usize = 2 * PAIRING_PAIR_BYTES;
-/// Historical floor for the accumulator MSM input buffer.
-///
-/// The accumulator path used a fixed `0x7000` scratch base before the planner.
-/// Preserve that address whenever the decompressed commitment payload ends
-/// below it, so generated verifier byte addresses stay stable. Larger circuits
-/// move the scratch up to `after_comms`.
-pub(crate) const ACC_MSM_MIN_SCRATCH_BYTES: usize = 0x7000;
-/// Static low-memory working set required by the PCS pairing helpers.
-pub(crate) const PCS_STATIC_WORKING_WORDS: usize = 32;
+pub(crate) use crate::codegen::layout::{
+    ACC_MSM_MIN_SCRATCH_BYTES, G1ADD_INPUT_BYTES, G1_BYTES, G1_MSM_PAIR_BYTES, G1_WORDS,
+    MODEXP_FRAME_BYTES, MODEXP_SCRATCH_BYTES, PAIRING_PAIR_BYTES, PAIRING_TWO_PAIR_BYTES,
+    PCS_STATIC_WORKING_WORDS, WORD_BYTES,
+};
 /// Accumulator pairing-batch hash frame.
 ///
 /// The template starts this frame at `0x100`, writes a one-word domain tag,
@@ -91,13 +59,13 @@ const ACCUMULATOR_PAIRING_BATCH_BYTES: usize =
 //   40..44      final_com G1
 //   44..48      pairing lhs G1
 //   48..52      pairing rhs G1
-const ROT_POINTS_OFFSET_WORDS: usize = 52;
-const X1_POWERS_OFFSET_WORDS: usize = 80;
-const Q_COM_OFFSET_WORDS: usize = 145;
-const Q_EVAL_SET_OFFSET_WORDS: usize = 145;
-const Q_EVAL_CPTR_OFFSET_WORDS: usize = 201;
-const G1_IDENTITY_OFFSET_WORDS: usize = 209;
-const REVERSED_EVALS_OFFSET_WORDS: usize = 220;
+const ROT_POINTS_OFFSET_WORDS: usize = theta_window::ROT_POINTS_WORD;
+const X1_POWERS_OFFSET_WORDS: usize = theta_window::X1_POWERS_WORD;
+const Q_COM_OFFSET_WORDS: usize = theta_window::Q_COM_WORD;
+const Q_EVAL_SET_OFFSET_WORDS: usize = theta_window::Q_EVAL_SET_WORD;
+const Q_EVAL_CPTR_OFFSET_WORDS: usize = theta_window::Q_EVAL_CPTR_WORD;
+const G1_IDENTITY_OFFSET_WORDS: usize = theta_window::G1_IDENTITY_WORD;
+const REVERSED_EVALS_OFFSET_WORDS: usize = theta_window::REVERSED_EVALS_WORD;
 
 // Capacities of the historical PCS fixed windows above. Validation fails when
 // a circuit would exceed one of these windows rather than silently overwriting
@@ -537,9 +505,9 @@ impl VerifierMemoryLayout {
             MemoryLifetime::Permanent,
         );
         let challenge_mptr = Ptr::memory(challenge_start);
-        let theta_mptr = Ptr::memory(theta_start);
         let at_theta = |words: usize| theta_start + words * WORD_BYTES;
-        let ptr_at_theta = |words: usize| Ptr::memory(at_theta(words));
+        let ptr_at_theta = |slot: ThetaSlot| Ptr::memory(at_theta(slot.word()));
+        let theta_mptr = ptr_at_theta(ThetaSlot::Theta);
 
         let total_advices: usize = meta.num_user_advices.iter().sum();
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
@@ -712,32 +680,32 @@ impl VerifierMemoryLayout {
             vk_mptr,
             challenge_mptr,
             theta_mptr,
-            beta_mptr: ptr_at_theta(1),
-            gamma_mptr: ptr_at_theta(2),
-            trash_challenge_mptr: ptr_at_theta(3),
-            y_mptr: ptr_at_theta(4),
-            x_mptr: ptr_at_theta(5),
-            x1_mptr: ptr_at_theta(6),
-            x2_mptr: ptr_at_theta(7),
-            x3_mptr: ptr_at_theta(8),
-            x4_mptr: ptr_at_theta(9),
-            f_com_mptr: ptr_at_theta(10),
-            pi_mptr: ptr_at_theta(14),
-            acc_lhs_mptr: ptr_at_theta(18),
-            acc_rhs_mptr: ptr_at_theta(22),
-            x_n_mptr: ptr_at_theta(26),
-            x_n_minus_1_inv_mptr: ptr_at_theta(27),
-            l_last_mptr: ptr_at_theta(28),
-            l_blind_mptr: ptr_at_theta(29),
-            l_0_mptr: ptr_at_theta(30),
-            instance_eval_mptr: ptr_at_theta(31),
-            quotient_eval_mptr: ptr_at_theta(32),
-            quotient_mptr: ptr_at_theta(33),
-            f_eval_mptr: ptr_at_theta(38),
-            v_mptr: ptr_at_theta(39),
-            final_com_mptr: ptr_at_theta(40),
-            pairing_lhs_mptr: ptr_at_theta(44),
-            pairing_rhs_mptr: ptr_at_theta(48),
+            beta_mptr: ptr_at_theta(ThetaSlot::Beta),
+            gamma_mptr: ptr_at_theta(ThetaSlot::Gamma),
+            trash_challenge_mptr: ptr_at_theta(ThetaSlot::TrashChallenge),
+            y_mptr: ptr_at_theta(ThetaSlot::Y),
+            x_mptr: ptr_at_theta(ThetaSlot::X),
+            x1_mptr: ptr_at_theta(ThetaSlot::X1),
+            x2_mptr: ptr_at_theta(ThetaSlot::X2),
+            x3_mptr: ptr_at_theta(ThetaSlot::X3),
+            x4_mptr: ptr_at_theta(ThetaSlot::X4),
+            f_com_mptr: ptr_at_theta(ThetaSlot::FCom),
+            pi_mptr: ptr_at_theta(ThetaSlot::Pi),
+            acc_lhs_mptr: ptr_at_theta(ThetaSlot::AccLhs),
+            acc_rhs_mptr: ptr_at_theta(ThetaSlot::AccRhs),
+            x_n_mptr: ptr_at_theta(ThetaSlot::XN),
+            x_n_minus_1_inv_mptr: ptr_at_theta(ThetaSlot::XNMinus1Inv),
+            l_last_mptr: ptr_at_theta(ThetaSlot::LLast),
+            l_blind_mptr: ptr_at_theta(ThetaSlot::LBlind),
+            l_0_mptr: ptr_at_theta(ThetaSlot::L0),
+            instance_eval_mptr: ptr_at_theta(ThetaSlot::InstanceEval),
+            quotient_eval_mptr: ptr_at_theta(ThetaSlot::QuotientEval),
+            quotient_mptr: ptr_at_theta(ThetaSlot::Quotient),
+            f_eval_mptr: ptr_at_theta(ThetaSlot::FEval),
+            v_mptr: ptr_at_theta(ThetaSlot::V),
+            final_com_mptr: ptr_at_theta(ThetaSlot::FinalCom),
+            pairing_lhs_mptr: ptr_at_theta(ThetaSlot::PairingLhs),
+            pairing_rhs_mptr: ptr_at_theta(ThetaSlot::PairingRhs),
             rot_points_mptr,
             x1_powers_mptr,
             q_com_mptr,
@@ -921,7 +889,9 @@ mod tests {
     fn synthetic_vk() -> Halo2VerifyingKey {
         let fixed: Vec<G1Words> = vec![(U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO)];
         Halo2VerifyingKey {
-            constants: (0..31).map(|_| ("c", U256::ZERO)).collect(),
+            constants: (0..crate::codegen::layout::VK_HEADER_WORDS)
+                .map(|_| ("c", U256::ZERO))
+                .collect(),
             fixed_comms: fixed,
             permutation_comms: vec![],
             quotient_const_offset_words: None,
@@ -954,31 +924,31 @@ mod tests {
 
         assert_eq!(
             layout.rot_points_mptr.value().as_usize(),
-            theta + 52 * WORD_BYTES
+            theta + theta_window::ROT_POINTS_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.x1_powers_mptr.value().as_usize(),
-            theta + 80 * WORD_BYTES
+            theta + theta_window::X1_POWERS_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.q_eval_set_mptr.value().as_usize(),
-            theta + 145 * WORD_BYTES
+            theta + theta_window::Q_EVAL_SET_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.q_eval_cptr_mptr.value().as_usize(),
-            theta + 201 * WORD_BYTES
+            theta + theta_window::Q_EVAL_CPTR_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.g1_identity_mptr.value().as_usize(),
-            theta + 209 * WORD_BYTES
+            theta + theta_window::G1_IDENTITY_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.reversed_evals_mptr.value().as_usize(),
-            theta + 220 * WORD_BYTES
+            theta + theta_window::REVERSED_EVALS_WORD * WORD_BYTES
         );
         assert_eq!(
             layout.comms_mptr_base.value().as_usize(),
-            theta + (220 + meta.num_evals) * WORD_BYTES
+            theta + (theta_window::REVERSED_EVALS_WORD + meta.num_evals) * WORD_BYTES
         );
     }
 

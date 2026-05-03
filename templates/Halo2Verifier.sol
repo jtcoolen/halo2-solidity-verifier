@@ -73,20 +73,20 @@ contract Halo2Verifier {
     // per-stage scratch (theta_mptr..).
     // ----------------------------------------------------------------------
     uint256 internal constant                VK_MPTR = {{ memory.vk_mptr }};
-    uint256 internal constant         VK_DIGEST_MPTR = {{ memory.vk_mptr }};
-    uint256 internal constant     NUM_INSTANCES_MPTR = {{ memory.vk_mptr + 1 }};
-    uint256 internal constant                 K_MPTR = {{ memory.vk_mptr + 2 }};
-    uint256 internal constant             N_INV_MPTR = {{ memory.vk_mptr + 3 }};
-    uint256 internal constant             OMEGA_MPTR = {{ memory.vk_mptr + 4 }};
-    uint256 internal constant         OMEGA_INV_MPTR = {{ memory.vk_mptr + 5 }};
-    uint256 internal constant    OMEGA_INV_TO_L_MPTR = {{ memory.vk_mptr + 6 }};
-    uint256 internal constant   HAS_ACCUMULATOR_MPTR = {{ memory.vk_mptr + 7 }};
-    uint256 internal constant        ACC_OFFSET_MPTR = {{ memory.vk_mptr + 8 }};
-    uint256 internal constant     NUM_ACC_LIMBS_MPTR = {{ memory.vk_mptr + 9 }};
-    uint256 internal constant NUM_ACC_LIMB_BITS_MPTR = {{ memory.vk_mptr + 10 }};
-    uint256 internal constant            G1_BASE_MPTR = {{ memory.vk_mptr + 11 }};
-    uint256 internal constant            G2_BASE_MPTR = {{ memory.vk_mptr + 15 }};
-    uint256 internal constant      NEG_S_G2_BASE_MPTR = {{ memory.vk_mptr + 23 }};
+    uint256 internal constant         VK_DIGEST_MPTR = {{ memory.vk_mptr + vk_header.vk_digest }};
+    uint256 internal constant     NUM_INSTANCES_MPTR = {{ memory.vk_mptr + vk_header.num_instances }};
+    uint256 internal constant                 K_MPTR = {{ memory.vk_mptr + vk_header.k }};
+    uint256 internal constant             N_INV_MPTR = {{ memory.vk_mptr + vk_header.n_inv }};
+    uint256 internal constant             OMEGA_MPTR = {{ memory.vk_mptr + vk_header.omega }};
+    uint256 internal constant         OMEGA_INV_MPTR = {{ memory.vk_mptr + vk_header.omega_inv }};
+    uint256 internal constant    OMEGA_INV_TO_L_MPTR = {{ memory.vk_mptr + vk_header.omega_inv_to_l }};
+    uint256 internal constant   HAS_ACCUMULATOR_MPTR = {{ memory.vk_mptr + vk_header.has_accumulator }};
+    uint256 internal constant        ACC_OFFSET_MPTR = {{ memory.vk_mptr + vk_header.acc_offset }};
+    uint256 internal constant     NUM_ACC_LIMBS_MPTR = {{ memory.vk_mptr + vk_header.num_acc_limbs }};
+    uint256 internal constant NUM_ACC_LIMB_BITS_MPTR = {{ memory.vk_mptr + vk_header.num_acc_limb_bits }};
+    uint256 internal constant            G1_BASE_MPTR = {{ memory.vk_mptr + vk_header.g1_base }};
+    uint256 internal constant            G2_BASE_MPTR = {{ memory.vk_mptr + vk_header.g2_base }};
+    uint256 internal constant      NEG_S_G2_BASE_MPTR = {{ memory.vk_mptr + vk_header.neg_s_g2_base }};
 
     uint256 internal constant CHALLENGE_MPTR = {{ memory.challenge_mptr }};
 
@@ -330,7 +330,7 @@ contract Halo2Verifier {
         uint256[] calldata instances
     ) external {%- if self.trace || self.gas_checkpoints %} returns (bool) {%- else %} view returns (bool) {%- endif %} {
         assembly ("memory-safe") {
-            if iszero(and(eq(calldataload(0x04), 0x40), eq(calldataload(0x24), sub(NUM_INSTANCE_CPTR, 4)))) {
+            if iszero(and(eq(calldataload({{ abi_selector_bytes|hex() }}), {{ abi_proof_head_offset|hex() }}), eq(calldataload({{ abi_instances_head_cptr|hex() }}), sub(NUM_INSTANCE_CPTR, {{ abi_selector_bytes|hex() }})))) {
                 revert(0, 0)
             }
         }
@@ -417,12 +417,13 @@ contract Halo2Verifier {
             // generated 7-limb basis. It is used for normalization and the
             // sum_x/sum_y/sum_z pieces of multiplication.
             function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
-                z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x400000000, x3, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x40000000000000000000000, x4, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x1000, x5, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x100000000000000000, x6, FR_MODULUS), FR_MODULUS)
+                {%- for coeff in limb7_yul_coeffs %}
+                {%- if loop.first %}
+                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, FR_MODULUS), FR_MODULUS)
+                {%- else %}
+                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, FR_MODULUS), FR_MODULUS)
+                {%- endif %}
+                {%- endfor %}
             }
 
             {%- endif %}
@@ -438,12 +439,13 @@ contract Halo2Verifier {
             // Native multiplication callbacks group repeated 7-term slices of
             // the double-base product-convolution basis into q_limb7_wide.
             function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
-                z := addmod(x0, mulmod(0x100000000000000, x1, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x10000000000000000000000000000, x2, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x1000000000000000000000000000000000000000000, x3, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x100000000000000000000000000000000000000000000000000000000, x4, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x6bc66e553973f396854f5626172ba135587d41e37a68209402355093fdcaaf6c, x5, FR_MODULUS), FR_MODULUS)
-                z := addmod(z, mulmod(0x63f31e3f446953960c9d6964474300df43ab29179970f642a28e39d6c883c74b, x6, FR_MODULUS), FR_MODULUS)
+                {%- for coeff in wide_limb7_yul_coeffs %}
+                {%- if loop.first %}
+                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, FR_MODULUS), FR_MODULUS)
+                {%- else %}
+                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, FR_MODULUS), FR_MODULUS)
+                {%- endif %}
+                {%- endfor %}
             }
 
             {%- endif %}
@@ -1081,8 +1083,8 @@ contract Halo2Verifier {
             let proof_cptr := PROOF_CPTR
             let advice_walk := ADVICE_COMMS_MPTR_BASE
             {%- if self.trace %}
-            let proof_commit_trace_id := 10000
-            let proof_eval_trace_id := 20000
+            let proof_commit_trace_id := {{ proof_commit_trace_base }}
+            let proof_eval_trace_id := {{ proof_eval_trace_base }}
             {%- endif %}
 
             {%- for phase in user_phases %}
@@ -1775,7 +1777,7 @@ contract Halo2Verifier {
             trace_point(33, FINAL_COM_MPTR)
             trace_u256(35, success)
             {%- for _ in simple_selector_cols %}
-            trace_u256({{ 60000 + loop.index0 }}, mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 32)|hex() }})))
+            trace_u256({{ selector_trace_base + loop.index0 }}, mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 32)|hex() }})))
             {%- endfor %}
             if mload(HAS_ACCUMULATOR_MPTR) {
                 trace_point(29, ACC_LHS_MPTR)

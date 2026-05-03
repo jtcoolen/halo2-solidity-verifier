@@ -246,7 +246,12 @@ mod tests {
     #[test]
     fn vk_payload_layout_rejects_duplicate_sections() {
         let mut layout = VkPayloadLayout::new();
-        layout.reserve(PayloadSectionKind::Header, 31).unwrap();
+        layout
+            .reserve(
+                PayloadSectionKind::Header,
+                crate::codegen::layout::VK_HEADER_WORDS,
+            )
+            .unwrap();
         let err = layout
             .reserve(PayloadSectionKind::Header, 1)
             .expect_err("duplicate section rejected");
