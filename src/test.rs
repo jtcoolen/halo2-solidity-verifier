@@ -2,13 +2,20 @@ use crate::{
     compile_solidity, encode_calldata, CallOutcome, Evm, SolidityGenerator, FN_SIG_VERIFY_PROOF,
 };
 use ff::Field;
+use group::Group as _;
 use midnight_circuits::{
     hash::poseidon::PoseidonChip,
     instructions::{hash::HashCPU, AssignmentInstructions, PublicInputInstructions},
 };
+use midnight_curves::{Bls12, G1Projective};
 use midnight_proofs::{
-    circuit::{Layouter, Value},
-    plonk::Error,
+    circuit::{Layouter, SimpleFloorPlanner, Value},
+    plonk::{
+        create_proof, keygen_pk, keygen_vk_with_k, prepare, Advice, Circuit, Column,
+        ConstraintSystem, Constraints, Error, Expression, Fixed, SecondPhase, Selector,
+    },
+    poly::{commitment::Guard as _, kzg::KZGCommitmentScheme, Rotation},
+    transcript::{CircuitTranscript, Transcript},
 };
 use midnight_zk_stdlib::{
     setup_vk, utils::plonk_api::srs_for_test, MidnightVK, Relation, ZkStdLib, ZkStdLibArch,
@@ -112,6 +119,387 @@ fn prague_evm_runs_eip2537_identity_smoke_tests() {
         [vec![0; 31], vec![1]].concat(),
         "EIP-2537 pairing identity input should return true"
     );
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ShapeFuzzSpec {
+    next_rotation: bool,
+    second_phase: bool,
+    permutation: bool,
+    lookup: bool,
+    additive_selector: bool,
+    complex_selector: bool,
+    fixed_scale: bool,
+    tag: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShapeFuzzCase {
+    name: &'static str,
+    k: u32,
+    spec: ShapeFuzzSpec,
+    seed: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ShapeFuzzConfig {
+    a: Column<Advice>,
+    b: Column<Advice>,
+    out: Column<Advice>,
+    phase2: Option<Column<Advice>>,
+    fixed_scale: Option<Column<Fixed>>,
+    lookup_table: Option<Column<Fixed>>,
+    selector: Selector,
+}
+
+#[derive(Clone, Debug)]
+struct ShapeFuzzCircuit {
+    spec: ShapeFuzzSpec,
+    a: F,
+    b: F,
+}
+
+impl ShapeFuzzCircuit {
+    fn new(spec: ShapeFuzzSpec, seed: u64) -> Self {
+        let a = F::from(seed.wrapping_mul(17).wrapping_add(5));
+        let b = F::from(seed.wrapping_mul(29).wrapping_add(11));
+        Self { spec, a, b }
+    }
+
+    fn out(&self) -> F {
+        self.a + self.b + F::from(self.spec.tag + 19)
+    }
+
+    fn public_instance(&self) -> F {
+        self.out() - self.a - self.b
+    }
+
+    fn next_a(&self) -> F {
+        self.a + F::from(self.spec.tag + 7)
+    }
+
+    fn phase2_value(&self) -> F {
+        self.out() + F::from(self.spec.tag + 23)
+    }
+}
+
+impl Circuit<F> for ShapeFuzzCircuit {
+    type Config = ShapeFuzzConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+    type Params = ShapeFuzzSpec;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            spec: self.spec,
+            a: F::ZERO,
+            b: F::ZERO,
+        }
+    }
+
+    fn params(&self) -> Self::Params {
+        self.spec
+    }
+
+    fn configure(_meta: &mut ConstraintSystem<F>) -> Self::Config {
+        unreachable!("ShapeFuzzCircuit is always configured with explicit params")
+    }
+
+    fn configure_with_params(meta: &mut ConstraintSystem<F>, spec: Self::Params) -> Self::Config {
+        let a = meta.advice_column();
+        let b = meta.advice_column();
+        let out = meta.advice_column();
+        let phase2 = spec
+            .second_phase
+            .then(|| meta.advice_column_in(SecondPhase));
+        let fixed_scale = spec.fixed_scale.then(|| meta.fixed_column());
+        let lookup_table = spec.lookup.then(|| meta.fixed_column());
+        let committed_instance = meta.instance_column();
+        let public_instance = meta.instance_column();
+
+        if spec.permutation {
+            for column in [a, b, out] {
+                meta.enable_equality(column);
+            }
+        }
+
+        let selector = if spec.additive_selector || spec.complex_selector || spec.lookup {
+            meta.complex_selector()
+        } else {
+            meta.selector()
+        };
+
+        meta.create_gate("shape-fuzz arithmetic", |meta| {
+            let a_cur = meta.query_advice(a, Rotation::cur());
+            let b_cur = meta.query_advice(b, Rotation::cur());
+            let out_cur = meta.query_advice(out, Rotation::cur());
+            let committed = meta.query_instance(committed_instance, Rotation::cur());
+            let public = meta.query_instance(public_instance, Rotation::cur());
+
+            let mut balance = a_cur.clone() + b_cur + public + committed - out_cur.clone();
+            if let Some(scale) = fixed_scale {
+                balance = meta.query_fixed(scale, Rotation::cur()) * balance;
+            }
+
+            let mut constraints = vec![("public balance", balance)];
+            if spec.next_rotation {
+                constraints.push((
+                    "next rotation",
+                    meta.query_advice(a, Rotation::next())
+                        - a_cur
+                        - Expression::Constant(F::from(spec.tag + 7)),
+                ));
+            }
+            if let Some(phase2) = phase2 {
+                constraints.push((
+                    "second phase",
+                    meta.query_advice(phase2, Rotation::cur())
+                        - out_cur
+                        - Expression::Constant(F::from(spec.tag + 23)),
+                ));
+            }
+
+            if spec.additive_selector {
+                Constraints::with_additive_selector(selector, constraints)
+            } else {
+                Constraints::with_selector(selector, constraints)
+            }
+        });
+
+        if let Some(table) = lookup_table {
+            meta.lookup_any("shape-fuzz lookup", Some(selector), |meta| {
+                vec![(
+                    meta.query_advice(a, Rotation::cur()),
+                    meta.query_fixed(table, Rotation::cur()),
+                )]
+            });
+        }
+
+        ShapeFuzzConfig {
+            a,
+            b,
+            out,
+            phase2,
+            fixed_scale,
+            lookup_table,
+            selector,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "shape-fuzz witness",
+            |mut region| {
+                config.selector.enable(&mut region, 0)?;
+                region.assign_advice(|| "a", config.a, 0, || Value::known(self.a))?;
+                region.assign_advice(|| "b", config.b, 0, || Value::known(self.b))?;
+                region.assign_advice(|| "out", config.out, 0, || Value::known(self.out()))?;
+
+                if self.spec.next_rotation {
+                    region.assign_advice(
+                        || "a next",
+                        config.a,
+                        1,
+                        || Value::known(self.next_a()),
+                    )?;
+                }
+                if let Some(column) = config.phase2 {
+                    region.assign_advice(
+                        || "second phase value",
+                        column,
+                        0,
+                        || Value::known(self.phase2_value()),
+                    )?;
+                }
+                if let Some(column) = config.fixed_scale {
+                    region.assign_fixed(|| "fixed scale", column, 0, || Value::known(F::ONE))?;
+                }
+                if let Some(column) = config.lookup_table {
+                    region.assign_fixed(
+                        || "lookup table value",
+                        column,
+                        0,
+                        || Value::known(self.a),
+                    )?;
+                }
+
+                if self.spec.permutation {
+                    let copied = region.assign_advice(
+                        || "permutation source",
+                        config.a,
+                        2,
+                        || Value::known(self.b),
+                    )?;
+                    copied.copy_advice(|| "permutation target", &mut region, config.b, 3)?;
+                }
+
+                Ok(())
+            },
+        )
+    }
+}
+
+#[test]
+fn supported_shape_circuit_fuzz_e2e() {
+    if !shape_fuzz_inputs_available_for_evm() {
+        return;
+    }
+
+    let cases = [
+        ShapeFuzzCase {
+            name: "simple-selector current-row fixed-scale",
+            k: 5,
+            seed: 101,
+            spec: ShapeFuzzSpec {
+                fixed_scale: true,
+                tag: 1,
+                ..ShapeFuzzSpec::default()
+            },
+        },
+        ShapeFuzzCase {
+            name: "next-rotation permutation",
+            k: 5,
+            seed: 202,
+            spec: ShapeFuzzSpec {
+                next_rotation: true,
+                permutation: true,
+                tag: 2,
+                ..ShapeFuzzSpec::default()
+            },
+        },
+        ShapeFuzzCase {
+            name: "second-phase lookup",
+            k: 5,
+            seed: 303,
+            spec: ShapeFuzzSpec {
+                second_phase: true,
+                lookup: true,
+                fixed_scale: true,
+                tag: 3,
+                ..ShapeFuzzSpec::default()
+            },
+        },
+        ShapeFuzzCase {
+            name: "trash-additive selector with lookup",
+            k: 5,
+            seed: 404,
+            spec: ShapeFuzzSpec {
+                next_rotation: true,
+                lookup: true,
+                additive_selector: true,
+                fixed_scale: true,
+                tag: 4,
+                ..ShapeFuzzSpec::default()
+            },
+        },
+    ];
+
+    let requested = env::var("SHAPE_FUZZ_CASES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(cases.len())
+        .min(cases.len());
+
+    for case in cases.iter().take(requested) {
+        run_supported_shape_fuzz_case(case);
+    }
+}
+
+fn run_supported_shape_fuzz_case(case: &ShapeFuzzCase) {
+    let circuit = ShapeFuzzCircuit::new(case.spec, case.seed);
+    let mut setup_rng = ChaCha8Rng::seed_from_u64(case.seed ^ 0x5eed_5eed);
+    let params = PoseidonParams::unsafe_setup(case.k, &mut setup_rng);
+    let vk = keygen_vk_with_k::<F, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, case.k)
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` vk generation failed: {err:?}", case.name));
+    let pk = keygen_pk(vk, &circuit)
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` pk generation failed: {err:?}", case.name));
+
+    let committed = [F::ZERO];
+    let public = [circuit.public_instance()];
+    let all_instance_columns: [&[F]; 2] = [&committed, &public];
+    let mut proof_rng = ChaCha8Rng::seed_from_u64(case.seed ^ 0x0bad_f00d);
+    let mut transcript = CircuitTranscript::<sha3::Keccak256>::init();
+    create_proof::<F, KZGCommitmentScheme<Bls12>, _, _>(
+        &params,
+        &pk,
+        std::slice::from_ref(&circuit),
+        1,
+        &[&all_instance_columns],
+        &mut proof_rng,
+        &mut transcript,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "shape fuzz `{}` proof generation failed: {err:?}",
+            case.name
+        )
+    });
+    let compressed_proof = transcript.finalize();
+
+    let committed_pi = [G1Projective::identity()];
+    let public_columns: [&[F]; 1] = [&public];
+    let mut transcript = CircuitTranscript::<sha3::Keccak256>::init_from_bytes(&compressed_proof);
+    let guard = prepare::<F, KZGCommitmentScheme<Bls12>, CircuitTranscript<sha3::Keccak256>>(
+        pk.get_vk(),
+        &[&committed_pi],
+        &[&public_columns],
+        &mut transcript,
+    )
+    .unwrap_or_else(|err| panic!("shape fuzz `{}` native prepare failed: {err:?}", case.name));
+    transcript.assert_empty().unwrap_or_else(|_| {
+        panic!(
+            "shape fuzz `{}` native transcript had trailing bytes",
+            case.name
+        )
+    });
+    guard
+        .verify(&params.verifier_params())
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` native verify failed: {err:?}", case.name));
+
+    let generator = SolidityGenerator::new(&params, pk.get_vk(), public.len(), 1);
+    let (verifier_solidity, vk_solidity) = generator
+        .render_separately()
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` render failed: {err:?}", case.name));
+    let repacked_proof = generator.repack_compressed_proof(&compressed_proof);
+    let mut deployed = deploy_separate_verifier_from_sources(&verifier_solidity, &vk_solidity);
+
+    assert_solidity_accepts(
+        call_deployed_verifier(&mut deployed, &repacked_proof, &public),
+        &format!("shape fuzz `{}` valid proof", case.name),
+    );
+
+    let mut wrong_public = public.to_vec();
+    wrong_public[0] += F::ONE;
+    assert_solidity_rejects(
+        call_deployed_verifier(&mut deployed, &repacked_proof, &wrong_public),
+        &format!("shape fuzz `{}` wrong public input", case.name),
+    );
+
+    let mut bad_proof = repacked_proof.clone();
+    let mutation_idx = bad_proof.len() / 2;
+    bad_proof[mutation_idx] ^= 0x01;
+    assert_solidity_rejects(
+        call_deployed_verifier(&mut deployed, &bad_proof, &public),
+        &format!(
+            "shape fuzz `{}` mutated proof byte {mutation_idx}",
+            case.name
+        ),
+    );
+}
+
+fn shape_fuzz_inputs_available_for_evm() -> bool {
+    if !env_flag_enabled(RUN_EVM_TESTS_ENV) {
+        eprintln!("skipping supported-shape circuit fuzz: set {RUN_EVM_TESTS_ENV}=1 to run it");
+        return false;
+    }
+    if !solc_available() {
+        eprintln!("skipping supported-shape circuit fuzz: solc not found");
+        return false;
+    }
+    true
 }
 
 #[test]

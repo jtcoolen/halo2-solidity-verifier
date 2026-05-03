@@ -941,6 +941,22 @@ mod tests {
     }
 
     #[test]
+    fn trash_challenge_is_squeezed_even_without_trash_arguments() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let squeeze = verifier_template
+            .find("buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)")
+            .expect("trash challenge squeeze should be rendered");
+        let trash_guard = verifier_template
+            .find("{%- if num_trashcans != 0 %}\n            // ---- trashcans ----")
+            .expect("trashcan commitment reads should still be guarded");
+
+        assert!(
+            squeeze < trash_guard,
+            "Midnight squeezes trash_challenge unconditionally; only trashcan commitment reads may be guarded"
+        );
+    }
+
+    #[test]
     fn truncated_challenge_comments_cover_x1_x4_power_masks() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
         let pcs_codegen = include_str!("pcs.rs");

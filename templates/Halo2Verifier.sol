@@ -1154,9 +1154,11 @@ contract Halo2Verifier {
             gas_checkpoint(7) // after lookup helpers + Z accumulators
             {%- endif %}
 
-            {%- if num_trashcans != 0 %}
             // ---- trash_challenge ----
+            // Midnight squeezes this challenge unconditionally, even when the
+            // circuit has no trash arguments.
             buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)
+            {%- if num_trashcans != 0 %}
             // ---- trashcans ----
             let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE
             for { let end := add(proof_cptr, {{ (num_trashcans * 128)|hex() }}) }
