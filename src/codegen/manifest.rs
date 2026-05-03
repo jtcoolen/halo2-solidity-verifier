@@ -359,6 +359,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codegen::protocol::{CommitmentRead, ProofReadPlan, ProtocolPlan};
 
     #[test]
     fn manifest_json_contains_core_sections() {
@@ -393,5 +394,182 @@ mod tests {
         assert!(json.contains("\"proof_len\""));
         assert!(json.contains("\"quotient_limbs\""));
         assert!(json.contains("\"dependency_hashes\""));
+    }
+
+    #[test]
+    fn poseidon_like_manifest_snapshot_shape_is_stable() {
+        let protocol = manifest_protocol_shape(vec![3], vec![], 1, 0, 3);
+        let proof = ProofCalldataLayout::from_protocol(
+            &protocol,
+            crate::codegen::layout::abi::VERIFY_PROOF_PROOF_CPTR,
+            6,
+            2,
+        );
+        let manifest = test_manifest(&proof, 0x800, 0x180, 0x40, 12);
+        let names = manifest
+            .proof_sections
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "advice_phase_0",
+                "lookup_multiplicities",
+                "permutation_products",
+                "trash",
+                "quotient_limbs",
+                "evals",
+                "f_com",
+                "q_evals",
+                "pi",
+            ]
+        );
+        assert_eq!(manifest.proof_len, 1408);
+        let json = manifest.to_json_pretty();
+        assert!(json.contains("\"vk_len\": 2048"));
+        assert!(json.contains(
+            "\"name\":\"advice_phase_0\",\"start\":100,\"byte_len\":384,\"item_count\":3,\"item_bytes\":128"
+        ));
+        assert!(json.contains("\"program_bytes\":384"));
+        assert!(json.contains("\"const_words\":64"));
+        assert!(json.contains("\"transcript_events\": 12"));
+    }
+
+    #[test]
+    fn ivc_like_manifest_snapshot_shape_is_stable() {
+        let protocol = manifest_protocol_shape(vec![2, 1], vec![2, 1], 2, 1, 4);
+        let proof = ProofCalldataLayout::from_protocol(
+            &protocol,
+            crate::codegen::layout::abi::VERIFY_PROOF_PROOF_CPTR,
+            17,
+            5,
+        );
+        let manifest = test_manifest(&proof, 0x2c00, 0x640, 0x120, 31);
+        let names = manifest
+            .proof_sections
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "advice_phase_0",
+                "advice_phase_1",
+                "lookup_multiplicities",
+                "permutation_products",
+                "lookup_0_helpers",
+                "lookup_0_accumulator",
+                "lookup_1_helpers",
+                "lookup_1_accumulator",
+                "trash",
+                "quotient_limbs",
+                "evals",
+                "f_com",
+                "q_evals",
+                "pi",
+            ]
+        );
+        assert_eq!(manifest.proof_len, 3136);
+        let json = manifest.to_json_pretty();
+        assert!(json.contains("\"vk_len\": 11264"));
+        assert!(json.contains(
+            "\"name\":\"lookup_0_helpers\",\"start\":996,\"byte_len\":256,\"item_count\":2,\"item_bytes\":128"
+        ));
+        assert!(json.contains(
+            "\"name\":\"q_evals\",\"start\":2948,\"byte_len\":160,\"item_count\":5,\"item_bytes\":32"
+        ));
+        assert!(json.contains("\"program_bytes\":1600"));
+        assert!(json.contains("\"const_words\":288"));
+        assert!(json.contains("\"transcript_events\": 31"));
+    }
+
+    fn manifest_protocol_shape(
+        user_advices: Vec<usize>,
+        lookup_chunks: Vec<usize>,
+        permutation_zs: usize,
+        trashcans: usize,
+        quotients: usize,
+    ) -> ProtocolPlan {
+        let num_lookups = lookup_chunks.len();
+        let mut proof = ProofReadPlan::default();
+        for column in 0..user_advices.iter().sum::<usize>() {
+            proof.commitments.push(CommitmentRead::Advice { column });
+        }
+        proof
+            .commitments
+            .extend((0..num_lookups).map(|lookup| CommitmentRead::LookupMultiplicity { lookup }));
+        proof
+            .commitments
+            .extend((0..permutation_zs).map(|set| CommitmentRead::PermutationProduct { set }));
+        for (lookup, chunks) in lookup_chunks.iter().copied().enumerate() {
+            proof.commitments.extend(
+                (0..chunks).map(move |chunk| CommitmentRead::LookupHelper { lookup, chunk }),
+            );
+            proof
+                .commitments
+                .push(CommitmentRead::LookupAccumulator { lookup });
+        }
+        proof
+            .commitments
+            .extend((0..trashcans).map(|index| CommitmentRead::Trash { index }));
+        proof
+            .commitments
+            .extend((0..quotients).map(|limb| CommitmentRead::Quotient { limb }));
+
+        ProtocolPlan {
+            num_user_advices: user_advices,
+            lookup_chunks,
+            num_lookups,
+            num_permutation_zs: permutation_zs,
+            num_trashcans: trashcans,
+            num_quotients: quotients,
+            proof,
+            ..ProtocolPlan::default()
+        }
+    }
+
+    fn test_manifest(
+        proof: &ProofCalldataLayout,
+        vk_len: usize,
+        program_bytes: usize,
+        const_words: usize,
+        transcript_events: usize,
+    ) -> CodegenManifest {
+        CodegenManifest {
+            proof_len: proof.proof_len,
+            proof_sections: proof_sections(proof),
+            vk_len,
+            memory: ManifestMemory {
+                vk_mptr: 0x4000,
+                challenge_mptr: 0x5000,
+                theta_mptr: 0x6000,
+                reversed_evals_mptr: 0x7000,
+                comms_mptr_base: 0x8000,
+                selector_acc_mptr: 0x9000,
+                quotient_tmp_mptr: 0xa000,
+                quotient_stack_mptr: 0xb000,
+            },
+            quotient: ManifestQuotient {
+                external: false,
+                program_bytes,
+                const_words,
+                packed32: false,
+                cse_temps: 0,
+                max_stack: 8,
+            },
+            transcript_events,
+            pcs: ManifestPcs {
+                rot_points_words: 3,
+                x1_powers_words: 4,
+                q_eval_set_words: proof.q_evals.item_count,
+                q_eval_source_table_words: 0,
+                final_msm_terms: 9,
+            },
+            features: ManifestFeatures::current(),
+            dependency_hashes: ManifestDependencyHashes::default(),
+        }
     }
 }

@@ -1247,7 +1247,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     #[allow(dead_code)]
-    fn quotient_identity_yul_expr(identity: &QuotientIdentity) -> QuotientExpr {
+    pub(super) fn quotient_identity_yul_expr(identity: &QuotientIdentity) -> QuotientExpr {
         let mut parser = QuotientProgramBuilder::default();
         for line in &identity.lines {
             parser.assignment(line);

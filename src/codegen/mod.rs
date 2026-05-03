@@ -1836,6 +1836,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_quotient_identities_match_legacy_yul_parser_for_argument_shapes() {
+        let mut values = HashMap::new();
+        for (ptr, value) in [
+            (0x100, 3),
+            (0x120, 5),
+            (0x140, 7),
+            (0x160, 11),
+            (0x180, 13),
+            (0x1a0, 17),
+            (0x1c0, 19),
+            (0x1e0, 23),
+            (0x200, 29),
+            (0x220, 31),
+            (0x240, 37),
+        ] {
+            values.insert(ptr, Fq::from(value));
+        }
+
+        assert_typed_identity_matches_legacy_yul(
+            "permutation boundary",
+            vec![
+                "let l0 := mload(0x100)".to_string(),
+                "let z := mload(0x120)".to_string(),
+                "let one_minus_z := addmod(1, sub(r, z), r)".to_string(),
+                "let out := mulmod(l0, one_minus_z, r)".to_string(),
+            ],
+            "out",
+            quotient_mul_expr(
+                QuotientExpr::Mem(QuotientMem::Literal(0x100)),
+                quotient_add_expr(
+                    QuotientExpr::Const(U256::from(1u64)),
+                    QuotientExpr::Neg(Box::new(QuotientExpr::Mem(QuotientMem::Literal(0x120)))),
+                ),
+            ),
+            &values,
+        );
+
+        assert_typed_identity_matches_legacy_yul(
+            "lookup boundary",
+            vec![
+                "let l0 := mload(0x140)".to_string(),
+                "let llast := mload(0x160)".to_string(),
+                "let z := mload(0x180)".to_string(),
+                "let lsum := addmod(l0, llast, r)".to_string(),
+                "let out := mulmod(lsum, z, r)".to_string(),
+            ],
+            "out",
+            quotient_mul_expr(
+                quotient_add_expr(
+                    QuotientExpr::Mem(QuotientMem::Literal(0x140)),
+                    QuotientExpr::Mem(QuotientMem::Literal(0x160)),
+                ),
+                QuotientExpr::Mem(QuotientMem::Literal(0x180)),
+            ),
+            &values,
+        );
+
+        assert_typed_identity_matches_legacy_yul(
+            "trash compressed minus disabled eval",
+            vec![
+                "let compressed := mload(0x1a0)".to_string(),
+                "let selector := mload(0x1c0)".to_string(),
+                "let trash_eval := mload(0x1e0)".to_string(),
+                "let one_minus_q := addmod(1, sub(r, selector), r)".to_string(),
+                "let scaled := mulmod(one_minus_q, trash_eval, r)".to_string(),
+                "let out := addmod(compressed, sub(r, scaled), r)".to_string(),
+            ],
+            "out",
+            quotient_add_expr(
+                QuotientExpr::Mem(QuotientMem::Literal(0x1a0)),
+                QuotientExpr::Neg(Box::new(quotient_mul_expr(
+                    quotient_add_expr(
+                        QuotientExpr::Const(U256::from(1u64)),
+                        QuotientExpr::Neg(Box::new(QuotientExpr::Mem(QuotientMem::Literal(0x1c0)))),
+                    ),
+                    QuotientExpr::Mem(QuotientMem::Literal(0x1e0)),
+                ))),
+            ),
+            &values,
+        );
+    }
+
+    fn assert_typed_identity_matches_legacy_yul(
+        label: &str,
+        lines: Vec<String>,
+        var: &str,
+        typed: QuotientExpr,
+        values: &HashMap<u32, Fq>,
+    ) {
+        let identity = QuotientIdentity {
+            lines,
+            var: var.to_string(),
+            target: QuotientTarget::Main,
+            expr: Some(typed.clone()),
+        };
+        let legacy = SolidityGenerator::quotient_identity_yul_expr(&identity);
+
+        assert_eq!(
+            eval_quotient_expr_for_test(&typed, values),
+            eval_quotient_expr_for_test(&legacy, values),
+            "{label} typed expression must match legacy Yul semantic recovery"
+        );
+
+        let mut typed_builder = QuotientProgramBuilder::default();
+        typed_builder.emit_expr(&typed);
+        let mut legacy_builder = QuotientProgramBuilder::default();
+        legacy_builder.emit_expr(&legacy);
+
+        assert_eq!(
+            eval_quotient_vm_for_test(&typed_builder.bytes, &typed_builder.consts, values),
+            eval_quotient_vm_for_test(&legacy_builder.bytes, &legacy_builder.consts, values),
+            "{label} typed and legacy quotient VM programs must be trace-equivalent"
+        );
+    }
+
     fn quotient_add_expr(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
         QuotientExpr::Add(Box::new(lhs), Box::new(rhs))
     }
