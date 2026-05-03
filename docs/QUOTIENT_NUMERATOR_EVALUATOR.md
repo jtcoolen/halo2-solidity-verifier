@@ -20,6 +20,12 @@ Solidity split verifier:
 The Solidity evaluator is not a second verifier design. It is a lowered,
 size-aware implementation of the same Rust verifier steps.
 
+The complete upstream comment corpus is preserved in
+`docs/MIDFALL_PROOFS_COMMENT_CORPUS.md`. This document adapts only the comments
+that directly explain the generated quotient path: identity ordering, simple
+selector handling, LogUp/permutation/trash evaluations, and the linearization
+commitment sign convention.
+
 ## Contract Role
 
 `Halo2QuotientEvaluator` is an external helper contract used by the split
@@ -108,6 +114,10 @@ The relevant Rust files are:
 - `midfall/proofs/src/plonk/permutation.rs`
 - `midfall/proofs/src/plonk/logup.rs`
 - `midfall/proofs/src/plonk/trash.rs`
+
+When this repository copies or adapts those comments into Solidity/Yul, it keeps
+the upstream role intact: the comments explain the Rust verifier behavior first,
+then name the local memory slot or generated block that ports it.
 
 The Rust verifier flow around the quotient numerator is:
 

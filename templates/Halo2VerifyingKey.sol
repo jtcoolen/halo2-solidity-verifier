@@ -2,47 +2,49 @@
 
 pragma solidity ^0.8.24;
 
-// BLS12-381 verifying key contract (midnight-proofs flavour).
-//
-// Layout (in 32-byte words, big-endian). The byte offsets are absolute
-// from the start of the VK contract's runtime bytecode. The verifier
-// loads the entire VK via `extcodecopy(vk, VK_MPTR, 0x00, vk_len)` and
-// then references each slot by `VK_MPTR + i`.
-//
-//   word  0  : vk_digest                    (Fq, transcript_repr of the CS)
-//   word  1  : num_instances
-//   word  2  : k                            (log2 of the domain size)
-//   word  3  : n_inv                        (1/n in Fr)
-//   word  4  : omega                        (n-th primitive root of unity)
-//   word  5  : omega_inv
-//   word  6  : omega_inv_to_l               (omega_inv ^ |rotation_last|)
-//   word  7  : has_accumulator              (0 or 1)
-//   word  8  : acc_offset                   (instance index of the accumulator)
-//   word  9  : num_acc_limbs
-//   word 10  : num_acc_limb_bits
-//   word 11..14 : G1_BASE                   (4 words, EIP-2537 padded)
-//   word 15..22 : G2_BASE                   (8 words, EIP-2537 padded)
-//   word 23..30 : NEG_S_G2_BASE             (8 words, EIP-2537 padded)
-//   word 31..30 + Q_PAYLOAD      : quotient VM constants + packed bytecode
-//   word 31 + Q_PAYLOAD ..       : fixed_comms (4 words each)
-//   word 31 + Q_PAYLOAD + 4*N_FIXED ..
-//                                : permutation_comms (4 words each)
-//
-// Notes:
-//   * `extcodehash` of this contract is pinned by the linked verifier
-//     via `EXPECTED_VK_CODEHASH`, so any byte tweak (including a
-//     byte-padding miss) is detected at deploy time.
-//   * The quotient identity interpreter's static program is stored in
-//     this pinned VK runtime. The verifier reads it from memory after
-//     `extcodecopy`, avoiding verifier-side PUSH32/mstore immediates
-//     while keeping the program covered by EXPECTED_VK_CODEHASH.
-//   * The midnight-proofs migration bakes the per-lookup chunk counts,
-//     trashcan structure, and num_simple_selectors into the codegen
-//     side (the Yul body emitted by the evaluator), so they do **not**
-//     appear as separate user-configurable runtime parameters. Adding
-//     new circuits with different lookup/trashcan shapes regenerates
-//     the verifier code and VK layout together.
+/// @title Halo2 BLS12-381 verifying-key payload.
+/// @notice Data-only contract whose deployed runtime is the generated verifier-key payload.
+/// @dev The linked verifier loads this runtime with `extcodecopy` and pins it by length and codehash.
+/// @dev The layout follows the verifier inputs derived from
+/// `midfall/proofs/src/plonk/mod.rs::VerifyingKey` and the transcript
+/// `vk.hash_into` behavior used by `midfall/proofs/src/plonk/verifier.rs`.
+///
+/// Layout (in 32-byte words, big-endian). The byte offsets are absolute
+/// from the start of the VK contract's runtime bytecode. The verifier
+/// loads the entire VK via `extcodecopy(vk, VK_MPTR, 0x00, vk_len)` and
+/// then references each slot by `VK_MPTR + i`.
+///
+///   word  0  : vk_digest                    (Fq, transcript_repr of the CS)
+///   word  1  : num_instances
+///   word  2  : k                            (log2 of the domain size)
+///   word  3  : n_inv                        (1/n in Fr)
+///   word  4  : omega                        (n-th primitive root of unity)
+///   word  5  : omega_inv
+///   word  6  : omega_inv_to_l               (omega_inv ^ |rotation_last|)
+///   word  7  : has_accumulator              (0 or 1)
+///   word  8  : acc_offset                   (instance index of the accumulator)
+///   word  9  : num_acc_limbs
+///   word 10  : num_acc_limb_bits
+///   word 11..14 : G1_BASE                   (4 words, EIP-2537 padded)
+///   word 15..22 : G2_BASE                   (8 words, EIP-2537 padded)
+///   word 23..30 : NEG_S_G2_BASE             (8 words, EIP-2537 padded)
+///   word 31..30 + Q_PAYLOAD      : quotient VM constants + packed bytecode
+///   word 31 + Q_PAYLOAD ..       : fixed_comms (4 words each)
+///   word 31 + Q_PAYLOAD + 4*N_FIXED ..
+///                                : permutation_comms (4 words each)
+///
+/// Notes:
+/// - `extcodehash` of this contract is pinned by the linked verifier via
+///   `EXPECTED_VK_CODEHASH`, so any byte tweak is detected at deploy time.
+/// - The quotient identity interpreter's static program is stored in this
+///   pinned VK runtime. The verifier reads it from memory after `extcodecopy`,
+///   avoiding verifier-side PUSH32/mstore immediates while keeping the program
+///   covered by `EXPECTED_VK_CODEHASH`.
+/// - The midnight-proofs migration bakes the per-lookup chunk counts, trashcan
+///   structure, and `num_simple_selectors` into the generated verifier code.
 contract Halo2VerifyingKey {
+    /// @notice Deploy the verifying-key payload as this contract's runtime bytecode.
+    /// @dev The constructor writes generated words into memory and returns only that payload, so the runtime contains no callable code.
     constructor() {
         assembly {
             {%- for (name, chunk) in constants %}

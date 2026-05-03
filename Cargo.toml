@@ -39,14 +39,14 @@ rand_chacha = "0.3.1"
 # we need to deserialize the VK and rebuild the SolidityGenerator.
 midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
-# IVC final-step Keccak proof end-to-end test (tests/ivc_keccak_solidity.rs).
+# IVC Poseidon-chain final-step Keccak proof end-to-end test
+# (tests/ivc_keccak_solidity.rs).
 # The local aggregation crate currently builds in truncated mode, so Solidity
 # tests that exercise it require this crate's matching feature too.
 midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = [
     "keccak-transcript",
     "truncated-challenges",
 ] }
-sha2 = "0.10"
 
 # Keep Midfall subcrates on the same published `keccak` branch without
 # committing machine-local path overrides. Local development overrides belong

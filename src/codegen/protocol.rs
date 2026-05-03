@@ -237,6 +237,16 @@ pub(crate) struct ProtocolPlan {
 }
 
 impl ProtocolPlan {
+    /// Build the generated verifier's proof-read and PCS-query plan from the
+    /// Midfall constraint system.
+    ///
+    /// This is the codegen-time counterpart of the iterator-heavy verifier
+    /// flow in `midfall/proofs/src/plonk/verifier.rs`: hash/read advice
+    /// commitments by phase, read lookup/permutation/trash commitments, read
+    /// quotient limb commitments, sample `x`, then read or compute the evals
+    /// passed to `partially_evaluate_identities` and KZG `multi_prepare`.
+    /// The plan preserves that order so the Solidity transcript and proof
+    /// cursors stay byte-compatible with the Rust verifier.
     pub(crate) fn from_constraint_system(
         cs: &ConstraintSystem<Fq>,
         nb_committed_instances: usize,
@@ -310,15 +320,24 @@ impl ProtocolPlan {
         let rotation_last = -(cs.blinding_factors() as i32 + 1);
         let mut proof = ProofReadPlan::default();
 
+        // Hash the prover's advice commitments into the transcript by phase,
+        // squeezing the phase challenge before the next phase's commitments
+        // are read (`parse_trace`).
         proof.commitments.extend(
             advice_indices
                 .iter()
                 .copied()
                 .map(|column| CommitmentRead::Advice { column }),
         );
+        // Lookup commitments follow the Rust verifier order: one LogUp
+        // multiplicity commitment per lookup, then each chunk helper and
+        // accumulator commitment after permutation products are bound.
         proof
             .commitments
             .extend((0..num_lookups).map(|lookup| CommitmentRead::LookupMultiplicity { lookup }));
+        // The verifier samples beta/gamma before hashing each permutation
+        // product commitment; this plan keeps only the proof cursor order,
+        // while the Solidity template owns the transcript squeezes.
         proof
             .commitments
             .extend((0..num_permutation_zs).map(|set| CommitmentRead::PermutationProduct { set }));
@@ -333,10 +352,16 @@ impl ProtocolPlan {
         proof
             .commitments
             .extend((0..num_trashcans).map(|index| CommitmentRead::Trash { index }));
+        // Read commitment(s) to the quotient polynomial h(X)=nu(X)/(X^n-1).
+        // Multi-limb quotient commitments are kept unless the circuit only
+        // needs a single h limb.
         proof
             .commitments
             .extend((0..num_quotients).map(|limb| CommitmentRead::Quotient { limb }));
 
+        // Committed-instance columns are opened by PCS and read as proof
+        // evals. Non-committed instance columns are Lagrange-interpolated
+        // locally from public inputs and therefore do not appear here.
         proof.evals.extend(
             instance_queries
                 .iter()
@@ -347,6 +372,9 @@ impl ProtocolPlan {
         proof
             .evals
             .extend(advice_queries.iter().copied().map(EvalRead::Advice));
+        // Read (num_fixed_columns - num_simple_selectors) fixed evaluations.
+        // Simple selector columns are intentionally absent from the proof
+        // scalar stream and are filled by the quotient/linearization path.
         proof.evals.extend(
             fixed_queries
                 .iter()
@@ -354,6 +382,8 @@ impl ProtocolPlan {
                 .filter(|q| !simple_selector_cols.contains(&q.column))
                 .map(EvalRead::Fixed),
         );
+        // The permutation argument opens its product commitments at x and
+        // omega*x, plus omega^last*x for every set except the final one.
         proof.evals.extend(
             permutation_columns
                 .iter()
@@ -394,6 +424,10 @@ impl ProtocolPlan {
             .evals
             .extend((0..num_trashcans).map(|index| EvalRead::Trash { index }));
 
+        // Collect the queries checked in the KZG multi-open.
+        // Queries corresponding to simple, multiplicative selectors need not be checked directly;
+        // `compute_linearization_commitment` reintroduces
+        // those selector commitments through the custom linearization query.
         let mut pcs_queries: Vec<PcsQuerySource> = Vec::new();
         pcs_queries.extend(advice_queries.iter().copied().map(PcsQuerySource::Advice));
         pcs_queries.extend(
@@ -454,6 +488,9 @@ impl ProtocolPlan {
             num_lookups != 0,
             num_trashcans != 0,
         );
+        // `verify_algebraic_constraints` samples x after all proof
+        // commitments, then every planned PCS query opens at
+        // omega^rotation*x (including x itself at rotation zero).
         common_polys.extend(
             pcs_queries
                 .iter()

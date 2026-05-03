@@ -23,6 +23,26 @@ Existing focused notes remain useful, especially `docs/MEMORY_LAYOUT.md` and
 verifier contract, proof format, transcript, algebra, KZG opening check, and
 split-artifact architecture.
 
+## Midfall Comment Corpus And Porting Map
+
+`docs/MIDFALL_PROOFS_COMMENT_CORPUS.md` preserves every Rust comment block from
+`../midfall/proofs/src/**/*.rs`, grouped by upstream file and line span. Local
+source and template comments intentionally adapt only the comments that map to
+this generator:
+
+- Transcript comments from `transcript/mod.rs` and `transcript/implementors.rs`
+  map to `src/transcript.rs` and `templates/Halo2Verifier.sol`.
+- PLONK verifier-flow comments from `plonk/verifier.rs` map to
+  `src/codegen/protocol.rs`, verifier NatSpec, and proof-layout sections below.
+- Identity and linearization comments from `plonk/mod.rs` and
+  `plonk/linearization/verifier.rs` map to `templates/QuotientNumeratorBlock.yul`
+  and `docs/QUOTIENT_NUMERATOR_EVALUATOR.md`.
+- KZG multi-open, dummy-query, point-set sorting, MSM, and pairing comments from
+  `poly/kzg/{mod.rs,msm.rs,utils.rs}` map to `src/codegen/pcs.rs`.
+- LogUp, permutation, and trash comments map to the quotient evaluator docs and
+  generated Yul comments; broader circuit/dev/floor-planning comments remain in
+  the corpus because they are not verifier behavior ported by this repository.
+
 ## 1. Scope
 
 The generator emits Solidity verifiers for `midnight-proofs` / Midfall Halo2
@@ -1144,15 +1164,31 @@ If `has_accumulator` is true, the verifier reconstructs a public KZG
 accumulator from the `instances` array and batches its pairing equation with
 the final KZG pairing equation.
 
-The generator is configured with:
+This path is optional and generated-verifier-specific. It is disabled by
+default (`AccumulatorEncoding = None`) and activated only by configuring the
+generator:
 
 ```rust
-AccumulatorEncoding {
-    offset,
-    num_limbs,
-    num_limb_bits,
-}
+let generator = SolidityGenerator::new(params, vk, num_instances, num_committed_instances)
+    .set_acc_encoding(Some(AccumulatorEncoding::new(offset, 7, 56)));
 ```
+
+Use `try_set_acc_encoding` instead when the public-input layout comes from
+caller-controlled metadata and should return a typed `GeneratorError` instead
+of panicking. Enabling the accumulator writes the expected accumulator metadata
+into the generated VK payload:
+
+```text
+has_accumulator = 1
+acc_offset = offset
+num_acc_limbs = 7
+num_acc_limb_bits = 56
+```
+
+The Solidity verifier checks those VK header words against the generator's
+compiled-in expectations before it decodes public inputs. A stale VK or a
+verifier rendered with the wrong accumulator metadata therefore reverts before
+any accumulator point reconstruction.
 
 The current Solidity path requires:
 
@@ -1163,7 +1199,19 @@ num_limb_bits = 56
 
 ### 13.1 Public Input Layout
 
-At `instances[offset]`:
+The accumulator is not passed through a separate ABI argument. It is a public
+input tail inside the normal non-committed `instances` vector, beginning at
+`instances[offset]`. The circuit must constrain that public tail to equal the
+carried accumulator it recomputes internally. The IVC decider does this by
+formatting:
+
+```text
+[leaf public state words..., fully collapsed final accumulator public input]
+```
+
+and passing the starting index of the accumulator tail as `offset`.
+
+At `instances[offset]`, the decoded schema is:
 
 ```text
 lhs point coordinates
@@ -1172,6 +1220,22 @@ rhs point coordinates
 rhs scalar
 optional RHS fixed-base scalar tail
 ```
+
+The verifier computes the expected total public-input width:
+
+```text
+expected_words =
+    offset
+  + lhs point words
+  + lhs scalar word
+  + rhs point words
+  + rhs scalar word
+  + fixed-base scalar tail words
+```
+
+and requires `num_instances == expected_words`. This makes the accumulator a
+checked tail convention, not an unchecked side channel: extra words after the
+accumulator and missing accumulator words both cause verification to revert.
 
 With 7 limbs and 56-bit limbs:
 

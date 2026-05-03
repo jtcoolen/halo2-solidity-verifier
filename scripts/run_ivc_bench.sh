@@ -9,6 +9,8 @@ RUN_NATIVE_MIDFALL=0
 RUN_SOLIDITY_BENCH=1
 SKIP_SRS_DOWNLOAD=0
 RUN_TRACE=0
+IN_CIRCUIT_FEWER_POINT_SETS=1
+OUTER_FEWER_POINT_SETS=1
 
 SRS_DIR="${SRS_DIR:-"$ROOT_DIR/.srs"}"
 MIDFALL_DIR="${MIDFALL_DIR:-"$ROOT_DIR/../midfall"}"
@@ -19,7 +21,7 @@ MIDNIGHT_SRS_2P20_URL="https://srs.midnight.network/midnight-srs-2p20"
 
 usage() {
   cat <<'USAGE'
-Run the IVC Keccak Solidity verifier bench.
+Run the IVC Keccak Solidity verifier bench over Poseidon hash-chain leaves.
 
 Usage:
   scripts/run_ivc_bench.sh [options]
@@ -30,21 +32,23 @@ Options:
   --skip-srs-download  Fail if a required SRS asset is missing.
   --srs-dir DIR        Directory for SRS assets. Defaults to $SRS_DIR or ./.srs.
   --no-gas-checkpoints Run the Solidity verifier bench without section logs.
+  --no-outer-fewer-point-sets
+                       Disable fewer-point-sets for the final Solidity-facing
+                       decider proof while keeping the recursive in-circuit
+                       verifier on the fewer-point-sets layout.
   --trace              Enable native Rust/Solidity trace equivalence.
                        Requires midnight-proofs/solidity-verifier-trace.
-  --native-midfall     Also run Midfall's native Keccak final IVC test from
+  --native-midfall     Also run Midfall's native Poseidon-chain final IVC test from
                         $MIDFALL_DIR/aggregation.
-  --native-only        Run only the Midfall native Keccak final IVC test.
+  --native-only        Run only the Midfall native Poseidon-chain final IVC test.
   --midfall-dir DIR    Local Midfall checkout for --native-midfall.
                         Defaults to ../midfall.
   -h, --help           Show this help.
 
 Default behavior:
-  1. Ensure SRS_DIR has Midnight's midnight-srs-2p19 and midnight-srs-2p20,
-     plus either Filecoin's bls_filecoin_2p13 or bls_filecoin_2p19. If
-     bls_filecoin_2p13 is absent, Midfall's loader downsizes bls_filecoin_2p19
-     on the first full run.
-  2. Compile the ignored Solidity verifier bench.
+  1. Ensure SRS_DIR has Midnight's midnight-srs-2p19 and midnight-srs-2p20.
+     The optional --native-midfall path also needs a Filecoin SRS.
+  2. Compile the gated Solidity verifier bench.
   3. Run tests/ivc_keccak_solidity.rs::ivc_final_keccak_solidity_e2e with
      evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints.
 
@@ -86,6 +90,9 @@ while (($#)); do
       ;;
     --no-gas-checkpoints)
       GAS_CHECKPOINTS=0
+      ;;
+    --no-outer-fewer-point-sets)
+      OUTER_FEWER_POINT_SETS=0
       ;;
     --trace)
       RUN_TRACE=1
@@ -139,6 +146,11 @@ download_if_missing() {
 ensure_srs_assets() {
   mkdir -p "$SRS_DIR"
 
+  download_if_missing "$SRS_DIR/midnight-srs-2p19" "$MIDNIGHT_SRS_2P19_URL"
+  download_if_missing "$SRS_DIR/midnight-srs-2p20" "$MIDNIGHT_SRS_2P20_URL"
+}
+
+ensure_filecoin_srs_asset() {
   if [[ -s "$SRS_DIR/bls_filecoin_2p13" ]]; then
     echo "[ivc-bench] using bls_filecoin_2p13"
   elif [[ -s "$SRS_DIR/bls_filecoin_2p19" ]]; then
@@ -146,13 +158,16 @@ ensure_srs_assets() {
   else
     download_if_missing "$SRS_DIR/bls_filecoin_2p19" "$FILECOIN_SRS_URL"
   fi
-
-  download_if_missing "$SRS_DIR/midnight-srs-2p19" "$MIDNIGHT_SRS_2P19_URL"
-  download_if_missing "$SRS_DIR/midnight-srs-2p20" "$MIDNIGHT_SRS_2P20_URL"
 }
 
 cargo_features() {
-  local features="evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets"
+  local features="evm,truncated-challenges"
+  if [[ "$IN_CIRCUIT_FEWER_POINT_SETS" -eq 1 ]]; then
+    features="$features,in-circuit-fewer-point-sets"
+  fi
+  if [[ "$OUTER_FEWER_POINT_SETS" -eq 1 ]]; then
+    features="$features,outer-fewer-point-sets"
+  fi
   if [[ "$GAS_CHECKPOINTS" -eq 1 ]]; then
     features="$features,solidity-gas-checkpoints"
   fi
@@ -164,21 +179,22 @@ cargo_features() {
 
 run_native_midfall() {
   [[ -f "$MIDFALL_DIR/aggregation/Cargo.toml" ]] || die "Midfall aggregation Cargo.toml not found under $MIDFALL_DIR"
+  ensure_filecoin_srs_asset
 
-  echo "[ivc-bench] compiling Midfall native Keccak final IVC test"
-  echo "+ SRS_DIR=$SRS_DIR cargo test --release --manifest-path $MIDFALL_DIR/aggregation/Cargo.toml --test single_aggregation_keccak_final --features keccak-transcript,truncated-challenges,fewer-point-sets --no-run"
+  echo "[ivc-bench] compiling Midfall native Poseidon-chain final IVC test"
+  echo "+ SRS_DIR=$SRS_DIR cargo test --release --manifest-path $MIDFALL_DIR/aggregation/Cargo.toml --test ivc_keccak_final --features keccak-transcript,truncated-challenges,fewer-point-sets --no-run"
   SRS_DIR="$SRS_DIR" cargo test --release \
     --manifest-path "$MIDFALL_DIR/aggregation/Cargo.toml" \
-    --test single_aggregation_keccak_final \
+    --test ivc_keccak_final \
     --features keccak-transcript,truncated-challenges,fewer-point-sets \
     --no-run
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
-    echo "[ivc-bench] running Midfall native Keccak final IVC test"
-    echo "+ SRS_DIR=$SRS_DIR cargo test --release --manifest-path $MIDFALL_DIR/aggregation/Cargo.toml --test single_aggregation_keccak_final --features keccak-transcript,truncated-challenges,fewer-point-sets -- --ignored --nocapture"
+    echo "[ivc-bench] running Midfall native Poseidon-chain final IVC test"
+    echo "+ SRS_DIR=$SRS_DIR cargo test --release --manifest-path $MIDFALL_DIR/aggregation/Cargo.toml --test ivc_keccak_final --features keccak-transcript,truncated-challenges,fewer-point-sets -- --ignored --nocapture"
     SRS_DIR="$SRS_DIR" cargo test --release \
       --manifest-path "$MIDFALL_DIR/aggregation/Cargo.toml" \
-      --test single_aggregation_keccak_final \
+      --test ivc_keccak_final \
       --features keccak-transcript,truncated-challenges,fewer-point-sets \
       -- --ignored --nocapture
   fi
@@ -192,7 +208,7 @@ run_solidity_bench() {
     require_cmd solc
   fi
 
-  echo "[ivc-bench] compiling IVC Keccak Solidity verifier bench"
+  echo "[ivc-bench] compiling IVC Keccak Solidity verifier bench (Poseidon-chain leaves)"
   echo "+ SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e --no-run"
   (
     cd "$ROOT_DIR"
@@ -203,7 +219,7 @@ run_solidity_bench() {
   )
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
-    echo "[ivc-bench] running IVC Keccak Solidity verifier bench"
+    echo "[ivc-bench] running IVC Keccak Solidity verifier bench (Poseidon-chain leaves)"
     echo "+ HALO2_SOLIDITY_RUN_IVC_BENCH=1 SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --nocapture"
     (
       cd "$ROOT_DIR"

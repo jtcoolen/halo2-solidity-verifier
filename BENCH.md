@@ -41,17 +41,27 @@ The 16 checkpoints sit at semantic section boundaries — see
 
 ## Running the IVC Keccak final bench
 
-The IVC bench proves two independent one-step IVC SHA-256 aggregation leaves,
+The IVC bench proves two independent one-step IVC Poseidon hash-chain leaves,
 then proves a final Keccak-transcript tree decider that verifies both leaf
 proofs and fully collapses the carried IVC proof accumulator. It renders
 separate verifier/VK contracts for that decider proof, compiles them with
 solc, deploys them in Prague-spec revm, and verifies the final proof end to
-end. It is marked ignored because it is slow.
+end. It self-skips unless `HALO2_SOLIDITY_RUN_IVC_BENCH=1` is set because it
+is slow.
 
 Recommended runner:
 
 ```
 scripts/run_ivc_bench.sh
+```
+
+The default runner enables fewer point sets for both the recursive in-circuit
+verifier and the outer Solidity-facing decider proof. To keep the recursive
+verifier on fewer point sets but benchmark the outer decider proof without
+dummy PCS evals:
+
+```
+scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
 ```
 
 Compile-only preflight:
@@ -72,7 +82,7 @@ Manual compile command:
 ```
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
 cargo test --release \
-  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints \
   --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
   --no-run
 ```
@@ -82,9 +92,9 @@ Manual full gas-checkpoint command:
 ```
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
 cargo test --release \
-  --features evm,truncated-challenges,fewer-point-sets,solidity-gas-checkpoints \
+  --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints \
   --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  -- --ignored --nocapture
+  -- --nocapture
 ```
 
 The test writes generated artifacts to:
@@ -102,9 +112,9 @@ ls -lh target/ivc-keccak-solidity-dump
 
 ### IVC Keccak final run, 2026-04-29
 
-This measurement is the previous one-step final-proof baseline. Re-run the
-bench after fetching `midnight-srs-2p20` to populate the new two-leaf tree
-decider numbers.
+This historical measurement is the previous one-step SHA aggregation baseline.
+Re-run the bench after fetching `midnight-srs-2p20` to populate current
+Poseidon-chain tree decider numbers.
 
 Run shape:
 

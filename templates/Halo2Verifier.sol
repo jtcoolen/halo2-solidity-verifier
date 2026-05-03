@@ -1,40 +1,47 @@
 
 pragma solidity ^0.8.24;
 
-// Halo2 KZG verifier for the BLS12-381 curve, midnight-proofs flavour.
+/// @title Halo2 BLS12-381 KZG verifier.
+/// @notice Circuit-specialized verifier for Midfall/midnight-proofs Halo2
+/// proofs rendered by this repository's Rust generator.
+/// @dev This contract ports the verifier flow from
+/// `midfall/proofs/src/plonk/verifier.rs`, the Keccak transcript comments from
+/// `midfall/proofs/src/transcript/implementors.rs`, and the KZG multi-open
+/// comments from `midfall/proofs/src/poly/kzg/mod.rs`.
+/// @dev It is not a generic verifier. The proof layout, VK payload, quotient
+/// identity program, memory layout, and optional quotient evaluator are all
+/// generated for one `VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>`.
+///
+/// Halo2 KZG verifier for the BLS12-381 curve, midnight-proofs flavour.
+///
+/// Differences vs the original BN254 / halo2 v0.4 template:
 //
-// Differences vs the original BN254 / halo2 v0.4 template:
-//
-//   * BLS12-381 base field Fp is 381 bits and does not fit in a uint256.
-//     Each Fp coord is encoded EIP-2537 padded (16 zero bytes + 48 bytes).
-//     A G1 point is 128 bytes (4 words); a G2 point is 256 bytes (8).
-//   * Calldata carries G1 commitments in uncompressed EIP-2537 padded
-//     form (4 words = 128 bytes per point: x_hi, x_lo, y_hi, y_lo). The
-//     proof bytes produced by midnight-proofs prover are repacked off
-//     chain (compressed -> uncompressed) before being passed to
-//     `verifyProof`. The verifier hashes the **uncompressed** 128-byte
-//     form into the transcript verbatim (matches the patched
-//     `Hashable<Keccak256> for G1Projective::to_input` in
-//     midnight-proofs); see `common_uncompressed_g1`.
-//   * Transcript accumulates raw absorbed inputs in order. Squeeze
-//     computes one Keccak digest of the accumulated bytes, resets the
-//     transcript buffer to that 32-byte digest, then samples by
-//     interpreting the digest as a big-endian integer modulo r.
-//   * Fq sampling: uint256(keccak_digest_be) mod r.
-//   * Scalar inversion uses modexp(scalar, r-2, r).
-//   * Precompiles:
-//       0x05 modexp (used for Fr inversion)
-//       0x0b BLS12_G1ADD
-//       0x0c BLS12_G1MSM
-//       0x0f BLS12_PAIRING_CHECK
-//     Constructors run a deployment-time smoke test for the EIP-2537
-//     precompiles using identity inputs. Compile with Solidity >=0.8.24
-//     and deploy only on chains/forks that support MCOPY and EIP-2537.
+/// - BLS12-381 base field Fp is 381 bits and does not fit in a uint256.
+///   Each Fp coord is encoded EIP-2537 padded (16 zero bytes + 48 bytes).
+///   A G1 point is 128 bytes (4 words); a G2 point is 256 bytes (8).
+/// - Calldata carries G1 commitments in uncompressed EIP-2537 padded
+///   form (4 words = 128 bytes per point: x_hi, x_lo, y_hi, y_lo). The
+///   proof bytes produced by midnight-proofs prover are repacked off
+///   chain (compressed -> uncompressed) before being passed to
+///   `verifyProof`. The verifier hashes the uncompressed 128-byte form into
+///   the transcript verbatim, matching `Hashable<Keccak256> for
+///   G1Projective::to_input`; see `common_uncompressed_g1`.
+/// - Transcript `common` absorbs raw inputs in order. `squeeze` computes one
+///   Keccak digest, resets the transcript buffer to that digest, then samples
+///   by interpreting the digest as a big-endian integer modulo r.
+/// - Scalar inversion uses modexp(scalar, r-2, r).
+/// - Constructors run a deployment-time smoke test for the EIP-2537
+///   precompiles using identity inputs. Compile with Solidity >=0.8.24 and
+///   deploy only on chains/forks that support MCOPY and EIP-2537.
 contract Halo2Verifier {
+    /// @notice Reverts when a pinned verifier dependency no longer matches its generated code hash.
+    /// @dev Covers the external verifying-key contract and, in split mode, the quotient evaluator.
     error InvalidVerifierDependency();
 
     {%- match self.expected_vk_codehash %}
     {%- when Some with (expected_vk_codehash) %}
+    /// @notice Verifying-key contract address authorized for this verifier.
+    /// @dev The runtime length and codehash are pinned by generated constants and checked at construction and verification time.
     address public immutable AUTHORIZED_VK;
     uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
     bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
@@ -42,6 +49,8 @@ contract Halo2Verifier {
     {%- endmatch %}
     {%- match quotient_external %}
     {%- when Some with (_) %}
+    /// @notice Quotient evaluator contract authorized for split quotient reconstruction.
+    /// @dev The evaluator returns the linearization expected scalar and selector buckets; its runtime may be pinned by generated constants.
     address public immutable AUTHORIZED_QUOTIENT;
     {%- match self.expected_quotient_codehash %}
     {%- when Some with (expected_quotient_codehash) %}
@@ -188,6 +197,8 @@ contract Halo2Verifier {
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_0_WITH_ID_FLAG = 0x00000000f38512bf6730d2a0f6b0f6241eabfffeb153ffffbafeffffffffaaaa;
     uint256 internal constant BLS_P_MINUS_ONE_PACKED_1 = 0x0000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd764774b84;
 
+    /// @notice Smoke-check the BLS12-381 precompiles required by the verifier.
+    /// @dev Uses identity inputs to catch absent EIP-2537 implementations, short return data, and incompatible pairing semantics at deployment.
     function require_eip2537_precompiles() private view {
         assembly ("memory-safe") {
             let scratch := 0x80
@@ -222,6 +233,10 @@ contract Halo2Verifier {
     {%- when Some with (_) %}
     {%- match quotient_external %}
     {%- when Some with (_) %}
+    /// @notice Create a verifier pinned to a verifying key and quotient evaluator.
+    /// @dev Checks EIP-2537 availability and verifies both dependency runtimes before storing their addresses.
+    /// @param authorizedVk Address of the generated `Halo2VerifyingKey` runtime.
+    /// @param authorizedQuotient Address of the generated `Halo2QuotientEvaluator` runtime.
     constructor(address authorizedVk, address authorizedQuotient) {
         require_eip2537_precompiles();
         require(
@@ -246,6 +261,9 @@ contract Halo2Verifier {
         {%- endmatch %}
     }
     {%- when None %}
+    /// @notice Create a verifier pinned to a generated verifying key.
+    /// @dev Checks EIP-2537 availability and verifies the VK runtime before storing its address.
+    /// @param authorizedVk Address of the generated `Halo2VerifyingKey` runtime.
     constructor(address authorizedVk) {
         require_eip2537_precompiles();
         require(
@@ -259,6 +277,9 @@ contract Halo2Verifier {
     {%- when None %}
     {%- match quotient_external %}
     {%- when Some with (_) %}
+    /// @notice Create a verifier pinned to a quotient evaluator.
+    /// @dev Used when the VK is embedded in the verifier but quotient reconstruction is split out.
+    /// @param authorizedQuotient Address of the generated `Halo2QuotientEvaluator` runtime.
     constructor(address authorizedQuotient) {
         require_eip2537_precompiles();
         {%- match self.expected_quotient_codehash %}
@@ -277,6 +298,8 @@ contract Halo2Verifier {
         {%- endmatch %}
     }
     {%- when None %}
+    /// @notice Create a verifier with embedded verifier data.
+    /// @dev Checks EIP-2537 availability at deployment.
     constructor() {
         require_eip2537_precompiles();
     }
@@ -293,6 +316,9 @@ contract Halo2Verifier {
     /// `true`, while malformed calldata, invalid proof material, failed
     /// precompiles, or mismatched pinned dependency code revert. Trace and gas
     /// renders keep the same failure policy.
+    /// @param proof Solidity-facing proof bytes, with G1 elements repacked into EIP-2537 padded uncompressed form.
+    /// @param instances Public instance scalars encoded as canonical BLS12-381 scalar-field words.
+    /// @return Always `true` for accepted proofs; invalid proofs revert instead of returning `false`.
     function verifyProof(
         bytes calldata proof,
         uint256[] calldata instances

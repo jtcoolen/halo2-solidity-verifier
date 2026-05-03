@@ -8,11 +8,15 @@
 //! Reference Rust implementation:
 //!   * `midfall/proofs/src/transcript/mod.rs::CircuitTranscript`
 //!   * `midfall/proofs/src/transcript/implementors.rs::TranscriptHash for Keccak256`
+//!   * `midfall/proofs/src/transcript/implementors.rs::Hashable<Keccak256> for G1Projective`
 //!
 //! Behaviour summary:
 //!
 //!   * `init`: Keccak state starts empty.
 //!   * `common(input)`: absorb `input`.
+//!     This ports the upstream `Transcript::common` comment path: typed
+//!     verifier values are converted with `Hashable::to_input` before they are
+//!     appended to the Fiat-Shamir state.
 //!     For G1, `input` is the **EIP-2537 padded 128-byte uncompressed
 //!     form** (`x_hi || x_lo || y_hi || y_lo`, 64 bytes per coord = 16
 //!     zero pad bytes + 48 BE bytes of the BLS12-381 base-field
@@ -24,6 +28,8 @@
 //!     For Fq scalars, `input` is the canonical big-endian 32-byte repr.
 //!   * `squeeze`: produce one 32-byte Keccak digest over the current state,
 //!     then reseed the Keccak state with that digest.
+//!     This mirrors the Midfall comment that subsequent absorb/squeeze calls
+//!     must depend on the challenge that was just produced.
 //!   * `sample::<Fq>(out32)`: interpret the digest as a big-endian integer
 //!     and reduce it modulo the scalar-field modulus.
 //!
@@ -97,6 +103,11 @@ impl<S> Keccak256Transcript<S> {
     /// Layout: `x_hi (32) || x_lo (32) || y_hi (32) || y_lo (32)` where
     /// each coord is 16 zero pad bytes followed by 48 BE bytes of the
     /// base-field element. Identity = 128 zero bytes.
+    ///
+    /// The upstream comment explains why this is verifier-friendly on EVM:
+    /// the Solidity verifier can copy the four calldata words into the
+    /// Keccak buffer after canonical padding/range checks, rather than
+    /// deriving a compressed sign bit on chain.
     pub fn common_g1(&mut self, point: &G1Projective) -> io::Result<()> {
         let bytes = g1_to_uncompressed_eip2537(point);
         self.absorb_bytes(&bytes);

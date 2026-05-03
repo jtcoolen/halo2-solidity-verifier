@@ -16,7 +16,8 @@
 //!        Lagrange interpolation at `x3`.
 //!      - Builds the final commitment via `msm_inner_product` with `x4`
 //!        powers, plus `f_com` at the highest power.
-//!      - Emits the pairing inputs `(pi, final_com - v*G + x3*pi)`.
+//!      - Scales `z*pi - vG` as the final pairing-side correction and emits
+//!        the pairing inputs `(pi, final_com - v*G + x3*pi)`.
 //!
 //! Notes:
 //!
@@ -31,6 +32,13 @@
 //!     set (`x3 - p_j`), then locally compose. This is gas-suboptimal
 //!     but correct and easy to validate; a Montgomery batch invert can
 //!     replace it once the rest of the verifier is byte-stable.
+//!
+//! Upstream comments ported here are preserved in
+//! `docs/MIDFALL_PROOFS_COMMENT_CORPUS.md` and adapted at the matching
+//! emission points below. The most important ones are the Halo 2
+//! multi-opening description, dummy-query/fewer-point-sets behavior, the
+//! deterministic ascending-cardinality point-set sort, and the final KZG
+//! pairing input `(pi, C - vG + z*pi)`.
 
 #![allow(dead_code)]
 
@@ -50,10 +58,10 @@ use crate::codegen::{
 // ---------------------------------------------------------------------------
 
 /// A single verifier query: a commitment opened at `omega^rotation * x`
-/// to claim `eval`. The current Step 5 emitter assumes commitments are
-/// `OnePiece` (single G1 point). The linearized commitment introduced
-/// by `compute_linearization_commitment` will be added in Step 6/7 as
-/// a `Linear` variant.
+/// to claim `eval`. The current emitter assumes commitments are `OnePiece`
+/// (single G1 point) except for the linearization query, whose synthetic
+/// commitment is expanded into quotient-limb and simple-selector MSM terms
+/// when the Yul is emitted.
 #[derive(Clone, Debug)]
 pub(crate) struct Query {
     pub rotation: i32,
@@ -74,9 +82,10 @@ impl Query {
 /// Build the verifier query list for the codegen verifier.
 ///
 /// Mirrors the iterator chain in
-/// `midfall/proofs/src/plonk/verifier.rs::verify_algebraic_constraints`,
-/// excluding committed-instance queries (the codegen path supports only
-/// `nb_committed_instances == 0` for now).
+/// `midfall/proofs/src/plonk/verifier.rs::verify_algebraic_constraints`.
+/// The upstream verifier collects all queries for the final multi-open proof;
+/// simple multiplicative selector queries are skipped because the custom
+/// linearization query carries their commitments and selector accumulators.
 pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
     meta.protocol
         .pcs_queries
@@ -180,6 +189,8 @@ pub(crate) struct DummyQuery {
 /// pointer), unions all non-singleton point sets, and emits the
 /// missing `(first_index, point)` pairs that, once added, make every
 /// non-singleton point set identical.
+/// Upstream comment: add dummy queries to reduce the number of distinct
+/// point sets that the KZG verifier must batch.
 ///
 /// The output order is deterministic (insertion order of groups *
 /// insertion order of points), matching the prover's transcript layout.
@@ -359,9 +370,12 @@ fn construct_intermediate_sets_impl(queries: &[Query]) -> IntermediateSets {
     }
 }
 
-/// Sort the IntermediateSets by ascending cardinality (tiebreaker by
-/// original set index). Returns a new IntermediateSets with `set_index`
-/// values rewritten to point to the sorted positions.
+/// Sort point sets by ascending cardinality (tiebreaker by original set
+/// index). The Rust KZG verifier relies on this deterministic order so the
+/// first point set contains the fixed commitments opened at x, and the
+/// in-circuit verifier can collapse the same MSMs. Returns a new
+/// IntermediateSets with `set_index` values rewritten to point to the sorted
+/// positions.
 fn sort_sets(input: IntermediateSets) -> IntermediateSets {
     let mut order: Vec<usize> = (0..input.point_sets.len()).collect();
     order.sort_by_key(|&i| (input.point_sets[i].len(), i));
@@ -413,6 +427,12 @@ fn commitments_by_set(sets: &IntermediateSets, n_sets: usize) -> Vec<Vec<&Commit
 }
 
 fn linearization_term_count(meta: &ConstraintSystemMeta) -> usize {
+    // `linearization/verifier.rs::compute_linearization_commitment` builds an
+    // MSM for
+    //   S_0*id_0(x) + y*S_1*id_1(x) + ... -
+    //   (h_0 + x^(n-1)h_1 + ...)*(x^n - 1)
+    // Fully evaluated identities are not included on the commitment side;
+    // they are accumulated, negated, and used as the expected eval scalar.
     meta.num_quotients + meta.simple_selector_cols.len()
 }
 
@@ -545,7 +565,7 @@ pub(super) fn static_working_memory_size() -> usize {
 }
 
 /// Emit the multi-prepare Yul body. The output is the same vec-of-vec-of-strings
-/// shape the rest of the codegen uses; each inner Vec<String> is a discrete
+/// shape the rest of the codegen uses; each inner `Vec<String>` is a discrete
 /// Yul code block (rendered between `{` and `}` in the template).
 #[allow(clippy::vec_init_then_push)]
 pub(super) fn computations(
@@ -1032,6 +1052,10 @@ pub(super) fn computations(
     // ------------------------------------------------------------------
     // Block 4: f_eval via Horner over reverse(point_sets) using Lagrange
     // interpolation at x3.
+    // Sample a challenge x_3 so the verifier can check that f(X)
+    // is correctly committed by evaluating it at a fresh point. The expected
+    // eval uses the prover-supplied q_eval scalar, the reconstructed
+    // interpolation r_eval, and prod_i (x_3 - point_i).
     //
     //   acc <- 0
     //   for s in (n_sets - 1).. down to 0:
@@ -1453,6 +1477,7 @@ pub(super) fn computations(
     // ------------------------------------------------------------------
     {
         let mut lines: Vec<String> = Vec::new();
+        lines.push("// Scale z*pi - vG before the final pairing check".to_string());
         lines.push("// pairing inputs (LHS = pi; RHS = final_com - v*G + x3*pi)".to_string());
 
         // PAIRING_LHS = pi (paired against G2_BASE).

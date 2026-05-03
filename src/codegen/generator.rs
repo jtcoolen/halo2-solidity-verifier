@@ -28,6 +28,10 @@ impl<'a> SolidityGenerator<'a> {
         if vk.cs().num_advice_columns() == 0 {
             return Err(GeneratorError::NoAdviceColumns);
         }
+        // Midfall's Rust verifier receives instances in two arguments:
+        // committed instances and normal (non-committed) instances. The
+        // total number of instance columns is their sum, with committed
+        // columns first in verifier order (`plonk/verifier.rs::verify_proof`).
         Self::validate_instance_column_shape(
             vk.cs().num_instance_columns(),
             num_committed_instances,
@@ -57,9 +61,28 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     /// Set `AccumulatorEncoding`.
-    pub fn set_acc_encoding(mut self, acc_encoding: Option<AccumulatorEncoding>) -> Self {
+    ///
+    /// This is the panic-on-error convenience form. Use
+    /// [`Self::try_set_acc_encoding`] when caller-controlled public-input
+    /// layouts should produce a typed [`GeneratorError`] instead.
+    pub fn set_acc_encoding(self, acc_encoding: Option<AccumulatorEncoding>) -> Self {
+        self.try_set_acc_encoding(acc_encoding)
+            .unwrap_or_else(|err| panic!("unsupported accumulator encoding: {err}"))
+    }
+
+    /// Try to enable or disable the optional public-accumulator pairing batch.
+    ///
+    /// When enabled, the accumulator must be a tail of the public-input vector
+    /// and must use the currently supported Midnight BLS12-381 limb packing.
+    pub fn try_set_acc_encoding(
+        mut self,
+        acc_encoding: Option<AccumulatorEncoding>,
+    ) -> Result<Self, GeneratorError> {
+        if let Some(acc_encoding) = acc_encoding {
+            acc_encoding.validate_for_num_instances(self.num_instances)?;
+        }
         self.acc_encoding = acc_encoding;
-        self
+        Ok(self)
     }
 
     /// Number of instance columns committed to in the transcript (vs read
@@ -128,6 +151,11 @@ impl<'a> SolidityGenerator<'a> {
             committed_instance,
             computed_instance,
             advice: meta.advice_queries.len(),
+            // The Rust verifier reads
+            // (num_fixed_columns - num_simple_selectors) fixed evals from the
+            // proof, then synthesizes simple selector values locally. Codegen
+            // mirrors that split so selector-gated identities feed the
+            // linearization buckets instead of consuming proof scalars.
             fixed: meta.num_fixeds - meta.num_simple_selectors,
             simple_selector_fixed: meta.num_simple_selectors,
             permutation_common: meta.permutation_columns.len(),
@@ -295,7 +323,7 @@ impl<'a> SolidityGenerator<'a> {
     ///
     /// External quotient evaluators are correctness-critical. Production
     /// callers must first render/compile/deploy the quotient evaluator, then
-    /// call [`render_separately_with_pinned_quotient_into`] with its runtime
+    /// call [`Self::render_separately_with_pinned_quotient_into`] with its runtime
     /// length and codehash.
     #[deprecated(
         note = "external quotient evaluators must be pinned; use render_quotient_evaluator_into + render_separately_with_pinned_quotient_into"
@@ -330,7 +358,7 @@ impl<'a> SolidityGenerator<'a> {
     /// and linked `Halo2QuotientEvaluator.sol`.
     ///
     /// External quotient evaluators must be pinned even in trace builds.
-    /// Use [`render_trace_separately_with_pinned_quotient_into`].
+    /// Use [`Self::render_trace_separately_with_pinned_quotient_into`].
     #[deprecated(
         note = "external quotient evaluators must be pinned; use render_trace_separately_with_pinned_quotient_into"
     )]
@@ -365,7 +393,7 @@ impl<'a> SolidityGenerator<'a> {
     /// Render only `Halo2QuotientEvaluator.sol`. Production deployment
     /// tooling can compile/deploy this first, compute its runtime length and
     /// codehash, then render a verifier with
-    /// [`render_separately_with_pinned_quotient_into`].
+    /// [`Self::render_separately_with_pinned_quotient_into`].
     pub fn render_quotient_evaluator_into(
         &self,
         quotient_writer: &mut impl fmt::Write,
@@ -527,6 +555,10 @@ impl<'a> SolidityGenerator<'a> {
             // little-endian-to-u256 conversion that worked for BN254 Fr
             // also works here: the verifier reads each scalar from
             // calldata into a single 32-byte word.
+            // `plonk/verifier.rs` hashes the verifying key into the
+            // transcript before reading prover data. The Solidity template
+            // absorbs this `transcript_repr` digest as its first transcript
+            // word to preserve the Rust verifier's Fiat-Shamir prefix.
             let vk_digest = fe_to_u256::<Fq>(&self.vk.transcript_repr());
             let num_instances = U256::from(self.num_instances);
             let k = U256::from(domain.k());
@@ -939,6 +971,14 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> QuotientIdentityParts {
+        // This is the codegen-time split of Midfall's
+        // `partially_evaluate_identities` comment: the Rust verifier returns
+        // `(Option<selector_column>, evaluation)` for gates first, then
+        // permutation, lookup, and trash identities. `Some(selector_column)`
+        // means the identity is gated by a simple multiplicative selector and
+        // must feed a selector bucket in `compute_linearization_commitment`;
+        // `None` means it is fully evaluated and contributes to the negated
+        // expected scalar.
         let evaluator = Evaluator::new(self.vk.cs(), meta, data);
         let gate_items = evaluator.gate_computations_tagged();
         let gate_exprs = self
@@ -2526,13 +2566,9 @@ impl<'a> SolidityGenerator<'a> {
         let acc_msm_terms = self
             .acc_encoding
             .map(|acc_encoding| {
-                let limbs_per_instance = (254 / acc_encoding.num_limb_bits).max(1);
-                let coord_words = acc_encoding.num_limbs.div_ceil(limbs_per_instance);
-                let point_and_scalar_words = 4 * coord_words + 2;
-                let fixed_scalar_count = self
-                    .num_instances
-                    .checked_sub(acc_encoding.offset + point_and_scalar_words)
-                    .expect("accumulator public input exceeds num_instances");
+                let fixed_scalar_count = acc_encoding
+                    .fixed_scalar_count(self.num_instances)
+                    .expect("accumulator encoding validated by set_acc_encoding");
                 fixed_scalar_count + 1
             })
             .unwrap_or(0);
@@ -2773,13 +2809,9 @@ impl<'a> SolidityGenerator<'a> {
 
         let mut acc_fixed_bases: Vec<(String, usize, bool)> = Vec::new();
         if let Some(acc_encoding) = self.acc_encoding {
-            let limbs_per_instance = (254 / acc_encoding.num_limb_bits).max(1);
-            let coord_words = acc_encoding.num_limbs.div_ceil(limbs_per_instance);
-            let point_and_scalar_words = 4 * coord_words + 2;
-            let fixed_scalar_count = self
-                .num_instances
-                .checked_sub(acc_encoding.offset + point_and_scalar_words)
-                .expect("accumulator public input exceeds num_instances");
+            let fixed_scalar_count = acc_encoding
+                .fixed_scalar_count(self.num_instances)
+                .expect("accumulator encoding validated by set_acc_encoding");
             // A fully-collapsed public accumulator has no fixed-base scalar
             // tail: just (lhs point, lhs scalar=1, rhs point, rhs scalar=1).
             // Older partially-collapsed accumulators still expose the RHS

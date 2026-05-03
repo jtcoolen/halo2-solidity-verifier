@@ -17,7 +17,7 @@
 //!
 //! All four emitters are now ported:
 //!
-//!   * [`Evaluator::gate_computations`]      — per-gate `polynomials()`
+//!   * [`Evaluator::gate_computations_tagged`] — per-gate `polynomials()`
 //!   * [`Evaluator::permutation_computations`] — boundary + product equality
 //!   * [`Evaluator::lookup_computations`]    — boundary + helper + accumulator
 //!   * [`Evaluator::trashcan_computations`]  — `compressed - (1-q)*trash`
@@ -587,7 +587,7 @@ impl<'a> Evaluator<'a> {
     }
 
     // ----------------------------------------------------------------
-    // Trash emitter.
+    // Trashcan emitter.
     //
     // Mirrors `midfall/proofs/src/plonk/trash.rs::Evaluated::expressions`:
     //

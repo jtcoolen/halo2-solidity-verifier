@@ -21,9 +21,10 @@ ignored so machine-local overrides do not leak into commits.
 
 The ignored proving benches need local SRS files. `scripts/run_ivc_bench.sh`
 downloads the IVC bench assets into `.srs/` by default, or you can point
-`SRS_DIR` at an existing Filecoin/Midnight SRS directory. The IVC Solidity
-tree bench needs Midnight `midnight-srs-2p19` for the leaf IVC proofs and
-`midnight-srs-2p20` for the final decider proof.
+`SRS_DIR` at an existing SRS directory. The IVC Solidity tree bench needs
+Midnight `midnight-srs-2p19` for the leaf IVC proofs and
+`midnight-srs-2p20` for the final decider proof; the optional native Midfall
+comparison path also needs a Filecoin SRS.
 
 ```bash
 rustc --version    # should report 1.90.0
@@ -126,7 +127,7 @@ What each one covers:
 
 ### IVC Keccak Solidity bench
 
-This slow ignored test proves two independent one-step IVC SHA-256 aggregation
+This slow ignored test proves two independent one-step IVC Poseidon hash-chain
 leaves, proves a final Keccak-transcript tree decider that verifies both leaf
 proofs and fully collapses the carried IVC proof accumulator, renders the
 Solidity verifier/VK for that decider proof, deploys them in Prague-spec
@@ -143,6 +144,13 @@ Full bench:
 
 ```bash
 scripts/run_ivc_bench.sh
+```
+
+Run the same bench with fewer point sets kept for the recursive verifier, but
+disabled for the outer Solidity-facing decider proof:
+
+```bash
+scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
 ```
 
 Use an existing SRS directory and also run the native Midfall final-proof twin:

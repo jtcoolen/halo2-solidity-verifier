@@ -44,7 +44,7 @@ The implemented suite is narrower than the full assurance roadmap in
 compatibility, protocol planning, memory layout, VK payload encoding, proof
 layout/canonicality checks, Solidity render invariants, Prague EIP-2537 smoke
 coverage, Poseidon verifier property/adversarial tests, a Poseidon end-to-end
-fixture, the Keccak IVC Solidity bench, and two ignored diagnostic
+fixture, the Keccak IVC Poseidon-chain Solidity bench, and two ignored diagnostic
 decompression probes.
 
 | Area | Current status | Default behavior |
@@ -52,7 +52,7 @@ decompression probes.
 | Library/codegen tests under `src/` | Implemented and part of the normal Cargo suite. | Run by `cargo test`. |
 | Solidity/EVM tests in `src/test.rs` | Implemented behind the `evm` feature. Heavy Poseidon cases self-skip unless `HALO2_SOLIDITY_RUN_EVM_TESTS=1`, `solc`, and SRS assets are available. | Listed by Cargo; skipped cleanly without the gate. |
 | `tests/poseidon_fixture.rs` | Implemented end-to-end Poseidon proof -> Solidity render -> `solc` -> Prague `revm` verification. | Self-skips unless `HALO2_SOLIDITY_RUN_EVM_TESTS=1`. |
-| `tests/ivc_keccak_solidity.rs` | Implemented slow Keccak IVC final-proof Solidity bench. | Self-skips unless `HALO2_SOLIDITY_RUN_IVC_BENCH=1`. |
+| `tests/ivc_keccak_solidity.rs` | Implemented slow Keccak IVC final-proof Solidity bench over Poseidon hash-chain leaves. | Self-skips unless `HALO2_SOLIDITY_RUN_IVC_BENCH=1`. |
 | `tests/fcom_decompress.rs` | Implemented diagnostic probes only. | Marked `#[ignore]`. |
 
 ### Requirements
@@ -128,7 +128,7 @@ cargo test --test fcom_decompress -- --ignored --nocapture
 
 ### IVC detailed bench
 
-Run the Keccak IVC Solidity verifier bench with per-section gas checkpoints:
+Run the Keccak IVC Solidity verifier bench over Poseidon hash-chain leaves with per-section gas checkpoints:
 
 ```bash
 SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
@@ -137,6 +137,13 @@ scripts/run_ivc_bench.sh
 
 This prints the detailed checkpoint table, deployed runtime sizes, total
 transaction gas, and real checkpointed section work.
+
+To keep the recursive verifier on fewer point sets but benchmark the outer
+decider proof without dummy PCS evals:
+
+```bash
+scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
+```
 
 Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
 `scripts/run_ivc_bench.sh --trace`. Custom Midfall overrides must expose the

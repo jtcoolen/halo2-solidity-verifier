@@ -1,39 +1,42 @@
 pragma solidity ^0.8.24;
 
-// Native quotient evaluator for Halo2Verifier.
-//
-// This contract is the split-out implementation of the expensive
-// `partially_evaluate_identities` / `compute_linearization_commitment` scalar
-// side from the Midfall Rust verifier. It is deliberately tiny at the ABI
-// boundary: the main verifier has already parsed calldata, checked proof
-// scalar ranges, sampled Fiat-Shamir challenges, loaded the VK payload, and
-// computed local Lagrange/public-input values.
-//
-// Instead of receiving structured Solidity arguments, the evaluator receives
-// the verifier's memory frame as raw calldata:
-//
-//   calldata[0..QUOTIENT_FRAME_LEN)
-//      == memory[QUOTIENT_FRAME_BASE..QUOTIENT_FRAME_BASE+QUOTIENT_FRAME_LEN)
-//
-// The fallback copies that frame back into the same generated memory
-// addresses. All constants below are therefore memory addresses inside that
-// copied frame, not ABI offsets.
-//
-// Output is a compact fixed frame consumed by Halo2Verifier:
-//
-//   word 0: QUOTIENT_MAGIC, a generated version/magic guard
-//   word 1: linearization_expected_eval
-//   word 2..: simple-selector accumulator scalars
-//
-// This contract reconstructs the Rust verifier's y-batched identity numerator
-// nu_y(x) and returns the linearization expected scalar -nu_y(x). It does not
-// evaluate or trust a quotient scalar h(x).
-//
-// The quotient limb commitments are handled by Halo2Verifier on the commitment
-// side as (1 - x^n) * sum_i x_split^i * Q_i. That is why this scalar side is
-// -nu_y(x), not h(x) = nu_y(x) / (x^n - 1).
-//
-// See docs/QUOTIENT_NUMERATOR_EVALUATOR.md for the full Rust/Solidity mapping.
+/// @title Split Halo2 quotient numerator evaluator.
+/// @notice Reconstructs the scalar side of the linearization query for a generated verifier.
+/// @dev This is the split-out implementation of the expensive
+/// `partially_evaluate_identities` / `compute_linearization_commitment` side
+/// from the Midfall Rust verifier:
+/// - `midfall/proofs/src/plonk/mod.rs::partially_evaluate_identities`
+/// - `midfall/proofs/src/plonk/linearization/verifier.rs::compute_linearization_commitment`
+/// - `midfall/proofs/src/plonk/{permutation,logup,trash}.rs`
+/// @dev The main verifier has already parsed calldata, checked proof scalar
+/// ranges, sampled Fiat-Shamir challenges, loaded the VK payload, and computed
+/// local Lagrange/public-input values before making the staticcall.
+///
+/// Instead of receiving structured Solidity arguments, the evaluator receives
+/// the verifier's memory frame as raw calldata:
+///
+///   calldata[0..QUOTIENT_FRAME_LEN)
+///      == memory[QUOTIENT_FRAME_BASE..QUOTIENT_FRAME_BASE+QUOTIENT_FRAME_LEN)
+///
+/// The fallback copies that frame back into the same generated memory
+/// addresses. All constants below are therefore memory addresses inside that
+/// copied frame, not ABI offsets.
+///
+/// Output is a compact fixed frame consumed by Halo2Verifier:
+///
+///   word 0: QUOTIENT_MAGIC, a generated version/magic guard
+///   word 1: linearization_expected_eval
+///   word 2..: simple-selector accumulator scalars
+///
+/// This contract reconstructs the Rust verifier's y-batched identity numerator
+/// nu_y(x) and returns the linearization expected scalar -nu_y(x). It does not
+/// evaluate or trust a quotient scalar h(x).
+///
+/// The quotient limb commitments are handled by Halo2Verifier on the commitment
+/// side as (1 - x^n) * sum_i x_split^i * Q_i. That is why this scalar side is
+/// -nu_y(x), not h(x) = nu_y(x) / (x^n - 1).
+///
+/// See docs/QUOTIENT_NUMERATOR_EVALUATOR.md for the full Rust/Solidity mapping.
 contract Halo2QuotientEvaluator {
     // BLS12-381 scalar field modulus. All arithmetic in this contract is over
     // Fr and uses addmod/mulmod with this modulus.
@@ -92,6 +95,8 @@ contract Halo2QuotientEvaluator {
     uint256 internal constant QUOTIENT_OUTPUT_LEN = {{ quotient_external.output_len|hex() }};
     uint256 internal constant QUOTIENT_MAGIC = {{ quotient_external.magic|hex_padded(64) }};
 
+    /// @notice Evaluate the generated quotient numerator block for one verifier memory frame.
+    /// @dev Calldata is exactly the raw frame, not ABI-encoded arguments. Returns `QUOTIENT_MAGIC`, the linearization expected eval, and selector buckets.
     fallback() external {
         assembly ("memory-safe") {
             // Reject malformed calls. This contract is not a general-purpose
@@ -201,6 +206,13 @@ contract Halo2QuotientEvaluator {
             // Depending on codegen settings, some identities are native Yul
             // callbacks and the rest are executed by the compact q_program VM
             // stored in the copied VK payload.
+            //
+            // The upstream Rust comments call out that simple multiplicative
+            // selectors do not appear as normal proof eval scalars. The Yul
+            // block mirrors that rule by accumulating those identities into
+            // SELECTOR_ACC_MPTR buckets for later multiplication by fixed
+            // selector commitments, while fully evaluated identities contribute
+            // to the negated expected scalar.
             {%- include "QuotientNumeratorBlock.yul" %}
 
             // Return the compact output frame. Halo2Verifier checks the magic,

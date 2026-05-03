@@ -280,7 +280,7 @@ pub(crate) mod test {
             self.try_call_with_gas(address, calldata, 50_000_000)
         }
 
-        /// Like [`try_call`] but with a caller-controlled gas ceiling.
+        /// Like [`Self::try_call`] but with a caller-controlled gas ceiling.
         /// Necessary for very wide circuits (e.g. the IVC verifier at
         /// k = 19 with ~20+ advice columns) whose verifier doesn't fit
         /// within the default 50M cap during dev.

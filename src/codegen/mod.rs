@@ -71,6 +71,24 @@ pub struct SolidityGenerator<'a> {
 }
 
 /// KZG accumulator encoding information.
+///
+/// Accumulator verification is opt-in. A generated verifier only batches a
+/// public accumulator pairing equation into the final PLONK/KZG pairing when
+/// [`SolidityGenerator::set_acc_encoding`] or
+/// [`SolidityGenerator::try_set_acc_encoding`] is called with `Some`.
+///
+/// The accumulator is encoded as a tail of the non-committed public-input
+/// vector, starting at [`Self::offset`]. The current Solidity decoder supports
+/// Midnight's fully-collapsed BLS12-381 accumulator layout:
+///
+/// ```text
+/// lhs point coordinates, lhs scalar, rhs point coordinates, rhs scalar
+/// ```
+///
+/// with each BLS12-381 base-field coordinate represented as seven radix-2^56
+/// limbs, packed four limbs per public-input field element. Any public-input
+/// words after the fixed accumulator payload are interpreted as the optional
+/// RHS fixed-base scalar tail for partially collapsed accumulators.
 #[derive(Clone, Copy, Debug)]
 pub struct AccumulatorEncoding {
     /// Offset of accumulator limbs in instances.
@@ -82,6 +100,10 @@ pub struct AccumulatorEncoding {
 }
 
 impl AccumulatorEncoding {
+    pub const SUPPORTED_NUM_LIMBS: usize = 7;
+    pub const SUPPORTED_NUM_LIMB_BITS: usize = 56;
+    pub const FULLY_COLLAPSED_PUBLIC_INPUT_WORDS: usize = 10;
+
     /// Return a new `AccumulatorEncoding`.
     pub fn new(offset: usize, num_limbs: usize, num_limb_bits: usize) -> Self {
         Self {
@@ -89,6 +111,54 @@ impl AccumulatorEncoding {
             num_limbs,
             num_limb_bits,
         }
+    }
+
+    fn coordinate_words(self) -> usize {
+        let limbs_per_instance = (254 / self.num_limb_bits).max(1);
+        self.num_limbs.div_ceil(limbs_per_instance)
+    }
+
+    fn point_and_scalar_words(self) -> usize {
+        4 * self.coordinate_words() + 2
+    }
+
+    /// Minimum number of public-input words occupied by the accumulator tail,
+    /// excluding any optional fixed-base scalar tail.
+    pub fn fully_collapsed_public_input_words(self) -> Result<usize, GeneratorError> {
+        self.validate_for_num_instances(usize::MAX)?;
+        Ok(self.point_and_scalar_words())
+    }
+
+    fn validate_for_num_instances(self, num_instances: usize) -> Result<(), GeneratorError> {
+        if self.num_limbs != Self::SUPPORTED_NUM_LIMBS
+            || self.num_limb_bits != Self::SUPPORTED_NUM_LIMB_BITS
+        {
+            return Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                offset: self.offset,
+                num_limbs: self.num_limbs,
+                num_limb_bits: self.num_limb_bits,
+                num_instances,
+                reason: "expected 7 radix-2^56 limbs per BLS12-381 base-field coordinate",
+            });
+        }
+
+        let required_words = self.point_and_scalar_words();
+        if self.offset.saturating_add(required_words) > num_instances {
+            return Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                offset: self.offset,
+                num_limbs: self.num_limbs,
+                num_limb_bits: self.num_limb_bits,
+                num_instances,
+                reason: "accumulator public-input tail exceeds num_instances",
+            });
+        }
+
+        Ok(())
+    }
+
+    fn fixed_scalar_count(self, num_instances: usize) -> Result<usize, GeneratorError> {
+        self.validate_for_num_instances(num_instances)?;
+        Ok(num_instances - (self.offset + self.point_and_scalar_words()))
     }
 }
 
@@ -111,6 +181,16 @@ pub enum GeneratorError {
     /// Instance columns are read as direct public inputs and locally
     /// Lagrange-interpolated only at the current row.
     RotatedInstanceQuery { column: usize, rotation: i32 },
+    /// The optional public accumulator pairing batch currently supports only
+    /// the Midnight BLS12-381 public-input encoding used by the IVC decider
+    /// fixtures.
+    UnsupportedAccumulatorEncoding {
+        offset: usize,
+        num_limbs: usize,
+        num_limb_bits: usize,
+        num_instances: usize,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for GeneratorError {
@@ -137,6 +217,16 @@ impl fmt::Display for GeneratorError {
             Self::RotatedInstanceQuery { column, rotation } => write!(
                 f,
                 "rotated instance query is not supported: column {column}, rotation {rotation}"
+            ),
+            Self::UnsupportedAccumulatorEncoding {
+                offset,
+                num_limbs,
+                num_limb_bits,
+                num_instances,
+                reason,
+            } => write!(
+                f,
+                "unsupported accumulator encoding: offset={offset}, num_limbs={num_limbs}, num_limb_bits={num_limb_bits}, num_instances={num_instances}; {reason}"
             ),
         }
     }
@@ -552,6 +642,7 @@ mod tests {
     #[test]
     fn accumulator_schema_is_checked_against_instance_count() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let spec = include_str!("../../docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md");
 
         assert!(
             verifier_template.contains("let acc_expected_words :="),
@@ -573,6 +664,16 @@ mod tests {
             verifier_template.contains("{%- if acc_fixed_bases.len() > 0 %}"),
             "fixed-base scalar tail parsing should only render when generated bases exist"
         );
+        for required in [
+            "try_set_acc_encoding",
+            "The accumulator is not passed through a separate ABI argument",
+            "checked tail convention",
+        ] {
+            assert!(
+                spec.contains(required),
+                "accumulator activation/layout docs should mention: {required}"
+            );
+        }
     }
 
     #[test]
@@ -609,6 +710,38 @@ mod tests {
                 .contains("ok := check_acc_coord_packing(src, bits, n, limbs_per_word)"),
             "accumulator coordinate decoding must apply packing canonicality before masking limbs"
         );
+    }
+
+    #[test]
+    fn accumulator_encoding_validation_rejects_dead_configs() {
+        let fully_collapsed = AccumulatorEncoding::new(4, 7, 56);
+        assert_eq!(
+            fully_collapsed.fully_collapsed_public_input_words(),
+            Ok(AccumulatorEncoding::FULLY_COLLAPSED_PUBLIC_INPUT_WORDS)
+        );
+        assert!(fully_collapsed.validate_for_num_instances(14).is_ok());
+        assert_eq!(fully_collapsed.fixed_scalar_count(14), Ok(0));
+        assert_eq!(fully_collapsed.fixed_scalar_count(17), Ok(3));
+
+        let wrong_limb_shape = AccumulatorEncoding::new(4, 8, 32);
+        assert!(matches!(
+            wrong_limb_shape.validate_for_num_instances(14),
+            Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                num_limbs: 8,
+                num_limb_bits: 32,
+                ..
+            })
+        ));
+
+        let out_of_bounds = AccumulatorEncoding::new(5, 7, 56);
+        assert!(matches!(
+            out_of_bounds.validate_for_num_instances(14),
+            Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                offset: 5,
+                reason: "accumulator public-input tail exceeds num_instances",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -946,6 +1079,16 @@ mod tests {
                 "verifyProof NatSpec must document application binding requirement: {required}"
             );
         }
+        for required in [
+            "/// @param proof Solidity-facing proof bytes",
+            "/// @param instances Public instance scalars",
+            "/// @return Always `true`",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "verifyProof NatSpec must include ABI documentation: {required}"
+            );
+        }
     }
 
     #[test]
@@ -959,6 +1102,173 @@ mod tests {
         assert!(
             !verifier_template.contains(") public {%- if self.trace || self.gas_checkpoints %}"),
             "production verifier should not expose the calldata entrypoint as public"
+        );
+    }
+
+    #[test]
+    fn midfall_comment_corpus_is_source_indexed_and_attributed() {
+        let corpus = include_str!("../../docs/MIDFALL_PROOFS_COMMENT_CORPUS.md");
+        let extractor = include_str!("../../scripts/extract_midfall_comments.py");
+
+        for required in [
+            "# Midfall Proofs Comment Corpus",
+            "Rust source files: `57`",
+            "Comment lines: `3597`",
+            "## `plonk/verifier.rs`",
+            "## `plonk/linearization/verifier.rs`",
+            "## `poly/kzg/mod.rs`",
+            "## `transcript/implementors.rs`",
+            "SPDX-License-Identifier: Apache-2.0",
+            "License And Attribution",
+        ] {
+            assert!(
+                corpus.contains(required),
+                "Midfall comment corpus missing expected source-indexed content: {required}"
+            );
+        }
+
+        for required in [
+            "COMMENT_RE",
+            "--check",
+            "--write",
+            "Git commit",
+            "CommentBlock",
+        ] {
+            assert!(
+                extractor.contains(required),
+                "comment extractor should remain deterministic/checkable: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn solidity_templates_have_required_natspec_surface() {
+        let verifier = include_str!("../../templates/Halo2Verifier.sol");
+        let vk = include_str!("../../templates/Halo2VerifyingKey.sol");
+        let quotient = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+
+        for (name, source, contract) in [
+            ("verifier", verifier, "contract Halo2Verifier"),
+            ("verifying key", vk, "contract Halo2VerifyingKey"),
+            (
+                "quotient evaluator",
+                quotient,
+                "contract Halo2QuotientEvaluator",
+            ),
+        ] {
+            assert!(
+                source.contains("/// @title")
+                    && source.contains("/// @notice")
+                    && source.contains("/// @dev"),
+                "{name} template should have contract-level NatSpec"
+            );
+            assert!(
+                source.contains(contract),
+                "{name} template should still declare {contract}"
+            );
+        }
+
+        for required in [
+            "/// @notice Reverts when a pinned verifier dependency",
+            "/// @notice Verifying-key contract address",
+            "/// @notice Quotient evaluator contract",
+            "/// @param authorizedVk",
+            "/// @param authorizedQuotient",
+            "/// @return Always `true`",
+        ] {
+            assert!(
+                verifier.contains(required),
+                "verifier NatSpec missing required declaration docs: {required}"
+            );
+        }
+        assert!(
+            vk.contains("/// @notice Deploy the verifying-key payload"),
+            "VK constructor should have NatSpec"
+        );
+        assert!(
+            quotient.contains("/// @notice Evaluate the generated quotient numerator block"),
+            "quotient fallback should have NatSpec"
+        );
+    }
+
+    #[test]
+    fn midfall_comment_ports_reference_rust_sources() {
+        let verifier = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let numerator = include_str!("../../templates/QuotientNumeratorBlock.yul");
+        let transcript = include_str!("../transcript.rs");
+        let generator = include_str!("generator.rs");
+        let evaluator = include_str!("evaluator.rs");
+        let protocol = include_str!("protocol.rs");
+        let pcs = include_str!("pcs.rs");
+        let spec = include_str!("../../docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md");
+
+        for required in [
+            "midfall/proofs/src/plonk/verifier.rs",
+            "midfall/proofs/src/transcript/implementors.rs",
+            "midfall/proofs/src/poly/kzg/mod.rs",
+        ] {
+            assert!(
+                verifier.contains(required) || spec.contains(required),
+                "verifier docs should reference upstream Rust source: {required}"
+            );
+        }
+        for required in [
+            "midfall/proofs/src/plonk/mod.rs::partially_evaluate_identities",
+            "midfall/proofs/src/plonk/linearization/verifier.rs::compute_linearization_commitment",
+            "selectors do not appear as normal proof eval scalars",
+        ] {
+            assert!(
+                quotient.contains(required) || numerator.contains(required),
+                "quotient docs should carry adapted upstream comments: {required}"
+            );
+        }
+        assert!(
+            transcript.contains("Hashable<Keccak256> for G1Projective"),
+            "transcript docs should reference upstream point hashing comments"
+        );
+        assert!(
+            protocol.contains("counterpart of the iterator-heavy verifier"),
+            "protocol plan should document the Midfall verifier-flow port"
+        );
+        for required in [
+            "committed instances and normal (non-committed) instances",
+            "(num_fixed_columns - num_simple_selectors) fixed evals",
+            "absorbs this `transcript_repr` digest",
+        ] {
+            assert!(
+                generator.contains(required),
+                "generator should carry adapted verifier comment: {required}"
+            );
+        }
+        for required in [
+            "Hash the prover's advice commitments",
+            "Read commitment(s) to the quotient polynomial h(X)=nu(X)/(X^n-1)",
+            "Queries corresponding to simple, multiplicative selectors need not be",
+            "omega^rotation*x",
+        ] {
+            assert!(
+                protocol.contains(required),
+                "protocol plan should carry adapted verifier comment: {required}"
+            );
+        }
+        for required in [
+            "partially_evaluate_identities",
+            "LogUp emitter",
+            "Permutation emitter",
+            "Trashcan emitter",
+        ] {
+            assert!(
+                evaluator.contains(required),
+                "quotient evaluator codegen should carry adapted verifier comment: {required}"
+            );
+        }
+        assert!(
+            pcs.contains("Upstream comments ported here")
+                && pcs.contains("Sort point sets by ascending cardinality")
+                && pcs.contains("Sample a challenge x_3")
+                && pcs.contains("Scale z*pi - vG"),
+            "PCS emitter should document the KZG comment port"
         );
     }
 
@@ -1091,6 +1401,17 @@ mod tests {
             }
             .to_string(),
             "rotated instance query is not supported: column 1, rotation -1"
+        );
+        assert_eq!(
+            GeneratorError::UnsupportedAccumulatorEncoding {
+                offset: 5,
+                num_limbs: 7,
+                num_limb_bits: 56,
+                num_instances: 14,
+                reason: "accumulator public-input tail exceeds num_instances",
+            }
+            .to_string(),
+            "unsupported accumulator encoding: offset=5, num_limbs=7, num_limb_bits=56, num_instances=14; accumulator public-input tail exceeds num_instances"
         );
         let stale = ["not", " yet ", "implemented"].concat();
         assert!(

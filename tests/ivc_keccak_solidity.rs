@@ -1,8 +1,8 @@
 //! End-to-end on-chain verification of a Keccak-transcript decider proof for
-//! a two-leaf IVC SHA-256 aggregation tree.
+//! a two-leaf IVC Poseidon hash-chain tree.
 //!
 //! Pipeline:
-//!   1. Build the IVC circuit (k = 19, ProofAggregation transition).
+//!   1. Build the IVC circuit (k = 19, PoseidonChain transition).
 //!   2. Produce two independent one-step IVC proofs under the Poseidon
 //!      transcript; these are the leaves of the tree.
 //!   3. Build a final decider circuit (k = 20) that verifies both IVC leaves,
@@ -18,8 +18,10 @@
 //!      calldata, call `verifyProof`.
 //!   6. Assert success and dump gas.
 //!
-//! Required features: `evm`, `truncated-challenges`,
-//! `in-circuit-fewer-point-sets`, `outer-fewer-point-sets`.
+//! Required features: `evm`, `truncated-challenges`. The bench runner enables
+//! `in-circuit-fewer-point-sets` and `outer-fewer-point-sets` by default;
+//! omit only `outer-fewer-point-sets` to benchmark the non-fewer final proof
+//! layout while the recursive verifier remains on fewer point sets.
 //! Midnight crates are pulled from the published midfall `keccak` branch
 //! configured in `Cargo.toml`; `SRS_DIR` still needs to point at local SRS
 //! assets.
@@ -48,12 +50,7 @@
 //! Native Rust/Solidity trace equivalence needs a local Midfall checkout that
 //! exposes `midnight_proofs::plonk::solidity_trace`.
 
-#![cfg(all(
-    feature = "evm",
-    feature = "truncated-challenges",
-    feature = "in-circuit-fewer-point-sets",
-    feature = "outer-fewer-point-sets",
-))]
+#![cfg(all(feature = "evm", feature = "truncated-challenges",))]
 
 use std::{collections::BTreeMap, time::Instant};
 
@@ -70,7 +67,7 @@ use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::{self, ConstraintSystem, Error},
     poly::{
-        kzg::{params::ParamsVerifierKZG, KZGCommitmentScheme},
+        kzg::{params::ParamsVerifierKZG, scoped_fewer_point_sets, KZGCommitmentScheme},
         EvaluationDomain,
     },
     transcript::{CircuitTranscript, Transcript},
@@ -78,10 +75,9 @@ use midnight_proofs::{
 use midnight_zk_stdlib::{
     cs_degree,
     utils::plonk_api::{load_srs, SrsSource},
-    MidnightPK, MidnightVK, Relation, ZkStdLib, ZkStdLibArch,
+    MidnightVK, Relation, ZkStdLib, ZkStdLibArch,
 };
-use rand::{rngs::OsRng, Rng};
-use sha2::Digest;
+use rand::rngs::OsRng;
 
 use halo2_solidity_verifier::{
     compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding, CallOutcome, Evm,
@@ -96,105 +92,145 @@ type E = <S as SelfEmulation>::Engine;
 const RUN_IVC_BENCH_ENV: &str = "HALO2_SOLIDITY_RUN_IVC_BENCH";
 
 // ---------------------------------------------------------------------------
-// Inner SHA-256 preimage circuit (mirror of
-// midfall/aggregation/examples/common/sha_preimage.rs).
+// IVC Poseidon hash-chain transition (mirror of
+// midfall/aggregation/examples/ivc.rs).
 // ---------------------------------------------------------------------------
 
-const SHA_K: u32 = 13;
-const SHA_NB_PUBLIC_INPUTS: usize = 32;
+const POSEIDON_HASHES_PER_STEP: usize = 1;
 
-#[derive(Clone, Debug, Default)]
-struct ShaPreimageCircuit;
+type Chain = PoseidonChain<POSEIDON_HASHES_PER_STEP>;
 
-impl Relation for ShaPreimageCircuit {
-    type Instance = [u8; 32];
-    type Witness = [u8; 24];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct State {
+    cnt: F,
+    val: F,
+}
 
-    fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
-        Ok(instance
-            .iter()
-            .flat_map(midnight_circuits::types::AssignedByte::<F>::as_public_input)
-            .collect())
+#[derive(Clone, Debug)]
+struct AssignedState {
+    cnt: AssignedNative<F>,
+    val: AssignedNative<F>,
+}
+
+#[derive(Clone, Debug)]
+struct PoseidonChain<const N: usize> {
+    std_lib: ZkStdLib,
+}
+
+impl<const N: usize> IvcContext for PoseidonChain<N> {
+    type Context = ();
+
+    fn new(std_lib: ZkStdLib, _ctx: &()) -> Self {
+        PoseidonChain { std_lib }
     }
 
-    fn circuit(
+    fn write_context<W: std::io::Write>(_ctx: &(), _writer: &mut W) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_context<R: std::io::Read>(_reader: &mut R) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<const N: usize> IvcState for PoseidonChain<N> {
+    type State = State;
+    type AssignedState = AssignedState;
+
+    fn genesis(_ctx: &()) -> Self::State {
+        State {
+            cnt: F::ZERO,
+            val: F::ZERO,
+        }
+    }
+
+    fn is_genesis(
         &self,
-        std_lib: &ZkStdLib,
         layouter: &mut impl Layouter<F>,
-        _instance: Value<Self::Instance>,
-        witness: Value<Self::Witness>,
-    ) -> Result<(), Error> {
-        let witness_bytes = witness.transpose_array();
-        let assigned_input = std_lib.assign_many(layouter, &witness_bytes)?;
-        let output = std_lib.sha2_256(layouter, &assigned_input)?;
-        output
-            .iter()
-            .try_for_each(|b| std_lib.constrain_as_public_input(layouter, b))
+        state: &Self::AssignedState,
+    ) -> Result<AssignedBit<F>, Error> {
+        let scalar_chip = self.std_lib.bls12_381_scalar();
+        let cnt_is_zero = scalar_chip.is_zero(layouter, &state.cnt)?;
+        let val_is_zero = scalar_chip.is_zero(layouter, &state.val)?;
+        self.std_lib.and(layouter, &[cnt_is_zero, val_is_zero])
     }
 
-    fn used_chips(&self) -> ZkStdLibArch {
+    fn decider(_ctx: &(), _state: &Self::State) -> bool {
+        true
+    }
+}
+
+impl<const N: usize> IvcIO for PoseidonChain<N> {
+    fn assign(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        value: Value<State>,
+    ) -> Result<AssignedState, Error> {
+        let scalar_chip = self.std_lib.bls12_381_scalar();
+        Ok(AssignedState {
+            cnt: scalar_chip.assign(layouter, value.as_ref().map(|s| s.cnt))?,
+            val: scalar_chip.assign(layouter, value.as_ref().map(|s| s.val))?,
+        })
+    }
+
+    fn constrain_as_public_input(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        state: &AssignedState,
+    ) -> Result<(), Error> {
+        let scalar_chip = self.std_lib.bls12_381_scalar();
+        scalar_chip.constrain_as_public_input(layouter, &state.cnt)?;
+        scalar_chip.constrain_as_public_input(layouter, &state.val)
+    }
+
+    fn as_public_input(
+        &self,
+        _layouter: &mut impl Layouter<F>,
+        state: &AssignedState,
+    ) -> Result<Vec<AssignedNative<F>>, Error> {
+        Ok(vec![state.cnt.clone(), state.val.clone()])
+    }
+
+    fn format_public_input(state: &State) -> Vec<F> {
+        vec![state.cnt, state.val]
+    }
+}
+
+impl<const N: usize> IvcTransition for PoseidonChain<N> {
+    type Witness = ();
+
+    fn arch() -> ZkStdLibArch {
         ZkStdLibArch {
-            sha2_256: true,
+            poseidon: true,
+            nr_pow2range_cols: 4,
             ..ZkStdLibArch::default()
         }
     }
 
-    fn write_relation<W: std::io::Write>(&self, _writer: &mut W) -> std::io::Result<()> {
-        Ok(())
+    fn transition(_ctx: &(), state: &Self::State, _witness: Self::Witness) -> Self::State {
+        let mut val = state.val;
+        for _ in 0..N {
+            val = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[val]);
+        }
+        State {
+            cnt: state.cnt + F::from(N as u64),
+            val,
+        }
     }
 
-    fn read_relation<R: std::io::Read>(_reader: &mut R) -> std::io::Result<Self> {
-        Ok(ShaPreimageCircuit)
-    }
-}
-
-fn sha_random_instance() -> ([u8; 32], [u8; 24]) {
-    let preimage: [u8; 24] = OsRng.gen();
-    let digest: [u8; 32] = sha2::Sha256::digest(preimage).into();
-    (digest, preimage)
-}
-
-fn sha_setup_vk(srs: &midnight_proofs::poly::kzg::params::ParamsKZG<E>) -> MidnightVK {
-    midnight_zk_stdlib::setup_vk(srs, &ShaPreimageCircuit)
-}
-
-fn sha_setup_pk(vk: &MidnightVK) -> MidnightPK<ShaPreimageCircuit> {
-    midnight_zk_stdlib::setup_pk(&ShaPreimageCircuit, vk)
-}
-
-fn sha_prove(
-    srs: &midnight_proofs::poly::kzg::params::ParamsKZG<E>,
-    pk: &MidnightPK<ShaPreimageCircuit>,
-    instance: &[u8; 32],
-    witness: [u8; 24],
-) -> Vec<u8> {
-    midnight_zk_stdlib::prove::<ShaPreimageCircuit, PoseidonState<F>>(
-        srs,
-        pk,
-        &ShaPreimageCircuit,
-        instance,
-        witness,
-        OsRng,
-    )
-    .expect("inner SHA proof generation should not fail")
-}
-
-// ---------------------------------------------------------------------------
-// IVC ProofAggregation transition (mirror of
-// midfall/aggregation/examples/single_circuit_aggregation.rs).
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-struct InnerCircuitContext {
-    cs: ConstraintSystem<F>,
-    domain: EvaluationDomain<F>,
-    vk: MidnightVK,
-    params_verifier: ParamsVerifierKZG<E>,
-}
-
-impl InnerCircuitContext {
-    fn fixed_bases(&self) -> BTreeMap<String, C> {
-        verifier::fixed_bases::<S>("inner_vk", self.vk.vk())
+    fn circuit_transition(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        state: &Self::AssignedState,
+        _witness: Value<Self::Witness>,
+    ) -> Result<Self::AssignedState, Error> {
+        let scalar_chip = self.std_lib.bls12_381_scalar();
+        let mut val = state.val.clone();
+        for _ in 0..N {
+            val = self.std_lib.poseidon(layouter, &[val])?;
+        }
+        let cnt = scalar_chip.add_constant(layouter, &state.cnt, F::from(N as u64))?;
+        Ok(AssignedState { cnt, val })
     }
 }
 
@@ -256,255 +292,6 @@ fn constrain_same_accumulator_public_input(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct State {
-    statements: Vec<<ShaPreimageCircuit as Relation>::Instance>,
-    statements_hash: F,
-    inner_acc: Accumulator<S>,
-}
-
-#[derive(Clone, Debug)]
-struct AssignedState {
-    statements_hash: AssignedNative<F>,
-    inner_acc: AssignedAccumulator<S>,
-}
-
-#[derive(Clone, Debug)]
-struct AggregationWitness {
-    inner_statement: <ShaPreimageCircuit as Relation>::Instance,
-    inner_proof: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-struct ProofAggregation {
-    std_lib: ZkStdLib,
-    inner_ctx: InnerCircuitContext,
-}
-
-impl IvcContext for ProofAggregation {
-    type Context = InnerCircuitContext;
-    fn new(std_lib: ZkStdLib, ctx: &InnerCircuitContext) -> Self {
-        ProofAggregation {
-            std_lib,
-            inner_ctx: ctx.clone(),
-        }
-    }
-    fn write_context<W: std::io::Write>(
-        _ctx: &InnerCircuitContext,
-        _writer: &mut W,
-    ) -> std::io::Result<()> {
-        unimplemented!()
-    }
-    fn read_context<R: std::io::Read>(_reader: &mut R) -> std::io::Result<InnerCircuitContext> {
-        unimplemented!()
-    }
-}
-
-impl IvcState for ProofAggregation {
-    type State = State;
-    type AssignedState = AssignedState;
-
-    fn genesis(_ctx: &InnerCircuitContext) -> Self::State {
-        State {
-            statements: vec![],
-            statements_hash: F::ZERO,
-            inner_acc: Accumulator::<S>::trivial(&[]),
-        }
-    }
-
-    fn is_genesis(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        state: &Self::AssignedState,
-    ) -> Result<AssignedBit<F>, Error> {
-        self.std_lib.is_zero(layouter, &state.statements_hash)
-    }
-
-    fn decider(ctx: &InnerCircuitContext, state: &State) -> bool {
-        let expected_hash = state.statements.iter().fold(F::ZERO, |h_acc, x| {
-            let pis = ShaPreimageCircuit::format_instance(x).expect("valid instance");
-            let h = <PoseidonChip<F> as HashCPU<F, F>>::hash(&pis);
-            <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, h_acc])
-        });
-        if expected_hash != state.statements_hash {
-            return false;
-        }
-        state
-            .inner_acc
-            .check(&ctx.params_verifier, &ctx.fixed_bases())
-    }
-}
-
-impl IvcIO for ProofAggregation {
-    fn assign(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        value: Value<State>,
-    ) -> Result<AssignedState, Error> {
-        let statements_hash = self
-            .std_lib
-            .assign(layouter, value.as_ref().map(|s| s.statements_hash))?;
-        let inner_acc = self.std_lib.verifier().assign_collapsed_accumulator(
-            layouter,
-            &[],
-            value.as_ref().map(|s| s.inner_acc.clone()),
-        )?;
-        Ok(AssignedState {
-            statements_hash,
-            inner_acc,
-        })
-    }
-
-    fn constrain_as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        state: &AssignedState,
-    ) -> Result<(), Error> {
-        self.std_lib
-            .constrain_as_public_input(layouter, &state.statements_hash)?;
-        self.std_lib
-            .verifier()
-            .constrain_as_public_input(layouter, &state.inner_acc)
-    }
-
-    fn as_public_input(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        state: &AssignedState,
-    ) -> Result<Vec<AssignedNative<F>>, Error> {
-        Ok([
-            self.std_lib
-                .as_public_input(layouter, &state.statements_hash)?,
-            self.std_lib
-                .verifier()
-                .as_public_input(layouter, &state.inner_acc)?,
-        ]
-        .concat())
-    }
-
-    fn format_public_input(state: &State) -> Vec<F> {
-        [
-            vec![state.statements_hash],
-            AssignedAccumulator::<S>::as_public_input(&state.inner_acc),
-        ]
-        .concat()
-    }
-}
-
-impl IvcTransition for ProofAggregation {
-    type Witness = AggregationWitness;
-
-    fn arch() -> ZkStdLibArch {
-        ZkStdLibArch {
-            poseidon: true,
-            nr_pow2range_cols: 4,
-            ..ZkStdLibArch::default()
-        }
-    }
-
-    fn transition(
-        ctx: &InnerCircuitContext,
-        state: &Self::State,
-        witness: Self::Witness,
-    ) -> Self::State {
-        let statement_pis =
-            ShaPreimageCircuit::format_instance(&witness.inner_statement).expect("valid instance");
-
-        let inner_proof_acc = {
-            let mut transcript =
-                CircuitTranscript::<PoseidonState<F>>::init_from_bytes(&witness.inner_proof);
-            let dual_msm =
-                plonk::prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
-                    ctx.vk.vk(),
-                    &[&[C::identity()]],
-                    &[&[&statement_pis]],
-                    &mut transcript,
-                )
-                .expect("off-circuit prepare should succeed");
-            assert!(
-                dual_msm.clone().check(&ctx.params_verifier),
-                "invalid inner proof"
-            );
-            Accumulator::from_dual_msm(dual_msm, "inner_vk", &ctx.fixed_bases())
-        };
-
-        let inner_acc = Accumulator::accumulate(&[inner_proof_acc, state.inner_acc.clone()]);
-        let inner_acc = fully_collapsed_accumulator(&inner_acc, &ctx.fixed_bases());
-
-        let statements_hash = {
-            let h_statement = <PoseidonChip<F> as HashCPU<F, F>>::hash(&statement_pis);
-            <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h_statement, state.statements_hash])
-        };
-
-        let mut statements = state.statements.clone();
-        statements.push(witness.inner_statement);
-
-        State {
-            statements,
-            statements_hash,
-            inner_acc,
-        }
-    }
-
-    fn circuit_transition(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        state: &Self::AssignedState,
-        witness: Value<Self::Witness>,
-    ) -> Result<Self::AssignedState, Error> {
-        let inner_vk = self.std_lib.verifier().assign_fixed_vk(
-            layouter,
-            "inner_vk",
-            &self.inner_ctx.domain,
-            &self.inner_ctx.cs,
-            self.inner_ctx.vk.vk().transcript_repr(),
-        )?;
-
-        let statement_pis = self.std_lib.assign_many(
-            layouter,
-            &witness
-                .as_ref()
-                .map(|w| ShaPreimageCircuit::format_instance(&w.inner_statement).unwrap())
-                .transpose_vec(SHA_NB_PUBLIC_INPUTS),
-        )?;
-
-        let id_point: <S as SelfEmulation>::AssignedPoint = self
-            .std_lib
-            .bls12_381_curve()
-            .assign_fixed(layouter, C::identity())?;
-
-        let inner_proof_acc = self.std_lib.verifier().prepare(
-            layouter,
-            &inner_vk,
-            &[id_point],
-            &[&statement_pis],
-            witness.map(|w| w.inner_proof),
-        )?;
-
-        let inner_acc = self
-            .std_lib
-            .verifier()
-            .accumulate(layouter, &[inner_proof_acc, state.inner_acc.clone()])?;
-        let inner_acc = constrain_fully_collapsed_accumulator(
-            &self.std_lib,
-            layouter,
-            inner_acc,
-            &self.inner_ctx.fixed_bases(),
-        )?;
-
-        let statements_hash = {
-            let h_statement = self.std_lib.poseidon(layouter, &statement_pis)?;
-            self.std_lib
-                .poseidon(layouter, &[h_statement, state.statements_hash.clone()])?
-        };
-
-        Ok(AssignedState {
-            statements_hash,
-            inner_acc,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Final two-leaf tree decider.
 // ---------------------------------------------------------------------------
@@ -513,7 +300,6 @@ const TREE_LEAVES: usize = 2;
 
 #[derive(Clone, Debug)]
 struct TreeDeciderContext {
-    inner_ctx: InnerCircuitContext,
     ivc_cs: ConstraintSystem<F>,
     ivc_domain: EvaluationDomain<F>,
     ivc_vk: MidnightVK,
@@ -536,7 +322,7 @@ impl TreeDeciderContext {
     fn leaf_public_input(&self, state: &State) -> Vec<F> {
         [
             vec![self.ivc_vk.vk().transcript_repr()],
-            ProofAggregation::format_public_input(state),
+            Chain::format_public_input(state),
             AssignedAccumulator::<S>::as_public_input(&self.one_step_outer_acc()),
         ]
         .concat()
@@ -577,7 +363,7 @@ impl TreeDeciderContext {
 
 #[derive(Clone, Debug)]
 struct TreeDeciderInstance {
-    leaf_statement_hashes: [F; TREE_LEAVES],
+    leaf_states: [State; TREE_LEAVES],
     final_acc: Accumulator<S>,
 }
 
@@ -617,8 +403,13 @@ impl Relation for IvcTreeDeciderCircuit {
     type Witness = TreeDeciderWitness;
 
     fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
+        let leaf_states = instance
+            .leaf_states
+            .iter()
+            .flat_map(Chain::format_public_input)
+            .collect::<Vec<_>>();
         Ok([
-            instance.leaf_statement_hashes.to_vec(),
+            leaf_states,
             AssignedAccumulator::<S>::as_public_input(&instance.final_acc),
         ]
         .concat())
@@ -632,21 +423,28 @@ impl Relation for IvcTreeDeciderCircuit {
         witness: Value<Self::Witness>,
     ) -> Result<(), Error> {
         let verifier_gadget = std_lib.verifier();
-        let proof_aggregation = ProofAggregation::new(std_lib.clone(), &self.ctx.inner_ctx);
+        let poseidon_chain = Chain::new(std_lib.clone(), &());
 
-        let mut public_leaf_hashes = Vec::with_capacity(TREE_LEAVES);
+        let mut public_leaf_states = Vec::with_capacity(TREE_LEAVES);
         for i in 0..TREE_LEAVES {
-            public_leaf_hashes.push(
-                std_lib.assign(
-                    layouter,
-                    instance
-                        .as_ref()
-                        .map(|instance| instance.leaf_statement_hashes[i]),
-                )?,
-            );
+            let cnt = std_lib.assign(
+                layouter,
+                instance
+                    .as_ref()
+                    .map(|instance| instance.leaf_states[i].cnt),
+            )?;
+            let val = std_lib.assign(
+                layouter,
+                instance
+                    .as_ref()
+                    .map(|instance| instance.leaf_states[i].val),
+            )?;
+            public_leaf_states.push(vec![cnt, val]);
         }
-        for hash in &public_leaf_hashes {
-            std_lib.constrain_as_public_input(layouter, hash)?;
+        for public_state in &public_leaf_states {
+            for value in public_state {
+                std_lib.constrain_as_public_input(layouter, value)?;
+            }
         }
 
         let public_final_acc = verifier_gadget.assign_collapsed_accumulator(
@@ -676,15 +474,16 @@ impl Relation for IvcTreeDeciderCircuit {
         let outer_acc_pi = verifier_gadget.as_public_input(layouter, &outer_acc)?;
 
         let mut leaf_accs = Vec::with_capacity(TREE_LEAVES);
-        for (i, public_hash) in public_leaf_hashes.iter().enumerate() {
-            let leaf_state = proof_aggregation.assign(
+        for (i, public_state) in public_leaf_states.iter().enumerate() {
+            let leaf_state = poseidon_chain.assign(
                 layouter,
-                witness
-                    .as_ref()
-                    .map(|witness| witness.leaves[i].state.clone()),
+                witness.as_ref().map(|witness| witness.leaves[i].state),
             )?;
-            let leaf_state_pi = proof_aggregation.as_public_input(layouter, &leaf_state)?;
-            std_lib.assert_equal(layouter, public_hash, &leaf_state_pi[0])?;
+            let leaf_state_pi = poseidon_chain.as_public_input(layouter, &leaf_state)?;
+            assert_eq!(public_state.len(), leaf_state_pi.len());
+            for (public, witnessed) in public_state.iter().zip(leaf_state_pi.iter()) {
+                std_lib.assert_equal(layouter, public, witnessed)?;
+            }
 
             let leaf_pi = [ivc_vk_pi.clone(), leaf_state_pi, outer_acc_pi.clone()].concat();
             let proof_acc = verifier_gadget.prepare(
@@ -741,17 +540,6 @@ fn srs_dir() -> String {
 fn has_required_srs_assets() -> bool {
     let srs_dir = srs_dir();
     let mut ok = true;
-
-    let filecoin_2p13 = format!("{srs_dir}/bls_filecoin_2p13");
-    let filecoin_2p19 = format!("{srs_dir}/bls_filecoin_2p19");
-    if !std::path::Path::new(&filecoin_2p13).is_file()
-        && !std::path::Path::new(&filecoin_2p19).is_file()
-    {
-        println!(
-            "[ivc-keccak-solidity] missing Filecoin SRS: need {filecoin_2p13} or {filecoin_2p19}"
-        );
-        ok = false;
-    }
 
     for k in [19, 20] {
         let path = format!("{srs_dir}/midnight-srs-2p{k}");
@@ -832,46 +620,12 @@ fn ivc_final_keccak_solidity_e2e() {
     }
 
     // ----------------------------------------------------------
-    // Inner circuit: SHA-256 preimage at k = 13 (Filecoin SRS).
+    // Two independent one-step Poseidon-chain IVC leaves
+    // (Midnight SRS at k = 19).
     // ----------------------------------------------------------
-    let inner_arch = ShaPreimageCircuit.used_chips();
-    let inner_srs = load_srs(SrsSource::Filecoin, SHA_K, cs_degree(inner_arch));
-    let inner_vk = sha_setup_vk(&inner_srs);
-    let inner_pk = sha_setup_pk(&inner_vk);
-    let inner_ctx = {
-        let (inner_cs, inner_domain) = ivc_constraint_system(inner_arch, SHA_K);
-        InnerCircuitContext {
-            cs: inner_cs,
-            domain: inner_domain,
-            vk: inner_vk,
-            params_verifier: inner_srs.verifier_params(),
-        }
-    };
-
+    let ivc_srs = load_srs(SrsSource::Midnight, IVC_K, IvcCircuit::<Chain>::cs_degree());
     let start = Instant::now();
-    let inner_statements_with_witnesses: [_; TREE_LEAVES] =
-        std::array::from_fn(|_| sha_random_instance());
-    let inner_proofs: [_; TREE_LEAVES] = std::array::from_fn(|i| {
-        let (digest, preimage) = &inner_statements_with_witnesses[i];
-        sha_prove(&inner_srs, &inner_pk, digest, *preimage)
-    });
-    let inner_statements = inner_statements_with_witnesses.map(|(x, _)| x);
-    println!(
-        "[ivc-keccak-solidity] {TREE_LEAVES} inner SHA proofs generated in {:.2?}",
-        start.elapsed()
-    );
-
-    // ----------------------------------------------------------
-    // Two independent one-step IVC leaves (Midnight SRS at k = 19).
-    // ----------------------------------------------------------
-    let ivc_srs = load_srs(
-        SrsSource::Midnight,
-        IVC_K,
-        IvcCircuit::<ProofAggregation>::cs_degree(),
-    );
-    let start = Instant::now();
-    let (leaf_prover, verifier) =
-        ivc::setup::<ProofAggregation>(ivc_srs.clone(), IVC_K, inner_ctx.clone());
+    let (leaf_prover, verifier) = ivc::setup::<Chain>(ivc_srs.clone(), IVC_K, ());
     println!(
         "[ivc-keccak-solidity] IVC setup completed in {:.2?}",
         start.elapsed()
@@ -879,23 +633,20 @@ fn ivc_final_keccak_solidity_e2e() {
 
     let mut leaf_witnesses = Vec::with_capacity(TREE_LEAVES);
     for i in 0..TREE_LEAVES {
-        let w = AggregationWitness {
-            inner_statement: inner_statements[i],
-            inner_proof: inner_proofs[i].clone(),
-        };
         let mut prover = leaf_prover.clone();
         let t0 = Instant::now();
-        let p = prover.prove_step(w).unwrap();
+        let p = prover.prove_step(()).unwrap();
         let dt = t0.elapsed();
         let inst = prover.instance();
         let t0 = Instant::now();
-        verifier.verify(&inner_ctx, &inst, &p).unwrap();
+        verifier.verify::<Chain>(&(), &inst, &p).unwrap();
         println!(
-            "[ivc-keccak-solidity] Leaf {i} IVC (Poseidon): prove {dt:.2?}, verify {:.2?}",
-            t0.elapsed()
+            "[ivc-keccak-solidity] Leaf {i} IVC Poseidon chain: prove {dt:.2?}, verify {:.2?}, state = {:?}",
+            t0.elapsed(),
+            inst.state()
         );
         leaf_witnesses.push(TreeLeafWitness {
-            state: inst.state().clone(),
+            state: *inst.state(),
             proof: p,
         });
     }
@@ -906,9 +657,8 @@ fn ivc_final_keccak_solidity_e2e() {
     // ----------------------------------------------------------
     // Final tree decider proof under Keccak.
     // ----------------------------------------------------------
-    let (ivc_cs, ivc_domain) = ivc_constraint_system(IvcCircuit::<ProofAggregation>::arch(), IVC_K);
+    let (ivc_cs, ivc_domain) = ivc_constraint_system(IvcCircuit::<Chain>::arch(), IVC_K);
     let decider_ctx = TreeDeciderContext {
-        inner_ctx: inner_ctx.clone(),
         ivc_cs,
         ivc_domain,
         ivc_vk: verifier.vk().clone(),
@@ -916,7 +666,7 @@ fn ivc_final_keccak_solidity_e2e() {
     };
     let decider_relation = IvcTreeDeciderCircuit::new(decider_ctx.clone());
     let decider_instance = TreeDeciderInstance {
-        leaf_statement_hashes: std::array::from_fn(|i| leaf_witnesses[i].state.statements_hash),
+        leaf_states: std::array::from_fn(|i| leaf_witnesses[i].state),
         final_acc: decider_ctx.final_acc(&leaf_witnesses),
     };
     let no_fixed_bases = BTreeMap::new();
@@ -944,26 +694,30 @@ fn ivc_final_keccak_solidity_e2e() {
         start.elapsed()
     );
 
-    if cfg!(feature = "outer-fewer-point-sets") {
+    let outer_fewer_point_sets = halo2_solidity_verifier::OUTER_FEWER_POINT_SETS_ENABLED;
+    if outer_fewer_point_sets {
         println!(
             "[ivc-keccak-solidity] outer proof fewer-point-sets: enabled (dummy query evals expected)"
         );
     } else {
         println!(
-            "[ivc-keccak-solidity] outer proof fewer-point-sets: disabled (published Midfall uses cargo feature state)"
+            "[ivc-keccak-solidity] outer proof fewer-point-sets: disabled (in-circuit verifier still uses fewer-point-sets)"
         );
     }
 
     let t0 = Instant::now();
-    let final_proof = midnight_zk_stdlib::prove::<IvcTreeDeciderCircuit, sha3::Keccak256>(
-        &decider_srs,
-        &decider_pk,
-        &decider_relation,
-        &decider_instance,
-        decider_witness,
-        OsRng,
-    )
-    .expect("tree decider proof generation should succeed");
+    let final_proof = {
+        let _outer_proof_layout = scoped_fewer_point_sets(outer_fewer_point_sets);
+        midnight_zk_stdlib::prove::<IvcTreeDeciderCircuit, sha3::Keccak256>(
+            &decider_srs,
+            &decider_pk,
+            &decider_relation,
+            &decider_instance,
+            decider_witness,
+            OsRng,
+        )
+        .expect("tree decider proof generation should succeed")
+    };
     println!(
         "[ivc-keccak-solidity] tree decider (Keccak): prove {:.2?} ({} bytes compressed)",
         t0.elapsed(),
@@ -976,25 +730,31 @@ fn ivc_final_keccak_solidity_e2e() {
 
     // Sanity: native verifier must accept the final Keccak decider proof.
     let t0 = Instant::now();
-    midnight_zk_stdlib::verify::<IvcTreeDeciderCircuit, sha3::Keccak256>(
-        &decider_srs.verifier_params(),
-        &decider_vk,
-        &decider_instance,
-        None,
-        &final_proof,
-    )
-    .expect("native decider verify must accept the Keccak proof");
+    {
+        let _outer_proof_layout = scoped_fewer_point_sets(outer_fewer_point_sets);
+        midnight_zk_stdlib::verify::<IvcTreeDeciderCircuit, sha3::Keccak256>(
+            &decider_srs.verifier_params(),
+            &decider_vk,
+            &decider_instance,
+            None,
+            &final_proof,
+        )
+        .expect("native decider verify must accept the Keccak proof");
+    }
     println!(
         "[ivc-keccak-solidity] native tree decider verify: OK ({:.2?})",
         t0.elapsed()
     );
     #[cfg(feature = "rust-verifier-trace")]
-    let rust_trace = collect_native_midfall_trace(
-        &decider_srs.verifier_params(),
-        &decider_vk,
-        &pi,
-        &final_proof,
-    );
+    let rust_trace = {
+        let _outer_proof_layout = scoped_fewer_point_sets(outer_fewer_point_sets);
+        collect_native_midfall_trace(
+            &decider_srs.verifier_params(),
+            &decider_vk,
+            &pi,
+            &final_proof,
+        )
+    };
 
     // ----------------------------------------------------------
     // Render Halo2Verifier.sol + Halo2VerifyingKey.sol.
@@ -1003,11 +763,12 @@ fn ivc_final_keccak_solidity_e2e() {
     // non-committed). num_instances counts the non-committed slots.
     //
     // IvcTreeDeciderCircuit::format_instance(instance) =
-    //   [leaf_statement_hashes..., fully_collapsed_final_acc].
+    //   [leaf_chain_state_0..., leaf_chain_state_1..., fully_collapsed_final_acc].
     // The Solidity verifier consumes `fully_collapsed_final_acc` for the
     // final accumulator pairing check, so pass its starting instance offset.
     let num_instances = pi.len();
-    let final_acc_offset = TREE_LEAVES;
+    let final_acc_offset =
+        TREE_LEAVES * Chain::format_public_input(&decider_instance.leaf_states[0]).len();
     let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), num_instances, 1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
     let proof_evaluation_counts = generator.proof_evaluation_counts();
