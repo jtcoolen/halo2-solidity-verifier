@@ -54,8 +54,8 @@
                 // Running Horner accumulator for fully evaluated identities.
                 // After all identities, this is nu_y(x) for the `None`
                 // identity group.
-                let quotient_eval_numer := 0
-                let q_trace_id := 30000
+                mstore({{ program.eval_numer_mptr|hex() }}, 0)
+                mstore({{ program.trace_id_mptr|hex() }}, 30000)
                 {%- if simple_selector_cols.len() > 0 %}
                 // Simple selectors are grouped into separate linearization
                 // buckets. They start at zero for every proof.
@@ -67,9 +67,9 @@
                 // buckets. q_sel_inv_scale tracks y^-k at each identity so a
                 // selector bucket can be accumulated during a forward scan and
                 // scaled once at the end to match Rust's reverse y-fold.
-                let q_sel_scale := 1
-                let q_sel_inv_scale := 1
-                let q_y_inv := 0
+                mstore({{ program.sel_scale_mptr|hex() }}, 1)
+                mstore({{ program.sel_inv_scale_mptr|hex() }}, 1)
+                mstore({{ program.y_inv_mptr|hex() }}, 0)
                 {
                     // Keep this inversion away from scalar_inv's fixed 0x6000
                     // scratch: large separated VKs occupy that range.
@@ -83,7 +83,7 @@
                     mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)
                     if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }
                     if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }
-                    q_y_inv := mload(q_inv_scratch)
+                    mstore({{ program.y_inv_mptr|hex() }}, mload(q_inv_scratch))
                 }
                 {%- endif %}
 
@@ -338,35 +338,35 @@
                     case 0x0a {
                         let q_eval := q_top
                         q_has_top := 0
-                        trace_u256(q_trace_id, q_eval)
-                        q_trace_id := add(q_trace_id, 1)
+                        trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
+                        mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         // Fully-evaluated identity: qn = qn*y + eval.
                         // This forward Horner fold matches Rust's reverse
                         // y-power fold after all identities have been read.
-                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
                         {%- if simple_selector_cols.len() > 0 %}
-                        q_sel_scale := mulmod(q_sel_scale, y, r)
-                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
+                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
+                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
                         {%- endif %}
-                        quotient_eval_numer := addmod(quotient_eval_numer, q_eval, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
                     case 0x0b {
                         let q_sel_idx := q_arg
                         let q_eval := q_top
                         q_has_top := 0
-                        trace_u256(q_trace_id, q_eval)
-                        q_trace_id := add(q_trace_id, 1)
+                        trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
+                        mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         // Simple-selector identity: advance the global y
                         // position, then accumulate into the selector bucket
                         // with y^-k. The final selector scaling restores the
                         // same y power used by Rust's grouped selector MSM.
-                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
                         {%- if simple_selector_cols.len() > 0 %}
-                        q_sel_scale := mulmod(q_sel_scale, y, r)
-                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
+                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
+                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
                         {%- endif %}
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
-                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, q_sel_inv_scale, r), r))
+                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
                     }
                     default {
                         revert(0, 0)
@@ -747,36 +747,36 @@
                     case 0x0a {
                         let q_eval := q_top
                         q_has_top := 0
-                        trace_u256(q_trace_id, q_eval)
-                        q_trace_id := add(q_trace_id, 1)
+                        trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
+                        mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         // Fully-evaluated identity: qn = qn*y + eval.
                         // This matches the reverse y-power fold in Rust
                         // linearization once all identities have been read.
-                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
                         {%- if simple_selector_cols.len() > 0 %}
-                        q_sel_scale := mulmod(q_sel_scale, y, r)
-                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
+                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
+                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
                         {%- endif %}
-                        quotient_eval_numer := addmod(quotient_eval_numer, q_eval, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
                     case 0x0b {
                         let q_sel_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         let q_eval := q_top
                         q_has_top := 0
-                        trace_u256(q_trace_id, q_eval)
-                        q_trace_id := add(q_trace_id, 1)
+                        trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
+                        mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         // Simple-selector identity: keep the same y-batch
                         // position as main identities, but defer the final
                         // y^m scaling so equal selector commitments are
                         // grouped like Rust's BTreeMap accumulator.
-                        quotient_eval_numer := mulmod(quotient_eval_numer, y, r)
+                        mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
                         {%- if simple_selector_cols.len() > 0 %}
-                        q_sel_scale := mulmod(q_sel_scale, y, r)
-                        q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)
+                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
+                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
                         {%- endif %}
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
-                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, q_sel_inv_scale, r), r))
+                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
                     }
                     default {
                         revert(0, 0)
@@ -800,14 +800,14 @@
                 // y power that Rust's reverse fold assigns to that identity.
                 for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
                     let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
-                    mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), q_sel_scale, r))
+                    mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), mload({{ program.sel_scale_mptr|hex() }}), r))
                 }
                 {%- endif %}
 
                 // Fully evaluated identities are the constant-polynomial side
                 // of the linearization query. Rust subtracts that grouped
                 // scalar into expected_eval, so Solidity stores -nu_y(x).
-                let linearization_expected_eval := sub(r, quotient_eval_numer)
+                let linearization_expected_eval := sub(r, mload({{ program.eval_numer_mptr|hex() }}))
                 mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 pop(y)
                 {%- when None %}

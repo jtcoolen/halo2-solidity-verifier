@@ -90,7 +90,8 @@ pub(crate) mod test {
     /// Panics if executable `solc` can not be found, or compilation fails.
     pub fn compile_solidity_with_runs(solidity: impl AsRef<[u8]>, runs: u32) -> Vec<u8> {
         let runs_str = runs.to_string();
-        let mut process = match Command::new("solc")
+        let solc = std::env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
+        let mut process = match Command::new(&solc)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -107,10 +108,10 @@ pub(crate) mod test {
         {
             Ok(process) => process,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                panic!("Command 'solc' not found");
+                panic!("Command '{solc}' not found");
             }
             Err(err) => {
-                panic!("Failed to spwan process with command 'solc':\n{err}");
+                panic!("Failed to spawn process with command '{solc}':\n{err}");
             }
         };
         process

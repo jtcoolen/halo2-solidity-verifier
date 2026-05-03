@@ -293,21 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn compact_quotient_default_matches_gas_capped_ivc_setting() {
+    fn compact_quotient_default_matches_compile_stable_setting() {
+        assert_eq!(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES, 0);
         assert_eq!(DEFAULT_QUOTIENT_NATIVE_GATES, 4);
 
         let docs = include_str!("../../docs/QUOTIENT_NUMERATOR_EVALUATOR.md");
         assert!(
-            docs.contains("total gas: `1,614,572`"),
-            "quotient evaluator docs should record the gas-capped compact default bench"
+            docs.contains("direct inline identities: 0"),
+            "quotient evaluator docs should record the compile-stable compact default"
         );
         assert!(
-            docs.contains("quotient runtime: `21,774` bytes"),
-            "quotient evaluator docs should record the compact default runtime"
+            docs.contains("structured trash suffix: off"),
+            "quotient evaluator docs should record the compile-stable structured-tail default"
         );
         assert!(
             docs.contains("HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N"),
             "quotient evaluator docs should describe the experimental tuning hook"
+        );
+        assert!(
+            docs.contains("HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N"),
+            "quotient evaluator docs should describe the direct-inline tuning hook"
         );
     }
 

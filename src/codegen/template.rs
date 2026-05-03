@@ -320,6 +320,11 @@ pub(crate) struct QuotientProgram {
     pub(crate) cse_temps: usize,
     pub(crate) const_mptr: usize,
     pub(crate) tmp_mptr: usize,
+    pub(crate) eval_numer_mptr: usize,
+    pub(crate) trace_id_mptr: usize,
+    pub(crate) sel_scale_mptr: usize,
+    pub(crate) sel_inv_scale_mptr: usize,
+    pub(crate) y_inv_mptr: usize,
     pub(crate) stack_mptr: usize,
     pub(crate) program_mptr: usize,
 }

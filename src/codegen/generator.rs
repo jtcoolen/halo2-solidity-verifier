@@ -3,6 +3,7 @@ use super::*;
 impl<'a> SolidityGenerator<'a> {
     const SUPPORTED_COMMITTED_INSTANCE_COLUMNS: usize = 1;
     const SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS: usize = 1;
+    const QUOTIENT_STATE_WORDS: usize = 5;
 
     /// Return a new `SolidityGenerator`.
     pub fn new(
@@ -148,7 +149,30 @@ impl<'a> SolidityGenerator<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuotientStateSlots {
+    eval_numer_mptr: usize,
+    trace_id_mptr: usize,
+    sel_scale_mptr: usize,
+    sel_inv_scale_mptr: usize,
+    y_inv_mptr: usize,
+}
+
+impl QuotientStateSlots {
+    fn new(tmp_mptr: usize, cse_temps: usize) -> Self {
+        let base = tmp_mptr + cse_temps * WORD_BYTES;
+        Self {
+            eval_numer_mptr: base,
+            trace_id_mptr: base + WORD_BYTES,
+            sel_scale_mptr: base + 2 * WORD_BYTES,
+            sel_inv_scale_mptr: base + 3 * WORD_BYTES,
+            y_inv_mptr: base + 4 * WORD_BYTES,
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1109,6 +1133,7 @@ impl<'a> SolidityGenerator<'a> {
         target: QuotientTarget,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
+        state_slots: Option<QuotientStateSlots>,
         _trace: bool,
     ) -> Vec<String> {
         let mut block = Vec::with_capacity(lines.len() + 6);
@@ -1119,29 +1144,76 @@ impl<'a> SolidityGenerator<'a> {
         }
         block.push(format!("mstore({eval_scratch_slot:#x}, {var})"));
         block.push("}".to_string());
-        block.push(format!(
-            "trace_u256(q_trace_id, mload({eval_scratch_slot:#x}))"
-        ));
-        block.push("q_trace_id := add(q_trace_id, 1)".to_string());
-        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-        if !sorted_simple.is_empty() {
-            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
-        }
+        Self::push_quotient_trace(
+            &mut block,
+            state_slots,
+            format!("mload({eval_scratch_slot:#x})"),
+        );
+        Self::push_structured_fold_advance(
+            &mut block,
+            1,
+            sorted_simple,
+            "q_direct_fold_i",
+            state_slots,
+        );
         match target {
             QuotientTarget::Main => {
-                block.push(format!(
-                    "quotient_eval_numer := addmod(quotient_eval_numer, mload({eval_scratch_slot:#x}), r)"
-                ));
+                Self::push_quotient_eval_numer_add(
+                    &mut block,
+                    state_slots,
+                    format!("mload({eval_scratch_slot:#x})"),
+                );
             }
             QuotientTarget::Selector(idx) => {
                 let offset = idx * 0x20;
+                let inv_scale = state_slots
+                    .map(|slots| format!("mload({:#x})", slots.sel_inv_scale_mptr))
+                    .unwrap_or_else(|| "q_sel_inv_scale".to_string());
                 block.push(format!(
-                    "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(mload({eval_scratch_slot:#x}), q_sel_inv_scale, r), r))"
+                    "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(mload({eval_scratch_slot:#x}), {inv_scale}, r), r))"
                 ));
             }
         }
         block
+    }
+
+    fn push_quotient_trace(
+        block: &mut Vec<String>,
+        state_slots: Option<QuotientStateSlots>,
+        value: impl AsRef<str>,
+    ) {
+        let value = value.as_ref();
+        if let Some(slots) = state_slots {
+            block.push(format!(
+                "trace_u256(mload({:#x}), {value})",
+                slots.trace_id_mptr
+            ));
+            block.push(format!(
+                "mstore({:#x}, add(mload({:#x}), 1))",
+                slots.trace_id_mptr, slots.trace_id_mptr
+            ));
+        } else {
+            block.push(format!("trace_u256(q_trace_id, {value})"));
+            block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+        }
+    }
+
+    fn push_quotient_eval_numer_add(
+        block: &mut Vec<String>,
+        state_slots: Option<QuotientStateSlots>,
+        value: impl AsRef<str>,
+    ) {
+        let value = value.as_ref();
+        if let Some(slots) = state_slots {
+            block.push(format!(
+                "mstore({:#x}, addmod(mload({:#x}), {value}, r))",
+                slots.eval_numer_mptr, slots.eval_numer_mptr
+            ));
+        } else {
+            block.push(format!(
+                "quotient_eval_numer := addmod(quotient_eval_numer, {value}, r)"
+            ));
+        }
     }
 
     fn push_structured_fold_advance(
@@ -1149,24 +1221,43 @@ impl<'a> SolidityGenerator<'a> {
         count: usize,
         sorted_simple: &[usize],
         loop_var: &str,
+        state_slots: Option<QuotientStateSlots>,
     ) {
-        if count == 1 {
-            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-            if !sorted_simple.is_empty() {
-                block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-                block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+        let push_one = |block: &mut Vec<String>| {
+            if let Some(slots) = state_slots {
+                block.push(format!(
+                    "mstore({:#x}, mulmod(mload({:#x}), y, r))",
+                    slots.eval_numer_mptr, slots.eval_numer_mptr
+                ));
+                if !sorted_simple.is_empty() {
+                    block.push(format!(
+                        "mstore({:#x}, mulmod(mload({:#x}), y, r))",
+                        slots.sel_scale_mptr, slots.sel_scale_mptr
+                    ));
+                    block.push(format!(
+                        "mstore({:#x}, mulmod(mload({:#x}), mload({:#x}), r))",
+                        slots.sel_inv_scale_mptr, slots.sel_inv_scale_mptr, slots.y_inv_mptr
+                    ));
+                }
+            } else {
+                block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
+                if !sorted_simple.is_empty() {
+                    block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
+                    block
+                        .push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
+                }
             }
+        };
+
+        if count == 1 {
+            push_one(block);
             return;
         }
 
         block.push(format!(
             "for {{ let {loop_var} := 0 }} lt({loop_var}, {count}) {{ {loop_var} := add({loop_var}, 1) }} {{"
         ));
-        block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-        if !sorted_simple.is_empty() {
-            block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-            block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
-        }
+        push_one(block);
         block.push("}".to_string());
     }
 
@@ -1369,6 +1460,7 @@ impl<'a> SolidityGenerator<'a> {
         selector_idx: usize,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
+        state_slots: Option<QuotientStateSlots>,
     ) -> Vec<String> {
         let capacity = run.iter().map(|(lines, _)| lines.len() + 5).sum::<usize>() + 10;
         let mut block = Vec::with_capacity(capacity);
@@ -1389,9 +1481,18 @@ impl<'a> SolidityGenerator<'a> {
             Self::push_selector_run_identity(&mut block, lines, var, eval_scratch_slot);
             idx += 1;
         }
-        Self::push_structured_fold_advance(&mut block, run.len(), sorted_simple, "q_gate_run_i");
+        Self::push_structured_fold_advance(
+            &mut block,
+            run.len(),
+            sorted_simple,
+            "q_gate_run_i",
+            state_slots,
+        );
+        let inv_scale = state_slots
+            .map(|slots| format!("mload({:#x})", slots.sel_inv_scale_mptr))
+            .unwrap_or_else(|| "q_sel_inv_scale".to_string());
         block.push(format!(
-            "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(q_gate_run, q_sel_inv_scale, r), r))"
+            "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(q_gate_run, {inv_scale}, r), r))"
         ));
         block.push("}".to_string());
         block
@@ -1403,6 +1504,7 @@ impl<'a> SolidityGenerator<'a> {
         pending_run: &mut Vec<(Vec<String>, String)>,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
+        state_slots: Option<QuotientStateSlots>,
         _trace: bool,
     ) {
         let Some(selector_idx) = pending_selector.take() else {
@@ -1417,6 +1519,7 @@ impl<'a> SolidityGenerator<'a> {
                 QuotientTarget::Selector(selector_idx),
                 sorted_simple,
                 eval_scratch_slot,
+                state_slots,
                 _trace,
             ));
         } else if !run.is_empty() {
@@ -1425,6 +1528,7 @@ impl<'a> SolidityGenerator<'a> {
                 selector_idx,
                 sorted_simple,
                 eval_scratch_slot,
+                state_slots,
             ));
         }
     }
@@ -1559,15 +1663,12 @@ impl<'a> SolidityGenerator<'a> {
         block: &mut Vec<String>,
         value: impl AsRef<str>,
         sorted_simple: &[usize],
+        state_slots: Option<QuotientStateSlots>,
         _trace: bool,
     ) {
-        block.push(format!("trace_u256(q_trace_id, {})", value.as_ref()));
-        block.push("q_trace_id := add(q_trace_id, 1)".to_string());
-        Self::push_structured_fold_advance(block, 1, sorted_simple, "q_main_fold_i");
-        block.push(format!(
-            "quotient_eval_numer := addmod(quotient_eval_numer, {}, r)",
-            value.as_ref()
-        ));
+        Self::push_quotient_trace(block, state_slots, value.as_ref());
+        Self::push_structured_fold_advance(block, 1, sorted_simple, "q_main_fold_i", state_slots);
+        Self::push_quotient_eval_numer_add(block, state_slots, value.as_ref());
     }
 
     fn structured_permutation_scratch_words(meta: &ConstraintSystemMeta) -> usize {
@@ -1589,6 +1690,7 @@ impl<'a> SolidityGenerator<'a> {
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
         scratch_mptr: usize,
+        state_slots: Option<QuotientStateSlots>,
         _trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_permutation_zs == 0 {
@@ -1679,32 +1781,21 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let fold_eval = |block: &mut Vec<String>| {
-            block.push("trace_u256(q_trace_id, q_perm_eval)".to_string());
-            block.push("q_trace_id := add(q_trace_id, 1)".to_string());
-            block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
-            if !sorted_simple.is_empty() {
-                block.push("q_sel_scale := mulmod(q_sel_scale, y, r)".to_string());
-                block.push("q_sel_inv_scale := mulmod(q_sel_inv_scale, q_y_inv, r)".to_string());
-            }
-            block.push(
-                "quotient_eval_numer := addmod(quotient_eval_numer, q_perm_eval, r)".to_string(),
+            Self::push_quotient_trace(block, state_slots, "q_perm_eval");
+            Self::push_structured_fold_advance(
+                block,
+                1,
+                sorted_simple,
+                "q_perm_fold_i",
+                state_slots,
             );
+            Self::push_quotient_eval_numer_add(block, state_slots, "q_perm_eval");
         };
 
-        block.push("let q_perm_l0 := mload(L_0_MPTR)".to_string());
-        block.push("let q_perm_llast := mload(L_LAST_MPTR)".to_string());
-        block.push("let q_perm_lblind := mload(L_BLIND_MPTR)".to_string());
-        block.push("let q_perm_beta := mload(BETA_MPTR)".to_string());
-        block.push("let q_perm_gamma := mload(GAMMA_MPTR)".to_string());
-        block.push(
-            "let q_perm_active := addmod(1, sub(r, addmod(q_perm_llast, q_perm_lblind, r)), r)"
-                .to_string(),
-        );
-        block.push("let q_perm_xbeta := mulmod(q_perm_beta, mload(X_MPTR), r)".to_string());
         block.push("let q_perm_eval := 0".to_string());
 
         block.push(
-            "q_perm_eval := mulmod(q_perm_l0, addmod(1, sub(r, mload(q_perm_z_cur)), r), r)"
+            "q_perm_eval := mulmod(mload(L_0_MPTR), addmod(1, sub(r, mload(q_perm_z_cur)), r), r)"
                 .to_string(),
         );
         fold_eval(&mut block);
@@ -1714,7 +1805,7 @@ impl<'a> SolidityGenerator<'a> {
             "let q_perm_zn := mload(add(q_perm_z_cur, {final_z_offset:#x}))"
         ));
         block.push(
-            "q_perm_eval := mulmod(q_perm_llast, addmod(mulmod(q_perm_zn, q_perm_zn, r), sub(r, q_perm_zn), r), r)"
+            "q_perm_eval := mulmod(mload(L_LAST_MPTR), addmod(mulmod(q_perm_zn, q_perm_zn, r), sub(r, q_perm_zn), r), r)"
                 .to_string(),
         );
         fold_eval(&mut block);
@@ -1729,14 +1820,16 @@ impl<'a> SolidityGenerator<'a> {
                     .to_string(),
             );
             block.push(
-                "q_perm_eval := mulmod(q_perm_l0, addmod(q_perm_cur, sub(r, q_perm_prev), r), r)"
+                "q_perm_eval := mulmod(mload(L_0_MPTR), addmod(q_perm_cur, sub(r, q_perm_prev), r), r)"
                     .to_string(),
             );
             fold_eval(&mut block);
             block.push("}".to_string());
         }
 
-        block.push("mstore(q_perm_delta_base_ptr, q_perm_xbeta)".to_string());
+        block.push(
+            "mstore(q_perm_delta_base_ptr, mulmod(mload(BETA_MPTR), mload(X_MPTR), r))".to_string(),
+        );
         block.push(format!(
             "for {{ let q_perm_set := 0 }} lt(q_perm_set, {num_sets}) {{ q_perm_set := add(q_perm_set, 1) }} {{"
         ));
@@ -1753,17 +1846,17 @@ impl<'a> SolidityGenerator<'a> {
         block.push("let q_perm_v := mload(add(q_perm_vals, q_perm_off))".to_string());
         block.push("let q_perm_s := mload(add(q_perm_sigmas, q_perm_off))".to_string());
         block.push(
-            "q_perm_left := mulmod(q_perm_left, addmod(addmod(q_perm_v, mulmod(q_perm_beta, q_perm_s, r), r), q_perm_gamma, r), r)"
+            "q_perm_left := mulmod(q_perm_left, addmod(addmod(q_perm_v, mulmod(mload(BETA_MPTR), q_perm_s, r), r), mload(GAMMA_MPTR), r), r)"
                 .to_string(),
         );
         block.push(
-            "q_perm_right := mulmod(q_perm_right, addmod(addmod(q_perm_v, q_perm_delta_pow, r), q_perm_gamma, r), r)"
+            "q_perm_right := mulmod(q_perm_right, addmod(addmod(q_perm_v, q_perm_delta_pow, r), mload(GAMMA_MPTR), r), r)"
                 .to_string(),
         );
         block.push("q_perm_delta_pow := mulmod(q_perm_delta_pow, delta, r)".to_string());
         block.push("}".to_string());
         block.push(
-            "q_perm_eval := mulmod(q_perm_active, addmod(q_perm_left, sub(r, q_perm_right), r), r)"
+            "q_perm_eval := mulmod(addmod(1, sub(r, addmod(mload(L_LAST_MPTR), mload(L_BLIND_MPTR), r)), r), addmod(q_perm_left, sub(r, q_perm_right), r), r)"
                 .to_string(),
         );
         fold_eval(&mut block);
@@ -1776,6 +1869,7 @@ impl<'a> SolidityGenerator<'a> {
         Some(block)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn structured_lookup_loop_block(
         &self,
         meta: &ConstraintSystemMeta,
@@ -1783,6 +1877,7 @@ impl<'a> SolidityGenerator<'a> {
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
         scratch_mptr: usize,
+        state_slots: Option<QuotientStateSlots>,
         trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_lookups == 0 {
@@ -1829,7 +1924,13 @@ impl<'a> SolidityGenerator<'a> {
                 "let q_lookup_eval := mulmod(q_lookup_lsum, {}, r)",
                 z_eval
             ));
-            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
+            Self::push_structured_main_fold(
+                &mut block,
+                "q_lookup_eval",
+                sorted_simple,
+                state_slots,
+                trace,
+            );
             block.push("}".to_string());
 
             for (input_chunk, h_eval) in
@@ -1844,6 +1945,7 @@ impl<'a> SolidityGenerator<'a> {
                         &mut block,
                         "q_lookup_eval",
                         sorted_simple,
+                        state_slots,
                         trace,
                     );
                     block.push("}".to_string());
@@ -1925,7 +2027,13 @@ impl<'a> SolidityGenerator<'a> {
                     "let q_lookup_eval := addmod(mulmod({}, q_lookup_product, r), sub(r, q_lookup_sum), r)",
                     h_eval
                 ));
-                Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
+                Self::push_structured_main_fold(
+                    &mut block,
+                    "q_lookup_eval",
+                    sorted_simple,
+                    state_slots,
+                    trace,
+                );
                 block.push("}".to_string());
             }
 
@@ -1968,7 +2076,13 @@ impl<'a> SolidityGenerator<'a> {
             ));
             block
                 .push("let q_lookup_eval := mulmod(q_lookup_active, q_lookup_core, r)".to_string());
-            Self::push_structured_main_fold(&mut block, "q_lookup_eval", sorted_simple, trace);
+            Self::push_structured_main_fold(
+                &mut block,
+                "q_lookup_eval",
+                sorted_simple,
+                state_slots,
+                trace,
+            );
             block.push("}".to_string());
 
             block.push("}".to_string());
@@ -1984,6 +2098,7 @@ impl<'a> SolidityGenerator<'a> {
         data: &Data,
         evaluator: &Evaluator<'_>,
         sorted_simple: &[usize],
+        state_slots: Option<QuotientStateSlots>,
         trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_trashcans == 0 {
@@ -2016,7 +2131,13 @@ impl<'a> SolidityGenerator<'a> {
             block.push(format!(
                 "let q_trash_eval := addmod({compressed_var}, sub(r, q_trash_scaled), r)"
             ));
-            Self::push_structured_main_fold(&mut block, "q_trash_eval", sorted_simple, trace);
+            Self::push_structured_main_fold(
+                &mut block,
+                "q_trash_eval",
+                sorted_simple,
+                state_slots,
+                trace,
+            );
             block.push("}".to_string());
         }
 
@@ -2093,6 +2214,7 @@ impl<'a> SolidityGenerator<'a> {
                             &mut pending_selector_run,
                             sorted_simple,
                             eval_scratch_slot,
+                            None,
                             trace,
                         );
                         pending_selector = Some(idx);
@@ -2106,6 +2228,7 @@ impl<'a> SolidityGenerator<'a> {
                         &mut pending_selector_run,
                         sorted_simple,
                         eval_scratch_slot,
+                        None,
                         trace,
                     );
                     computations.push(Self::direct_quotient_block(
@@ -2114,6 +2237,7 @@ impl<'a> SolidityGenerator<'a> {
                         target,
                         sorted_simple,
                         eval_scratch_slot,
+                        None,
                         trace,
                     ));
                 }
@@ -2125,6 +2249,7 @@ impl<'a> SolidityGenerator<'a> {
             &mut pending_selector_run,
             sorted_simple,
             eval_scratch_slot,
+            None,
             trace,
         );
 
@@ -2134,6 +2259,7 @@ impl<'a> SolidityGenerator<'a> {
             &evaluator,
             sorted_simple,
             scratch_mptr,
+            None,
             trace,
         ) {
             computations.push(block);
@@ -2145,13 +2271,14 @@ impl<'a> SolidityGenerator<'a> {
             &evaluator,
             sorted_simple,
             eval_scratch_slot,
+            None,
             trace,
         ) {
             computations.push(block);
         }
 
         if let Some(block) =
-            self.structured_trash_loop_block(meta, data, &evaluator, sorted_simple, trace)
+            self.structured_trash_loop_block(meta, data, &evaluator, sorted_simple, None, trace)
         {
             computations.push(block);
         }
@@ -2197,7 +2324,7 @@ impl<'a> SolidityGenerator<'a> {
             &vk,
             vk_mptr,
             VerifierMemoryLayoutConfig {
-                quotient_cse_temps: quotient_program_build.cse_temps,
+                quotient_cse_temps: quotient_program_build.cse_temps + Self::QUOTIENT_STATE_WORDS,
                 quotient_stack_words: quotient_program_build.max_stack,
                 ..VerifierMemoryLayoutConfig::default()
             },
@@ -2227,6 +2354,8 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_stack_mptr = memory.quotient_stack_mptr;
         let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
         let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
+        let quotient_state_slots =
+            QuotientStateSlots::new(quotient_tmp_mptr, quotient_program_build.cse_temps);
         let quotient_program = Some(QuotientProgram {
             consts: quotient_program_build.consts,
             chunks: quotient_program_chunks,
@@ -2235,6 +2364,11 @@ impl<'a> SolidityGenerator<'a> {
             cse_temps: quotient_program_build.cse_temps,
             const_mptr,
             tmp_mptr: quotient_tmp_mptr,
+            eval_numer_mptr: quotient_state_slots.eval_numer_mptr,
+            trace_id_mptr: quotient_state_slots.trace_id_mptr,
+            sel_scale_mptr: quotient_state_slots.sel_scale_mptr,
+            sel_inv_scale_mptr: quotient_state_slots.sel_inv_scale_mptr,
+            y_inv_mptr: quotient_state_slots.y_inv_mptr,
             stack_mptr: quotient_stack_mptr,
             program_mptr,
         });
@@ -2255,6 +2389,7 @@ impl<'a> SolidityGenerator<'a> {
                 identity.target,
                 &sorted_simple,
                 eval_scratch_slot,
+                Some(quotient_state_slots),
                 false,
             ));
         }
@@ -2265,6 +2400,7 @@ impl<'a> SolidityGenerator<'a> {
                 &evaluator,
                 &sorted_simple,
                 quotient_stack_mptr,
+                Some(quotient_state_slots),
                 false,
             ) {
                 quotient_native_permutation_computation = block;
@@ -2277,15 +2413,21 @@ impl<'a> SolidityGenerator<'a> {
                 identity.target,
                 &sorted_simple,
                 eval_scratch_slot,
+                Some(quotient_state_slots),
                 false,
             ));
         }
         if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
             && meta.num_trashcans > 0
         {
-            if let Some(block) =
-                self.structured_trash_loop_block(&meta, &data, &evaluator, &sorted_simple, false)
-            {
+            if let Some(block) = self.structured_trash_loop_block(
+                &meta,
+                &data,
+                &evaluator,
+                &sorted_simple,
+                Some(quotient_state_slots),
+                false,
+            ) {
                 quotient_post_vm_computations.push(block);
             }
         }
@@ -2397,7 +2539,7 @@ impl<'a> SolidityGenerator<'a> {
         let pcs_memory_requirements = pcs::memory_requirements(&meta, &data);
         let quotient_cse_temps = quotient_program_build
             .as_ref()
-            .map(|build| build.cse_temps)
+            .map(|build| build.cse_temps + Self::QUOTIENT_STATE_WORDS)
             .unwrap_or(0);
         let quotient_stack_words = quotient_program_build
             .as_ref()
@@ -2429,7 +2571,7 @@ impl<'a> SolidityGenerator<'a> {
         let (expected_quotient_len, expected_quotient_codehash) = expected_quotient
             .map(|(len, codehash)| (Some(len), Some(codehash)))
             .unwrap_or((None, None));
-        let (quotient_program, quotient_stack_mptr) =
+        let (quotient_program, quotient_stack_mptr, quotient_state_slots) =
             if let Some(quotient_program_build) = quotient_program_build {
                 let quotient_program_chunks =
                     PackedProgramCodec::encode_words(&quotient_program_build.bytes);
@@ -2454,6 +2596,8 @@ impl<'a> SolidityGenerator<'a> {
                 let quotient_stack_mptr = memory.quotient_stack_mptr;
                 let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
                 let program_mptr = (vk_mptr + quotient_program_offset_words).value().as_usize();
+                let state_slots =
+                    QuotientStateSlots::new(quotient_tmp_mptr, quotient_program_build.cse_temps);
                 (
                     Some(QuotientProgram {
                         consts: quotient_program_build.consts,
@@ -2463,13 +2607,19 @@ impl<'a> SolidityGenerator<'a> {
                         cse_temps: quotient_program_build.cse_temps,
                         const_mptr,
                         tmp_mptr: quotient_tmp_mptr,
+                        eval_numer_mptr: state_slots.eval_numer_mptr,
+                        trace_id_mptr: state_slots.trace_id_mptr,
+                        sel_scale_mptr: state_slots.sel_scale_mptr,
+                        sel_inv_scale_mptr: state_slots.sel_inv_scale_mptr,
+                        y_inv_mptr: state_slots.y_inv_mptr,
                         stack_mptr: quotient_stack_mptr,
                         program_mptr,
                     }),
                     quotient_stack_mptr,
+                    Some(state_slots),
                 )
             } else {
-                (None, quotient_tmp_mptr)
+                (None, quotient_tmp_mptr, None)
             };
 
         let mut quotient_inline_computations: Vec<Vec<String>> = Vec::new();
@@ -2510,6 +2660,7 @@ impl<'a> SolidityGenerator<'a> {
                     identity.target,
                     &sorted_simple,
                     eval_scratch_slot,
+                    quotient_state_slots,
                     trace,
                 ));
             }
@@ -2521,6 +2672,7 @@ impl<'a> SolidityGenerator<'a> {
                     &evaluator,
                     &sorted_simple,
                     quotient_stack_mptr,
+                    quotient_state_slots,
                     trace,
                 ) {
                     quotient_native_permutation_computation = block;
@@ -2534,6 +2686,7 @@ impl<'a> SolidityGenerator<'a> {
                     identity.target,
                     &sorted_simple,
                     eval_scratch_slot,
+                    quotient_state_slots,
                     trace,
                 ));
             }
@@ -2546,6 +2699,7 @@ impl<'a> SolidityGenerator<'a> {
                     &data,
                     &evaluator,
                     &sorted_simple,
+                    quotient_state_slots,
                     trace,
                 ) {
                     quotient_post_vm_computations.push(block);

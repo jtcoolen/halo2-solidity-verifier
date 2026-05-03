@@ -8,6 +8,7 @@ GAS_CHECKPOINTS=1
 RUN_NATIVE_MIDFALL=0
 RUN_SOLIDITY_BENCH=1
 SKIP_SRS_DOWNLOAD=0
+RUN_TRACE=0
 
 SRS_DIR="${SRS_DIR:-"$ROOT_DIR/.srs"}"
 MIDFALL_DIR="${MIDFALL_DIR:-"$ROOT_DIR/../midfall"}"
@@ -29,6 +30,8 @@ Options:
   --skip-srs-download  Fail if a required SRS asset is missing.
   --srs-dir DIR        Directory for SRS assets. Defaults to $SRS_DIR or ./.srs.
   --no-gas-checkpoints Run the Solidity verifier bench without section logs.
+  --trace              Enable native Rust/Solidity trace equivalence.
+                       Requires midnight-proofs/solidity-verifier-trace.
   --native-midfall     Also run Midfall's native Keccak final IVC test from
                         $MIDFALL_DIR/aggregation.
   --native-only        Run only the Midfall native Keccak final IVC test.
@@ -83,6 +86,9 @@ while (($#)); do
       ;;
     --no-gas-checkpoints)
       GAS_CHECKPOINTS=0
+      ;;
+    --trace)
+      RUN_TRACE=1
       ;;
     --native-midfall)
       RUN_NATIVE_MIDFALL=1
@@ -149,6 +155,9 @@ cargo_features() {
   local features="evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets"
   if [[ "$GAS_CHECKPOINTS" -eq 1 ]]; then
     features="$features,solidity-gas-checkpoints"
+  fi
+  if [[ "$RUN_TRACE" -eq 1 ]]; then
+    features="$features,rust-verifier-trace,solidity-trace"
   fi
   printf '%s\n' "$features"
 }

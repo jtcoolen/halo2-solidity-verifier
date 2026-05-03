@@ -42,7 +42,7 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 
 > [!NOTE]
 > The workspace is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml)
-> and Solidity-touching checks require `solc >=0.8.24`.
+> and CI compiles Solidity with `solc 0.8.24`.
 
 Only maintained examples are registered in `Cargo.toml`; stale pre-Midnight
 diagnostic examples under `examples/` are kept out of default builds by
@@ -60,9 +60,9 @@ scripts/run_ivc_bench.sh
 This prints the detailed checkpoint table, deployed runtime sizes, total
 transaction gas, and real checkpointed section work.
 
-Native Rust/Solidity trace equivalence is currently local-checkout diagnostic
-coverage only: the published Midfall branch used by default does not expose the
-native `solidity_trace` hook.
+Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
+`scripts/run_ivc_bench.sh --trace`. Custom Midfall overrides must expose the
+`midnight-proofs/solidity-verifier-trace` feature for that leg.
 
 ## Limitations & Caveats
 

@@ -437,6 +437,66 @@ fn compile_solidity_is_deterministic_for_same_source() {
     assert_eq!(bytecode_a, bytecode_b);
 }
 
+#[test]
+#[ignore = "solidity compile-matrix heavy; run explicitly in CI"]
+fn poseidon_verifier_variants_compile_with_pinned_solc() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let variants = [
+        (
+            "embedded verifier",
+            fixture.embedded_verifier_solidity.as_str(),
+        ),
+        (
+            "embedded trace verifier",
+            fixture.embedded_trace_verifier_solidity.as_str(),
+        ),
+        (
+            "embedded gas verifier",
+            fixture.embedded_gas_verifier_solidity.as_str(),
+        ),
+        (
+            "separate verifier",
+            fixture.separate_verifier_solidity.as_str(),
+        ),
+        (
+            "separate gas verifier",
+            fixture.gas_separate_verifier_solidity.as_str(),
+        ),
+        (
+            "separate trace verifier",
+            fixture.trace_verifier_solidity.as_str(),
+        ),
+        ("separate VK", fixture.vk_solidity.as_str()),
+        ("separate trace VK", fixture.trace_vk_solidity.as_str()),
+        (
+            "external quotient verifier",
+            fixture.quotient_verifier_solidity.as_str(),
+        ),
+        (
+            "external quotient evaluator",
+            fixture.quotient_evaluator_solidity.as_str(),
+        ),
+        (
+            "external quotient trace verifier",
+            fixture.trace_quotient_verifier_solidity.as_str(),
+        ),
+        (
+            "external quotient trace VK",
+            fixture.trace_quotient_vk_solidity.as_str(),
+        ),
+    ];
+
+    for (name, source) in variants {
+        let bytecode = std::panic::catch_unwind(AssertUnwindSafe(|| compile_solidity(source)))
+            .unwrap_or_else(|_| panic!("{name} did not compile"));
+        assert!(!bytecode.is_empty(), "{name} compiled to empty bytecode");
+    }
+}
+
 #[cfg(feature = "rust-verifier-trace")]
 #[test]
 #[ignore = "solidity/EVM-heavy differential trace; run explicitly"]
@@ -600,10 +660,15 @@ struct PropertyPoseidonFixture {
     params_verifier: PoseidonVerifierParams,
     vk: MidnightVK,
     embedded_verifier_solidity: String,
+    embedded_trace_verifier_solidity: String,
+    embedded_gas_verifier_solidity: String,
     separate_verifier_solidity: String,
+    gas_separate_verifier_solidity: String,
     vk_solidity: String,
     quotient_verifier_solidity: String,
     quotient_evaluator_solidity: String,
+    trace_quotient_verifier_solidity: String,
+    trace_quotient_vk_solidity: String,
     #[allow(dead_code)]
     trace_verifier_solidity: String,
     #[allow(dead_code)]
@@ -660,8 +725,19 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
 
     let generator = SolidityGenerator::new(&srs, vk.vk(), 1, 1);
     let embedded_verifier_solidity = generator.render().expect("embedded render");
+    let embedded_trace_verifier_solidity = generator.render_trace().expect("embedded trace render");
+    let embedded_gas_verifier_solidity = generator
+        .render_with_gas_checkpoints()
+        .expect("embedded gas render");
     let (separate_verifier_solidity, vk_solidity) =
         generator.render_separately().expect("separate render");
+    let (gas_separate_verifier_solidity, gas_vk_solidity) = generator
+        .render_with_gas_checkpoints_separately()
+        .expect("separate gas render");
+    assert_eq!(
+        vk_solidity, gas_vk_solidity,
+        "plain and gas-checkpoint render paths must share the same VK"
+    );
     let quotient_evaluator_solidity = generator
         .render_quotient_evaluator()
         .expect("quotient evaluator render");
@@ -673,13 +749,25 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
     let (quotient_verifier_solidity, quotient_vk_solidity, pinned_quotient_solidity) = generator
         .render_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
         .expect("separate pinned render with quotient evaluator");
+    let (trace_quotient_verifier_solidity, trace_quotient_vk_solidity, trace_pinned_quotient) =
+        generator
+            .render_trace_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
+            .expect("trace pinned render with quotient evaluator");
     assert_eq!(
         quotient_evaluator_solidity, pinned_quotient_solidity,
         "pinning the quotient evaluator must not change the evaluator source"
     );
     assert_eq!(
+        quotient_evaluator_solidity, trace_pinned_quotient,
+        "trace pinning must not change the quotient evaluator source"
+    );
+    assert_eq!(
         vk_solidity, quotient_vk_solidity,
         "plain and quotient-separated render paths must share the same VK"
+    );
+    assert_eq!(
+        vk_solidity, trace_quotient_vk_solidity,
+        "plain and trace quotient-separated render paths must share the same VK"
     );
     let (trace_verifier_solidity, trace_vk_solidity) =
         generator.render_trace_separately().expect("trace render");
@@ -695,10 +783,15 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
         params_verifier,
         vk,
         embedded_verifier_solidity,
+        embedded_trace_verifier_solidity,
+        embedded_gas_verifier_solidity,
         separate_verifier_solidity,
+        gas_separate_verifier_solidity,
         vk_solidity,
         quotient_verifier_solidity,
         quotient_evaluator_solidity,
+        trace_quotient_verifier_solidity,
+        trace_quotient_vk_solidity,
         trace_verifier_solidity,
         trace_vk_solidity,
     }
@@ -1485,11 +1578,14 @@ fn poseidon_inputs_available_for_evm() -> bool {
 }
 
 fn poseidon_srs_available() -> bool {
-    let srs_path = PathBuf::from(srs_dir()).join(format!("bls_filecoin_2p{POSEIDON_K}"));
-    if !srs_path.exists() {
+    let srs_dir = PathBuf::from(srs_dir());
+    let exact_srs_path = srs_dir.join(format!("bls_filecoin_2p{POSEIDON_K}"));
+    let fallback_srs_path = srs_dir.join("bls_filecoin_2p19");
+    if !exact_srs_path.exists() && !fallback_srs_path.exists() {
         eprintln!(
-            "skipping Poseidon Solidity property test: SRS not found at {}",
-            srs_path.display()
+            "skipping Poseidon Solidity property test: SRS not found at {} or {}",
+            exact_srs_path.display(),
+            fallback_srs_path.display()
         );
         return false;
     }
@@ -1497,7 +1593,8 @@ fn poseidon_srs_available() -> bool {
 }
 
 fn solc_available() -> bool {
-    std::process::Command::new("solc")
+    let solc = env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
+    std::process::Command::new(solc)
         .arg("--version")
         .output()
         .is_ok()

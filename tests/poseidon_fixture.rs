@@ -118,9 +118,10 @@ fn poseidon_renders_compiles_and_verifies() {
     // hasn't been downloaded yet).
     let srs_dir = srs_dir();
     let srs_path = format!("{srs_dir}/bls_filecoin_2p{K}");
-    if !Path::new(&srs_path).exists() {
+    let fallback_srs_path = format!("{srs_dir}/bls_filecoin_2p19");
+    if !Path::new(&srs_path).exists() && !Path::new(&fallback_srs_path).exists() {
         eprintln!(
-            "skipping poseidon end-to-end smoke: SRS not found at {srs_path}. \
+            "skipping poseidon end-to-end smoke: SRS not found at {srs_path} or {fallback_srs_path}. \
              Set SRS_DIR or fetch the asset under midfall/zk_stdlib."
         );
         return;
@@ -188,12 +189,13 @@ fn poseidon_renders_compiles_and_verifies() {
     );
 
     // Skip the EVM portion if `solc` is not on PATH.
-    if std::process::Command::new("solc")
+    let solc = env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
+    if std::process::Command::new(&solc)
         .arg("--version")
         .output()
         .is_err()
     {
-        eprintln!("skipping poseidon end-to-end smoke: solc not found");
+        eprintln!("skipping poseidon end-to-end smoke: {solc} not found");
         return;
     }
 

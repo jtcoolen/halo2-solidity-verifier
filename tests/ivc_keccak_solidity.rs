@@ -809,12 +809,13 @@ fn ivc_final_keccak_solidity_e2e() {
     const EIP170_MAX_RUNTIME_SIZE: usize = 0x6000;
 
     // Bail out cleanly when solc isn't on PATH.
-    if std::process::Command::new("solc")
+    let solc = std::env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
+    if std::process::Command::new(&solc)
         .arg("--version")
         .output()
         .is_err()
     {
-        println!("[ivc-keccak-solidity] solc not found on PATH; skipping");
+        println!("[ivc-keccak-solidity] {solc} not found on PATH; skipping");
         return;
     }
     if !has_required_srs_assets() {
