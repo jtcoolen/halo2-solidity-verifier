@@ -583,6 +583,33 @@ impl ProtocolPlan {
             .count()
     }
 
+    /// Commitment group sizes in the exact proof/transcript order used by
+    /// the generated verifier and the off-chain proof repacker.
+    pub(crate) fn commitment_read_groups(&self) -> Vec<usize> {
+        let mut groups = Vec::new();
+        groups.extend(self.num_user_advices.iter().copied().filter(|&n| n != 0));
+        if self.num_lookups != 0 {
+            groups.push(self.num_lookups);
+        }
+        if self.num_permutation_zs != 0 {
+            groups.push(self.num_permutation_zs);
+        }
+        for &chunks in &self.lookup_chunks {
+            groups.push(chunks);
+            groups.push(1);
+        }
+        if self.num_trashcans != 0 {
+            groups.push(self.num_trashcans);
+        }
+        groups.push(self.num_quotients);
+        debug_assert_eq!(
+            groups.iter().sum::<usize>(),
+            self.proof.commitments.len(),
+            "protocol commitment groups must cover the proof commitment plan"
+        );
+        groups
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.num_simple_selectors != self.simple_selector_cols.len() {
             return Err(format!(
@@ -602,6 +629,14 @@ impl ProtocolPlan {
             return Err(format!(
                 "quotient commitment count mismatch: plan={quotient_count} meta={}",
                 self.num_quotients
+            ));
+        }
+
+        let grouped_commitments = self.commitment_read_groups().iter().sum::<usize>();
+        if grouped_commitments != self.proof.commitments.len() {
+            return Err(format!(
+                "commitment group schedule mismatch: groups={grouped_commitments} commitments={}",
+                self.proof.commitments.len()
             ));
         }
 
@@ -889,6 +924,7 @@ mod tests {
             ]
         );
         assert_eq!(plan.num_main_evals(), 4);
+        assert_eq!(plan.commitment_read_groups(), vec![2, plan.num_quotients]);
         assert_eq!(plan.quotient_trace_ids, vec![TRACE_QUOTIENT_IDENTITY_BASE]);
         assert_eq!(
             plan.pcs_query_trace_ids,
@@ -1019,6 +1055,10 @@ mod tests {
             let plan = ProtocolPlan::from_constraint_system(&cs, committed);
             prop_assert!(plan.validate().is_ok());
             prop_assert_eq!(plan.pcs_queries.len(), plan.proof.evals.len() + 1);
+            prop_assert_eq!(
+                plan.commitment_read_groups().iter().sum::<usize>(),
+                plan.proof.commitments.len()
+            );
             prop_assert_eq!(plan.quotient_trace_ids.len(), plan.quotient.total());
             prop_assert_eq!(plan.pcs_query_trace_ids.len(), plan.pcs_queries.len());
             let simple_selector_eval = plan

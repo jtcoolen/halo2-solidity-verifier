@@ -2,6 +2,7 @@
 
 use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
+    layout,
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
     util::Ptr,
 };
@@ -44,6 +45,230 @@ pub(crate) const BLS_SQRT_EXP_BOT16_LEFT: U256 = U256::from_be_slice(&[
 
 /// G1 point in EIP-2537 padded encoding: (x_hi, x_lo, y_hi, y_lo).
 pub(crate) type G1Words = (U256, U256, U256, U256);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TemplateConstants {
+    pub(crate) word_bytes: usize,
+    pub(crate) fr_bytes: usize,
+    pub(crate) g1_bytes: usize,
+    pub(crate) g2_bytes: usize,
+    pub(crate) g1_msm_pair_bytes: usize,
+    pub(crate) g1add_input_bytes: usize,
+    pub(crate) pairing_pair_bytes: usize,
+    pub(crate) pairing_two_pair_bytes: usize,
+    pub(crate) eip2537: Eip2537TemplateConstants,
+    pub(crate) modexp: ModexpTemplateConstants,
+    pub(crate) accumulator: AccumulatorTemplateConstants,
+    pub(crate) quotient_vm: QuotientVmTemplateConstants,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Eip2537TemplateConstants {
+    pub(crate) g1add_address: usize,
+    pub(crate) g1msm_address: usize,
+    pub(crate) pairing_address: usize,
+    pub(crate) g1add_gas_cap: usize,
+    pub(crate) g1msm_smoke_gas_cap: usize,
+    pub(crate) pairing_smoke_gas_cap: usize,
+    pub(crate) g1msm_base_gas: usize,
+    pub(crate) g1msm_scalar_multiplication_cost: usize,
+    pub(crate) g1msm_discount_denominator: usize,
+    pub(crate) pairing_base_gas: usize,
+    pub(crate) pairing_pair_gas: usize,
+    pub(crate) smoke_scratch_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModexpTemplateConstants {
+    pub(crate) address: usize,
+    pub(crate) frame_bytes: usize,
+    pub(crate) scratch_bytes: usize,
+    pub(crate) output_bytes: usize,
+    pub(crate) base_len_offset: usize,
+    pub(crate) exp_len_offset: usize,
+    pub(crate) mod_len_offset: usize,
+    pub(crate) base_offset: usize,
+    pub(crate) exp_offset: usize,
+    pub(crate) mod_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccumulatorTemplateConstants {
+    pub(crate) limb_bits: usize,
+    pub(crate) limbs: usize,
+    pub(crate) limbs_per_word: usize,
+    pub(crate) point_coords: usize,
+    pub(crate) carried_scalars: usize,
+    pub(crate) pairing_batch_ptr: usize,
+    pub(crate) pairing_batch_domain_tag_hex: &'static str,
+    pub(crate) pairing_batch_rhs_offset: usize,
+    pub(crate) pairing_batch_lhs_offset: usize,
+    pub(crate) pairing_batch_acc_rhs_offset: usize,
+    pub(crate) pairing_batch_acc_lhs_offset: usize,
+    pub(crate) pairing_batch_hash_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuotientVmOpcodeTemplateConstants {
+    pub(crate) push_const: u8,
+    pub(crate) push_mem_literal: u8,
+    pub(crate) push_mem_token: u8,
+    pub(crate) push_mem_token_offset: u8,
+    pub(crate) push_mem_u16: u8,
+    pub(crate) add: u8,
+    pub(crate) mul: u8,
+    pub(crate) neg: u8,
+    pub(crate) push_const_u8: u8,
+    pub(crate) fold_main: u8,
+    pub(crate) fold_selector: u8,
+    pub(crate) add_const_u8: u8,
+    pub(crate) mul_const_u8: u8,
+    pub(crate) add_const: u8,
+    pub(crate) mul_const: u8,
+    pub(crate) add_mem_u16: u8,
+    pub(crate) mul_mem_u16: u8,
+    pub(crate) add_mul_mem_mem_const_u8: u8,
+    pub(crate) add_mul_const_u8_mem_u16: u8,
+    pub(crate) add_mul_mem_mem: u8,
+    pub(crate) run_add_mul_mem_mem_const_u8: u8,
+    pub(crate) run_add_mul_const_u8_mem_u16: u8,
+    pub(crate) push_temp: u8,
+    pub(crate) store_temp: u8,
+    pub(crate) native_permutation: u8,
+    pub(crate) native_identity: u8,
+    pub(crate) lin7: u8,
+    pub(crate) bilin7_row: u8,
+    pub(crate) bilin7_pairwise: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuotientVmMemTokenTemplateConstants {
+    pub(crate) l0: u8,
+    pub(crate) l_last: u8,
+    pub(crate) l_blind: u8,
+    pub(crate) beta: u8,
+    pub(crate) gamma: u8,
+    pub(crate) x: u8,
+    pub(crate) theta: u8,
+    pub(crate) trash_challenge: u8,
+    pub(crate) instance_eval: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuotientVmTemplateConstants {
+    pub(crate) op: QuotientVmOpcodeTemplateConstants,
+    pub(crate) mem: QuotientVmMemTokenTemplateConstants,
+    pub(crate) packed_instruction_bytes: usize,
+    pub(crate) packed_arg_mask: u32,
+    pub(crate) limb_count: usize,
+    pub(crate) limb_pairwise_coeffs: usize,
+}
+
+impl Default for TemplateConstants {
+    fn default() -> Self {
+        use crate::codegen::quotient as q;
+
+        Self {
+            word_bytes: layout::WORD_BYTES,
+            fr_bytes: layout::FR_BYTES,
+            g1_bytes: layout::G1_BYTES,
+            g2_bytes: layout::G2_BYTES,
+            g1_msm_pair_bytes: layout::G1_MSM_PAIR_BYTES,
+            g1add_input_bytes: layout::G1ADD_INPUT_BYTES,
+            pairing_pair_bytes: layout::PAIRING_PAIR_BYTES,
+            pairing_two_pair_bytes: layout::PAIRING_TWO_PAIR_BYTES,
+            eip2537: Eip2537TemplateConstants {
+                g1add_address: layout::precompile::G1ADD_ADDRESS,
+                g1msm_address: layout::precompile::G1MSM_ADDRESS,
+                pairing_address: layout::precompile::PAIRING_ADDRESS,
+                g1add_gas_cap: layout::precompile::G1ADD_GAS_CAP,
+                g1msm_smoke_gas_cap: layout::precompile::G1MSM_SMOKE_GAS_CAP,
+                pairing_smoke_gas_cap: layout::precompile::PAIRING_SMOKE_GAS_CAP,
+                g1msm_base_gas: layout::precompile::G1MSM_BASE_GAS,
+                g1msm_scalar_multiplication_cost:
+                    layout::precompile::G1MSM_SCALAR_MULTIPLICATION_COST,
+                g1msm_discount_denominator: layout::precompile::G1MSM_DISCOUNT_DENOMINATOR,
+                pairing_base_gas: layout::precompile::PAIRING_BASE_GAS,
+                pairing_pair_gas: layout::precompile::PAIRING_PAIR_GAS,
+                smoke_scratch_bytes: layout::PAIRING_PAIR_BYTES,
+            },
+            modexp: ModexpTemplateConstants {
+                address: layout::precompile::MODEXP_ADDRESS,
+                frame_bytes: layout::MODEXP_FRAME_BYTES,
+                scratch_bytes: layout::MODEXP_SCRATCH_BYTES,
+                output_bytes: layout::WORD_BYTES,
+                base_len_offset: layout::modexp_frame::BASE_LEN_OFFSET,
+                exp_len_offset: layout::modexp_frame::EXP_LEN_OFFSET,
+                mod_len_offset: layout::modexp_frame::MOD_LEN_OFFSET,
+                base_offset: layout::modexp_frame::BASE_OFFSET,
+                exp_offset: layout::modexp_frame::EXP_OFFSET,
+                mod_offset: layout::modexp_frame::MOD_OFFSET,
+            },
+            accumulator: AccumulatorTemplateConstants {
+                limb_bits: layout::accumulator::LIMB_BITS,
+                limbs: layout::accumulator::LIMBS,
+                limbs_per_word: layout::accumulator::LIMBS_PER_WORD,
+                point_coords: layout::accumulator::POINT_COORDS,
+                carried_scalars: layout::accumulator::CARRIED_SCALARS,
+                pairing_batch_ptr: layout::accumulator::PAIRING_BATCH_PTR,
+                pairing_batch_domain_tag_hex: layout::accumulator::PAIRING_BATCH_DOMAIN_TAG_HEX,
+                pairing_batch_rhs_offset: layout::accumulator::PAIRING_BATCH_RHS_OFFSET,
+                pairing_batch_lhs_offset: layout::accumulator::PAIRING_BATCH_LHS_OFFSET,
+                pairing_batch_acc_rhs_offset: layout::accumulator::PAIRING_BATCH_ACC_RHS_OFFSET,
+                pairing_batch_acc_lhs_offset: layout::accumulator::PAIRING_BATCH_ACC_LHS_OFFSET,
+                pairing_batch_hash_bytes: layout::accumulator::PAIRING_BATCH_HASH_BYTES,
+            },
+            quotient_vm: QuotientVmTemplateConstants {
+                op: QuotientVmOpcodeTemplateConstants {
+                    push_const: q::Q_OP_PUSH_CONST,
+                    push_mem_literal: q::Q_OP_PUSH_MEM_LITERAL,
+                    push_mem_token: q::Q_OP_PUSH_MEM_TOKEN,
+                    push_mem_token_offset: q::Q_OP_PUSH_MEM_TOKEN_OFFSET,
+                    push_mem_u16: q::Q_OP_PUSH_MEM_U16,
+                    add: q::Q_OP_ADD,
+                    mul: q::Q_OP_MUL,
+                    neg: q::Q_OP_NEG,
+                    push_const_u8: q::Q_OP_PUSH_CONST_U8,
+                    fold_main: q::Q_OP_FOLD_MAIN,
+                    fold_selector: q::Q_OP_FOLD_SELECTOR,
+                    add_const_u8: q::Q_OP_ADD_CONST_U8,
+                    mul_const_u8: q::Q_OP_MUL_CONST_U8,
+                    add_const: q::Q_OP_ADD_CONST,
+                    mul_const: q::Q_OP_MUL_CONST,
+                    add_mem_u16: q::Q_OP_ADD_MEM_U16,
+                    mul_mem_u16: q::Q_OP_MUL_MEM_U16,
+                    add_mul_mem_mem_const_u8: q::Q_OP_ADD_MUL_MEM_MEM_CONST_U8,
+                    add_mul_const_u8_mem_u16: q::Q_OP_ADD_MUL_CONST_U8_MEM_U16,
+                    add_mul_mem_mem: q::Q_OP_ADD_MUL_MEM_MEM,
+                    run_add_mul_mem_mem_const_u8: q::Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8,
+                    run_add_mul_const_u8_mem_u16: q::Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
+                    push_temp: q::Q_OP_PUSH_TEMP,
+                    store_temp: q::Q_OP_STORE_TEMP,
+                    native_permutation: q::Q_OP_NATIVE_PERMUTATION,
+                    native_identity: q::Q_OP_NATIVE_IDENTITY,
+                    lin7: q::Q_OP_LIN7,
+                    bilin7_row: q::Q_OP_BILIN7_ROW,
+                    bilin7_pairwise: q::Q_OP_BILIN7_PAIRWISE,
+                },
+                mem: QuotientVmMemTokenTemplateConstants {
+                    l0: q::Q_MEM_L0,
+                    l_last: q::Q_MEM_L_LAST,
+                    l_blind: q::Q_MEM_L_BLIND,
+                    beta: q::Q_MEM_BETA,
+                    gamma: q::Q_MEM_GAMMA,
+                    x: q::Q_MEM_X,
+                    theta: q::Q_MEM_THETA,
+                    trash_challenge: q::Q_MEM_TRASH_CHALLENGE,
+                    instance_eval: q::Q_MEM_INSTANCE_EVAL,
+                },
+                packed_instruction_bytes: q::QUOTIENT_VM_PACKED_INSTRUCTION_BYTES,
+                packed_arg_mask: q::QUOTIENT_VM_PACKED_ARG_MASK,
+                limb_count: q::QUOTIENT_VM_LIMBS,
+                limb_pairwise_coeffs: q::QUOTIENT_VM_PAIRWISE_COEFFS,
+            },
+        }
+    }
+}
 
 #[derive(Template)]
 #[template(path = "Halo2VerifyingKey.sol")]
@@ -192,6 +417,7 @@ impl Default for VkHeaderTemplateSlots {
 #[derive(Template)]
 #[template(path = "Halo2Verifier.sol")]
 pub(crate) struct Halo2Verifier {
+    pub(crate) template_constants: TemplateConstants,
     pub(crate) trace: bool,
     /// When true, the rendered verifier emits LOG1 gas() checkpoints at
     /// section boundaries. See SOLIDITY_GAS_CHECKPOINTS_ENABLED.
@@ -200,8 +426,8 @@ pub(crate) struct Halo2Verifier {
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
-    pub(crate) limb7_yul_coeffs: [&'static str; 6],
-    pub(crate) wide_limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
+    pub(crate) wide_limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
     pub(crate) fr_delta: String,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
@@ -344,15 +570,45 @@ pub(crate) struct QuotientExternal {
     pub(crate) magic: u64,
 }
 
+impl QuotientExternal {
+    fn frame_end(&self) -> usize {
+        self.frame_base + self.frame_len
+    }
+
+    fn contains_range(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        start >= self.frame_base && end <= self.frame_end()
+    }
+
+    fn disjoint_range(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        end <= self.frame_base || start >= self.frame_end()
+    }
+
+    fn validate_contains(&self, name: &str, start: usize, len: usize) -> Result<(), String> {
+        if self.contains_range(start, len) {
+            Ok(())
+        } else {
+            Err(format!(
+                "external quotient frame does not contain {name}: range {start:#x}..{:#x}, frame {:#x}..{:#x}",
+                start.saturating_add(len),
+                self.frame_base,
+                self.frame_end()
+            ))
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "Halo2QuotientEvaluator.sol")]
 pub(crate) struct Halo2QuotientEvaluator {
+    pub(crate) template_constants: TemplateConstants,
     pub(crate) trace: bool,
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
-    pub(crate) limb7_yul_coeffs: [&'static str; 6],
-    pub(crate) wide_limb7_yul_coeffs: [&'static str; 6],
+    pub(crate) limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
+    pub(crate) wide_limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
     pub(crate) fr_delta: String,
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_mptr: Ptr,
@@ -459,6 +715,46 @@ impl Halo2Verifier {
                 "selector accumulator layout mismatch: got {:#x}, expected {expected_selector_acc:#x}",
                 self.selector_acc_mptr
             ));
+        }
+
+        if let Some(qext) = &self.quotient_external {
+            qext.validate_contains("VK payload", self.vk_mptr.value().as_usize(), self.vk_len)?;
+            qext.validate_contains(
+                "user challenge block",
+                self.challenge_mptr.value().as_usize(),
+                self.num_user_challenges * WORD_BYTES,
+            )?;
+            let quotient_input_end = self.memory.instance_eval_mptr.value().as_usize() + WORD_BYTES;
+            qext.validate_contains(
+                "quotient challenge/common slots",
+                self.theta_mptr.value().as_usize(),
+                quotient_input_end.saturating_sub(self.theta_mptr.value().as_usize()),
+            )?;
+            qext.validate_contains(
+                "decoded proof evaluations",
+                self.reversed_evals_mptr.value().as_usize(),
+                self.num_evals * WORD_BYTES,
+            )?;
+
+            let expected_output_len = 2 * WORD_BYTES + self.simple_selector_cols.len() * WORD_BYTES;
+            if qext.output_len != expected_output_len {
+                return Err(format!(
+                    "external quotient output length mismatch: got {:#x}, expected {expected_output_len:#x}",
+                    qext.output_len
+                ));
+            }
+            let selector_output_len = self.simple_selector_cols.len() * WORD_BYTES;
+            if selector_output_len != 0
+                && !qext.disjoint_range(self.selector_acc_mptr, selector_output_len)
+            {
+                return Err(format!(
+                    "external quotient selector output overlaps copied frame: selector {:#x}..{:#x}, frame {:#x}..{:#x}",
+                    self.selector_acc_mptr,
+                    self.selector_acc_mptr + selector_output_len,
+                    qext.frame_base,
+                    qext.frame_end()
+                ));
+            }
         }
 
         Ok(())
@@ -624,6 +920,7 @@ mod tests {
         let acc_msm_scratch = memory.acc_msm_scratch;
 
         Halo2Verifier {
+            template_constants: Default::default(),
             trace: false,
             gas_checkpoints: false,
             quotient_yul_helpers: false,

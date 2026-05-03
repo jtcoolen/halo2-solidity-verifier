@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use crate::codegen::{
+    layout::{BLS_FP_BYTES, EIP2537_FP_PAD_BYTES},
     memory::{VerifierMemoryLayout, G1_BYTES, G1_WORDS, WORD_BYTES},
     protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
@@ -1057,11 +1058,11 @@ pub(crate) fn group_backward_adjacent_ec_points<'a>(
 // ----------------------------------------------------------------------------
 
 fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
-    debug_assert_eq!(be.len(), 48);
+    debug_assert_eq!(be.len(), BLS_FP_BYTES);
     let mut hi_bytes = [0u8; 32];
-    hi_bytes[16..].copy_from_slice(&be[..16]);
+    hi_bytes[EIP2537_FP_PAD_BYTES..].copy_from_slice(&be[..EIP2537_FP_PAD_BYTES]);
     let mut lo_bytes = [0u8; 32];
-    lo_bytes.copy_from_slice(&be[16..]);
+    lo_bytes.copy_from_slice(&be[EIP2537_FP_PAD_BYTES..]);
     (U256::from_be_bytes(hi_bytes), U256::from_be_bytes(lo_bytes))
 }
 
@@ -1075,10 +1076,10 @@ pub(crate) fn g1_to_u256s(ec_point: impl Borrow<G1Affine>) -> [U256; 4] {
     else {
         return [U256::ZERO; 4];
     };
-    let mut x_be = [0u8; 48];
+    let mut x_be = [0u8; BLS_FP_BYTES];
     x_be.copy_from_slice(coords.x().to_repr().as_ref());
     x_be.reverse();
-    let mut y_be = [0u8; 48];
+    let mut y_be = [0u8; BLS_FP_BYTES];
     y_be.copy_from_slice(coords.y().to_repr().as_ref());
     y_be.reverse();
     let (x_hi, x_lo) = fp48_be_to_hi_lo(&x_be);
@@ -1098,8 +1099,8 @@ pub(crate) fn g2_to_u256s(ec_point: impl Borrow<G2Affine>) -> [U256; 8] {
         return [U256::ZERO; 8];
     };
 
-    let pack_fp = |fp: midnight_curves::Fp| -> [u8; 48] {
-        let mut be = [0u8; 48];
+    let pack_fp = |fp: midnight_curves::Fp| -> [u8; BLS_FP_BYTES] {
+        let mut be = [0u8; BLS_FP_BYTES];
         be.copy_from_slice(fp.to_repr().as_ref());
         be.reverse();
         be

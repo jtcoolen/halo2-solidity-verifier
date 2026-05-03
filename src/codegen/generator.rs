@@ -2220,17 +2220,43 @@ impl<'a> SolidityGenerator<'a> {
             init.push("{".to_string());
             init.push(format!("let q_inv_scratch := {eval_scratch_slot:#x}"));
             init.push("if iszero(y) { revert(0, 0) }".to_string());
-            init.push("mstore(q_inv_scratch, 0x20)".to_string());
-            init.push("mstore(add(q_inv_scratch, 0x20), 0x20)".to_string());
-            init.push("mstore(add(q_inv_scratch, 0x40), 0x20)".to_string());
-            init.push("mstore(add(q_inv_scratch, 0x60), y)".to_string());
-            init.push("mstore(add(q_inv_scratch, 0x80), sub(FR_MODULUS, 2))".to_string());
-            init.push("mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)".to_string());
-            init.push(
-                "if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }"
-                    .to_string(),
-            );
-            init.push("if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }".to_string());
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), {:#x})",
+                layout::modexp_frame::BASE_LEN_OFFSET,
+                layout::WORD_BYTES
+            ));
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), {:#x})",
+                layout::modexp_frame::EXP_LEN_OFFSET,
+                layout::WORD_BYTES
+            ));
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), {:#x})",
+                layout::modexp_frame::MOD_LEN_OFFSET,
+                layout::WORD_BYTES
+            ));
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), y)",
+                layout::modexp_frame::BASE_OFFSET
+            ));
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), sub(FR_MODULUS, 2))",
+                layout::modexp_frame::EXP_OFFSET
+            ));
+            init.push(format!(
+                "mstore(add(q_inv_scratch, {:#x}), FR_MODULUS)",
+                layout::modexp_frame::MOD_OFFSET
+            ));
+            init.push(format!(
+                "if iszero(staticcall(gas(), {:#x}, q_inv_scratch, {:#x}, q_inv_scratch, {:#x})) {{ revert(0, 0) }}",
+                layout::precompile::MODEXP_ADDRESS,
+                layout::MODEXP_FRAME_BYTES,
+                layout::WORD_BYTES
+            ));
+            init.push(format!(
+                "if iszero(eq(returndatasize(), {:#x})) {{ revert(0, 0) }}",
+                layout::WORD_BYTES
+            ));
             init.push("q_y_inv := mload(q_inv_scratch)".to_string());
             init.push("}".to_string());
         }
@@ -2504,6 +2530,7 @@ impl<'a> SolidityGenerator<'a> {
             .any(|line| line.contains("q_limb7_wide("));
 
         Halo2QuotientEvaluator {
+            template_constants: Default::default(),
             trace: false,
             quotient_pow5_helper,
             quotient_limb7_helper,
@@ -2883,6 +2910,7 @@ impl<'a> SolidityGenerator<'a> {
         let acc_msm_scratch = memory.acc_msm_scratch;
 
         let verifier = Halo2Verifier {
+            template_constants: Default::default(),
             trace,
             gas_checkpoints,
             quotient_yul_helpers,
@@ -3103,6 +3131,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn repacked_proof_scalar_layout_for_test(&self) -> RepackedProofScalarLayout {
         self.repacked_proof_layout_plan().scalar_layout()
     }
@@ -3112,38 +3141,7 @@ impl<'a> SolidityGenerator<'a> {
         let vk = self.generate_vk();
         let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
 
-        let cs = self.vk.cs();
-        let perm_chunks = cs.permutation().columns.chunks(cs.degree() - 2).count();
-        let mut g1_groups: Vec<usize> = Vec::new();
-        let advice_phase = cs.advice_column_phase();
-        let max_phase = *advice_phase.iter().max().unwrap_or(&0);
-        for phase in 0..=max_phase {
-            let n = advice_phase.iter().filter(|p| **p == phase).count();
-            if n != 0 {
-                g1_groups.push(n);
-            }
-        }
-        if !cs.lookups().is_empty() {
-            g1_groups.push(cs.lookups().len());
-        }
-        if perm_chunks != 0 {
-            g1_groups.push(perm_chunks);
-        }
-        for lookup in cs.lookups().iter() {
-            let nb_chunks = lookup.chunk_by_degree(cs.degree()).num_chunks();
-            g1_groups.push(nb_chunks);
-            g1_groups.push(1);
-        }
-        if !cs.trashcans().is_empty() {
-            g1_groups.push(cs.trashcans().len());
-        }
-        g1_groups.push(cs.degree() - 1);
-
-        RepackedProofLayoutPlan {
-            g1_groups,
-            num_evals: meta.num_evals,
-            num_point_sets: meta.num_point_sets,
-        }
+        RepackedProofLayoutPlan::from_protocol(&meta.protocol, meta.num_evals, meta.num_point_sets)
     }
 
     fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
@@ -3206,21 +3204,27 @@ impl<'a> SolidityGenerator<'a> {
         // causes the keccak buffer to overrun `VK_MPTR` mid-verify and
         // silently corrupt `K_MPTR`, `OMEGA_MPTR`, etc., producing a
         // multi-billion-gas spin in the Lagrange block.
-        // (a) initial run: vk_digest (32) + committed_pi (128)
-        //     + num_instances scalar (32) + num_instances * 32
-        //     + phase-1 advices * 128 + 32 cushion.
+        let word_absorb = layout::transcript::WORD_ABSORB_BYTES;
+        let g1_absorb = layout::transcript::G1_ABSORB_BYTES;
+        let squeeze_cushion = layout::transcript::POST_SQUEEZE_CUSHION_WORDS * WORD_BYTES;
+
+        // (a) initial run: vk_digest + committed_pi + num_instances scalar
+        //     + num_instances committed-instance scalars + phase-1 advices
+        //     + post-squeeze seed cushion.
         let phase_1_advices = meta.num_user_advices.first().copied().unwrap_or(0);
-        let initial_run = 32                  // vk_digest
-            + 128                             // committed_pi
-            + 32                              // num_instances scalar
-            + num_instances * 32              // committed instances
-            + phase_1_advices * 128           // phase-1 advices
-            + 32; // post-squeeze seed cushion
+        let initial_run = word_absorb
+            + g1_absorb
+            + word_absorb
+            + num_instances * word_absorb
+            + phase_1_advices * g1_absorb
+            + squeeze_cushion;
 
         // (b) eval-block run: quotient limbs + num_evals scalars
         //     + num_point_sets scalars + 32 cushion.
-        let eval_run =
-            meta.num_quotients * 128 + meta.num_evals * 32 + meta.num_point_sets * 32 + 32;
+        let eval_run = meta.num_quotients * g1_absorb
+            + meta.num_evals * word_absorb
+            + meta.num_point_sets * word_absorb
+            + squeeze_cushion;
 
         // Catch-all: any other phase. We bound it by every G1 + every
         // scalar absorbed across the whole transcript; this is a strict
@@ -3233,9 +3237,14 @@ impl<'a> SolidityGenerator<'a> {
             + meta.num_trashcans
             + meta.num_quotients
             + 2; // f_com + pi
-        let total_scalar = meta.num_evals + meta.num_point_sets + 32;
-        let total_run = 32 + total_g1 * 128 + total_scalar * 32 + 32;
+        let total_scalar =
+            meta.num_evals + meta.num_point_sets + layout::transcript::POST_SQUEEZE_CUSHION_WORDS;
+        let total_run =
+            word_absorb + total_g1 * g1_absorb + total_scalar * word_absorb + squeeze_cushion;
 
-        initial_run.max(eval_run).max(total_run).div_ceil(0x20)
+        initial_run
+            .max(eval_run)
+            .max(total_run)
+            .div_ceil(WORD_BYTES)
     }
 }

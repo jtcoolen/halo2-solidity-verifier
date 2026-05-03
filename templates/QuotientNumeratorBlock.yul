@@ -75,14 +75,14 @@
                     // scratch: large separated VKs occupy that range.
                     let q_inv_scratch := {{ program.stack_mptr|hex() }}
                     if iszero(y) { revert(0, 0) }
-                    mstore(q_inv_scratch,            0x20)
-                    mstore(add(q_inv_scratch, 0x20), 0x20)
-                    mstore(add(q_inv_scratch, 0x40), 0x20)
-                    mstore(add(q_inv_scratch, 0x60), y)
-                    mstore(add(q_inv_scratch, 0x80), sub(FR_MODULUS, 2))
-                    mstore(add(q_inv_scratch, 0xa0), FR_MODULUS)
-                    if iszero(staticcall(gas(), 0x05, q_inv_scratch, 0xc0, q_inv_scratch, 0x20)) { revert(0, 0) }
-                    if iszero(eq(returndatasize(), 0x20)) { revert(0, 0) }
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.base_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.exp_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.mod_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.base_offset|hex() }}), y)
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.exp_offset|hex() }}), sub(FR_MODULUS, 2))
+                    mstore(add(q_inv_scratch, {{ template_constants.modexp.mod_offset|hex() }}), FR_MODULUS)
+                    if iszero(staticcall(gas(), {{ template_constants.modexp.address|hex() }}, q_inv_scratch, {{ template_constants.modexp.frame_bytes|hex() }}, q_inv_scratch, {{ template_constants.modexp.output_bytes|hex() }})) { revert(0, 0) }
+                    if iszero(eq(returndatasize(), {{ template_constants.modexp.output_bytes|hex() }})) { revert(0, 0) }
                     mstore({{ program.y_inv_mptr|hex() }}, mload(q_inv_scratch))
                 }
                 {%- endif %}
@@ -130,12 +130,12 @@
                 // Some fused opcodes consume an extra packed word.
                 for { } lt(q_pc, q_end) { } {
                     let q_inst := shr(224, mload(q_pc))
-                    q_pc := add(q_pc, 4)
+                    q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                     let q_op := shr(24, q_inst)
-                    let q_arg := and(q_inst, 0xffffff)
+                    let q_arg := and(q_inst, {{ template_constants.quotient_vm.packed_arg_mask|hex() }})
 
                     switch q_op
-                    case 0x01 {
+                    case {{ template_constants.quotient_vm.op.push_const|hex() }} {
                         let qconst := q_arg
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -144,7 +144,7 @@
                         q_top := mload(add(q_const_mptr, shl(5, qconst)))
                         q_has_top := 1
                     }
-                    case 0x02 {
+                    case {{ template_constants.quotient_vm.op.push_mem_literal|hex() }} {
                         let q_ptr := q_arg
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -153,19 +153,19 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x03 {
+                    case {{ template_constants.quotient_vm.op.push_mem_token|hex() }} {
                         let q_token := q_arg
                         let q_ptr := 0
                         switch q_token
-                        case 0x01 { q_ptr := L_0_MPTR }
-                        case 0x02 { q_ptr := L_LAST_MPTR }
-                        case 0x03 { q_ptr := L_BLIND_MPTR }
-                        case 0x04 { q_ptr := BETA_MPTR }
-                        case 0x05 { q_ptr := GAMMA_MPTR }
-                        case 0x06 { q_ptr := X_MPTR }
-                        case 0x07 { q_ptr := THETA_MPTR }
-                        case 0x08 { q_ptr := TRASH_CHALLENGE_MPTR }
-                        case 0x09 { q_ptr := INSTANCE_EVAL_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := L_0_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := L_LAST_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l_blind|hex() }} { q_ptr := L_BLIND_MPTR }
+                        case {{ template_constants.quotient_vm.mem.beta|hex() }} { q_ptr := BETA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.gamma|hex() }} { q_ptr := GAMMA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.x|hex() }} { q_ptr := X_MPTR }
+                        case {{ template_constants.quotient_vm.mem.theta|hex() }} { q_ptr := THETA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.trash_challenge|hex() }} { q_ptr := TRASH_CHALLENGE_MPTR }
+                        case {{ template_constants.quotient_vm.mem.instance_eval|hex() }} { q_ptr := INSTANCE_EVAL_MPTR }
                         default { revert(0, 0) }
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -174,20 +174,20 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x04 {
+                    case {{ template_constants.quotient_vm.op.push_mem_token_offset|hex() }} {
                         let q_token := shr(16, q_arg)
                         let q_off := and(q_arg, 0xffff)
                         let q_ptr := 0
                         switch q_token
-                        case 0x01 { q_ptr := add(L_0_MPTR, q_off) }
-                        case 0x02 { q_ptr := add(L_LAST_MPTR, q_off) }
-                        case 0x03 { q_ptr := add(L_BLIND_MPTR, q_off) }
-                        case 0x04 { q_ptr := add(BETA_MPTR, q_off) }
-                        case 0x05 { q_ptr := add(GAMMA_MPTR, q_off) }
-                        case 0x06 { q_ptr := add(X_MPTR, q_off) }
-                        case 0x07 { q_ptr := add(THETA_MPTR, q_off) }
-                        case 0x08 { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
-                        case 0x09 { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := add(L_0_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := add(L_LAST_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l_blind|hex() }} { q_ptr := add(L_BLIND_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.beta|hex() }} { q_ptr := add(BETA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.gamma|hex() }} { q_ptr := add(GAMMA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.x|hex() }} { q_ptr := add(X_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.theta|hex() }} { q_ptr := add(THETA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.trash_challenge|hex() }} { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.instance_eval|hex() }} { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
                         default { revert(0, 0) }
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -196,7 +196,7 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x05 {
+                    case {{ template_constants.quotient_vm.op.push_mem_u16|hex() }} {
                         let q_ptr := q_arg
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -205,18 +205,18 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x06 {
+                    case {{ template_constants.quotient_vm.op.add|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := addmod(mload(q_sp), q_top, r)
                     }
-                    case 0x07 {
+                    case {{ template_constants.quotient_vm.op.mul|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
-                    case 0x08 {
+                    case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
                     }
-                    case 0x09 {
+                    case {{ template_constants.quotient_vm.op.push_const_u8|hex() }} {
                         let qconst := q_arg
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -225,27 +225,27 @@
                         q_top := mload(add(q_const_mptr, shl(5, qconst)))
                         q_has_top := 1
                     }
-                    case 0x0c {
+                    case {{ template_constants.quotient_vm.op.add_const_u8|hex() }} {
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
-                    case 0x0d {
+                    case {{ template_constants.quotient_vm.op.mul_const_u8|hex() }} {
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
-                    case 0x0e {
+                    case {{ template_constants.quotient_vm.op.add_const|hex() }} {
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
-                    case 0x0f {
+                    case {{ template_constants.quotient_vm.op.mul_const|hex() }} {
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
-                    case 0x10 {
+                    case {{ template_constants.quotient_vm.op.add_mem_u16|hex() }} {
                         q_top := addmod(q_top, mload(q_arg), r)
                     }
-                    case 0x11 {
+                    case {{ template_constants.quotient_vm.op.mul_mem_u16|hex() }} {
                         q_top := mulmod(q_top, mload(q_arg), r)
                     }
-                    case 0x12 {
+                    case {{ template_constants.quotient_vm.op.add_mul_mem_mem_const_u8|hex() }} {
                         let q_pair := shr(224, mload(q_pc))
-                        q_pc := add(q_pc, 4)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                         let q_lhs := shr(16, q_pair)
                         let q_rhs := and(q_pair, 0xffff)
                         q_top := addmod(
@@ -258,7 +258,7 @@
                             r
                         )
                     }
-                    case 0x13 {
+                    case {{ template_constants.quotient_vm.op.add_mul_const_u8_mem_u16|hex() }} {
                         let qconst := shr(16, q_arg)
                         let q_ptr := and(q_arg, 0xffff)
                         q_top := addmod(
@@ -267,15 +267,15 @@
                             r
                         )
                     }
-                    case 0x14 {
+                    case {{ template_constants.quotient_vm.op.add_mul_mem_mem|hex() }} {
                         let q_pair := shr(224, mload(q_pc))
-                        q_pc := add(q_pc, 4)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                         let q_lhs := shr(16, q_pair)
                         let q_rhs := and(q_pair, 0xffff)
                         q_top := addmod(q_top, mulmod(mload(q_lhs), mload(q_rhs), r), r)
                     }
                     {%- if program.cse_temps > 0 %}
-                    case 0x17 {
+                    case {{ template_constants.quotient_vm.op.push_temp|hex() }} {
                         if q_has_top {
                             mstore(q_sp, q_top)
                             q_sp := add(q_sp, 0x20)
@@ -283,7 +283,7 @@
                         q_top := mload(add(q_tmp_mptr, shl(5, q_arg)))
                         q_has_top := 1
                     }
-                    case 0x18 {
+                    case {{ template_constants.quotient_vm.op.store_temp|hex() }} {
                         mstore(add(q_tmp_mptr, shl(5, q_arg)), q_top)
                     }
                     {%- endif %}
@@ -292,7 +292,7 @@
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
                     // avoiding a large interpreted product loop.
-                    case 0x19 {
+                    case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
@@ -306,7 +306,7 @@
                     // opcode at the identity's original position, so the
                     // native Yul block keeps the same y-batching order as the
                     // compact interpreted identities.
-                    case 0x1b {
+                    case {{ template_constants.quotient_vm.op.native_identity|hex() }} {
                         let q_native_idx := q_arg
                         q_top := 0
                         q_has_top := 0
@@ -322,7 +322,7 @@
                         default { revert(0, 0) }
                     }
                     {%- endif %}
-                    case 0x0a {
+                    case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
@@ -337,7 +337,7 @@
                         {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
-                    case 0x0b {
+                    case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
                         let q_sel_idx := q_arg
                         let q_eval := q_top
                         q_has_top := 0
@@ -368,7 +368,7 @@
                     q_pc := add(q_pc, 1)
 
                     switch q_op
-                    case 0x01 {
+                    case {{ template_constants.quotient_vm.op.push_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -378,9 +378,9 @@
                         q_has_top := 1
                         q_pc := add(q_pc, 2)
                     }
-                    case 0x02 {
+                    case {{ template_constants.quotient_vm.op.push_mem_literal|hex() }} {
                         let q_ptr := shr(224, mload(q_pc))
-                        q_pc := add(q_pc, 4)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                         if q_has_top {
                             mstore(q_sp, q_top)
                             q_sp := add(q_sp, 0x20)
@@ -388,20 +388,20 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x03 {
+                    case {{ template_constants.quotient_vm.op.push_mem_token|hex() }} {
                         let q_token := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         let q_ptr := 0
                         switch q_token
-                        case 0x01 { q_ptr := L_0_MPTR }
-                        case 0x02 { q_ptr := L_LAST_MPTR }
-                        case 0x03 { q_ptr := L_BLIND_MPTR }
-                        case 0x04 { q_ptr := BETA_MPTR }
-                        case 0x05 { q_ptr := GAMMA_MPTR }
-                        case 0x06 { q_ptr := X_MPTR }
-                        case 0x07 { q_ptr := THETA_MPTR }
-                        case 0x08 { q_ptr := TRASH_CHALLENGE_MPTR }
-                        case 0x09 { q_ptr := INSTANCE_EVAL_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := L_0_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := L_LAST_MPTR }
+                        case {{ template_constants.quotient_vm.mem.l_blind|hex() }} { q_ptr := L_BLIND_MPTR }
+                        case {{ template_constants.quotient_vm.mem.beta|hex() }} { q_ptr := BETA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.gamma|hex() }} { q_ptr := GAMMA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.x|hex() }} { q_ptr := X_MPTR }
+                        case {{ template_constants.quotient_vm.mem.theta|hex() }} { q_ptr := THETA_MPTR }
+                        case {{ template_constants.quotient_vm.mem.trash_challenge|hex() }} { q_ptr := TRASH_CHALLENGE_MPTR }
+                        case {{ template_constants.quotient_vm.mem.instance_eval|hex() }} { q_ptr := INSTANCE_EVAL_MPTR }
                         default { revert(0, 0) }
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -410,21 +410,21 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x04 {
+                    case {{ template_constants.quotient_vm.op.push_mem_token_offset|hex() }} {
                         let q_token := byte(0, mload(q_pc))
                         let q_off := shr(224, mload(add(q_pc, 1)))
                         q_pc := add(q_pc, 5)
                         let q_ptr := 0
                         switch q_token
-                        case 0x01 { q_ptr := add(L_0_MPTR, q_off) }
-                        case 0x02 { q_ptr := add(L_LAST_MPTR, q_off) }
-                        case 0x03 { q_ptr := add(L_BLIND_MPTR, q_off) }
-                        case 0x04 { q_ptr := add(BETA_MPTR, q_off) }
-                        case 0x05 { q_ptr := add(GAMMA_MPTR, q_off) }
-                        case 0x06 { q_ptr := add(X_MPTR, q_off) }
-                        case 0x07 { q_ptr := add(THETA_MPTR, q_off) }
-                        case 0x08 { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
-                        case 0x09 { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := add(L_0_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := add(L_LAST_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.l_blind|hex() }} { q_ptr := add(L_BLIND_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.beta|hex() }} { q_ptr := add(BETA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.gamma|hex() }} { q_ptr := add(GAMMA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.x|hex() }} { q_ptr := add(X_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.theta|hex() }} { q_ptr := add(THETA_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.trash_challenge|hex() }} { q_ptr := add(TRASH_CHALLENGE_MPTR, q_off) }
+                        case {{ template_constants.quotient_vm.mem.instance_eval|hex() }} { q_ptr := add(INSTANCE_EVAL_MPTR, q_off) }
                         default { revert(0, 0) }
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -433,7 +433,7 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x05 {
+                    case {{ template_constants.quotient_vm.op.push_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         if q_has_top {
@@ -443,18 +443,18 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
-                    case 0x06 {
+                    case {{ template_constants.quotient_vm.op.add|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := addmod(mload(q_sp), q_top, r)
                     }
-                    case 0x07 {
+                    case {{ template_constants.quotient_vm.op.mul|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
-                    case 0x08 {
+                    case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
                     }
-                    case 0x09 {
+                    case {{ template_constants.quotient_vm.op.push_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -464,37 +464,37 @@
                         q_has_top := 1
                         q_pc := add(q_pc, 1)
                     }
-                    case 0x0c {
+                    case {{ template_constants.quotient_vm.op.add_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
-                    case 0x0d {
+                    case {{ template_constants.quotient_vm.op.mul_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
-                    case 0x0e {
+                    case {{ template_constants.quotient_vm.op.add_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
-                    case 0x0f {
+                    case {{ template_constants.quotient_vm.op.mul_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
-                    case 0x10 {
+                    case {{ template_constants.quotient_vm.op.add_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := addmod(q_top, mload(q_ptr), r)
                     }
-                    case 0x11 {
+                    case {{ template_constants.quotient_vm.op.mul_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := mulmod(q_top, mload(q_ptr), r)
                     }
-                    case 0x12 {
+                    case {{ template_constants.quotient_vm.op.add_mul_mem_mem_const_u8|hex() }} {
                         let q_lhs := shr(240, mload(q_pc))
                         let q_rhs := shr(240, mload(add(q_pc, 2)))
                         let qconst := byte(0, mload(add(q_pc, 4)))
@@ -509,7 +509,7 @@
                             r
                         )
                     }
-                    case 0x13 {
+                    case {{ template_constants.quotient_vm.op.add_mul_const_u8_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         let qconst := byte(0, mload(add(q_pc, 2)))
                         q_pc := add(q_pc, 3)
@@ -519,14 +519,14 @@
                             r
                         )
                     }
-                    case 0x14 {
+                    case {{ template_constants.quotient_vm.op.add_mul_mem_mem|hex() }} {
                         let q_lhs := shr(240, mload(q_pc))
                         let q_rhs := shr(240, mload(add(q_pc, 2)))
-                        q_pc := add(q_pc, 4)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                         q_top := addmod(q_top, mulmod(mload(q_lhs), mload(q_rhs), r), r)
                     }
                     {%- if program.cse_temps > 0 %}
-                    case 0x17 {
+                    case {{ template_constants.quotient_vm.op.push_temp|hex() }} {
                         let q_tmp_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         if q_has_top {
@@ -536,13 +536,13 @@
                         q_top := mload(add(q_tmp_mptr, shl(5, q_tmp_idx)))
                         q_has_top := 1
                     }
-                    case 0x18 {
+                    case {{ template_constants.quotient_vm.op.store_temp|hex() }} {
                         let q_tmp_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         mstore(add(q_tmp_mptr, shl(5, q_tmp_idx)), q_top)
                     }
                     {%- endif %}
-                    case 0x15 {
+                    case {{ template_constants.quotient_vm.op.run_add_mul_mem_mem_const_u8|hex() }} {
                         let q_count := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         let q_run_end := add(q_pc, mul(q_count, 5))
@@ -562,7 +562,7 @@
                             )
                         }
                     }
-                    case 0x16 {
+                    case {{ template_constants.quotient_vm.op.run_add_mul_const_u8_mem_u16|hex() }} {
                         let q_count := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         let q_run_end := add(q_pc, mul(q_count, 3))
@@ -593,7 +593,7 @@
                     // 2^LOG2_BASE. The verifier does not switch fields; it
                     // evaluates the lowered identity over BLS12-381 Fr, using
                     // Fr coefficients equal to base^i mod m or base^(i+j) mod m.
-                    case 0x1c {
+                    case {{ template_constants.quotient_vm.op.lin7|hex() }} {
                         // LIN7: sum_i coeff[i] * value[i] over Fr.
                         // Typical Rust origin: foreign/gates/norm.rs
                         // normalization and foreign/gates/mul.rs base-power
@@ -603,7 +603,7 @@
                             q_sp := add(q_sp, 0x20)
                         }
                         let q_acc := 0
-                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                        for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
                             let qconst := byte(0, mload(q_pc))
                             let q_ptr := shr(240, mload(add(q_pc, 1)))
                             q_pc := add(q_pc, 3)
@@ -616,7 +616,7 @@
                         q_top := q_acc
                         q_has_top := 1
                     }
-                    case 0x1d {
+                    case {{ template_constants.quotient_vm.op.bilin7_row|hex() }} {
                         // BILIN7_ROW: lhs * sum_i coeff[i] * rhs[i].
                         // Typical Rust origin: one row/slice of
                         // pair_wise_prod in foreign multiplication and EC
@@ -629,7 +629,7 @@
                             q_sp := add(q_sp, 0x20)
                         }
                         let q_acc := 0
-                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                        for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
                             let qconst := byte(0, mload(q_pc))
                             let q_rhs := shr(240, mload(add(q_pc, 1)))
                             q_pc := add(q_pc, 3)
@@ -646,7 +646,7 @@
                         q_top := q_acc
                         q_has_top := 1
                     }
-                    case 0x1e {
+                    case {{ template_constants.quotient_vm.op.bilin7_pairwise|hex() }} {
                         // BILIN7_PAIRWISE:
                         //   sum_{i=0..6,j=0..6} coeff[i+j] * lhs[i] * rhs[j].
                         // Bases point to contiguous 7-word limb vectors.
@@ -656,17 +656,17 @@
                         // where double_base_powers[k] = base^k mod m.
                         let q_lhs_base := shr(240, mload(q_pc))
                         let q_rhs_base := shr(240, mload(add(q_pc, 2)))
-                        q_pc := add(q_pc, 4)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
                         let q_coeff_pc := q_pc
-                        q_pc := add(q_pc, 13)
+                        q_pc := add(q_pc, {{ template_constants.quotient_vm.limb_pairwise_coeffs }})
                         if q_has_top {
                             mstore(q_sp, q_top)
                             q_sp := add(q_sp, 0x20)
                         }
                         let q_acc := 0
-                        for { let q_i := 0 } lt(q_i, 7) { q_i := add(q_i, 1) } {
+                        for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
                             let q_lhs_value := mload(add(q_lhs_base, shl(5, q_i)))
-                            for { let q_j := 0 } lt(q_j, 7) { q_j := add(q_j, 1) } {
+                            for { let q_j := 0 } lt(q_j, {{ template_constants.quotient_vm.limb_count }}) { q_j := add(q_j, 1) } {
                                 let qconst := byte(0, mload(add(q_coeff_pc, add(q_i, q_j))))
                                 q_acc := addmod(
                                     q_acc,
@@ -687,7 +687,7 @@
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
                     // avoiding a large interpreted product loop.
-                    case 0x19 {
+                    case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
@@ -702,7 +702,7 @@
                     // lookup, and non-native identity arithmetic remains in
                     // the compact q_program VM above, preserving the Rust
                     // `partially_evaluate_identities` order.
-                    case 0x1b {
+                    case {{ template_constants.quotient_vm.op.native_identity|hex() }} {
                         let q_native_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := 0
@@ -719,7 +719,7 @@
                         default { revert(0, 0) }
                     }
                     {%- endif %}
-                    case 0x0a {
+                    case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
@@ -734,7 +734,7 @@
                         {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
-                    case 0x0b {
+                    case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
                         let q_sel_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         let q_eval := q_top

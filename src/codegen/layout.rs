@@ -37,6 +37,10 @@ pub(crate) const G1_BYTES: usize = G1_WORDS * WORD_BYTES;
 pub(crate) const G2_BYTES: usize = G2_WORDS * WORD_BYTES;
 /// Native midnight-proofs compressed G1 encoding before off-chain EIP-2537 repack.
 pub(crate) const G1_COMPRESSED_BYTES: usize = 48;
+/// Big-endian byte length of an unpadded BLS12-381 base-field coordinate.
+pub(crate) const BLS_FP_BYTES: usize = 48;
+/// EIP-2537 pads each 48-byte Fp coordinate with 16 leading zero bytes.
+pub(crate) const EIP2537_FP_PAD_BYTES: usize = 16;
 /// EIP-2537 G1MSM input tuple: one padded G1 plus one scalar.
 pub(crate) const G1_MSM_PAIR_BYTES: usize = G1_BYTES + FR_BYTES;
 /// EIP-2537 G1ADD input tuple: two padded G1 points.
@@ -64,6 +68,81 @@ pub(crate) const PAIRING_STATIC_WORKING_WORDS: usize = PAIRING_TWO_PAIR_BYTES / 
 pub(crate) const FINAL_PAIRING_SCRATCH_START: usize = PAIRING_TWO_PAIR_BYTES;
 /// Conservative low-memory decompression/modexp scratch words.
 pub(crate) const MODEXP_DECOMPRESSION_WORKING_WORDS: usize = 16;
+
+pub(crate) mod precompile {
+    //! EVM precompile addresses, frame lengths, and gas constants used by the
+    //! generated verifier. These values come from EIP-198 and EIP-2537; keep
+    //! template call sites wired through these names so future fork changes are
+    //! not hidden in hand-written Yul literals.
+
+    pub(crate) const MODEXP_ADDRESS: usize = 0x05;
+    pub(crate) const G1ADD_ADDRESS: usize = 0x0b;
+    pub(crate) const G1MSM_ADDRESS: usize = 0x0c;
+    pub(crate) const PAIRING_ADDRESS: usize = 0x0f;
+
+    pub(crate) const G1ADD_GAS_CAP: usize = 50_000;
+    pub(crate) const G1MSM_SMOKE_GAS_CAP: usize = 60_000;
+    pub(crate) const PAIRING_SMOKE_GAS_CAP: usize = 120_000;
+    pub(crate) const G1MSM_BASE_GAS: usize = 50_000;
+    pub(crate) const G1MSM_SCALAR_MULTIPLICATION_COST: usize = 12_000;
+    pub(crate) const G1MSM_DISCOUNT_DENOMINATOR: usize = 1_000;
+    pub(crate) const PAIRING_BASE_GAS: usize = 50_000;
+    pub(crate) const PAIRING_PAIR_GAS: usize = 60_000;
+}
+
+pub(crate) mod modexp_frame {
+    //! 32-byte base/exponent/modulus EIP-198 frame offsets.
+
+    use super::WORD_BYTES;
+
+    pub(crate) const BASE_LEN_OFFSET: usize = 0 * WORD_BYTES;
+    pub(crate) const EXP_LEN_OFFSET: usize = 1 * WORD_BYTES;
+    pub(crate) const MOD_LEN_OFFSET: usize = 2 * WORD_BYTES;
+    pub(crate) const BASE_OFFSET: usize = 3 * WORD_BYTES;
+    pub(crate) const EXP_OFFSET: usize = 4 * WORD_BYTES;
+    pub(crate) const MOD_OFFSET: usize = 5 * WORD_BYTES;
+}
+
+pub(crate) mod accumulator {
+    //! Public-input encoding used by `AssignedAccumulator<S>::as_public_input`
+    //! for the current BLS12-381 self-emulation circuits.
+
+    use super::{G1_BYTES, WORD_BYTES};
+
+    pub(crate) const LIMB_BITS: usize = 56;
+    pub(crate) const LIMBS: usize = 7;
+    pub(crate) const LIMBS_PER_WORD: usize = 4;
+    pub(crate) const POINT_COORDS: usize = 2;
+    pub(crate) const CARRIED_SCALARS: usize = 2;
+    pub(crate) const PAIRING_BATCH_PTR: usize = 0x100;
+    pub(crate) const PAIRING_BATCH_DOMAIN_TAG_HEX: &str =
+        "0x70616972696e672d62617463682d6163632d6b7a670000000000000000";
+    pub(crate) const PAIRING_BATCH_RHS_OFFSET: usize = WORD_BYTES;
+    pub(crate) const PAIRING_BATCH_LHS_OFFSET: usize = WORD_BYTES + G1_BYTES;
+    pub(crate) const PAIRING_BATCH_ACC_RHS_OFFSET: usize = WORD_BYTES + 2 * G1_BYTES;
+    pub(crate) const PAIRING_BATCH_ACC_LHS_OFFSET: usize = WORD_BYTES + 3 * G1_BYTES;
+    pub(crate) const PAIRING_BATCH_HASH_BYTES: usize = WORD_BYTES + 4 * G1_BYTES;
+}
+
+pub(crate) mod quotient_limb {
+    //! Foreign-field limb-specialized quotient VM shapes.
+
+    pub(crate) const LIMBS: usize = 7;
+    pub(crate) const LIN_COEFFS: usize = LIMBS - 1;
+    pub(crate) const PAIRWISE_TERMS: usize = LIMBS * LIMBS;
+    pub(crate) const PAIRWISE_COEFFS: usize = 2 * LIMBS - 1;
+}
+
+pub(crate) mod transcript {
+    //! Transcript buffer bound heuristics. These are not protocol constants;
+    //! they are gas/codegen guardrails used by `transcript_buffer_words_bound`.
+
+    use super::{G1_BYTES, WORD_BYTES};
+
+    pub(crate) const WORD_ABSORB_BYTES: usize = WORD_BYTES;
+    pub(crate) const G1_ABSORB_BYTES: usize = G1_BYTES;
+    pub(crate) const POST_SQUEEZE_CUSHION_WORDS: usize = 32;
+}
 
 pub(crate) mod abi {
     /// Solidity selector length before ABI-encoded arguments.
@@ -164,7 +243,10 @@ pub(crate) mod trace {
 
 #[cfg(test)]
 mod tests {
-    use super::{abi, theta_window, trace, ThetaSlot, VkHeaderSlot};
+    use super::{
+        abi, accumulator, modexp_frame, precompile, quotient_limb, theta_window, trace, transcript,
+        ThetaSlot, VkHeaderSlot,
+    };
 
     #[test]
     fn abi_offsets_match_verify_proof_calldata_layout() {
@@ -214,5 +296,41 @@ mod tests {
         assert_eq!(trace::QUOTIENT_IDENTITY_BASE, 30_000);
         assert_eq!(trace::PCS_SERIALIZED_POINT_SET_BASE, 41_000);
         assert_eq!(trace::SELECTOR_FOLD_BASE, 60_000);
+    }
+
+    #[test]
+    fn precompile_and_modexp_constants_preserve_existing_frames() {
+        assert_eq!(precompile::MODEXP_ADDRESS, 0x05);
+        assert_eq!(precompile::G1ADD_ADDRESS, 0x0b);
+        assert_eq!(precompile::G1MSM_ADDRESS, 0x0c);
+        assert_eq!(precompile::PAIRING_ADDRESS, 0x0f);
+        assert_eq!(precompile::G1ADD_GAS_CAP, 50_000);
+        assert_eq!(precompile::G1MSM_SMOKE_GAS_CAP, 60_000);
+        assert_eq!(precompile::PAIRING_SMOKE_GAS_CAP, 120_000);
+        assert_eq!(modexp_frame::BASE_LEN_OFFSET, 0x00);
+        assert_eq!(modexp_frame::EXP_LEN_OFFSET, 0x20);
+        assert_eq!(modexp_frame::MOD_LEN_OFFSET, 0x40);
+        assert_eq!(modexp_frame::BASE_OFFSET, 0x60);
+        assert_eq!(modexp_frame::EXP_OFFSET, 0x80);
+        assert_eq!(modexp_frame::MOD_OFFSET, 0xa0);
+    }
+
+    #[test]
+    fn accumulator_and_limb_constants_preserve_current_encoding() {
+        assert_eq!(accumulator::LIMB_BITS, 56);
+        assert_eq!(accumulator::LIMBS, 7);
+        assert_eq!(accumulator::LIMBS_PER_WORD, 4);
+        assert_eq!(accumulator::PAIRING_BATCH_PTR, 0x100);
+        assert_eq!(accumulator::PAIRING_BATCH_HASH_BYTES, 0x220);
+        assert_eq!(quotient_limb::LIMBS, 7);
+        assert_eq!(quotient_limb::PAIRWISE_TERMS, 49);
+        assert_eq!(quotient_limb::PAIRWISE_COEFFS, 13);
+    }
+
+    #[test]
+    fn transcript_bound_constants_preserve_absorb_sizes() {
+        assert_eq!(transcript::WORD_ABSORB_BYTES, 0x20);
+        assert_eq!(transcript::G1_ABSORB_BYTES, 0x80);
+        assert_eq!(transcript::POST_SQUEEZE_CUSHION_WORDS, 32);
     }
 }

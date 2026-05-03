@@ -27,6 +27,7 @@ pub(super) struct QuotientIdentity {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RepackedProofScalarLayout {
     pub(crate) eval_offset: usize,
@@ -43,6 +44,18 @@ pub(crate) struct RepackedProofLayoutPlan {
 }
 
 impl RepackedProofLayoutPlan {
+    pub(crate) fn from_protocol(
+        protocol: &crate::codegen::protocol::ProtocolPlan,
+        num_evals: usize,
+        num_point_sets: usize,
+    ) -> Self {
+        Self {
+            g1_groups: protocol.commitment_read_groups(),
+            num_evals,
+            num_point_sets,
+        }
+    }
+
     pub(crate) fn prefix_g1_count(&self) -> usize {
         self.g1_groups.iter().sum()
     }
@@ -64,6 +77,7 @@ impl RepackedProofLayoutPlan {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn scalar_layout(&self) -> RepackedProofScalarLayout {
         let eval_offset = self.prefix_g1_count() * crate::codegen::layout::G1_BYTES;
         let q_eval_offset = eval_offset
@@ -122,7 +136,7 @@ pub(super) struct QuotientProgramPlan {
 }
 
 pub(super) const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
-pub(super) const LIMB7_YUL_COEFFS: [&str; 6] = [
+pub(super) const LIMB7_YUL_COEFFS: [&str; layout::quotient_limb::LIN_COEFFS] = [
     "0x100000000000000",
     "0x10000000000000000000000000000",
     "0x400000000",
@@ -130,7 +144,7 @@ pub(super) const LIMB7_YUL_COEFFS: [&str; 6] = [
     "0x1000",
     "0x100000000000000000",
 ];
-pub(super) const WIDE_LIMB7_YUL_COEFFS: [&str; 6] = [
+pub(super) const WIDE_LIMB7_YUL_COEFFS: [&str; layout::quotient_limb::LIN_COEFFS] = [
     "0x100000000000000",
     "0x10000000000000000000000000000",
     "0x1000000000000000000000000000000000000000000",
@@ -144,6 +158,16 @@ pub(super) enum QuotientProgramEncoding {
     Bytes,
     Packed32,
 }
+
+pub(super) const QUOTIENT_VM_PACKED_INSTRUCTION_BYTES: usize = 4;
+pub(super) const QUOTIENT_VM_PACKED_ARG_BITS: usize = 24;
+pub(super) const QUOTIENT_VM_PACKED_ARG_MASK: u32 = 0x00ff_ffff;
+pub(super) const QUOTIENT_VM_RUN_COMPACTION_MIN_LEN: usize = 4;
+pub(super) const QUOTIENT_VM_BYTE_U16_BYTES: usize = 2;
+pub(super) const QUOTIENT_VM_BYTE_U32_BYTES: usize = 4;
+pub(super) const QUOTIENT_VM_LIMBS: usize = layout::quotient_limb::LIMBS;
+pub(super) const QUOTIENT_VM_PAIRWISE_TERMS: usize = layout::quotient_limb::PAIRWISE_TERMS;
+pub(super) const QUOTIENT_VM_PAIRWISE_COEFFS: usize = layout::quotient_limb::PAIRWISE_COEFFS;
 
 pub(super) const Q_OP_PUSH_CONST: u8 = 0x01;
 pub(super) const Q_OP_PUSH_MEM_LITERAL: u8 = 0x02;
@@ -185,56 +209,320 @@ pub(super) const Q_MEM_THETA: u8 = 0x07;
 pub(super) const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
 pub(super) const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
 
-#[cfg(test)]
-pub(super) const QUOTIENT_OPCODE_TABLE: &[(&str, u8)] = &[
-    ("push_const", Q_OP_PUSH_CONST),
-    ("push_mem_literal", Q_OP_PUSH_MEM_LITERAL),
-    ("push_mem_token", Q_OP_PUSH_MEM_TOKEN),
-    ("push_mem_token_offset", Q_OP_PUSH_MEM_TOKEN_OFFSET),
-    ("push_mem_u16", Q_OP_PUSH_MEM_U16),
-    ("add", Q_OP_ADD),
-    ("mul", Q_OP_MUL),
-    ("neg", Q_OP_NEG),
-    ("push_const_u8", Q_OP_PUSH_CONST_U8),
-    ("fold_main", Q_OP_FOLD_MAIN),
-    ("fold_selector", Q_OP_FOLD_SELECTOR),
-    ("add_const_u8", Q_OP_ADD_CONST_U8),
-    ("mul_const_u8", Q_OP_MUL_CONST_U8),
-    ("add_const", Q_OP_ADD_CONST),
-    ("mul_const", Q_OP_MUL_CONST),
-    ("add_mem_u16", Q_OP_ADD_MEM_U16),
-    ("mul_mem_u16", Q_OP_MUL_MEM_U16),
-    ("add_mul_mem_mem_const_u8", Q_OP_ADD_MUL_MEM_MEM_CONST_U8),
-    ("add_mul_const_u8_mem_u16", Q_OP_ADD_MUL_CONST_U8_MEM_U16),
-    ("add_mul_mem_mem", Q_OP_ADD_MUL_MEM_MEM),
-    (
-        "run_add_mul_mem_mem_const_u8",
-        Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8,
-    ),
-    (
-        "run_add_mul_const_u8_mem_u16",
-        Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
-    ),
-    ("push_temp", Q_OP_PUSH_TEMP),
-    ("store_temp", Q_OP_STORE_TEMP),
-    ("native_permutation", Q_OP_NATIVE_PERMUTATION),
-    ("native_identity", Q_OP_NATIVE_IDENTITY),
-    ("lin7", Q_OP_LIN7),
-    ("bilin7_row", Q_OP_BILIN7_ROW),
-    ("bilin7_pairwise", Q_OP_BILIN7_PAIRWISE),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum QuotientOpcodeEncoding {
+    None,
+    U8,
+    U16,
+    U32,
+    TokenOffset,
+    AddMulMemMemConstU8,
+    AddMulConstU8MemU16,
+    AddMulMemMem,
+    RunAddMulMemMemConstU8,
+    RunAddMulConstU8MemU16,
+    LimbLin,
+    LimbBilinRow,
+    LimbBilinPairwise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct QuotientOpcodeSpec {
+    pub(super) name: &'static str,
+    pub(super) opcode: u8,
+    pub(super) byte_len: usize,
+    pub(super) encoding: QuotientOpcodeEncoding,
+    pub(super) packed32: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct QuotientMemTokenSpec {
+    pub(super) name: &'static str,
+    pub(super) token: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct QuotientVmSpec {
+    pub(super) opcodes: &'static [QuotientOpcodeSpec],
+    pub(super) mem_tokens: &'static [QuotientMemTokenSpec],
+    pub(super) packed_instruction_bytes: usize,
+    pub(super) packed_arg_bits: usize,
+    pub(super) packed_arg_mask: u32,
+    pub(super) run_compaction_min_len: usize,
+    pub(super) limb_count: usize,
+    pub(super) limb_pairwise_terms: usize,
+    pub(super) limb_pairwise_coeffs: usize,
+}
+
+pub(super) const QUOTIENT_OPCODE_TABLE: &[QuotientOpcodeSpec] = &[
+    QuotientOpcodeSpec {
+        name: "push_const",
+        opcode: Q_OP_PUSH_CONST,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "push_mem_literal",
+        opcode: Q_OP_PUSH_MEM_LITERAL,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U32_BYTES,
+        encoding: QuotientOpcodeEncoding::U32,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "push_mem_token",
+        opcode: Q_OP_PUSH_MEM_TOKEN,
+        byte_len: 1 + 1,
+        encoding: QuotientOpcodeEncoding::U8,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "push_mem_token_offset",
+        opcode: Q_OP_PUSH_MEM_TOKEN_OFFSET,
+        byte_len: 1 + 1 + QUOTIENT_VM_BYTE_U32_BYTES,
+        encoding: QuotientOpcodeEncoding::TokenOffset,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "push_mem_u16",
+        opcode: Q_OP_PUSH_MEM_U16,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add",
+        opcode: Q_OP_ADD,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "mul",
+        opcode: Q_OP_MUL,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "neg",
+        opcode: Q_OP_NEG,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "push_const_u8",
+        opcode: Q_OP_PUSH_CONST_U8,
+        byte_len: 1 + 1,
+        encoding: QuotientOpcodeEncoding::U8,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "fold_main",
+        opcode: Q_OP_FOLD_MAIN,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "fold_selector",
+        opcode: Q_OP_FOLD_SELECTOR,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_const_u8",
+        opcode: Q_OP_ADD_CONST_U8,
+        byte_len: 1 + 1,
+        encoding: QuotientOpcodeEncoding::U8,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "mul_const_u8",
+        opcode: Q_OP_MUL_CONST_U8,
+        byte_len: 1 + 1,
+        encoding: QuotientOpcodeEncoding::U8,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_const",
+        opcode: Q_OP_ADD_CONST,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "mul_const",
+        opcode: Q_OP_MUL_CONST,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_mem_u16",
+        opcode: Q_OP_ADD_MEM_U16,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "mul_mem_u16",
+        opcode: Q_OP_MUL_MEM_U16,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_mul_mem_mem_const_u8",
+        opcode: Q_OP_ADD_MUL_MEM_MEM_CONST_U8,
+        byte_len: 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES + 1,
+        encoding: QuotientOpcodeEncoding::AddMulMemMemConstU8,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_mul_const_u8_mem_u16",
+        opcode: Q_OP_ADD_MUL_CONST_U8_MEM_U16,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES + 1,
+        encoding: QuotientOpcodeEncoding::AddMulConstU8MemU16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "add_mul_mem_mem",
+        opcode: Q_OP_ADD_MUL_MEM_MEM,
+        byte_len: 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::AddMulMemMem,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "run_add_mul_mem_mem_const_u8",
+        opcode: Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8,
+        byte_len: 0,
+        encoding: QuotientOpcodeEncoding::RunAddMulMemMemConstU8,
+        packed32: false,
+    },
+    QuotientOpcodeSpec {
+        name: "run_add_mul_const_u8_mem_u16",
+        opcode: Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
+        byte_len: 0,
+        encoding: QuotientOpcodeEncoding::RunAddMulConstU8MemU16,
+        packed32: false,
+    },
+    QuotientOpcodeSpec {
+        name: "push_temp",
+        opcode: Q_OP_PUSH_TEMP,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "store_temp",
+        opcode: Q_OP_STORE_TEMP,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "native_permutation",
+        opcode: Q_OP_NATIVE_PERMUTATION,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "native_identity",
+        opcode: Q_OP_NATIVE_IDENTITY,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
+        encoding: QuotientOpcodeEncoding::U16,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "lin7",
+        opcode: Q_OP_LIN7,
+        byte_len: 1 + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES),
+        encoding: QuotientOpcodeEncoding::LimbLin,
+        packed32: false,
+    },
+    QuotientOpcodeSpec {
+        name: "bilin7_row",
+        opcode: Q_OP_BILIN7_ROW,
+        byte_len: 1
+            + QUOTIENT_VM_BYTE_U16_BYTES
+            + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES),
+        encoding: QuotientOpcodeEncoding::LimbBilinRow,
+        packed32: false,
+    },
+    QuotientOpcodeSpec {
+        name: "bilin7_pairwise",
+        opcode: Q_OP_BILIN7_PAIRWISE,
+        byte_len: 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_PAIRWISE_COEFFS,
+        encoding: QuotientOpcodeEncoding::LimbBilinPairwise,
+        packed32: false,
+    },
 ];
 
-pub(super) const QUOTIENT_MEM_TOKEN_TABLE: &[(&str, u8)] = &[
-    ("L_0_MPTR", Q_MEM_L0),
-    ("L_LAST_MPTR", Q_MEM_L_LAST),
-    ("L_BLIND_MPTR", Q_MEM_L_BLIND),
-    ("BETA_MPTR", Q_MEM_BETA),
-    ("GAMMA_MPTR", Q_MEM_GAMMA),
-    ("X_MPTR", Q_MEM_X),
-    ("THETA_MPTR", Q_MEM_THETA),
-    ("TRASH_CHALLENGE_MPTR", Q_MEM_TRASH_CHALLENGE),
-    ("INSTANCE_EVAL_MPTR", Q_MEM_INSTANCE_EVAL),
+pub(super) const QUOTIENT_MEM_TOKEN_TABLE: &[QuotientMemTokenSpec] = &[
+    QuotientMemTokenSpec {
+        name: "L_0_MPTR",
+        token: Q_MEM_L0,
+    },
+    QuotientMemTokenSpec {
+        name: "L_LAST_MPTR",
+        token: Q_MEM_L_LAST,
+    },
+    QuotientMemTokenSpec {
+        name: "L_BLIND_MPTR",
+        token: Q_MEM_L_BLIND,
+    },
+    QuotientMemTokenSpec {
+        name: "BETA_MPTR",
+        token: Q_MEM_BETA,
+    },
+    QuotientMemTokenSpec {
+        name: "GAMMA_MPTR",
+        token: Q_MEM_GAMMA,
+    },
+    QuotientMemTokenSpec {
+        name: "X_MPTR",
+        token: Q_MEM_X,
+    },
+    QuotientMemTokenSpec {
+        name: "THETA_MPTR",
+        token: Q_MEM_THETA,
+    },
+    QuotientMemTokenSpec {
+        name: "TRASH_CHALLENGE_MPTR",
+        token: Q_MEM_TRASH_CHALLENGE,
+    },
+    QuotientMemTokenSpec {
+        name: "INSTANCE_EVAL_MPTR",
+        token: Q_MEM_INSTANCE_EVAL,
+    },
 ];
+
+pub(super) const QUOTIENT_VM_SPEC: QuotientVmSpec = QuotientVmSpec {
+    opcodes: QUOTIENT_OPCODE_TABLE,
+    mem_tokens: QUOTIENT_MEM_TOKEN_TABLE,
+    packed_instruction_bytes: QUOTIENT_VM_PACKED_INSTRUCTION_BYTES,
+    packed_arg_bits: QUOTIENT_VM_PACKED_ARG_BITS,
+    packed_arg_mask: QUOTIENT_VM_PACKED_ARG_MASK,
+    run_compaction_min_len: QUOTIENT_VM_RUN_COMPACTION_MIN_LEN,
+    limb_count: QUOTIENT_VM_LIMBS,
+    limb_pairwise_terms: QUOTIENT_VM_PAIRWISE_TERMS,
+    limb_pairwise_coeffs: QUOTIENT_VM_PAIRWISE_COEFFS,
+};
+
+pub(super) fn quotient_opcode_spec(opcode: u8) -> Option<&'static QuotientOpcodeSpec> {
+    QUOTIENT_VM_SPEC
+        .opcodes
+        .iter()
+        .find(|spec| spec.opcode == opcode)
+}
+
+pub(super) fn quotient_opcode_byte_len(opcode: u8) -> Option<usize> {
+    quotient_opcode_spec(opcode).and_then(|spec| (spec.byte_len != 0).then_some(spec.byte_len))
+}
 
 pub(super) fn scalar_le_to_be_word(bytes: &[u8]) -> [u8; 32] {
     assert_eq!(bytes.len(), 32, "scalar proof element must be 32 bytes");
@@ -513,7 +801,7 @@ impl<'a> QuotientInlineCseEmitter<'a> {
 
     fn cse_ptr(&self, key: &str) -> String {
         let slot = self.plan.slots[key] as usize;
-        format!("{:#x}", self.cse_mptr + slot * 0x20)
+        format!("{:#x}", self.cse_mptr + slot * layout::WORD_BYTES)
     }
 
     fn fresh_var(&mut self) -> String {
@@ -649,13 +937,10 @@ impl QuotientProgramBuilder {
     }
 
     pub(super) fn assignment(&mut self, line: &str) {
-        let line = line.trim();
-        let line = line.strip_prefix("let ").unwrap_or(line);
-        let (dst, expr) = line
-            .split_once(" := ")
-            .unwrap_or_else(|| panic!("unsupported quotient assignment: {line}"));
-        let expr = self.parse_expr(expr.trim());
-        self.vars.insert(dst.trim().to_string(), expr);
+        let assignment = yul_assignment(line)
+            .unwrap_or_else(|| panic!("unsupported quotient assignment: {}", line.trim()));
+        let expr = self.parse_expr(&assignment.expr);
+        self.vars.insert(assignment.dst, expr);
     }
 
     pub(super) fn parse_expr(&self, expr: &str) -> QuotientExpr {
@@ -1215,7 +1500,7 @@ impl QuotientProgramBuilder {
             match self.bytes[idx] {
                 Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP => {
                     temps = temps.max(read_u16(&self.bytes, idx + 1) as usize + 1);
-                    idx += 3;
+                    idx += quotient_op_len(&self.bytes, idx);
                 }
                 _ => idx += quotient_op_len(&self.bytes, idx),
             }
@@ -1248,7 +1533,7 @@ pub(super) fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
                 run_len += 1;
             }
 
-            if run_len >= 4 {
+            if run_len >= QUOTIENT_VM_SPEC.run_compaction_min_len {
                 out.push(run_op);
                 out.extend_from_slice(&(run_len as u16).to_be_bytes());
                 for term in 0..run_len {
@@ -1272,7 +1557,11 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
         panic!("{QUOTIENT_LIMB_VM_OPS_ENV}=1 is only supported with {QUOTIENT_ENCODING_ENV}=bytes");
     }
 
-    let mut out = Vec::with_capacity(bytes.len().next_multiple_of(4));
+    let mut out = Vec::with_capacity(
+        bytes
+            .len()
+            .next_multiple_of(QUOTIENT_VM_SPEC.packed_instruction_bytes),
+    );
     let mut idx = 0usize;
     while idx < bytes.len() {
         let op = bytes[idx];
@@ -1286,7 +1575,7 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
             Q_OP_PUSH_MEM_LITERAL => {
                 let ptr = read_u32(bytes, idx + 1);
                 assert!(
-                    ptr <= 0x00ff_ffff,
+                    ptr <= QUOTIENT_VM_SPEC.packed_arg_mask,
                     "packed quotient VM literal pointer exceeds 24-bit operand"
                 );
                 push_packed_quotient_op(&mut out, op, ptr);
@@ -1360,7 +1649,7 @@ pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
 
 pub(super) fn push_packed_quotient_op(out: &mut Vec<u8>, op: u8, arg: u32) {
     assert!(
-        arg <= 0x00ff_ffff,
+        arg <= QUOTIENT_VM_SPEC.packed_arg_mask,
         "packed quotient VM operand exceeds 24 bits"
     );
     out.extend_from_slice(&(((op as u32) << 24) | arg).to_be_bytes());
@@ -1549,14 +1838,14 @@ pub(super) fn quotient_mem_ptr_expr(mem: QuotientMem) -> String {
 pub(super) fn quotient_mem_token_name(token: u8) -> &'static str {
     QUOTIENT_MEM_TOKEN_TABLE
         .iter()
-        .find_map(|(name, value)| (*value == token).then_some(*name))
+        .find_map(|spec| (spec.token == token).then_some(spec.name))
         .unwrap_or_else(|| panic!("unknown quotient memory token {token:#x}"))
 }
 
 pub(super) fn quotient_mem_token_from_name(name: &str) -> Option<u8> {
     QUOTIENT_MEM_TOKEN_TABLE
         .iter()
-        .find_map(|(token_name, value)| (*token_name == name).then_some(*value))
+        .find_map(|spec| (spec.name == name).then_some(spec.token))
 }
 
 pub(super) trait QuotientExpressionEnv {
@@ -1691,23 +1980,9 @@ pub(super) fn quotient_commutative_expr_key(
 }
 
 pub(super) fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
-    match bytes[idx] {
-        Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
-        | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
-        | Q_OP_STORE_TEMP | Q_OP_NATIVE_IDENTITY => 3,
-        Q_OP_PUSH_MEM_LITERAL => 5,
-        Q_OP_PUSH_MEM_TOKEN => 2,
-        Q_OP_PUSH_MEM_TOKEN_OFFSET => 6,
-        Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => 2,
-        Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN | Q_OP_NATIVE_PERMUTATION => 1,
-        Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => 6,
-        Q_OP_ADD_MUL_CONST_U8_MEM_U16 => 4,
-        Q_OP_ADD_MUL_MEM_MEM => 5,
-        Q_OP_LIN7 => 1 + 7 * 3,
-        Q_OP_BILIN7_ROW => 1 + 2 + 7 * 3,
-        Q_OP_BILIN7_PAIRWISE => 1 + 2 + 2 + 13,
-        op => panic!("unknown quotient op {op:#x} at byte {idx}"),
-    }
+    let op = bytes[idx];
+    quotient_opcode_byte_len(op)
+        .unwrap_or_else(|| panic!("unknown quotient op {op:#x} at byte {idx}"))
 }
 
 pub(super) fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
@@ -1810,7 +2085,7 @@ pub(super) fn try_quotient_lin7_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<Q
         add_grouped_limb_coeff(&mut grouped, ptr, *coeff * inner_coeff);
     }
     grouped.retain(|(_, coeff)| *coeff != Fq::ZERO);
-    if grouped.len() != 7 {
+    if grouped.len() != QUOTIENT_VM_LIMBS {
         return None;
     }
     grouped.sort_by_key(|(ptr, _)| *ptr);
@@ -1834,7 +2109,7 @@ pub(super) fn try_quotient_bilin7_row_shape(
         let (inner_coeff, lhs, rhs) = quotient_product_mem_pair(expr)?;
         pairs.push((*coeff * inner_coeff, lhs, rhs));
     }
-    if pairs.len() != 7 {
+    if pairs.len() != QUOTIENT_VM_LIMBS {
         return None;
     }
 
@@ -1853,7 +2128,7 @@ pub(super) fn try_quotient_bilin7_row_shape(
             add_grouped_limb_coeff(&mut grouped, other, *coeff);
         }
         grouped.retain(|(_, coeff)| *coeff != Fq::ZERO);
-        if ok && grouped.len() == 7 {
+        if ok && grouped.len() == QUOTIENT_VM_LIMBS {
             grouped.sort_by_key(|(ptr, _)| *ptr);
             return Some(QuotientLimbShape::Bilin7Row {
                 lhs: candidate,
@@ -1885,15 +2160,15 @@ pub(super) fn try_quotient_bilin7_pairwise_shape(
         ptrs.insert(lhs);
         ptrs.insert(rhs);
     }
-    if pairs.len() != 49 {
+    if pairs.len() != QUOTIENT_VM_PAIRWISE_TERMS {
         return None;
     }
 
     let bases = limb7_base_candidates(&ptrs);
     for lhs_base in &bases {
         for rhs_base in &bases {
-            let mut coeffs = vec![Fq::ZERO; 49];
-            let mut seen = [false; 49];
+            let mut coeffs = vec![Fq::ZERO; QUOTIENT_VM_PAIRWISE_TERMS];
+            let mut seen = vec![false; QUOTIENT_VM_PAIRWISE_TERMS];
             let mut ok = true;
 
             for (coeff, lhs, rhs) in &pairs {
@@ -1903,7 +2178,7 @@ pub(super) fn try_quotient_bilin7_pairwise_shape(
                     ok = false;
                     break;
                 };
-                let idx = i * 7 + j;
+                let idx = i * QUOTIENT_VM_LIMBS + j;
                 coeffs[idx] += *coeff;
                 seen[idx] = true;
             }
@@ -1912,10 +2187,10 @@ pub(super) fn try_quotient_bilin7_pairwise_shape(
                 continue;
             }
 
-            let mut by_sum = vec![None; 13];
-            for i in 0..7 {
-                for j in 0..7 {
-                    let coeff = coeffs[i * 7 + j];
+            let mut by_sum = vec![None; QUOTIENT_VM_PAIRWISE_COEFFS];
+            for i in 0..QUOTIENT_VM_LIMBS {
+                for j in 0..QUOTIENT_VM_LIMBS {
+                    let coeff = coeffs[i * QUOTIENT_VM_LIMBS + j];
                     let slot = &mut by_sum[i + j];
                     if let Some(expected) = slot {
                         if *expected != coeff {
@@ -1997,8 +2272,8 @@ pub(super) fn limb7_base_candidates(ptrs: &HashSet<u16>) -> Vec<u16> {
         .iter()
         .copied()
         .filter(|base| {
-            (0..7).all(|idx| {
-                base.checked_add((idx * 0x20) as u16)
+            (0..QUOTIENT_VM_LIMBS).all(|idx| {
+                base.checked_add((idx * layout::WORD_BYTES) as u16)
                     .is_some_and(|ptr| ptrs.contains(&ptr))
             })
         })
@@ -2010,11 +2285,12 @@ pub(super) fn limb7_base_candidates(ptrs: &HashSet<u16>) -> Vec<u16> {
 
 pub(super) fn limb7_index(base: u16, ptr: u16) -> Option<usize> {
     let diff = ptr.checked_sub(base)?;
-    if diff % 0x20 != 0 {
+    let word_bytes = layout::WORD_BYTES as u16;
+    if diff % word_bytes != 0 {
         return None;
     }
-    let idx = (diff / 0x20) as usize;
-    (idx < 7).then_some(idx)
+    let idx = (diff / word_bytes) as usize;
+    (idx < QUOTIENT_VM_LIMBS).then_some(idx)
 }
 
 pub(super) fn quotient_fq_from_u256(value: U256) -> Option<Fq> {
@@ -2097,11 +2373,41 @@ pub(super) fn mem_token(name: &str) -> Option<u8> {
     quotient_mem_token_from_name(name)
 }
 
-pub(super) fn yul_let_assignment(line: &str) -> Option<(String, String)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct YulAssignment {
+    pub(super) dst: String,
+    pub(super) expr: String,
+    pub(super) has_let: bool,
+}
+
+pub(super) fn yul_assignment(line: &str) -> Option<YulAssignment> {
     let line = line.trim();
-    let line = line.strip_prefix("let ")?;
-    let (dst, expr) = line.split_once(" := ")?;
-    Some((dst.trim().to_string(), expr.trim().to_string()))
+    let (has_let, rest) = if let Some(rest) = line.strip_prefix("let") {
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        (true, rest.trim_start())
+    } else {
+        (false, line)
+    };
+    let (dst, expr) = rest.split_once(":=")?;
+    let dst = dst.trim();
+    let expr = expr.trim();
+    if dst.is_empty() || expr.is_empty() {
+        return None;
+    }
+    Some(YulAssignment {
+        dst: dst.to_string(),
+        expr: expr.to_string(),
+        has_let,
+    })
+}
+
+pub(super) fn yul_let_assignment(line: &str) -> Option<(String, String)> {
+    let assignment = yul_assignment(line)?;
+    assignment
+        .has_let
+        .then_some((assignment.dst, assignment.expr))
 }
 
 pub(super) fn yul_const_value(value: &str, const_vars: &HashMap<String, String>) -> Option<String> {
@@ -2158,11 +2464,13 @@ pub(super) fn yul_sub_r_assignment(line: &str) -> Option<(String, String)> {
 }
 
 pub(super) fn call_args(expr: &str, name: &str) -> Option<Vec<String>> {
-    let prefix = format!("{name}(");
-    if !expr.starts_with(&prefix) || !expr.ends_with(')') {
+    let expr = expr.trim();
+    let rest = expr.strip_prefix(name)?.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    if !rest.ends_with(')') {
         return None;
     }
-    Some(split_top_level(&expr[prefix.len()..expr.len() - 1]))
+    Some(split_top_level(&rest[..rest.len() - 1]))
 }
 
 pub(super) fn split_top_level(input: &str) -> Vec<String> {

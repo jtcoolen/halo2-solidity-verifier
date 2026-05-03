@@ -8,6 +8,8 @@
 
 use ruint::aliases::U256;
 
+use crate::codegen::layout::{G1_WORDS, WORD_BYTES};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PayloadSectionKind {
     Header,
@@ -30,11 +32,11 @@ impl PayloadSection {
     }
 
     pub(crate) fn byte_offset(self) -> usize {
-        self.word_offset * 0x20
+        self.word_offset * WORD_BYTES
     }
 
     pub(crate) fn byte_len(self) -> usize {
-        self.word_len * 0x20
+        self.word_len * WORD_BYTES
     }
 }
 
@@ -93,7 +95,7 @@ impl VkPayloadLayout {
         kind: PayloadSectionKind,
         commitments: usize,
     ) -> Result<PayloadSection, String> {
-        self.reserve(kind, commitments * 4)
+        self.reserve(kind, commitments * G1_WORDS)
     }
 
     pub(crate) fn section(&self, kind: PayloadSectionKind) -> Option<PayloadSection> {
@@ -132,7 +134,7 @@ impl VkPayloadLayout {
     }
 
     pub(crate) fn total_bytes(&self) -> usize {
-        self.total_words() * 0x20
+        self.total_words() * WORD_BYTES
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -160,20 +162,20 @@ pub(crate) struct PackedProgramCodec;
 
 impl PackedProgramCodec {
     pub(crate) fn word_len_for_bytes(byte_len: usize) -> usize {
-        byte_len.div_ceil(0x20)
+        byte_len.div_ceil(WORD_BYTES)
     }
 
     pub(crate) fn encode_words(bytes: &[u8]) -> Vec<U256> {
         let mut padded = bytes.to_vec();
-        padded.resize(Self::word_len_for_bytes(bytes.len()) * 0x20, 0);
+        padded.resize(Self::word_len_for_bytes(bytes.len()) * WORD_BYTES, 0);
         padded
-            .chunks(0x20)
+            .chunks(WORD_BYTES)
             .map(U256::from_be_slice)
             .collect::<Vec<_>>()
     }
 
     pub(crate) fn decode_words(words: &[U256], byte_len: usize) -> Result<Vec<u8>, String> {
-        let capacity = words.len() * 0x20;
+        let capacity = words.len() * WORD_BYTES;
         if byte_len > capacity {
             return Err(format!(
                 "packed program byte length {byte_len} exceeds word capacity {capacity}"

@@ -101,8 +101,8 @@ pub struct AccumulatorEncoding {
 }
 
 impl AccumulatorEncoding {
-    pub const SUPPORTED_NUM_LIMBS: usize = 7;
-    pub const SUPPORTED_NUM_LIMB_BITS: usize = 56;
+    pub const SUPPORTED_NUM_LIMBS: usize = layout::accumulator::LIMBS;
+    pub const SUPPORTED_NUM_LIMB_BITS: usize = layout::accumulator::LIMB_BITS;
     pub const FULLY_COLLAPSED_PUBLIC_INPUT_WORDS: usize = 10;
 
     /// Return a new `AccumulatorEncoding`.
@@ -602,11 +602,14 @@ mod tests {
             "G1ADD(identity, identity) -> identity",
             "G1MSM([(identity, 0)]) -> identity",
             "PAIRING_CHECK([(identity_g1, identity_g2)]) -> true",
-            "staticcall(50000, 0x0b",
-            "staticcall(60000, 0x0c",
-            "staticcall(120000, 0x0f",
-            "eq(returndatasize(), 0x80)",
-            "eq(returndatasize(), 0x20)",
+            "template_constants.eip2537.g1add_gas_cap",
+            "template_constants.eip2537.g1msm_smoke_gas_cap",
+            "template_constants.eip2537.pairing_smoke_gas_cap",
+            "template_constants.eip2537.g1add_address",
+            "template_constants.eip2537.g1msm_address",
+            "template_constants.eip2537.pairing_address",
+            "eq(returndatasize(), {{ template_constants.g1_bytes|hex() }})",
+            "eq(returndatasize(), {{ template_constants.word_bytes|hex() }})",
         ] {
             assert!(
                 verifier_template.contains(required),
@@ -911,11 +914,17 @@ mod tests {
     fn quotient_vm_opcode_and_token_tables_match_template_cases() {
         let quotient_template = include_str!("../../templates/QuotientNumeratorBlock.yul");
 
-        for (name, opcode) in QUOTIENT_OPCODE_TABLE {
-            let needle = format!("case {opcode:#04x}");
+        for spec in QUOTIENT_VM_SPEC.opcodes {
+            let name = spec.name;
+            let needle = [
+                "case {{ template_constants.quotient_vm.op.",
+                name,
+                "|hex() }}",
+            ]
+            .concat();
             assert!(
                 quotient_template.contains(&needle),
-                "quotient VM template missing opcode {name} ({opcode:#04x})"
+                "quotient VM template missing opcode {name} template constant"
             );
         }
         assert!(
@@ -923,13 +932,77 @@ mod tests {
             "stale native-trash opcode must not remain in quotient VM template"
         );
 
-        for (name, token) in QUOTIENT_MEM_TOKEN_TABLE {
-            let needle = format!("case {token:#04x} {{ q_ptr := {name}");
+        for spec in QUOTIENT_VM_SPEC.mem_tokens {
+            let name = spec.name;
+            let field = match name {
+                "L_0_MPTR" => "l0",
+                "L_LAST_MPTR" => "l_last",
+                "L_BLIND_MPTR" => "l_blind",
+                "BETA_MPTR" => "beta",
+                "GAMMA_MPTR" => "gamma",
+                "X_MPTR" => "x",
+                "THETA_MPTR" => "theta",
+                "TRASH_CHALLENGE_MPTR" => "trash_challenge",
+                "INSTANCE_EVAL_MPTR" => "instance_eval",
+                _ => panic!("unmapped quotient VM memory token {name}"),
+            };
+            let needle = [
+                "case {{ template_constants.quotient_vm.mem.",
+                field,
+                "|hex() }} { q_ptr := ",
+                name,
+            ]
+            .concat();
             assert!(
                 quotient_template.contains(&needle),
-                "quotient VM template missing memory token {name} ({token:#04x})"
+                "quotient VM template missing memory token {name} template constant"
             );
         }
+        assert_eq!(QUOTIENT_VM_SPEC.limb_count, layout::quotient_limb::LIMBS);
+        assert_eq!(
+            QUOTIENT_VM_SPEC.limb_pairwise_terms,
+            layout::quotient_limb::PAIRWISE_TERMS
+        );
+        assert_eq!(
+            QUOTIENT_VM_SPEC.limb_pairwise_coeffs,
+            layout::quotient_limb::PAIRWISE_COEFFS
+        );
+    }
+
+    #[test]
+    fn quotient_vm_lengths_are_derived_from_opcode_spec() {
+        for spec in QUOTIENT_VM_SPEC.opcodes {
+            if spec.byte_len == 0 {
+                continue;
+            }
+            let bytes = vec![spec.opcode; spec.byte_len];
+            assert_eq!(
+                quotient_op_len(&bytes, 0),
+                spec.byte_len,
+                "opcode {} length should come from QuotientVmSpec",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_yul_assignment_parser_tolerates_formatting_variants() {
+        assert_eq!(
+            yul_let_assignment("  let   z:=addmod(a, b, r)  "),
+            Some(("z".to_string(), "addmod(a, b, r)".to_string()))
+        );
+        assert_eq!(
+            yul_addmod_assignment("let z := addmod ( a, mulmod(b, c, r), r )"),
+            Some((
+                "z".to_string(),
+                "a".to_string(),
+                "mulmod(b, c, r)".to_string()
+            ))
+        );
+        assert_eq!(
+            yul_mulmod_assignment("let z:=mulmod(a,b,r)"),
+            Some(("z".to_string(), "a".to_string(), "b".to_string()))
+        );
     }
 
     #[test]
