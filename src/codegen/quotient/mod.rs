@@ -621,6 +621,10 @@ pub(super) struct QuotientCseState {
     // Expression key -> temp slot already materialized in bytecode. This
     // prevents recursive emit from generating the same STORE_TEMP repeatedly.
     pub(super) emitted: HashMap<String, u16>,
+    // Expression keys whose STORE_TEMP has not yet been emitted. Used to
+    // detect cyclic CSE expressions (impossible for the current tree-shaped
+    // QuotientExpr, but mirrors the inline emitter's defensive check).
+    pub(super) emitting: HashSet<String>,
 }
 
 impl QuotientCseState {
@@ -657,6 +661,7 @@ impl QuotientCseState {
         Self {
             slots,
             emitted: HashMap::new(),
+            emitting: HashSet::new(),
         }
     }
 }
@@ -913,18 +918,18 @@ impl QuotientProgramBuilder {
         // Mirrors the Rust `compute_linearization_commitment` y-batch:
         // every emitted identity is first absorbed into the same running
         // power of y, then either accumulated into the fully-evaluated
-        // numerator or into the simple-selector bucket.
+        // numerator or into the simple-selector bucket. Both fold variants
+        // consume exactly one stack item and count toward the fallback-op
+        // shape profile.
+        self.record_fallback_vm_op();
         match target {
-            QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
+            QuotientTarget::Main => self.bytes.push(Q_OP_FOLD_MAIN),
             QuotientTarget::Selector(idx) => {
                 self.bytes.push(Q_OP_FOLD_SELECTOR);
                 self.u16(idx);
-                self.pop_stack();
             }
         }
-        if matches!(target, QuotientTarget::Main) {
-            self.pop_stack();
-        }
+        self.pop_stack();
     }
 
     pub(super) fn native_permutation(&mut self) {
@@ -1092,8 +1097,13 @@ impl QuotientProgramBuilder {
                 return;
             }
 
-            cse.emitted.insert(key, slot);
+            assert!(
+                cse.emitting.insert(key.clone()),
+                "cyclic quotient VM CSE expression"
+            );
             self.emit_expr_cse_inner(expr, cse);
+            cse.emitting.remove(&key);
+            cse.emitted.insert(key, slot);
             self.bytes.push(Q_OP_STORE_TEMP);
             self.u16(slot as usize);
             return;
@@ -1692,15 +1702,28 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
+    // Limb opcodes are only ever emitted in the raw bytecode stream and
+    // never appear inside a run-compacted block (run compaction only fuses
+    // ADD_MUL_* fallback opcodes). The walk supports both pre- and
+    // post-compaction streams so callers don't have to reason about the
+    // ordering between compaction and limb-op detection.
     let mut idx = 0usize;
     while idx < bytes.len() {
-        if matches!(
-            bytes[idx],
-            Q_OP_LIN7 | Q_OP_BILIN7_ROW | Q_OP_BILIN7_PAIRWISE
-        ) {
+        let op = bytes[idx];
+        if matches!(op, Q_OP_LIN7 | Q_OP_BILIN7_ROW | Q_OP_BILIN7_PAIRWISE) {
             return true;
         }
-        idx += quotient_op_len(bytes, idx);
+        idx = match op {
+            Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+                let count = read_u16(bytes, idx + 1) as usize;
+                idx + 3 + count * 5
+            }
+            Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+                let count = read_u16(bytes, idx + 1) as usize;
+                idx + 3 + count * 3
+            }
+            _ => idx + quotient_op_len(bytes, idx),
+        };
     }
     false
 }
@@ -1850,10 +1873,13 @@ pub(super) fn quotient_inline_cse_candidate(count: usize, cost: usize) -> bool {
     if count <= 1 || cost <= 6 {
         return false;
     }
-    // Straight-line CSE stores the first evaluation in memory and replaces
-    // every use with an mload. Keep only expressions with enough estimated
-    // duplicated arithmetic to pay for the mstore/mload bytecode.
-    (count - 1) * cost > 12
+    // Straight-line CSE stores the first evaluation in memory (~6 bytes for
+    // the mstore) and replaces every later use with an mload (~6 bytes).
+    // Net byte savings:
+    //     count * cost  -  (cost + 6 + (count - 1) * 6)
+    //   = (count - 1) * cost  -  6 * count
+    // Keep only expressions where this is strictly positive.
+    (count - 1) * cost > 6 * count
 }
 
 pub(super) fn quotient_cse_sort_key(key: &str, count: usize, cost: usize) -> (usize, usize, &str) {
