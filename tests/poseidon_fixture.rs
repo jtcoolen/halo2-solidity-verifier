@@ -291,6 +291,7 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
             9 => "gamma",
             10 => "y",
             11 => "x",
+            12 => "trash_challenge",
             13 => "x1",
             14 => "x2",
             15 => "x3",
@@ -312,15 +313,28 @@ fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {
             31 => "f_eval",
             32 => "v",
             33 => "final_com",
+            34 => "linearization_commitment",
+            35 => "final_result",
+            36 => "quotient_numerator",
+            1000..=1999 => "user_challenge",
+            30000..=39999 => "quotient_identity_eval",
+            40000..=40999 => "pcs_q_com",
+            41000..=41999 => "pcs_point_set",
+            60000..=60999 => "selector_fold",
             _ => "unknown",
         };
-        if matches!(id, 24..=30 | 33) {
+        if matches!(id, 24..=30 | 33..=34 | 40000..=40999) {
             eprintln!("[yul-trace] {name}");
             for (slot, word) in ["x_hi", "x_lo", "y_hi", "y_lo"]
                 .iter()
                 .zip(data.chunks_exact(32))
             {
                 eprintln!("[yul-trace]   {slot} = 0x{}", hex::encode(word));
+            }
+        } else if matches!(id, 41000..=41999) {
+            eprintln!("[yul-trace] {name}[{id}]");
+            for (idx, word) in data.chunks_exact(32).enumerate() {
+                eprintln!("[yul-trace]   point[{idx}] = 0x{}", hex::encode(word));
             }
         } else {
             eprintln!("[yul-trace] {name}[{id}] = 0x{}", hex::encode(&data[0..32]));

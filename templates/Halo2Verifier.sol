@@ -1702,11 +1702,19 @@ contract Halo2Verifier {
             trace_u256(4,  mload(N_INV_MPTR))
             trace_u256(5,  mload(OMEGA_MPTR))
             trace_u256(6,  mload(OMEGA_INV_MPTR))
+            {%- for phase in user_phases %}
+            {%- for j in 0..phase.num_challenges %}
+            trace_u256({{ 1000 + phase.challenge_offset + j }}, mload(add(CHALLENGE_MPTR, {{ ((phase.challenge_offset + j) * 32)|hex() }})))
+            {%- endfor %}
+            {%- endfor %}
             trace_u256(7,  mload(THETA_MPTR))
             trace_u256(8,  mload(BETA_MPTR))
             trace_u256(9,  mload(GAMMA_MPTR))
             trace_u256(10, mload(Y_MPTR))
             trace_u256(11, mload(X_MPTR))
+            {%- if num_trashcans != 0 %}
+            trace_u256(12, mload(TRASH_CHALLENGE_MPTR))
+            {%- endif %}
             trace_u256(13, mload(X1_MPTR))
             trace_u256(14, mload(X2_MPTR))
             trace_u256(15, mload(X3_MPTR))
@@ -1718,6 +1726,7 @@ contract Halo2Verifier {
             trace_u256(21, mload(L_0_MPTR))
             trace_u256(22, mload(INSTANCE_EVAL_MPTR))
             trace_u256(23, mload(QUOTIENT_EVAL_MPTR))
+            trace_u256(36, addmod(0, sub(r, mload(QUOTIENT_EVAL_MPTR)), r))
             mstore(add(QUOTIENT_MPTR, 0x40), 0)
             mstore(add(QUOTIENT_MPTR, 0x60), 0)
             trace_point(24, QUOTIENT_MPTR)
@@ -1726,6 +1735,10 @@ contract Halo2Verifier {
             trace_u256(31, mload(F_EVAL_MPTR))
             trace_u256(32, mload(V_MPTR))
             trace_point(33, FINAL_COM_MPTR)
+            trace_u256(35, success)
+            {%- for _ in simple_selector_cols %}
+            trace_u256({{ 60000 + loop.index0 }}, mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 32)|hex() }})))
+            {%- endfor %}
             if mload(HAS_ACCUMULATOR_MPTR) {
                 trace_point(29, ACC_LHS_MPTR)
                 trace_point(30, ACC_RHS_MPTR)

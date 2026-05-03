@@ -649,6 +649,31 @@ pub(super) fn computations(
             }
         }
 
+        if trace {
+            for (set_idx, points) in sets.point_sets.iter().enumerate() {
+                lines.push(format!(
+                    "// trace serialized PCS point set {set_idx} ({} point(s))",
+                    points.len()
+                ));
+                for (point_idx, rot) in points.iter().enumerate() {
+                    let rot_idx = distinct_rotations
+                        .iter()
+                        .position(|r| r == rot)
+                        .expect("point-set rotation present in distinct rotations");
+                    lines.push(format!(
+                        "mstore(add(Q_EVAL_SET_MPTR, {:#x}), mload(add(ROT_POINTS_MPTR, {:#x})))",
+                        point_idx * WORD_BYTES,
+                        rot_idx * WORD_BYTES
+                    ));
+                }
+                lines.push(format!(
+                    "log1(Q_EVAL_SET_MPTR, {:#x}, {})",
+                    points.len() * WORD_BYTES,
+                    41_000 + set_idx
+                ));
+            }
+        }
+
         blocks.push(lines);
     }
 

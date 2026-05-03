@@ -552,6 +552,7 @@ fn native_midfall_verifier_trace_matches_solidity_trace() {
             event.id
         );
     }
+    assert_required_diff_trace_coverage(&rust_by_id, &solidity_trace);
 
     assert_eq!(
         rust_by_id.keys().copied().collect::<Vec<_>>(),
@@ -632,6 +633,86 @@ fn parse_solidity_trace_logs(logs: &[revm::primitives::Log]) -> BTreeMap<u64, Ve
 fn trace_topic_id(topic: B256) -> u64 {
     let bytes = topic.as_slice();
     u64::from_be_bytes(bytes[24..32].try_into().expect("topic is 32 bytes"))
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_required_diff_trace_coverage(
+    rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
+    solidity_trace: &BTreeMap<u64, Vec<u8>>,
+) {
+    for (name, id) in [
+        ("theta challenge", 7),
+        ("beta challenge", 8),
+        ("gamma challenge", 9),
+        ("y challenge", 10),
+        ("x challenge", 11),
+        ("x1 challenge", 13),
+        ("x2 challenge", 14),
+        ("x3 challenge", 15),
+        ("x4 challenge", 16),
+        ("quotient numerator", 36),
+        ("f_eval", 31),
+        ("final MSM commitment", 33),
+        ("pairing lhs input", 27),
+        ("pairing rhs input", 28),
+        ("final pairing result", 35),
+    ] {
+        assert_trace_id_present(rust_trace, solidity_trace, id, name);
+    }
+
+    assert_trace_range_present(
+        rust_trace,
+        solidity_trace,
+        30_000..40_000,
+        "quotient identity evaluations",
+    );
+    assert_trace_range_present(
+        rust_trace,
+        solidity_trace,
+        40_000..41_000,
+        "PCS q_com point-set commitments",
+    );
+    assert_trace_range_present(
+        rust_trace,
+        solidity_trace,
+        41_000..42_000,
+        "serialized PCS point sets",
+    );
+    assert_trace_range_present(rust_trace, solidity_trace, 60_000..61_000, "selector folds");
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_trace_id_present(
+    rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
+    solidity_trace: &BTreeMap<u64, Vec<u8>>,
+    id: u64,
+    name: &str,
+) {
+    assert!(
+        rust_trace.contains_key(&id),
+        "Rust trace missing required {name} id {id}"
+    );
+    assert!(
+        solidity_trace.contains_key(&id),
+        "Solidity trace missing required {name} id {id}"
+    );
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_trace_range_present(
+    rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
+    solidity_trace: &BTreeMap<u64, Vec<u8>>,
+    range: std::ops::Range<u64>,
+    name: &str,
+) {
+    assert!(
+        rust_trace.keys().any(|id| range.contains(id)),
+        "Rust trace missing required {name} in id range {range:?}"
+    );
+    assert!(
+        solidity_trace.keys().any(|id| range.contains(id)),
+        "Solidity trace missing required {name} in id range {range:?}"
+    );
 }
 
 #[derive(Clone, Debug)]

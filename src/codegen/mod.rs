@@ -732,6 +732,41 @@ mod tests {
     }
 
     #[test]
+    fn differential_trace_hooks_cover_expected_categories() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let pcs_source = include_str!("pcs.rs");
+
+        for (name, needle) in [
+            (
+                "user transcript challenges",
+                "1000 + phase.challenge_offset + j",
+            ),
+            ("quotient numerator", "trace_u256(36,"),
+            ("f_eval", "trace_u256(31,"),
+            ("final MSM commitment", "trace_point(33,"),
+            ("pairing lhs input", "trace_point(27,"),
+            ("pairing rhs input", "trace_point(28,"),
+            ("final result", "trace_u256(35,"),
+            ("selector folds", "60000 + loop.index0"),
+        ] {
+            assert!(
+                verifier_template.contains(needle),
+                "verifier template missing {name} trace hook"
+            );
+        }
+
+        for (name, needle) in [
+            ("serialized PCS point sets", "41_000 + set_idx"),
+            ("PCS q_com commitments", "40000 + set_idx"),
+        ] {
+            assert!(
+                pcs_source.contains(needle),
+                "PCS emitter missing {name} trace hook"
+            );
+        }
+    }
+
+    #[test]
     fn batch_invert_handles_empty_and_singleton_ranges() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 
