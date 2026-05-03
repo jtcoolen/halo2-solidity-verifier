@@ -23,7 +23,7 @@ use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
 use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, G2Affine};
 use midnight_proofs::{
-    plonk::{Any, Column, Expression, Selector, VerifyingKey},
+    plonk::{Expression, Selector, VerifyingKey},
     poly::{
         kzg::{params::ParamsKZG, KZGCommitmentScheme},
         Rotation,

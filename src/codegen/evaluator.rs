@@ -22,10 +22,13 @@
 //!   * [`Evaluator::lookup_computations`]    — boundary + helper + accumulator
 //!   * [`Evaluator::trashcan_computations`]  — `compressed - (1-q)*trash`
 //!
-//! Each returns a `Vec<(Vec<String>, String)>` where the inner pair is
-//! `(yul_lines, final_var)`; the caller (in `codegen.rs`) chains them
+//! Each string emitter returns a `Vec<(Vec<String>, String)>` where the inner
+//! pair is `(yul_lines, final_var)`; the caller (in `codegen.rs`) chains them
 //! into `quotient_eval_numer := addmod(mulmod(quotient_eval_numer, y, r),
-//! var, r)` (the y-power-fold accumulator).
+//! var, r)` (the y-power-fold accumulator). The companion
+//! `*_quotient_exprs` methods expose the same identities as typed
+//! [`QuotientExpr`] values so VM/native/inline lowerings do not recover
+//! semantics by parsing emitted Yul.
 //!
 //! All emitters reference well-known Yul memory pointers that the
 //! verifier prologue populates before invoking the quotient-numerator block.
@@ -39,7 +42,14 @@ use midnight_curves::Fq;
 use midnight_proofs::plonk::{Any, Column, ConstraintSystem, Expression};
 use ruint::aliases::U256;
 
-use crate::codegen::util::{fe_to_u256, ConstraintSystemMeta, Data, Location, Value, Word};
+use crate::codegen::{
+    quotient::{
+        quotient_expr_from_expression, word_to_quotient_expr, DataQuotientExpressionEnv,
+        QuotientExpr, QuotientMem, Q_MEM_BETA, Q_MEM_GAMMA, Q_MEM_L0, Q_MEM_L_BLIND, Q_MEM_L_LAST,
+        Q_MEM_THETA, Q_MEM_TRASH_CHALLENGE, Q_MEM_X,
+    },
+    util::{fe_to_u256, ConstraintSystemMeta, Data, Location, Value, Word},
+};
 
 #[derive(Debug)]
 pub(crate) struct Evaluator<'a> {
@@ -177,6 +187,24 @@ impl<'a> Evaluator<'a> {
                         let (lines, var) = self.evaluate_and_reset(poly);
                         (lines, var, simple_idx)
                     })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub(crate) fn gate_quotient_exprs_tagged(&self) -> Vec<(QuotientExpr, Option<usize>)> {
+        self.cs
+            .gates()
+            .iter()
+            .flat_map(|gate| {
+                let simple_idx = gate
+                    .queried_selectors()
+                    .iter()
+                    .find(|s| s.is_simple())
+                    .map(|s| s.index());
+                gate.polynomials()
+                    .iter()
+                    .map(|poly| (self.typed_expr(poly), simple_idx))
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -354,6 +382,82 @@ impl<'a> Evaluator<'a> {
         out
     }
 
+    pub(crate) fn permutation_quotient_exprs(&self) -> Vec<QuotientExpr> {
+        if self.meta.num_permutation_zs == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let chunk_len = self.meta.permutation_chunk_len;
+        let columns = &self.meta.permutation_columns;
+        let z_evals = &self.data.permutation_z_evals;
+        let l0 = Self::q_mem_token(Q_MEM_L0);
+        let llast = Self::q_mem_token(Q_MEM_L_LAST);
+        let lblind = Self::q_mem_token(Q_MEM_L_BLIND);
+        let beta = Self::q_mem_token(Q_MEM_BETA);
+        let gamma = Self::q_mem_token(Q_MEM_GAMMA);
+        let x = Self::q_mem_token(Q_MEM_X);
+        let one = Self::q_one();
+
+        let z0 = Self::q_word(z_evals.first().expect("perm sets non-empty").0);
+        out.push(Self::q_mul(l0.clone(), Self::q_sub(one.clone(), z0)));
+
+        let zn = Self::q_word(z_evals.last().expect("perm sets non-empty").0);
+        out.push(Self::q_mul(
+            llast.clone(),
+            Self::q_sub(Self::q_mul(zn.clone(), zn.clone()), zn),
+        ));
+
+        for i in 1..self.meta.num_permutation_zs {
+            let zi = Self::q_word(z_evals[i].0);
+            let z_prev_last = Self::q_word(z_evals[i - 1].2.expect("non-last set has last eval"));
+            out.push(Self::q_mul(l0.clone(), Self::q_sub(zi, z_prev_last)));
+        }
+
+        let active = Self::q_sub(one.clone(), Self::q_add(llast, lblind));
+        let delta = fe_to_u256::<Fq>(&Fq::DELTA);
+        for (set_idx, ((z_cur, z_next, _), chunk_cols)) in
+            z_evals.iter().zip(columns.chunks(chunk_len)).enumerate()
+        {
+            let mut left = Self::q_word(*z_next);
+            for col in chunk_cols {
+                let col_eval = self.typed_eval_at(col, 0);
+                let s_eval = Self::q_word(
+                    *self
+                        .data
+                        .permutation_evals
+                        .get(col)
+                        .expect("permutation eval present"),
+                );
+                let term = Self::q_add(
+                    Self::q_add(col_eval, Self::q_mul(beta.clone(), s_eval)),
+                    gamma.clone(),
+                );
+                left = Self::q_mul(left, term);
+            }
+
+            let initial_delta_power = Fq::DELTA.pow_vartime([(set_idx * chunk_len) as u64]);
+            let mut delta_pow = Self::q_mul(
+                Self::q_mul(beta.clone(), x.clone()),
+                Self::q_const(fe_to_u256::<Fq>(&initial_delta_power)),
+            );
+            let mut right = Self::q_word(*z_cur);
+            let last_col_idx = chunk_cols.len().saturating_sub(1);
+            for (col_pos, col) in chunk_cols.iter().enumerate() {
+                let col_eval = self.typed_eval_at(col, 0);
+                let term = Self::q_add(Self::q_add(col_eval, delta_pow.clone()), gamma.clone());
+                right = Self::q_mul(right, term);
+                if col_pos != last_col_idx {
+                    delta_pow = Self::q_mul(delta_pow, Self::q_const(delta));
+                }
+            }
+
+            out.push(Self::q_mul(active.clone(), Self::q_sub(left, right)));
+        }
+
+        out
+    }
+
     // ----------------------------------------------------------------
     // LogUp emitter.
     //
@@ -406,10 +510,8 @@ impl<'a> Evaluator<'a> {
             // `(Vec<String>, String)` entries.
             let selector_expr = chunked.selector_expression();
 
-            for (input_chunk, h_eval) in chunked
-                .input_expression_chunks()
-                .iter()
-                .zip(h_evals.iter())
+            for (input_chunk, h_eval) in
+                chunked.input_expression_chunks().iter().zip(h_evals.iter())
             {
                 self.reset();
                 let mut lines = Vec::new();
@@ -570,6 +672,83 @@ impl<'a> Evaluator<'a> {
         out
     }
 
+    pub(crate) fn lookup_quotient_exprs(&self) -> Vec<QuotientExpr> {
+        if self.meta.num_lookups == 0 {
+            return Vec::new();
+        }
+
+        let cs_degree = self.cs.degree();
+        let mut out = Vec::new();
+        for (lookup_idx, lookup) in self.cs.lookups().iter().enumerate() {
+            let chunked = lookup.chunk_by_degree(cs_degree);
+            let (m_eval, h_evals, z_eval, z_next_eval) = &self.data.lookup_evals[lookup_idx];
+
+            out.push(Self::q_mul(
+                Self::q_add(Self::q_mem_token(Q_MEM_L0), Self::q_mem_token(Q_MEM_L_LAST)),
+                Self::q_word(*z_eval),
+            ));
+
+            let beta = Self::q_mem_token(Q_MEM_BETA);
+            let theta = Self::q_mem_token(Q_MEM_THETA);
+            for (input_chunk, h_eval) in
+                chunked.input_expression_chunks().iter().zip(h_evals.iter())
+            {
+                let f_plus_beta = input_chunk
+                    .iter()
+                    .map(|parallel_input| {
+                        let compressed =
+                            self.typed_compress_expressions(parallel_input, theta.clone());
+                        Self::q_add(compressed, beta.clone())
+                    })
+                    .collect::<Vec<_>>();
+
+                if f_plus_beta.is_empty() {
+                    out.push(Self::q_zero());
+                    continue;
+                }
+
+                let product = Self::q_product(f_plus_beta.iter().cloned());
+                let mut sum = Self::q_zero();
+                for skip in 0..f_plus_beta.len() {
+                    let partial = Self::q_product(
+                        f_plus_beta
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, expr)| (idx != skip).then_some(expr.clone())),
+                    );
+                    sum = Self::q_add(sum, partial);
+                }
+
+                out.push(Self::q_sub(
+                    Self::q_mul(Self::q_word(*h_eval), product),
+                    sum,
+                ));
+            }
+
+            let active = Self::q_sub(
+                Self::q_one(),
+                Self::q_add(
+                    Self::q_mem_token(Q_MEM_L_LAST),
+                    Self::q_mem_token(Q_MEM_L_BLIND),
+                ),
+            );
+            let sum_h = Self::q_sum(h_evals.iter().copied().map(Self::q_word));
+            let selector = self.typed_expr(chunked.selector_expression());
+            let diff = Self::q_sub(
+                Self::q_sub(Self::q_word(*z_next_eval), Self::q_word(*z_eval)),
+                Self::q_mul(selector, sum_h),
+            );
+            let table = self.typed_compress_expressions(chunked.table_expressions(), theta.clone());
+            let core = Self::q_add(
+                Self::q_mul(diff, Self::q_add(table, beta)),
+                Self::q_word(*m_eval),
+            );
+            out.push(Self::q_mul(active, core));
+        }
+
+        out
+    }
+
     // ----------------------------------------------------------------
     // Trashcan emitter.
     //
@@ -655,6 +834,30 @@ impl<'a> Evaluator<'a> {
         }
 
         out
+    }
+
+    pub(crate) fn trashcan_quotient_exprs(&self) -> Vec<QuotientExpr> {
+        if self.meta.num_trashcans == 0 {
+            return Vec::new();
+        }
+
+        self.cs
+            .trashcans()
+            .iter()
+            .enumerate()
+            .map(|(idx, argument)| {
+                let compressed = self.typed_compress_expressions(
+                    argument.constraint_expressions(),
+                    Self::q_mem_token(Q_MEM_TRASH_CHALLENGE),
+                );
+                let selector = self.typed_expr(argument.selector());
+                let scaled = Self::q_mul(
+                    Self::q_sub(Self::q_one(), selector),
+                    Self::q_word(self.data.trashcan_evals[idx]),
+                );
+                Self::q_sub(compressed, scaled)
+            })
+            .collect()
     }
 
     // ----------------------------------------------------------------
@@ -748,6 +951,110 @@ impl<'a> Evaluator<'a> {
             Value::Integer(offset) if offset >= 0 => Some(offset as usize),
             _ => None,
         }
+    }
+
+    fn typed_expr(&self, expression: &Expression<Fq>) -> QuotientExpr {
+        quotient_expr_from_expression(
+            &DataQuotientExpressionEnv {
+                meta: self.meta,
+                data: self.data,
+            },
+            expression,
+        )
+    }
+
+    fn typed_eval_at(&self, column: &Column<Any>, rotation: i32) -> QuotientExpr {
+        let col_idx = column.index();
+        match column.column_type() {
+            Any::Advice(_) => Self::q_word(
+                *self
+                    .data
+                    .advice_evals
+                    .get(&(col_idx, rotation))
+                    .expect("advice eval present in permutation chunk"),
+            ),
+            Any::Fixed => {
+                if self.meta.simple_selector_cols.contains(&col_idx) {
+                    Self::q_one()
+                } else {
+                    Self::q_word(
+                        *self
+                            .data
+                            .fixed_evals
+                            .get(&(col_idx, rotation))
+                            .expect("fixed eval present in permutation chunk"),
+                    )
+                }
+            }
+            Any::Instance => {
+                if col_idx < self.meta.num_committed_instances {
+                    Self::q_word(
+                        *self
+                            .data
+                            .committed_instance_evals
+                            .get(&(col_idx, rotation))
+                            .expect("committed instance eval present"),
+                    )
+                } else {
+                    Self::q_word(self.data.instance_eval)
+                }
+            }
+        }
+    }
+
+    fn typed_compress_expressions(
+        &self,
+        expressions: &[Expression<Fq>],
+        challenge: QuotientExpr,
+    ) -> QuotientExpr {
+        expressions.iter().fold(Self::q_zero(), |acc, expr| {
+            let expr = self.typed_expr(expr);
+            Self::q_add(Self::q_mul(acc, challenge.clone()), expr)
+        })
+    }
+
+    fn q_sum(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
+        expressions.into_iter().fold(Self::q_zero(), Self::q_add)
+    }
+
+    fn q_product(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
+        expressions.into_iter().fold(Self::q_one(), Self::q_mul)
+    }
+
+    fn q_word(word: Word) -> QuotientExpr {
+        word_to_quotient_expr(word)
+    }
+
+    fn q_mem_token(token: u8) -> QuotientExpr {
+        QuotientExpr::Mem(QuotientMem::Token(token))
+    }
+
+    fn q_zero() -> QuotientExpr {
+        Self::q_const(U256::ZERO)
+    }
+
+    fn q_one() -> QuotientExpr {
+        Self::q_const(U256::from(1u64))
+    }
+
+    fn q_const(value: U256) -> QuotientExpr {
+        QuotientExpr::Const(value)
+    }
+
+    fn q_add(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Add(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn q_mul(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Mul(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn q_neg(expr: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Neg(Box::new(expr))
+    }
+
+    fn q_sub(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        Self::q_add(lhs, Self::q_neg(rhs))
     }
 
     fn pow5_base_expr<'b>(&self, expression: &'b Expression<Fq>) -> Option<&'b Expression<Fq>> {

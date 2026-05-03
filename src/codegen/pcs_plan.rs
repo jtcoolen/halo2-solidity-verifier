@@ -115,13 +115,16 @@ impl PcsRenderPlan {
             ));
         }
 
-        Ok(Self {
-            blocks: kinds
-                .into_iter()
-                .zip(blocks)
-                .map(|(kind, lines)| PcsRenderBlock { kind, lines })
-                .collect(),
-        })
+        let blocks = kinds
+            .into_iter()
+            .zip(blocks)
+            .map(|(kind, lines)| {
+                Self::validate_block(&kind, &lines)?;
+                Ok(PcsRenderBlock { kind, lines })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(Self { blocks })
     }
 
     pub(crate) fn expected_block_kinds(pcs: &PcsPlan, trace: bool) -> Vec<PcsRenderBlockKind> {
@@ -157,6 +160,54 @@ impl PcsRenderPlan {
             .iter()
             .map(|block| block.kind.as_str())
             .collect()
+    }
+
+    fn validate_block(kind: &PcsRenderBlockKind, lines: &[String]) -> Result<(), String> {
+        let block_name = kind.as_str();
+        let require = |needle: &str| {
+            if lines.iter().any(|line| line.contains(needle)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "PCS {block_name} block is missing expected marker `{needle}`"
+                ))
+            }
+        };
+
+        match kind {
+            PcsRenderBlockKind::RotationPoints => require("ROT_POINTS_MPTR"),
+            PcsRenderBlockKind::X1Powers => require("X1_POWERS_MPTR"),
+            PcsRenderBlockKind::QEvalSet { set, strategy } => {
+                require(&format!("q_eval_set[{set}]"))?;
+                require("Q_EVAL_SET_MPTR")?;
+                let has_rolled_loop = lines.iter().any(|line| line.contains("eval_p"));
+                match strategy {
+                    PcsQEvalStrategy::Rolled if !has_rolled_loop => Err(format!(
+                        "PCS q_eval_set block {set} is planned as rolled but has no eval_p loop"
+                    )),
+                    PcsQEvalStrategy::Unrolled if has_rolled_loop => Err(format!(
+                        "PCS q_eval_set block {set} is planned as unrolled but contains eval_p loop state"
+                    )),
+                    _ => Ok(()),
+                }
+            }
+            PcsRenderBlockKind::QComTrace => require("trace_point(40000"),
+            PcsRenderBlockKind::FEval => {
+                require("F_EVAL_MPTR")?;
+                require("Q_EVAL_CPTR_MPTR")?;
+                require("Q_EVAL_SET_MPTR")
+            }
+            PcsRenderBlockKind::FinalMsm => {
+                require("FINAL_COM_MPTR")?;
+                require("V_MPTR")?;
+                require("F_COM_MPTR")
+            }
+            PcsRenderBlockKind::PairingInputs => {
+                require("PAIRING_LHS_MPTR")?;
+                require("PAIRING_RHS_MPTR")?;
+                require("PI_MPTR")
+            }
+        }
     }
 }
 
@@ -359,20 +410,35 @@ mod tests {
         assert_eq!(plan.q_com_trace_msm, memory_requirements.q_com_trace_msm);
         assert!(plan.validate_against_memory(&memory_requirements).is_ok());
 
-        let render = PcsRenderPlan::from_blocks(
-            &plan,
+        let blocks = vec![
+            vec!["mstore(add(ROT_POINTS_MPTR, 0x0), x)".to_string()],
+            vec!["mstore(X1_POWERS_MPTR, 1)".to_string()],
             vec![
-                vec!["rotation".to_string()],
-                vec!["x1".to_string()],
-                vec!["q0".to_string()],
-                vec!["q1".to_string()],
-                vec!["f_eval".to_string()],
-                vec!["final_msm".to_string()],
-                vec!["pairing".to_string()],
+                "// q_eval_set[0]: 1 commitment(s)".to_string(),
+                "mstore(add(Q_EVAL_SET_MPTR, 0x0), q_eval_set_0)".to_string(),
             ],
-            false,
-        )
-        .expect("PCS render plan block order");
+            vec![
+                "// q_eval_set[1]: 4 commitment(s) (rolled, m>=4)".to_string(),
+                "let eval_p := add(0x1000, 0x20)".to_string(),
+                "mstore(add(Q_EVAL_SET_MPTR, 0x20), q_eval_set_0)".to_string(),
+            ],
+            vec![
+                "let Q_EVAL_CPTR := mload(Q_EVAL_CPTR_MPTR)".to_string(),
+                "let ev := mload(Q_EVAL_SET_MPTR)".to_string(),
+                "mstore(F_EVAL_MPTR, ev)".to_string(),
+            ],
+            vec![
+                "mcopy(FINAL_COM_MPTR, 0x1000, 0x80)".to_string(),
+                "mcopy(0x1000, F_COM_MPTR, 0x80)".to_string(),
+                "mstore(V_MPTR, v)".to_string(),
+            ],
+            vec![
+                "mcopy(PAIRING_LHS_MPTR, PI_MPTR, 0x80)".to_string(),
+                "mcopy(PAIRING_RHS_MPTR, PI_MPTR, 0x80)".to_string(),
+            ],
+        ];
+        let render =
+            PcsRenderPlan::from_blocks(&plan, blocks.clone(), false).expect("PCS render plan");
         assert_eq!(
             render.block_kinds(),
             vec![
@@ -386,5 +452,13 @@ mod tests {
             ]
         );
         assert!(PcsRenderPlan::from_blocks(&plan, vec![vec![]], true).is_err());
+
+        let mut missing_marker = blocks.clone();
+        missing_marker[2] = vec!["// q_eval_set[0]: 1 commitment(s)".to_string()];
+        assert!(PcsRenderPlan::from_blocks(&plan, missing_marker, false).is_err());
+
+        let mut wrong_strategy = blocks;
+        wrong_strategy[2].push("let eval_p := add(0x1000, 0x20)".to_string());
+        assert!(PcsRenderPlan::from_blocks(&plan, wrong_strategy, false).is_err());
     }
 }

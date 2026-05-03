@@ -1124,14 +1124,7 @@ impl<'a> SolidityGenerator<'a> {
         // expected scalar.
         let evaluator = Evaluator::new(self.vk.cs(), meta, data);
         let gate_items = evaluator.gate_computations_tagged();
-        let gate_exprs = self
-            .vk
-            .cs()
-            .gates()
-            .iter()
-            .flat_map(|gate| gate.polynomials().iter())
-            .map(|poly| Self::quotient_expr_from_plonk_expr(meta, data, poly))
-            .collect::<Vec<_>>();
+        let gate_exprs = evaluator.gate_quotient_exprs_tagged();
         assert_eq!(
             gate_items.len(),
             gate_exprs.len(),
@@ -1140,9 +1133,9 @@ impl<'a> SolidityGenerator<'a> {
         let perm_items = evaluator.permutation_computations();
         let lookup_items = evaluator.lookup_computations();
         let trash_items = evaluator.trashcan_computations();
-        let perm_exprs = Self::permutation_quotient_exprs(meta, data);
-        let lookup_exprs = self.lookup_quotient_exprs(meta, data);
-        let trash_exprs = self.trash_quotient_exprs(meta, data);
+        let perm_exprs = evaluator.permutation_quotient_exprs();
+        let lookup_exprs = evaluator.lookup_quotient_exprs();
+        let trash_exprs = evaluator.trashcan_quotient_exprs();
         assert_eq!(
             perm_items.len(),
             perm_exprs.len(),
@@ -1163,7 +1156,12 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple.sort_unstable();
 
         let mut gates = Vec::with_capacity(gate_items.len());
-        for ((lines, var, sel_idx), expr) in gate_items.into_iter().zip(gate_exprs) {
+        for ((lines, var, sel_idx), (expr, expr_sel_idx)) in gate_items.into_iter().zip(gate_exprs)
+        {
+            assert_eq!(
+                sel_idx, expr_sel_idx,
+                "gate selector target must agree between Yul and typed quotient paths"
+            );
             let target = match sel_idx {
                 Some(col) => {
                     let idx = sorted_simple
@@ -1253,296 +1251,6 @@ impl<'a> SolidityGenerator<'a> {
             parser.assignment(line);
         }
         parser.parse_expr(&identity.var)
-    }
-
-    fn quotient_expr_from_plonk_expr(
-        meta: &ConstraintSystemMeta,
-        data: &Data,
-        expression: &Expression<Fq>,
-    ) -> QuotientExpr {
-        quotient_expr_from_expression(&DataQuotientExpressionEnv { meta, data }, expression)
-    }
-
-    fn permutation_quotient_exprs(meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
-        if meta.num_permutation_zs == 0 {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        let chunk_len = meta.permutation_chunk_len;
-        let columns = &meta.permutation_columns;
-        let z_evals = &data.permutation_z_evals;
-        let l0 = Self::q_mem_token(Q_MEM_L0);
-        let llast = Self::q_mem_token(Q_MEM_L_LAST);
-        let lblind = Self::q_mem_token(Q_MEM_L_BLIND);
-        let beta = Self::q_mem_token(Q_MEM_BETA);
-        let gamma = Self::q_mem_token(Q_MEM_GAMMA);
-        let x = Self::q_mem_token(Q_MEM_X);
-        let one = Self::q_one();
-
-        let z0 = Self::q_word(z_evals.first().expect("perm sets non-empty").0);
-        out.push(Self::q_mul(l0.clone(), Self::q_sub(one.clone(), z0)));
-
-        let zn = Self::q_word(z_evals.last().expect("perm sets non-empty").0);
-        out.push(Self::q_mul(
-            llast.clone(),
-            Self::q_sub(Self::q_mul(zn.clone(), zn.clone()), zn),
-        ));
-
-        for i in 1..meta.num_permutation_zs {
-            let zi = Self::q_word(z_evals[i].0);
-            let z_prev_last = Self::q_word(z_evals[i - 1].2.expect("non-last set has last eval"));
-            out.push(Self::q_mul(l0.clone(), Self::q_sub(zi, z_prev_last)));
-        }
-
-        let active = Self::q_sub(one.clone(), Self::q_add(llast, lblind));
-        let delta = fe_to_u256::<Fq>(&Fq::DELTA);
-        for (set_idx, ((z_cur, z_next, _), chunk_cols)) in
-            z_evals.iter().zip(columns.chunks(chunk_len)).enumerate()
-        {
-            let mut left = Self::q_word(*z_next);
-            for col in chunk_cols {
-                let col_eval = Self::q_eval_at(meta, data, col, 0);
-                let s_eval = Self::q_word(
-                    *data
-                        .permutation_evals
-                        .get(col)
-                        .expect("permutation eval present"),
-                );
-                let term = Self::q_add(
-                    Self::q_add(col_eval, Self::q_mul(beta.clone(), s_eval)),
-                    gamma.clone(),
-                );
-                left = Self::q_mul(left, term);
-            }
-
-            let initial_delta_power = Fq::DELTA.pow_vartime([(set_idx * chunk_len) as u64]);
-            let mut delta_pow = Self::q_mul(
-                Self::q_mul(beta.clone(), x.clone()),
-                Self::q_const(fe_to_u256::<Fq>(&initial_delta_power)),
-            );
-            let mut right = Self::q_word(*z_cur);
-            let last_col_idx = chunk_cols.len().saturating_sub(1);
-            for (col_pos, col) in chunk_cols.iter().enumerate() {
-                let col_eval = Self::q_eval_at(meta, data, col, 0);
-                let term = Self::q_add(Self::q_add(col_eval, delta_pow.clone()), gamma.clone());
-                right = Self::q_mul(right, term);
-                if col_pos != last_col_idx {
-                    delta_pow = Self::q_mul(delta_pow, Self::q_const(delta));
-                }
-            }
-
-            out.push(Self::q_mul(active.clone(), Self::q_sub(left, right)));
-        }
-
-        out
-    }
-
-    fn lookup_quotient_exprs(&self, meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
-        if meta.num_lookups == 0 {
-            return Vec::new();
-        }
-
-        let cs_degree = self.vk.cs().degree();
-        let mut out = Vec::new();
-        for (lookup_idx, lookup) in self.vk.cs().lookups().iter().enumerate() {
-            let chunked = lookup.chunk_by_degree(cs_degree);
-            let (m_eval, h_evals, z_eval, z_next_eval) = &data.lookup_evals[lookup_idx];
-
-            out.push(Self::q_mul(
-                Self::q_add(Self::q_mem_token(Q_MEM_L0), Self::q_mem_token(Q_MEM_L_LAST)),
-                Self::q_word(*z_eval),
-            ));
-
-            let beta = Self::q_mem_token(Q_MEM_BETA);
-            let theta = Self::q_mem_token(Q_MEM_THETA);
-            for (input_chunk, h_eval) in
-                chunked.input_expression_chunks().iter().zip(h_evals.iter())
-            {
-                let f_plus_beta = input_chunk
-                    .iter()
-                    .map(|parallel_input| {
-                        let compressed =
-                            Self::q_compress_expressions(meta, data, parallel_input, theta.clone());
-                        Self::q_add(compressed, beta.clone())
-                    })
-                    .collect::<Vec<_>>();
-
-                if f_plus_beta.is_empty() {
-                    out.push(Self::q_zero());
-                    continue;
-                }
-
-                let product = Self::q_product(f_plus_beta.iter().cloned());
-                let mut sum = Self::q_zero();
-                for skip in 0..f_plus_beta.len() {
-                    let partial = Self::q_product(
-                        f_plus_beta
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, expr)| (idx != skip).then_some(expr.clone())),
-                    );
-                    sum = Self::q_add(sum, partial);
-                }
-
-                out.push(Self::q_sub(
-                    Self::q_mul(Self::q_word(*h_eval), product),
-                    sum,
-                ));
-            }
-
-            let active = Self::q_sub(
-                Self::q_one(),
-                Self::q_add(
-                    Self::q_mem_token(Q_MEM_L_LAST),
-                    Self::q_mem_token(Q_MEM_L_BLIND),
-                ),
-            );
-            let sum_h = Self::q_sum(h_evals.iter().copied().map(Self::q_word));
-            let selector =
-                Self::quotient_expr_from_plonk_expr(meta, data, chunked.selector_expression());
-            let diff = Self::q_sub(
-                Self::q_sub(Self::q_word(*z_next_eval), Self::q_word(*z_eval)),
-                Self::q_mul(selector, sum_h),
-            );
-            let table = Self::q_compress_expressions(
-                meta,
-                data,
-                chunked.table_expressions(),
-                theta.clone(),
-            );
-            let core = Self::q_add(
-                Self::q_mul(diff, Self::q_add(table, beta)),
-                Self::q_word(*m_eval),
-            );
-            out.push(Self::q_mul(active, core));
-        }
-
-        out
-    }
-
-    fn trash_quotient_exprs(&self, meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
-        if meta.num_trashcans == 0 {
-            return Vec::new();
-        }
-
-        self.vk
-            .cs()
-            .trashcans()
-            .iter()
-            .enumerate()
-            .map(|(idx, argument)| {
-                let compressed = Self::q_compress_expressions(
-                    meta,
-                    data,
-                    argument.constraint_expressions(),
-                    Self::q_mem_token(Q_MEM_TRASH_CHALLENGE),
-                );
-                let selector = Self::quotient_expr_from_plonk_expr(meta, data, argument.selector());
-                let scaled = Self::q_mul(
-                    Self::q_sub(Self::q_one(), selector),
-                    Self::q_word(data.trashcan_evals[idx]),
-                );
-                Self::q_sub(compressed, scaled)
-            })
-            .collect()
-    }
-
-    fn q_eval_at(
-        meta: &ConstraintSystemMeta,
-        data: &Data,
-        column: &Column<Any>,
-        rotation: i32,
-    ) -> QuotientExpr {
-        let col_idx = column.index();
-        match column.column_type() {
-            Any::Advice(_) => Self::q_word(
-                *data
-                    .advice_evals
-                    .get(&(col_idx, rotation))
-                    .expect("advice eval present in permutation chunk"),
-            ),
-            Any::Fixed => {
-                if meta.simple_selector_cols.contains(&col_idx) {
-                    Self::q_one()
-                } else {
-                    Self::q_word(
-                        *data
-                            .fixed_evals
-                            .get(&(col_idx, rotation))
-                            .expect("fixed eval present in permutation chunk"),
-                    )
-                }
-            }
-            Any::Instance => {
-                if col_idx < meta.num_committed_instances {
-                    Self::q_word(
-                        *data
-                            .committed_instance_evals
-                            .get(&(col_idx, rotation))
-                            .expect("committed instance eval present"),
-                    )
-                } else {
-                    Self::q_word(data.instance_eval)
-                }
-            }
-        }
-    }
-
-    fn q_compress_expressions(
-        meta: &ConstraintSystemMeta,
-        data: &Data,
-        expressions: &[Expression<Fq>],
-        challenge: QuotientExpr,
-    ) -> QuotientExpr {
-        expressions.iter().fold(Self::q_zero(), |acc, expr| {
-            let expr = Self::quotient_expr_from_plonk_expr(meta, data, expr);
-            Self::q_add(Self::q_mul(acc, challenge.clone()), expr)
-        })
-    }
-
-    fn q_sum(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
-        expressions.into_iter().fold(Self::q_zero(), Self::q_add)
-    }
-
-    fn q_product(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
-        expressions.into_iter().fold(Self::q_one(), Self::q_mul)
-    }
-
-    fn q_word(word: Word) -> QuotientExpr {
-        word_to_quotient_expr(word)
-    }
-
-    fn q_mem_token(token: u8) -> QuotientExpr {
-        QuotientExpr::Mem(QuotientMem::Token(token))
-    }
-
-    fn q_zero() -> QuotientExpr {
-        Self::q_const(U256::ZERO)
-    }
-
-    fn q_one() -> QuotientExpr {
-        Self::q_const(U256::from(1u64))
-    }
-
-    fn q_const(value: U256) -> QuotientExpr {
-        QuotientExpr::Const(value)
-    }
-
-    fn q_add(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
-        QuotientExpr::Add(Box::new(lhs), Box::new(rhs))
-    }
-
-    fn q_mul(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
-        QuotientExpr::Mul(Box::new(lhs), Box::new(rhs))
-    }
-
-    fn q_neg(expr: QuotientExpr) -> QuotientExpr {
-        QuotientExpr::Neg(Box::new(expr))
-    }
-
-    fn q_sub(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
-        Self::q_add(lhs, Self::q_neg(rhs))
     }
 
     fn inline_cse_quotient_computations(
