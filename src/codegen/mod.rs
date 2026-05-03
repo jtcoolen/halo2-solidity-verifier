@@ -5,7 +5,8 @@ use crate::codegen::{
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
-        QuotientProgram, UserPhase, VerifierCodegenLayout, VerifierProofReadPlan,
+        QuotientProgram, TranscriptRenderPlan, UserPhase, VerifierCodegenLayout,
+        VerifierProofReadPlan,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
@@ -1465,17 +1466,26 @@ mod tests {
 
     #[test]
     fn trash_challenge_is_squeezed_even_without_trash_arguments() {
-        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
-        let squeeze = verifier_template
-            .find("buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)")
-            .expect("trash challenge squeeze should be rendered");
-        let trash_guard = verifier_template
-            .find("{%- if num_trashcans != 0 %}\n            // ---- trashcans ----")
-            .expect("trashcan commitment reads should still be guarded");
-
+        let transcript_plan = include_str!("transcript_plan.rs");
+        let template_source = include_str!("template.rs");
+        let squeeze = transcript_plan
+            .find("TranscriptChallenge::TrashChallenge")
+            .expect("trash challenge squeeze should be planned");
+        let trash_read = transcript_plan
+            .find("TranscriptProofSection::Trash")
+            .expect("trashcan commitment reads should still be a separate proof section");
         assert!(
-            squeeze < trash_guard,
-            "Midnight squeezes trash_challenge unconditionally; only trashcan commitment reads may be guarded"
+            squeeze < trash_read,
+            "Midnight squeezes trash_challenge unconditionally before trashcan commitment reads"
+        );
+        assert!(
+            template_source
+                .contains("TranscriptChallenge::TrashChallenge => \"TRASH_CHALLENGE_MPTR\""),
+            "transcript rendering must map trash_challenge to the verifier memory slot"
+        );
+        assert!(
+            template_source.contains("TranscriptProofSection::Trash"),
+            "transcript rendering must keep trashcan commitments as a proof-read event"
         );
     }
 

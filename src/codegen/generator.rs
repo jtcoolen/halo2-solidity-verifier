@@ -3326,6 +3326,17 @@ impl<'a> SolidityGenerator<'a> {
             .collect();
         let num_user_challenges: usize = meta.num_user_challenges.iter().sum();
         let lookup_h_plus_acc: usize = meta.lookup_chunks.iter().sum::<usize>() + meta.num_lookups;
+        let transcript_render = TranscriptRenderPlan::from_plan(
+            &transcript_plan,
+            &proof_reads,
+            &user_phases,
+            trace,
+            gas_checkpoints,
+            layout::trace::PROOF_COMMIT_BASE,
+            layout::trace::PROOF_EVAL_BASE,
+            cfg!(feature = "truncated-challenges"),
+        )
+        .unwrap_or_else(|err| panic!("invalid transcript render plan: {err}"));
 
         // Compute VK / accumulator layout helpers before moving vk into
         // the template struct.
@@ -3417,6 +3428,7 @@ impl<'a> SolidityGenerator<'a> {
                 memory: memory.clone(),
                 vk_header: Default::default(),
                 transcript: transcript_layout,
+                transcript_render,
                 quotient_external: quotient_external.clone(),
             },
             memory,

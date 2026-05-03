@@ -5,6 +5,10 @@ use crate::codegen::{
     layout,
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
     proof_layout::{ProofCalldataLayout, ProofSection, TranscriptBufferLayout},
+    transcript_plan::{
+        BatchOpenCommitmentKind, TranscriptChallenge, TranscriptEvent, TranscriptPlan,
+        TranscriptProofSection,
+    },
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -528,6 +532,502 @@ pub(crate) struct UserPhase {
     pub(crate) challenge_offset: usize,
 }
 
+/// Render-ready Yul transcript body produced from `TranscriptPlan`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TranscriptRenderPlan {
+    pub(crate) lines: Vec<String>,
+}
+
+impl TranscriptRenderPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_plan(
+        plan: &TranscriptPlan,
+        proof_reads: &VerifierProofReadPlan,
+        user_phases: &[UserPhase],
+        trace: bool,
+        gas_checkpoints: bool,
+        proof_commit_trace_base: usize,
+        proof_eval_trace_base: usize,
+        truncated_challenges: bool,
+    ) -> Result<Self, String> {
+        let mut renderer = TranscriptRenderer {
+            proof_reads,
+            user_phases,
+            trace,
+            gas_checkpoints,
+            proof_commit_trace_base,
+            proof_eval_trace_base,
+            truncated_challenges,
+            lines: Vec::new(),
+            proof_cursor_declared: false,
+            checkpoint6_inserted: false,
+        };
+        renderer.render(plan)?;
+        Ok(Self {
+            lines: renderer.lines,
+        })
+    }
+}
+
+struct TranscriptRenderer<'a> {
+    proof_reads: &'a VerifierProofReadPlan,
+    user_phases: &'a [UserPhase],
+    trace: bool,
+    gas_checkpoints: bool,
+    proof_commit_trace_base: usize,
+    proof_eval_trace_base: usize,
+    truncated_challenges: bool,
+    lines: Vec<String>,
+    proof_cursor_declared: bool,
+    checkpoint6_inserted: bool,
+}
+
+impl TranscriptRenderer<'_> {
+    fn render(&mut self, plan: &TranscriptPlan) -> Result<(), String> {
+        let mut idx = 0usize;
+        while idx < plan.events.len() {
+            match plan.events[idx] {
+                TranscriptEvent::AbsorbVkDigest => {
+                    self.push("// VK_DIGEST_MPTR holds the digest as a BE 32-byte word.");
+                    self.push("let buf_len := transcript_init()");
+                    self.push("buf_len := common_word(buf_len, mload(VK_DIGEST_MPTR))");
+                    idx += 1;
+                }
+                TranscriptEvent::AbsorbCommittedInstanceIdentity { count } => {
+                    if count != 1 {
+                        return Err(format!(
+                            "unsupported committed instance identity absorb count: {count}"
+                        ));
+                    }
+                    self.push("// Absorb committed_pi = G1Affine::identity().");
+                    self.push("{");
+                    self.push("    mstore(buf_len, 0)");
+                    self.push("    mstore(add(buf_len, 0x20), 0)");
+                    self.push("    mstore(add(buf_len, 0x40), 0)");
+                    self.push("    mstore(add(buf_len, 0x60), 0)");
+                    self.push("    buf_len := add(buf_len, 0x80)");
+                    self.push("}");
+                    idx += 1;
+                }
+                TranscriptEvent::AbsorbInstanceCount => {
+                    let count = match plan.events.get(idx + 1) {
+                        Some(TranscriptEvent::AbsorbInstances { count }) => *count,
+                        other => {
+                            return Err(format!(
+                                "AbsorbInstanceCount must be followed by AbsorbInstances, got {other:?}"
+                            ));
+                        }
+                    };
+                    self.render_instances(count);
+                    self.gas_checkpoint(3, "after VK digest + committed_pi + instance absorbs");
+                    idx += 2;
+                }
+                TranscriptEvent::AbsorbInstances { .. } => {
+                    return Err("AbsorbInstances must be rendered with AbsorbInstanceCount".into());
+                }
+                TranscriptEvent::AbsorbProofCommitments { section, count } => {
+                    self.ensure_proof_cursor();
+                    self.render_proof_commitments(section, count)?;
+                    idx += 1;
+                }
+                TranscriptEvent::Squeeze { challenge, count } => {
+                    if count != 1 {
+                        return Err(format!(
+                            "unsupported squeeze count for {challenge:?}: {count}"
+                        ));
+                    }
+                    self.render_boundary_before_challenge(challenge);
+                    self.render_squeeze(challenge)?;
+                    idx += 1;
+                }
+                TranscriptEvent::AbsorbProofEvaluations { count } => {
+                    self.ensure_proof_cursor();
+                    self.render_main_evals(count)?;
+                    idx += 1;
+                }
+                TranscriptEvent::AbsorbBatchOpenCommitment { kind } => {
+                    self.ensure_proof_cursor();
+                    self.render_batch_open_commitment(kind)?;
+                    idx += 1;
+                }
+                TranscriptEvent::AbsorbBatchOpenEvaluations { count } => {
+                    self.ensure_proof_cursor();
+                    self.render_q_evals(count)?;
+                    idx += 1;
+                }
+            }
+        }
+
+        self.push("// The proof parser must consume exactly the ABI proof bytes.");
+        self.push("if iszero(eq(proof_cptr, NUM_INSTANCE_CPTR)) { revert(0, 0) }");
+        self.push("if iszero(success) { revert(0, 0) }");
+        self.gas_checkpoint(
+            10,
+            "after evaluations + x1/x2 + f_com + x3 + q_evals + x4 + pi (transcript done)",
+        );
+        Ok(())
+    }
+
+    fn render_instances(&mut self, _count: usize) {
+        self.push("{");
+        self.push("    let num_instances := mload(NUM_INSTANCES_MPTR)");
+        self.push("    buf_len := common_word(buf_len, num_instances)");
+        self.push("    let instance_cptr := INSTANCE_CPTR");
+        self.push(format!(
+            "    for {{ let instance_cptr_end := add(instance_cptr, mul(0x20, num_instances)) }}"
+        ));
+        self.push("        lt(instance_cptr, instance_cptr_end)");
+        self.push("        { instance_cptr := add(instance_cptr, 0x20) } {");
+        self.push("        let inst_be := calldataload(instance_cptr)");
+        self.push("        success := and(success, lt(inst_be, r))");
+        self.push("        buf_len := common_word(buf_len, inst_be)");
+        self.push("    }");
+        self.push("}");
+    }
+
+    fn ensure_proof_cursor(&mut self) {
+        if self.proof_cursor_declared {
+            return;
+        }
+        self.push("// Proof transcript reads are generated from TranscriptPlan.");
+        self.push("let proof_cptr := PROOF_CPTR");
+        self.push("let advice_walk := ADVICE_COMMS_MPTR_BASE");
+        self.push("let lookup_m_walk := LOOKUP_M_COMMS_MPTR_BASE");
+        self.push("let perm_z_walk := PERM_Z_COMMS_MPTR_BASE");
+        self.push("let lookup_helper_walk := LOOKUP_HELPER_COMMS_MPTR_BASE");
+        self.push("let lookup_z_walk := LOOKUP_Z_COMMS_MPTR_BASE");
+        self.push("let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE");
+        self.push("let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE");
+        if self.trace {
+            self.push(format!(
+                "let proof_commit_trace_id := {}",
+                self.proof_commit_trace_base
+            ));
+            self.push(format!(
+                "let proof_eval_trace_id := {}",
+                self.proof_eval_trace_base
+            ));
+        }
+        self.proof_cursor_declared = true;
+    }
+
+    fn render_boundary_before_challenge(&mut self, challenge: TranscriptChallenge) {
+        match challenge {
+            TranscriptChallenge::Theta => {
+                self.gas_checkpoint(4, "after user-phase advice reads + user challenge squeezes");
+            }
+            TranscriptChallenge::Beta => {
+                self.gas_checkpoint(5, "after theta squeeze + lookup multiplicities");
+            }
+            TranscriptChallenge::TrashChallenge => {
+                self.gas_checkpoint6();
+                self.gas_checkpoint(7, "after lookup helpers + Z accumulators");
+            }
+            TranscriptChallenge::Y => {
+                self.gas_checkpoint(8, "after trash_challenge + trashcans");
+            }
+            TranscriptChallenge::X => {
+                self.gas_checkpoint(9, "after y squeeze + quotient-limb reads");
+            }
+            TranscriptChallenge::User { .. }
+            | TranscriptChallenge::Gamma
+            | TranscriptChallenge::X1
+            | TranscriptChallenge::X2
+            | TranscriptChallenge::X3
+            | TranscriptChallenge::X4 => {}
+        }
+    }
+
+    fn render_squeeze(&mut self, challenge: TranscriptChallenge) -> Result<(), String> {
+        let target = self.challenge_target(challenge)?;
+        self.push(format!(
+            "buf_len := squeeze_to(buf_len, {target}) // {}",
+            challenge_label(challenge)
+        ));
+        if matches!(challenge, TranscriptChallenge::X3) && self.truncated_challenges {
+            self.push("// Truncate x3 immediately after squeeze.");
+            self.push("mstore(X3_MPTR, and(mload(X3_MPTR), 0xffffffffffffffffffffffffffffffff))");
+        }
+        Ok(())
+    }
+
+    fn challenge_target(&self, challenge: TranscriptChallenge) -> Result<String, String> {
+        Ok(match challenge {
+            TranscriptChallenge::User { phase, index } => {
+                let phase = self
+                    .user_phases
+                    .get(phase)
+                    .ok_or_else(|| format!("transcript references missing user phase {phase}"))?;
+                format!(
+                    "add(CHALLENGE_MPTR, {})",
+                    yul_hex((phase.challenge_offset + index) * WORD_BYTES)
+                )
+            }
+            TranscriptChallenge::Theta => "THETA_MPTR".to_string(),
+            TranscriptChallenge::Beta => "BETA_MPTR".to_string(),
+            TranscriptChallenge::Gamma => "GAMMA_MPTR".to_string(),
+            TranscriptChallenge::TrashChallenge => "TRASH_CHALLENGE_MPTR".to_string(),
+            TranscriptChallenge::Y => "Y_MPTR".to_string(),
+            TranscriptChallenge::X => "X_MPTR".to_string(),
+            TranscriptChallenge::X1 => "X1_MPTR".to_string(),
+            TranscriptChallenge::X2 => "X2_MPTR".to_string(),
+            TranscriptChallenge::X3 => "X3_MPTR".to_string(),
+            TranscriptChallenge::X4 => "X4_MPTR".to_string(),
+        })
+    }
+
+    fn render_proof_commitments(
+        &mut self,
+        section: TranscriptProofSection,
+        count: usize,
+    ) -> Result<(), String> {
+        let (label, read, walk_var) = self.commitment_read(section)?;
+        if matches!(
+            section,
+            TranscriptProofSection::LookupHelper { .. }
+                | TranscriptProofSection::LookupAccumulator { .. }
+        ) {
+            self.gas_checkpoint6();
+        }
+        if count != read.item_count {
+            return Err(format!(
+                "transcript commitment count mismatch for {label}: event={count}, read={}",
+                read.item_count
+            ));
+        }
+        if read.item_count == 0 {
+            return Ok(());
+        }
+        self.push(format!("// ---- {label} ----"));
+        self.push(format!(
+            "if iszero(eq(proof_cptr, {})) {{ revert(0, 0) }}",
+            yul_hex(read.cptr_start)
+        ));
+        self.push(format!("{walk_var} := {}", yul_hex(read.mptr_start)));
+        self.push(format!("for {{ let end := {} }}", yul_hex(read.cptr_end)));
+        self.push("    lt(proof_cptr, end)");
+        self.push("    {} {");
+        self.push("    buf_len := common_uncompressed_g1(buf_len, proof_cptr)");
+        self.push(format!("    calldatacopy({walk_var}, proof_cptr, 0x80)"));
+        if self.trace {
+            self.push(format!(
+                "    trace_point(proof_commit_trace_id, {walk_var})"
+            ));
+            self.push("    proof_commit_trace_id := add(proof_commit_trace_id, 1)");
+        }
+        self.push(format!("    {walk_var} := add({walk_var}, 0x80)"));
+        self.push("    proof_cptr := add(proof_cptr, 0x80)");
+        self.push("}");
+        Ok(())
+    }
+
+    fn render_main_evals(&mut self, count: usize) -> Result<(), String> {
+        let read = self.proof_reads.evals;
+        if count != read.item_count {
+            return Err(format!(
+                "transcript main eval count mismatch: event={count}, read={}",
+                read.item_count
+            ));
+        }
+        if read.item_count == 0 {
+            return Ok(());
+        }
+        self.push("// ---- evaluations ----");
+        self.push("{");
+        self.push(format!(
+            "    if iszero(eq(proof_cptr, {})) {{ revert(0, 0) }}",
+            yul_hex(read.cptr_start)
+        ));
+        self.push(format!("    let eval_buf := {}", yul_hex(read.mptr_start)));
+        self.push(format!(
+            "    for {{ let end := {} }}",
+            yul_hex(read.cptr_end)
+        ));
+        self.push("        lt(proof_cptr, end)");
+        self.push("        {} {");
+        self.push("        let eval := calldataload(proof_cptr)");
+        self.push("        if iszero(lt(eval, r)) { revert(0, 0) }");
+        self.push("        mstore(eval_buf, eval)");
+        self.push("        eval_buf := add(eval_buf, 0x20)");
+        self.push("        buf_len := common_word(buf_len, eval)");
+        if self.trace {
+            self.push("        trace_u256(proof_eval_trace_id, eval)");
+            self.push("        proof_eval_trace_id := add(proof_eval_trace_id, 1)");
+        }
+        self.push("        proof_cptr := add(proof_cptr, 0x20)");
+        self.push("    }");
+        self.push("}");
+        Ok(())
+    }
+
+    fn render_batch_open_commitment(
+        &mut self,
+        kind: BatchOpenCommitmentKind,
+    ) -> Result<(), String> {
+        let (label, read) = match kind {
+            BatchOpenCommitmentKind::FCom => ("f_com", self.proof_reads.f_com),
+            BatchOpenCommitmentKind::Pi => ("pi", self.proof_reads.pi),
+        };
+        if read.item_count != 1 {
+            return Err(format!(
+                "batch-open commitment {label} must contain one G1, got {}",
+                read.item_count
+            ));
+        }
+        self.push(format!("// ---- {label} ----"));
+        self.push(format!(
+            "if iszero(eq(proof_cptr, {})) {{ revert(0, 0) }}",
+            yul_hex(read.cptr_start)
+        ));
+        self.push("buf_len := common_uncompressed_g1(buf_len, proof_cptr)");
+        self.push(format!(
+            "calldatacopy({}, proof_cptr, 0x80)",
+            yul_hex(read.mptr_start)
+        ));
+        if self.trace {
+            self.push(format!(
+                "trace_point(proof_commit_trace_id, {})",
+                yul_hex(read.mptr_start)
+            ));
+            self.push("proof_commit_trace_id := add(proof_commit_trace_id, 1)");
+        }
+        self.push(format!("proof_cptr := {}", yul_hex(read.cptr_end)));
+        Ok(())
+    }
+
+    fn render_q_evals(&mut self, count: usize) -> Result<(), String> {
+        let read = self.proof_reads.q_evals;
+        if count != read.item_count {
+            return Err(format!(
+                "transcript q_eval count mismatch: event={count}, read={}",
+                read.item_count
+            ));
+        }
+        if read.item_count == 0 {
+            return Ok(());
+        }
+        self.push("// ---- q_evals ----");
+        self.push(format!(
+            "if iszero(eq(proof_cptr, {})) {{ revert(0, 0) }}",
+            yul_hex(read.cptr_start)
+        ));
+        self.push("mstore(Q_EVAL_CPTR_MPTR, proof_cptr)");
+        self.push(format!("for {{ let end := {} }}", yul_hex(read.cptr_end)));
+        self.push("    lt(proof_cptr, end)");
+        self.push("    {} {");
+        self.push("    let eval := calldataload(proof_cptr)");
+        self.push("    if iszero(lt(eval, r)) { revert(0, 0) }");
+        self.push("    buf_len := common_word(buf_len, eval)");
+        if self.trace {
+            self.push("    trace_u256(proof_eval_trace_id, eval)");
+            self.push("    proof_eval_trace_id := add(proof_eval_trace_id, 1)");
+        }
+        self.push("    proof_cptr := add(proof_cptr, 0x20)");
+        self.push("}");
+        Ok(())
+    }
+
+    fn commitment_read(
+        &self,
+        section: TranscriptProofSection,
+    ) -> Result<(&'static str, ProofG1ReadRange, &'static str), String> {
+        Ok(match section {
+            TranscriptProofSection::AdvicePhase(phase) => {
+                let read = self
+                    .proof_reads
+                    .user_phase_advice
+                    .get(phase)
+                    .copied()
+                    .ok_or_else(|| format!("missing advice proof read for phase {phase}"))?;
+                ("user phase advice", read, "advice_walk")
+            }
+            TranscriptProofSection::LookupMultiplicity => (
+                "multiplicities",
+                self.proof_reads.lookup_multiplicities,
+                "lookup_m_walk",
+            ),
+            TranscriptProofSection::PermutationProduct => (
+                "permutation Z products",
+                self.proof_reads.permutation_products,
+                "perm_z_walk",
+            ),
+            TranscriptProofSection::LookupHelper { lookup } => {
+                let read = self
+                    .proof_reads
+                    .lookups
+                    .iter()
+                    .find(|read| read.lookup == lookup)
+                    .map(|read| read.helpers)
+                    .ok_or_else(|| {
+                        format!("missing lookup helper proof read for lookup {lookup}")
+                    })?;
+                ("lookup helpers", read, "lookup_helper_walk")
+            }
+            TranscriptProofSection::LookupAccumulator { lookup } => {
+                let read = self
+                    .proof_reads
+                    .lookups
+                    .iter()
+                    .find(|read| read.lookup == lookup)
+                    .map(|read| read.accumulator)
+                    .ok_or_else(|| {
+                        format!("missing lookup accumulator proof read for lookup {lookup}")
+                    })?;
+                ("lookup accumulator", read, "lookup_z_walk")
+            }
+            TranscriptProofSection::Trash => ("trashcans", self.proof_reads.trash, "trashcan_walk"),
+            TranscriptProofSection::QuotientLimb => (
+                "quotient limbs",
+                self.proof_reads.quotient_limbs,
+                "quotient_walk",
+            ),
+        })
+    }
+
+    fn gas_checkpoint(&mut self, id: usize, label: &str) {
+        if self.gas_checkpoints {
+            self.push(format!("gas_checkpoint({id}) // {label}"));
+        }
+    }
+
+    fn gas_checkpoint6(&mut self) {
+        if !self.checkpoint6_inserted {
+            self.gas_checkpoint(6, "after beta/gamma + permutation Z products");
+            self.checkpoint6_inserted = true;
+        }
+    }
+
+    fn push(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+}
+
+fn challenge_label(challenge: TranscriptChallenge) -> &'static str {
+    match challenge {
+        TranscriptChallenge::User { .. } => "user challenge",
+        TranscriptChallenge::Theta => "theta",
+        TranscriptChallenge::Beta => "beta",
+        TranscriptChallenge::Gamma => "gamma",
+        TranscriptChallenge::TrashChallenge => "trash_challenge",
+        TranscriptChallenge::Y => "y",
+        TranscriptChallenge::X => "x",
+        TranscriptChallenge::X1 => "x1",
+        TranscriptChallenge::X2 => "x2",
+        TranscriptChallenge::X3 => "x3",
+        TranscriptChallenge::X4 => "x4",
+    }
+}
+
+fn yul_hex(value: usize) -> String {
+    if value == 0 {
+        "0x00".to_string()
+    } else if value < 0x10 {
+        format!("0x0{value:x}")
+    } else {
+        format!("0x{value:x}")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierCodegenLayout {
     pub(crate) proof: ProofCalldataLayout,
@@ -535,6 +1035,7 @@ pub(crate) struct VerifierCodegenLayout {
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_header: VkHeaderTemplateSlots,
     pub(crate) transcript: TranscriptBufferLayout,
+    pub(crate) transcript_render: TranscriptRenderPlan,
     pub(crate) quotient_external: Option<QuotientExternal>,
 }
 
@@ -1131,6 +1632,29 @@ mod tests {
             ProofCalldataLayout::from_protocol(&protocol, proof_cptr, num_evals, num_point_sets);
         let proof_reads = super::VerifierProofReadPlan::from_layout(&proof_layout, &memory);
         let proof_len = proof_layout.proof_len;
+        let user_phases = vec![super::UserPhase {
+            num_advices: total_advices,
+            advice_bytes: proof_layout.advice_phases[0].byte_len,
+            advice_read: proof_reads.user_phase_advice[0],
+            num_challenges: 0,
+            challenge_offset: 0,
+        }];
+        let transcript_plan = crate::codegen::transcript_plan::TranscriptPlan::from_protocol(
+            &protocol,
+            &proof_layout,
+            1,
+        );
+        let transcript_render = super::TranscriptRenderPlan::from_plan(
+            &transcript_plan,
+            &proof_reads,
+            &user_phases,
+            false,
+            false,
+            crate::codegen::layout::trace::PROOF_COMMIT_BASE,
+            crate::codegen::layout::trace::PROOF_EVAL_BASE,
+            false,
+        )
+        .expect("synthetic transcript render plan");
 
         Halo2Verifier {
             template_constants: Default::default(),
@@ -1153,6 +1677,7 @@ mod tests {
                 memory: memory.clone(),
                 vk_header: Default::default(),
                 transcript: TranscriptBufferLayout::default(),
+                transcript_render,
                 quotient_external: None,
             },
             memory: memory.clone(),
@@ -1172,13 +1697,7 @@ mod tests {
             instance_cptr: proof_cptr + proof_len + WORD_BYTES,
             quotient_comm_cptr: Ptr::calldata(proof_layout.quotient_comm_cptr),
             num_neg_lagranges: 0,
-            user_phases: vec![super::UserPhase {
-                num_advices: total_advices,
-                advice_bytes: proof_layout.advice_phases[0].byte_len,
-                advice_read: proof_reads.user_phase_advice[0],
-                num_challenges: 0,
-                challenge_offset: 0,
-            }],
+            user_phases,
             num_user_challenges: 0,
             num_lookups,
             num_permutation_zs,
