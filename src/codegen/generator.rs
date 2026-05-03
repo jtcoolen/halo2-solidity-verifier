@@ -278,6 +278,58 @@ impl<'a> SolidityGenerator<'a> {
         Ok(verifier_output)
     }
 
+    pub(crate) fn debug_manifest(&self) -> CodegenManifest {
+        let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
+        let vk = self.generate_vk();
+        let vk_len = vk.len();
+        let vk_codehash = {
+            let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
+            U256::from_be_bytes(digest)
+        };
+        let (_vk_mptr, meta, data, memory) =
+            self.meta_data_for_stable_static_layout(&vk, proof_cptr);
+        let proof_layout = ProofCalldataLayout::from_protocol(
+            &meta.protocol,
+            proof_cptr.value().as_usize(),
+            meta.num_evals,
+            meta.num_point_sets,
+        );
+        let transcript_plan =
+            TranscriptPlan::from_protocol(&meta.protocol, &proof_layout, self.num_instances);
+        transcript_plan
+            .validate_against_layout(&meta.protocol, &proof_layout)
+            .unwrap_or_else(|err| panic!("invalid transcript/proof plan: {err}"));
+        let quotient_plan = self.quotient_program_plan(&meta, &data);
+        let quotient_build = self.build_quotient_program_items(
+            &quotient_plan.items,
+            quotient_plan.native_identities.len(),
+            quotient_plan.sorted_simple.len(),
+        );
+        let pcs_plan = PcsPlan::new(&meta, &data);
+        pcs_plan
+            .validate_against_memory(&pcs_plan.memory)
+            .unwrap_or_else(|err| panic!("invalid PCS plan: {err}"));
+
+        CodegenManifest::new(
+            &proof_layout,
+            vk_len,
+            &memory,
+            Some(&quotient_build),
+            &transcript_plan,
+            pcs_plan.memory,
+            ManifestFeatures::current(),
+            ManifestDependencyHashes::new(Some(vk_codehash), None),
+        )
+    }
+
+    /// Render a generated-code debug manifest as JSON.
+    ///
+    /// This helper is additive: it does not affect any Solidity rendering path
+    /// and is intended for tests, snapshots, and audit tooling.
+    pub fn render_manifest_json(&self) -> String {
+        self.debug_manifest().to_json_pretty()
+    }
+
     /// Render a trace-enabled `Halo2Verifier.sol` with verifying key embedded into writer.
     pub fn render_trace_into(
         &self,
@@ -902,7 +954,11 @@ impl<'a> SolidityGenerator<'a> {
         // deterministic for a fixed VK base and proof shape.
         let plan = self.quotient_program_plan(meta, data);
         let sorted_simple = plan.sorted_simple.clone();
-        let quotient_program_build = self.build_quotient_program_items(&plan.items);
+        let quotient_program_build = self.build_quotient_program_items(
+            &plan.items,
+            plan.native_identities.len(),
+            sorted_simple.len(),
+        );
         let _quotient_max_stack = quotient_program_build.max_stack;
         (quotient_program_build, sorted_simple)
     }
@@ -1084,6 +1140,24 @@ impl<'a> SolidityGenerator<'a> {
         let perm_items = evaluator.permutation_computations();
         let lookup_items = evaluator.lookup_computations();
         let trash_items = evaluator.trashcan_computations();
+        let perm_exprs = Self::permutation_quotient_exprs(meta, data);
+        let lookup_exprs = self.lookup_quotient_exprs(meta, data);
+        let trash_exprs = self.trash_quotient_exprs(meta, data);
+        assert_eq!(
+            perm_items.len(),
+            perm_exprs.len(),
+            "permutation Yul expressions and typed expressions must stay aligned"
+        );
+        assert_eq!(
+            lookup_items.len(),
+            lookup_exprs.len(),
+            "lookup Yul expressions and typed expressions must stay aligned"
+        );
+        assert_eq!(
+            trash_items.len(),
+            trash_exprs.len(),
+            "trash Yul expressions and typed expressions must stay aligned"
+        );
 
         let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         sorted_simple.sort_unstable();
@@ -1108,30 +1182,30 @@ impl<'a> SolidityGenerator<'a> {
             });
         }
         let mut permutation = Vec::with_capacity(perm_items.len());
-        for (lines, var) in perm_items {
+        for ((lines, var), expr) in perm_items.into_iter().zip(perm_exprs) {
             permutation.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
-                expr: None,
+                expr: Some(expr),
             });
         }
         let mut lookup = Vec::with_capacity(lookup_items.len());
-        for (lines, var) in lookup_items {
+        for ((lines, var), expr) in lookup_items.into_iter().zip(lookup_exprs) {
             lookup.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
-                expr: None,
+                expr: Some(expr),
             });
         }
         let mut trash = Vec::with_capacity(trash_items.len());
-        for (lines, var) in trash_items {
+        for ((lines, var), expr) in trash_items.into_iter().zip(trash_exprs) {
             trash.push(QuotientIdentity {
                 lines,
                 var,
                 target: QuotientTarget::Main,
-                expr: None,
+                expr: Some(expr),
             });
         }
 
@@ -1166,12 +1240,13 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn quotient_identity_expr(identity: &QuotientIdentity) -> QuotientExpr {
-        if let Some(expr) = &identity.expr {
-            return expr.clone();
-        }
-        Self::quotient_identity_yul_expr(identity)
+        identity
+            .expr
+            .clone()
+            .expect("quotient identity must have typed expression")
     }
 
+    #[allow(dead_code)]
     fn quotient_identity_yul_expr(identity: &QuotientIdentity) -> QuotientExpr {
         let mut parser = QuotientProgramBuilder::default();
         for line in &identity.lines {
@@ -1188,6 +1263,288 @@ impl<'a> SolidityGenerator<'a> {
         quotient_expr_from_expression(&DataQuotientExpressionEnv { meta, data }, expression)
     }
 
+    fn permutation_quotient_exprs(meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
+        if meta.num_permutation_zs == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let chunk_len = meta.permutation_chunk_len;
+        let columns = &meta.permutation_columns;
+        let z_evals = &data.permutation_z_evals;
+        let l0 = Self::q_mem_token(Q_MEM_L0);
+        let llast = Self::q_mem_token(Q_MEM_L_LAST);
+        let lblind = Self::q_mem_token(Q_MEM_L_BLIND);
+        let beta = Self::q_mem_token(Q_MEM_BETA);
+        let gamma = Self::q_mem_token(Q_MEM_GAMMA);
+        let x = Self::q_mem_token(Q_MEM_X);
+        let one = Self::q_one();
+
+        let z0 = Self::q_word(z_evals.first().expect("perm sets non-empty").0);
+        out.push(Self::q_mul(l0.clone(), Self::q_sub(one.clone(), z0)));
+
+        let zn = Self::q_word(z_evals.last().expect("perm sets non-empty").0);
+        out.push(Self::q_mul(
+            llast.clone(),
+            Self::q_sub(Self::q_mul(zn.clone(), zn.clone()), zn),
+        ));
+
+        for i in 1..meta.num_permutation_zs {
+            let zi = Self::q_word(z_evals[i].0);
+            let z_prev_last = Self::q_word(z_evals[i - 1].2.expect("non-last set has last eval"));
+            out.push(Self::q_mul(l0.clone(), Self::q_sub(zi, z_prev_last)));
+        }
+
+        let active = Self::q_sub(one.clone(), Self::q_add(llast, lblind));
+        let delta = fe_to_u256::<Fq>(&Fq::DELTA);
+        for (set_idx, ((z_cur, z_next, _), chunk_cols)) in
+            z_evals.iter().zip(columns.chunks(chunk_len)).enumerate()
+        {
+            let mut left = Self::q_word(*z_next);
+            for col in chunk_cols {
+                let col_eval = Self::q_eval_at(meta, data, col, 0);
+                let s_eval = Self::q_word(
+                    *data
+                        .permutation_evals
+                        .get(col)
+                        .expect("permutation eval present"),
+                );
+                let term = Self::q_add(
+                    Self::q_add(col_eval, Self::q_mul(beta.clone(), s_eval)),
+                    gamma.clone(),
+                );
+                left = Self::q_mul(left, term);
+            }
+
+            let initial_delta_power = Fq::DELTA.pow_vartime([(set_idx * chunk_len) as u64]);
+            let mut delta_pow = Self::q_mul(
+                Self::q_mul(beta.clone(), x.clone()),
+                Self::q_const(fe_to_u256::<Fq>(&initial_delta_power)),
+            );
+            let mut right = Self::q_word(*z_cur);
+            let last_col_idx = chunk_cols.len().saturating_sub(1);
+            for (col_pos, col) in chunk_cols.iter().enumerate() {
+                let col_eval = Self::q_eval_at(meta, data, col, 0);
+                let term = Self::q_add(Self::q_add(col_eval, delta_pow.clone()), gamma.clone());
+                right = Self::q_mul(right, term);
+                if col_pos != last_col_idx {
+                    delta_pow = Self::q_mul(delta_pow, Self::q_const(delta));
+                }
+            }
+
+            out.push(Self::q_mul(active.clone(), Self::q_sub(left, right)));
+        }
+
+        out
+    }
+
+    fn lookup_quotient_exprs(&self, meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
+        if meta.num_lookups == 0 {
+            return Vec::new();
+        }
+
+        let cs_degree = self.vk.cs().degree();
+        let mut out = Vec::new();
+        for (lookup_idx, lookup) in self.vk.cs().lookups().iter().enumerate() {
+            let chunked = lookup.chunk_by_degree(cs_degree);
+            let (m_eval, h_evals, z_eval, z_next_eval) = &data.lookup_evals[lookup_idx];
+
+            out.push(Self::q_mul(
+                Self::q_add(Self::q_mem_token(Q_MEM_L0), Self::q_mem_token(Q_MEM_L_LAST)),
+                Self::q_word(*z_eval),
+            ));
+
+            let beta = Self::q_mem_token(Q_MEM_BETA);
+            let theta = Self::q_mem_token(Q_MEM_THETA);
+            for (input_chunk, h_eval) in
+                chunked.input_expression_chunks().iter().zip(h_evals.iter())
+            {
+                let f_plus_beta = input_chunk
+                    .iter()
+                    .map(|parallel_input| {
+                        let compressed =
+                            Self::q_compress_expressions(meta, data, parallel_input, theta.clone());
+                        Self::q_add(compressed, beta.clone())
+                    })
+                    .collect::<Vec<_>>();
+
+                if f_plus_beta.is_empty() {
+                    out.push(Self::q_zero());
+                    continue;
+                }
+
+                let product = Self::q_product(f_plus_beta.iter().cloned());
+                let mut sum = Self::q_zero();
+                for skip in 0..f_plus_beta.len() {
+                    let partial = Self::q_product(
+                        f_plus_beta
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, expr)| (idx != skip).then_some(expr.clone())),
+                    );
+                    sum = Self::q_add(sum, partial);
+                }
+
+                out.push(Self::q_sub(
+                    Self::q_mul(Self::q_word(*h_eval), product),
+                    sum,
+                ));
+            }
+
+            let active = Self::q_sub(
+                Self::q_one(),
+                Self::q_add(
+                    Self::q_mem_token(Q_MEM_L_LAST),
+                    Self::q_mem_token(Q_MEM_L_BLIND),
+                ),
+            );
+            let sum_h = Self::q_sum(h_evals.iter().copied().map(Self::q_word));
+            let selector =
+                Self::quotient_expr_from_plonk_expr(meta, data, chunked.selector_expression());
+            let diff = Self::q_sub(
+                Self::q_sub(Self::q_word(*z_next_eval), Self::q_word(*z_eval)),
+                Self::q_mul(selector, sum_h),
+            );
+            let table = Self::q_compress_expressions(
+                meta,
+                data,
+                chunked.table_expressions(),
+                theta.clone(),
+            );
+            let core = Self::q_add(
+                Self::q_mul(diff, Self::q_add(table, beta)),
+                Self::q_word(*m_eval),
+            );
+            out.push(Self::q_mul(active, core));
+        }
+
+        out
+    }
+
+    fn trash_quotient_exprs(&self, meta: &ConstraintSystemMeta, data: &Data) -> Vec<QuotientExpr> {
+        if meta.num_trashcans == 0 {
+            return Vec::new();
+        }
+
+        self.vk
+            .cs()
+            .trashcans()
+            .iter()
+            .enumerate()
+            .map(|(idx, argument)| {
+                let compressed = Self::q_compress_expressions(
+                    meta,
+                    data,
+                    argument.constraint_expressions(),
+                    Self::q_mem_token(Q_MEM_TRASH_CHALLENGE),
+                );
+                let selector = Self::quotient_expr_from_plonk_expr(meta, data, argument.selector());
+                let scaled = Self::q_mul(
+                    Self::q_sub(Self::q_one(), selector),
+                    Self::q_word(data.trashcan_evals[idx]),
+                );
+                Self::q_sub(compressed, scaled)
+            })
+            .collect()
+    }
+
+    fn q_eval_at(
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        column: &Column<Any>,
+        rotation: i32,
+    ) -> QuotientExpr {
+        let col_idx = column.index();
+        match column.column_type() {
+            Any::Advice(_) => Self::q_word(
+                *data
+                    .advice_evals
+                    .get(&(col_idx, rotation))
+                    .expect("advice eval present in permutation chunk"),
+            ),
+            Any::Fixed => {
+                if meta.simple_selector_cols.contains(&col_idx) {
+                    Self::q_one()
+                } else {
+                    Self::q_word(
+                        *data
+                            .fixed_evals
+                            .get(&(col_idx, rotation))
+                            .expect("fixed eval present in permutation chunk"),
+                    )
+                }
+            }
+            Any::Instance => {
+                if col_idx < meta.num_committed_instances {
+                    Self::q_word(
+                        *data
+                            .committed_instance_evals
+                            .get(&(col_idx, rotation))
+                            .expect("committed instance eval present"),
+                    )
+                } else {
+                    Self::q_word(data.instance_eval)
+                }
+            }
+        }
+    }
+
+    fn q_compress_expressions(
+        meta: &ConstraintSystemMeta,
+        data: &Data,
+        expressions: &[Expression<Fq>],
+        challenge: QuotientExpr,
+    ) -> QuotientExpr {
+        expressions.iter().fold(Self::q_zero(), |acc, expr| {
+            let expr = Self::quotient_expr_from_plonk_expr(meta, data, expr);
+            Self::q_add(Self::q_mul(acc, challenge.clone()), expr)
+        })
+    }
+
+    fn q_sum(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
+        expressions.into_iter().fold(Self::q_zero(), Self::q_add)
+    }
+
+    fn q_product(expressions: impl IntoIterator<Item = QuotientExpr>) -> QuotientExpr {
+        expressions.into_iter().fold(Self::q_one(), Self::q_mul)
+    }
+
+    fn q_word(word: Word) -> QuotientExpr {
+        word_to_quotient_expr(word)
+    }
+
+    fn q_mem_token(token: u8) -> QuotientExpr {
+        QuotientExpr::Mem(QuotientMem::Token(token))
+    }
+
+    fn q_zero() -> QuotientExpr {
+        Self::q_const(U256::ZERO)
+    }
+
+    fn q_one() -> QuotientExpr {
+        Self::q_const(U256::from(1u64))
+    }
+
+    fn q_const(value: U256) -> QuotientExpr {
+        QuotientExpr::Const(value)
+    }
+
+    fn q_add(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Add(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn q_mul(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Mul(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn q_neg(expr: QuotientExpr) -> QuotientExpr {
+        QuotientExpr::Neg(Box::new(expr))
+    }
+
+    fn q_sub(lhs: QuotientExpr, rhs: QuotientExpr) -> QuotientExpr {
+        Self::q_add(lhs, Self::q_neg(rhs))
+    }
+
     fn inline_cse_quotient_computations(
         identities: &[QuotientIdentity],
         sorted_simple: &[usize],
@@ -1198,7 +1555,7 @@ impl<'a> SolidityGenerator<'a> {
         let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
         let exprs = identities
             .iter()
-            .map(Self::quotient_identity_yul_expr)
+            .map(Self::quotient_identity_expr)
             .collect::<Vec<_>>();
         let plan = QuotientInlineCsePlan::new(&exprs);
         let eval_scratch_slot = cse_mptr + plan.slots.len() * 0x20;
@@ -2475,7 +2832,11 @@ impl<'a> SolidityGenerator<'a> {
             "external quotient evaluator is only implemented for the compact VM quotient path"
         );
 
-        let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
+        let quotient_program_build = self.build_quotient_program_items(
+            &quotient_plan.items,
+            quotient_plan.native_identities.len(),
+            sorted_simple.len(),
+        );
         let native_permutation_scratch_words = quotient_plan
             .has_native_permutation
             .then(|| Self::structured_permutation_scratch_words(&meta))
@@ -2689,8 +3050,13 @@ impl<'a> SolidityGenerator<'a> {
             "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
         );
         let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
-        let quotient_program_build = (!(use_inline_cse || use_structured_loops))
-            .then(|| self.build_quotient_program_items(&quotient_plan.items));
+        let quotient_program_build = (!(use_inline_cse || use_structured_loops)).then(|| {
+            self.build_quotient_program_items(
+                &quotient_plan.items,
+                quotient_plan.native_identities.len(),
+                sorted_simple.len(),
+            )
+        });
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -2703,7 +3069,11 @@ impl<'a> SolidityGenerator<'a> {
                 fixed_scalar_count + 1
             })
             .unwrap_or(0);
-        let pcs_memory_requirements = pcs::memory_requirements(&meta, &data);
+        let pcs_plan = PcsPlan::new(&meta, &data);
+        let pcs_memory_requirements = pcs_plan.memory;
+        pcs_plan
+            .validate_against_memory(&pcs_memory_requirements)
+            .unwrap_or_else(|err| panic!("invalid PCS plan: {err}"));
         let quotient_cse_temps = quotient_program_build
             .as_ref()
             .map(|build| build.cse_temps + Self::QUOTIENT_STATE_WORDS)
@@ -2744,6 +3114,11 @@ impl<'a> SolidityGenerator<'a> {
             meta.num_evals,
             meta.num_point_sets,
         );
+        let transcript_plan =
+            TranscriptPlan::from_protocol(&meta.protocol, &proof_layout, self.num_instances);
+        transcript_plan
+            .validate_against_layout(&meta.protocol, &proof_layout)
+            .unwrap_or_else(|err| panic!("invalid transcript/proof plan: {err}"));
         let transcript_layout = Self::transcript_buffer_layout_for_meta(&meta, self.num_instances);
         let quotient_external = external_quotient.then(|| {
             Self::quotient_external_frame(vk_mptr, vk_len, &meta, &memory, sorted_simple.len())
@@ -3113,7 +3488,12 @@ impl<'a> SolidityGenerator<'a> {
         verifier
     }
 
-    fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
+    fn build_quotient_program_items(
+        &self,
+        items: &[QuotientProgramItem],
+        native_identity_count: usize,
+        selector_count: usize,
+    ) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         // Lower the logical plan into bytecode in one pass. CSE planning looks
         // at all interpreted identities first, but native callbacks remain
@@ -3149,7 +3529,10 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
 
-        builder.finish(quotient_program_encoding())
+        let build = builder.finish(quotient_program_encoding());
+        QuotientProgramValidator::validate(&build, native_identity_count, selector_count)
+            .unwrap_or_else(|err| panic!("invalid quotient VM program: {err}"));
+        build
     }
 
     /// Repack a midnight-proofs proof from the on-the-wire compressed

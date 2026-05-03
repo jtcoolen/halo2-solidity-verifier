@@ -993,6 +993,7 @@ impl QuotientProgramBuilder {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn assignment(&mut self, line: &str) {
         let assignment = yul_assignment(line)
             .unwrap_or_else(|| panic!("unsupported quotient assignment: {}", line.trim()));
@@ -1000,6 +1001,7 @@ impl QuotientProgramBuilder {
         self.vars.insert(assignment.dst, expr);
     }
 
+    #[allow(dead_code)]
     pub(super) fn parse_expr(&self, expr: &str) -> QuotientExpr {
         let expr = expr.trim();
         if let Some(args) = call_args(expr, "addmod") {
@@ -1752,6 +1754,470 @@ pub(super) fn read_u32(bytes: &[u8], idx: usize) -> u32 {
     )
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct QuotientProgramValidator;
+
+impl QuotientProgramValidator {
+    pub(super) fn validate(
+        build: &QuotientProgramBuild,
+        native_identity_count: usize,
+        selector_count: usize,
+    ) -> Result<(), String> {
+        let mut state = QuotientProgramValidationState::default();
+        if build.packed32 {
+            Self::validate_packed32(build, native_identity_count, selector_count, &mut state)?;
+        } else {
+            Self::validate_bytes(build, native_identity_count, selector_count, &mut state)?;
+        }
+        if state.stack_depth != 0 {
+            return Err(format!(
+                "quotient VM stack leak: final depth={}",
+                state.stack_depth
+            ));
+        }
+        if state.max_stack != build.max_stack {
+            return Err(format!(
+                "quotient VM max-stack mismatch: validated={} build={}",
+                state.max_stack, build.max_stack
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_bytes(
+        build: &QuotientProgramBuild,
+        native_identity_count: usize,
+        selector_count: usize,
+        state: &mut QuotientProgramValidationState,
+    ) -> Result<(), String> {
+        let bytes = build.bytes.as_slice();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let op = bytes[idx];
+            match op {
+                Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+                    let count = read_u16_checked(bytes, idx + 1, idx)? as usize;
+                    if count == 0 {
+                        return Err(format!("empty quotient VM run at byte {idx}"));
+                    }
+                    let len = 3 + count * 5;
+                    check_bounds(bytes, idx, len)?;
+                    for term in 0..count {
+                        let term_idx = idx + 3 + term * 5;
+                        let scalar = bytes[term_idx + 4] as usize;
+                        validate_const_index(build, scalar, term_idx + 4)?;
+                    }
+                    state.apply(op, idx, selector_count)?;
+                    idx += len;
+                }
+                Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+                    let count = read_u16_checked(bytes, idx + 1, idx)? as usize;
+                    if count == 0 {
+                        return Err(format!("empty quotient VM run at byte {idx}"));
+                    }
+                    let len = 3 + count * 3;
+                    check_bounds(bytes, idx, len)?;
+                    for term in 0..count {
+                        let term_idx = idx + 3 + term * 3;
+                        let scalar = bytes[term_idx + 2] as usize;
+                        validate_const_index(build, scalar, term_idx + 2)?;
+                    }
+                    state.apply(op, idx, selector_count)?;
+                    idx += len;
+                }
+                _ => {
+                    let spec = quotient_opcode_spec(op).ok_or_else(|| {
+                        format!("unknown quotient VM opcode {op:#x} at byte {idx}")
+                    })?;
+                    if spec.byte_len == 0 {
+                        return Err(format!(
+                            "opcode {} has dynamic length but no validator at byte {idx}",
+                            spec.name
+                        ));
+                    }
+                    check_bounds(bytes, idx, spec.byte_len)?;
+                    Self::validate_byte_operands(
+                        build,
+                        op,
+                        idx,
+                        native_identity_count,
+                        selector_count,
+                    )?;
+                    state.apply(op, idx, selector_count)?;
+                    idx += spec.byte_len;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_byte_operands(
+        build: &QuotientProgramBuild,
+        op: u8,
+        idx: usize,
+        native_identity_count: usize,
+        selector_count: usize,
+    ) -> Result<(), String> {
+        let bytes = build.bytes.as_slice();
+        match op {
+            Q_OP_PUSH_CONST | Q_OP_ADD_CONST | Q_OP_MUL_CONST => {
+                validate_const_index(build, read_u16_checked(bytes, idx + 1, idx)? as usize, idx)
+            }
+            Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => {
+                validate_const_index(build, bytes[idx + 1] as usize, idx)
+            }
+            Q_OP_FOLD_SELECTOR => {
+                let selector = read_u16_checked(bytes, idx + 1, idx)? as usize;
+                if selector >= selector_count {
+                    return Err(format!(
+                        "quotient VM selector index {selector} out of range {selector_count} at byte {idx}"
+                    ));
+                }
+                Ok(())
+            }
+            Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP => {
+                validate_temp_index(build, read_u16_checked(bytes, idx + 1, idx)? as usize, idx)
+            }
+            Q_OP_NATIVE_IDENTITY => {
+                let native = read_u16_checked(bytes, idx + 1, idx)? as usize;
+                if native >= native_identity_count {
+                    return Err(format!(
+                        "quotient VM native identity index {native} out of range {native_identity_count} at byte {idx}"
+                    ));
+                }
+                Ok(())
+            }
+            Q_OP_PUSH_MEM_TOKEN => validate_mem_token(bytes[idx + 1], idx),
+            Q_OP_PUSH_MEM_TOKEN_OFFSET => validate_mem_token(bytes[idx + 1], idx),
+            Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => {
+                validate_const_index(build, bytes[idx + 5] as usize, idx)
+            }
+            Q_OP_ADD_MUL_CONST_U8_MEM_U16 => {
+                validate_const_index(build, bytes[idx + 3] as usize, idx)
+            }
+            Q_OP_LIN7 => {
+                for limb in 0..QUOTIENT_VM_LIMBS {
+                    validate_const_index(build, bytes[idx + 1 + limb * 3] as usize, idx)?;
+                }
+                Ok(())
+            }
+            Q_OP_BILIN7_ROW => {
+                let coeff_base = idx + 1 + QUOTIENT_VM_BYTE_U16_BYTES;
+                for limb in 0..QUOTIENT_VM_LIMBS {
+                    validate_const_index(build, bytes[coeff_base + limb * 3] as usize, idx)?;
+                }
+                Ok(())
+            }
+            Q_OP_BILIN7_PAIRWISE => {
+                let coeff_base = idx + 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES;
+                for coeff in 0..QUOTIENT_VM_PAIRWISE_COEFFS {
+                    validate_const_index(build, bytes[coeff_base + coeff] as usize, idx)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_packed32(
+        build: &QuotientProgramBuild,
+        native_identity_count: usize,
+        selector_count: usize,
+        state: &mut QuotientProgramValidationState,
+    ) -> Result<(), String> {
+        if build.bytes.len() % QUOTIENT_VM_PACKED_INSTRUCTION_BYTES != 0 {
+            return Err(format!(
+                "packed quotient VM bytecode length {} is not 4-byte aligned",
+                build.bytes.len()
+            ));
+        }
+        let mut idx = 0usize;
+        while idx < build.bytes.len() {
+            let word = read_u32_checked(&build.bytes, idx, idx)?;
+            let op = (word >> 24) as u8;
+            let arg = word & QUOTIENT_VM_PACKED_ARG_MASK;
+            let spec = quotient_opcode_spec(op).ok_or_else(|| {
+                format!("unknown packed quotient VM opcode {op:#x} at byte {idx}")
+            })?;
+            if !spec.packed32 {
+                return Err(format!(
+                    "opcode {} is not valid in packed32 quotient VM at byte {idx}",
+                    spec.name
+                ));
+            }
+
+            match op {
+                Q_OP_PUSH_CONST | Q_OP_ADD_CONST | Q_OP_MUL_CONST => {
+                    validate_const_index(build, arg as usize, idx)?;
+                }
+                Q_OP_PUSH_CONST_U8 | Q_OP_ADD_CONST_U8 | Q_OP_MUL_CONST_U8 => {
+                    validate_const_index(build, arg as usize, idx)?;
+                }
+                Q_OP_FOLD_SELECTOR => {
+                    let selector = arg as usize;
+                    if selector >= selector_count {
+                        return Err(format!(
+                            "packed quotient VM selector index {selector} out of range {selector_count} at byte {idx}"
+                        ));
+                    }
+                }
+                Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP => {
+                    validate_temp_index(build, arg as usize, idx)?;
+                }
+                Q_OP_NATIVE_IDENTITY => {
+                    let native = arg as usize;
+                    if native >= native_identity_count {
+                        return Err(format!(
+                            "packed quotient VM native identity index {native} out of range {native_identity_count} at byte {idx}"
+                        ));
+                    }
+                }
+                Q_OP_PUSH_MEM_TOKEN => validate_mem_token(arg as u8, idx)?,
+                Q_OP_PUSH_MEM_TOKEN_OFFSET => validate_mem_token((arg >> 16) as u8, idx)?,
+                Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => {
+                    validate_const_index(build, arg as usize, idx)?;
+                    check_bounds(&build.bytes, idx, 2 * QUOTIENT_VM_PACKED_INSTRUCTION_BYTES)?;
+                    idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+                }
+                Q_OP_ADD_MUL_CONST_U8_MEM_U16 => {
+                    validate_const_index(build, (arg >> 16) as usize, idx)?;
+                }
+                Q_OP_ADD_MUL_MEM_MEM => {
+                    check_bounds(&build.bytes, idx, 2 * QUOTIENT_VM_PACKED_INSTRUCTION_BYTES)?;
+                    idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+                }
+                _ => {}
+            }
+            state.apply(op, idx, selector_count)?;
+            idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QuotientProgramValidationState {
+    stack_depth: usize,
+    max_stack: usize,
+}
+
+impl QuotientProgramValidationState {
+    fn apply(&mut self, op: u8, idx: usize, selector_count: usize) -> Result<(), String> {
+        match op {
+            Q_OP_PUSH_CONST
+            | Q_OP_PUSH_MEM_LITERAL
+            | Q_OP_PUSH_MEM_TOKEN
+            | Q_OP_PUSH_MEM_TOKEN_OFFSET
+            | Q_OP_PUSH_MEM_U16
+            | Q_OP_PUSH_CONST_U8
+            | Q_OP_PUSH_TEMP
+            | Q_OP_LIN7
+            | Q_OP_BILIN7_ROW
+            | Q_OP_BILIN7_PAIRWISE => {
+                self.stack_depth += 1;
+                self.max_stack = self.max_stack.max(self.stack_depth);
+            }
+            Q_OP_ADD | Q_OP_MUL => {
+                if self.stack_depth < 2 {
+                    return Err(format!(
+                        "quotient VM stack underflow at byte {idx}: binary op with depth {}",
+                        self.stack_depth
+                    ));
+                }
+                self.stack_depth -= 1;
+            }
+            Q_OP_NEG
+            | Q_OP_ADD_CONST_U8
+            | Q_OP_MUL_CONST_U8
+            | Q_OP_ADD_CONST
+            | Q_OP_MUL_CONST
+            | Q_OP_ADD_MEM_U16
+            | Q_OP_MUL_MEM_U16
+            | Q_OP_ADD_MUL_MEM_MEM_CONST_U8
+            | Q_OP_ADD_MUL_CONST_U8_MEM_U16
+            | Q_OP_ADD_MUL_MEM_MEM
+            | Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8
+            | Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16
+            | Q_OP_STORE_TEMP => {
+                if self.stack_depth == 0 {
+                    return Err(format!(
+                        "quotient VM stack underflow at byte {idx}: op requires a top value"
+                    ));
+                }
+            }
+            Q_OP_FOLD_MAIN | Q_OP_FOLD_SELECTOR => {
+                if self.stack_depth != 1 {
+                    return Err(format!(
+                        "quotient VM fold at byte {idx} expects depth 1, got {}",
+                        self.stack_depth
+                    ));
+                }
+                if matches!(op, Q_OP_FOLD_SELECTOR) && selector_count == 0 {
+                    return Err(format!(
+                        "quotient VM selector fold at byte {idx} but no selectors are planned"
+                    ));
+                }
+                self.stack_depth = 0;
+            }
+            Q_OP_NATIVE_PERMUTATION | Q_OP_NATIVE_IDENTITY => {
+                if self.stack_depth != 0 {
+                    return Err(format!(
+                        "quotient VM native callback at byte {idx} expects empty stack, got {}",
+                        self.stack_depth
+                    ));
+                }
+            }
+            _ => return Err(format!("unknown quotient VM opcode {op:#x} at byte {idx}")),
+        }
+        Ok(())
+    }
+}
+
+fn check_bounds(bytes: &[u8], idx: usize, len: usize) -> Result<(), String> {
+    if idx + len > bytes.len() {
+        return Err(format!(
+            "truncated quotient VM instruction at byte {idx}: len={len} remaining={}",
+            bytes.len().saturating_sub(idx)
+        ));
+    }
+    Ok(())
+}
+
+fn read_u16_checked(bytes: &[u8], idx: usize, op_idx: usize) -> Result<u16, String> {
+    check_bounds(bytes, idx, QUOTIENT_VM_BYTE_U16_BYTES).map_err(|err| {
+        format!("truncated quotient VM u16 operand for instruction at byte {op_idx}: {err}")
+    })?;
+    Ok(u16::from_be_bytes(
+        bytes[idx..idx + QUOTIENT_VM_BYTE_U16_BYTES]
+            .try_into()
+            .expect("bounds checked"),
+    ))
+}
+
+fn read_u32_checked(bytes: &[u8], idx: usize, op_idx: usize) -> Result<u32, String> {
+    check_bounds(bytes, idx, QUOTIENT_VM_BYTE_U32_BYTES).map_err(|err| {
+        format!("truncated quotient VM u32 operand for instruction at byte {op_idx}: {err}")
+    })?;
+    Ok(u32::from_be_bytes(
+        bytes[idx..idx + QUOTIENT_VM_BYTE_U32_BYTES]
+            .try_into()
+            .expect("bounds checked"),
+    ))
+}
+
+fn validate_const_index(
+    build: &QuotientProgramBuild,
+    index: usize,
+    idx: usize,
+) -> Result<(), String> {
+    if index >= build.consts.len() {
+        return Err(format!(
+            "quotient VM const index {index} out of range {} at byte {idx}",
+            build.consts.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_temp_index(
+    build: &QuotientProgramBuild,
+    index: usize,
+    idx: usize,
+) -> Result<(), String> {
+    if index >= build.cse_temps {
+        return Err(format!(
+            "quotient VM temp index {index} out of range {} at byte {idx}",
+            build.cse_temps
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mem_token(token: u8, idx: usize) -> Result<(), String> {
+    if !QUOTIENT_MEM_TOKEN_TABLE
+        .iter()
+        .any(|spec| spec.token == token)
+    {
+        return Err(format!(
+            "quotient VM memory token {token:#x} is unknown at byte {idx}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+
+    fn build(
+        bytes: Vec<u8>,
+        const_count: usize,
+        max_stack: usize,
+        cse_temps: usize,
+    ) -> QuotientProgramBuild {
+        QuotientProgramBuild {
+            bytes,
+            consts: vec![U256::ZERO; const_count],
+            max_stack,
+            packed32: false,
+            cse_temps,
+        }
+    }
+
+    #[test]
+    fn quotient_vm_validator_accepts_minimal_identity() {
+        let build = build(vec![Q_OP_PUSH_CONST_U8, 0, Q_OP_FOLD_MAIN], 1, 1, 0);
+        assert!(QuotientProgramValidator::validate(&build, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn quotient_vm_validator_rejects_unknown_opcode() {
+        let build = build(vec![0xff], 0, 0, 0);
+        assert!(QuotientProgramValidator::validate(&build, 0, 0)
+            .unwrap_err()
+            .contains("unknown"));
+    }
+
+    #[test]
+    fn quotient_vm_validator_rejects_stack_underflow() {
+        let build = build(vec![Q_OP_ADD], 0, 0, 0);
+        assert!(QuotientProgramValidator::validate(&build, 0, 0)
+            .unwrap_err()
+            .contains("underflow"));
+    }
+
+    #[test]
+    fn quotient_vm_validator_rejects_invalid_const_and_temp_indices() {
+        let invalid_const = build(vec![Q_OP_PUSH_CONST_U8, 1, Q_OP_FOLD_MAIN], 1, 1, 0);
+        assert!(QuotientProgramValidator::validate(&invalid_const, 0, 0)
+            .unwrap_err()
+            .contains("const index"));
+
+        let invalid_temp = build(vec![Q_OP_PUSH_TEMP, 0, 0, Q_OP_FOLD_MAIN], 0, 1, 0);
+        assert!(QuotientProgramValidator::validate(&invalid_temp, 0, 0)
+            .unwrap_err()
+            .contains("temp index"));
+    }
+
+    #[test]
+    fn quotient_vm_validator_rejects_invalid_selector_and_native_indices() {
+        let invalid_selector = build(
+            vec![Q_OP_PUSH_CONST_U8, 0, Q_OP_FOLD_SELECTOR, 0, 0],
+            1,
+            1,
+            0,
+        );
+        assert!(QuotientProgramValidator::validate(&invalid_selector, 0, 0)
+            .unwrap_err()
+            .contains("selector"));
+
+        let invalid_native = build(vec![Q_OP_NATIVE_IDENTITY, 0, 0], 0, 0, 0);
+        assert!(QuotientProgramValidator::validate(&invalid_native, 0, 0)
+            .unwrap_err()
+            .contains("native identity"));
+    }
+}
+
 pub(super) fn hybrid_quotient_inline_count(identities: &[QuotientIdentity]) -> usize {
     identities
         .len()
@@ -2387,6 +2853,7 @@ pub(super) fn quotient_fq_to_u256(value: Fq) -> U256 {
     fe_to_u256::<Fq>(&value)
 }
 
+#[allow(dead_code)]
 pub(super) fn parse_mem(ptr: &str) -> QuotientMem {
     let ptr = ptr.trim();
     if let Some(value) = parse_u32_literal(ptr) {
@@ -2437,6 +2904,7 @@ pub(super) fn fr_delta_literal() -> String {
     u256_string(fe_to_u256::<Fq>(&Fq::DELTA))
 }
 
+#[allow(dead_code)]
 pub(super) fn parse_u32_literal(value: &str) -> Option<u32> {
     if !is_literal(value) {
         return None;
@@ -2453,6 +2921,7 @@ pub(super) fn parse_usize_literal(value: &str) -> Option<usize> {
     parsed.try_into().ok()
 }
 
+#[allow(dead_code)]
 pub(super) fn mem_token(name: &str) -> Option<u8> {
     quotient_mem_token_from_name(name)
 }

@@ -22,7 +22,7 @@ use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
 use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, G2Affine};
 use midnight_proofs::{
-    plonk::{Expression, Selector, VerifyingKey},
+    plonk::{Any, Column, Expression, Selector, VerifyingKey},
     poly::{
         kzg::{params::ParamsKZG, KZGCommitmentScheme},
         Rotation,
@@ -40,18 +40,25 @@ mod config;
 mod evaluator;
 mod generator;
 mod layout;
+mod manifest;
 mod memory;
 mod pcs;
+mod pcs_plan;
 mod proof_layout;
 mod protocol;
 mod quotient;
 mod template;
+mod transcript_plan;
+mod types;
 pub(crate) mod util;
 
 use config::*;
+use manifest::*;
+use pcs_plan::PcsPlan;
 #[cfg(test)]
 pub(crate) use quotient::RepackedProofScalarLayout;
 use quotient::*;
+use transcript_plan::TranscriptPlan;
 
 /// Solidity verifier generator for midnight-proofs (logup + trash + KZG
 /// multi-prepare PCS) on BLS12-381 EIP-2537.

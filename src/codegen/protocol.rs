@@ -325,12 +325,16 @@ impl ProtocolPlan {
         // Hash the prover's advice commitments into the transcript by phase,
         // squeezing the phase challenge before the next phase's commitments
         // are read (`parse_trace`).
-        proof.commitments.extend(
-            advice_indices
-                .iter()
-                .copied()
-                .map(|column| CommitmentRead::Advice { column }),
-        );
+        let advice_phases = cs.advice_column_phase();
+        for current_phase in 0..num_phase {
+            proof.commitments.extend(
+                advice_phases
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, phase)| **phase as usize == current_phase)
+                    .map(|(column, _)| CommitmentRead::Advice { column }),
+            );
+        }
         // Lookup commitments follow the Rust verifier order: one LogUp
         // multiplicity commitment per lookup, then each chunk helper and
         // accumulator commitment after permutation products are bound.
@@ -611,6 +615,12 @@ impl ProtocolPlan {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.rotation_last >= 0 || self.rotation_last.unsigned_abs() < 2 {
+            return Err(format!(
+                "unsupported Lagrange window: rotation_last={} must be at most -2",
+                self.rotation_last
+            ));
+        }
         if self.num_simple_selectors != self.simple_selector_cols.len() {
             return Err(format!(
                 "simple selector count mismatch: count={} cols={}",
@@ -841,7 +851,7 @@ impl ProtocolPlan {
 mod tests {
     use super::*;
     use midnight_proofs::{
-        plonk::{Constraints, FirstPhase},
+        plonk::{Constraints, FirstPhase, SecondPhase},
         poly::Rotation,
     };
     use proptest::prelude::*;
@@ -948,6 +958,35 @@ mod tests {
             .pcs_queries
             .iter()
             .any(|query| matches!(query, PcsQuerySource::CommittedInstance(_))));
+    }
+
+    #[test]
+    fn plan_distinguishes_original_and_phase_sorted_advice_columns() {
+        let mut cs = ConstraintSystem::default();
+        let a0 = cs.advice_column();
+        let a1 = cs.advice_column_in(SecondPhase);
+        let a2 = cs.advice_column_in(SecondPhase);
+        let a3 = cs.advice_column();
+        cs.create_gate("mixed phases", |meta| {
+            let a0 = meta.query_advice(a0, Rotation::cur());
+            let a1 = meta.query_advice(a1, Rotation::cur());
+            let a2 = meta.query_advice(a2, Rotation::cur());
+            let a3 = meta.query_advice(a3, Rotation::cur());
+            Constraints::without_selector(vec![("mixed", a0 + a1 + a2 + a3)])
+        });
+
+        let plan = ProtocolPlan::from_constraint_system(&cs, 0);
+        assert_eq!(plan.num_user_advices, vec![2, 2]);
+        assert_eq!(plan.advice_indices, vec![0, 2, 3, 1]);
+        assert_eq!(
+            &plan.proof.commitments[..4],
+            &[
+                CommitmentRead::Advice { column: 0 },
+                CommitmentRead::Advice { column: 3 },
+                CommitmentRead::Advice { column: 1 },
+                CommitmentRead::Advice { column: 2 },
+            ]
+        );
     }
 
     #[test]
