@@ -1094,17 +1094,17 @@ contract Halo2Verifier {
 
             {%- for phase in user_phases %}
             // ---- User phase {{ loop.index }} ----
-            for { let end := add(proof_cptr, {{ (phase.num_advices * 128)|hex() }}) }
+            for { let end := add(proof_cptr, {{ phase.advice_bytes|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(advice_walk, proof_cptr, 0x80)
+                calldatacopy(advice_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, advice_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                advice_walk := add(advice_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                advice_walk := add(advice_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
             {%- for j in 0..phase.num_challenges %}
             buf_len := squeeze_to(buf_len, add(CHALLENGE_MPTR, {{ ((phase.challenge_offset + j) * 32)|hex() }}))
@@ -1121,17 +1121,17 @@ contract Halo2Verifier {
             {%- if num_lookups != 0 %}
             // ---- multiplicities (one G1 per lookup) ----
             let lookup_m_walk := LOOKUP_M_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_lookups * 128)|hex() }}) }
+            for { let end := add(proof_cptr, {{ codegen_layout.proof.lookup_multiplicities.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(lookup_m_walk, proof_cptr, 0x80)
+                calldatacopy(lookup_m_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, lookup_m_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                lookup_m_walk := add(lookup_m_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                lookup_m_walk := add(lookup_m_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
             {%- endif %}
 
@@ -1146,17 +1146,17 @@ contract Halo2Verifier {
             {%- if num_permutation_zs != 0 %}
             // ---- permutation Z products ----
             let perm_z_walk := PERM_Z_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_permutation_zs * 128)|hex() }}) }
+            for { let end := add(proof_cptr, {{ codegen_layout.proof.permutation_products.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(perm_z_walk, proof_cptr, 0x80)
+                calldatacopy(perm_z_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, perm_z_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                perm_z_walk := add(perm_z_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                perm_z_walk := add(perm_z_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
             {%- endif %}
 
@@ -1168,28 +1168,28 @@ contract Halo2Verifier {
             // ---- lookup helpers + accumulators (per-lookup) ----
             let lookup_helper_walk := LOOKUP_HELPER_COMMS_MPTR_BASE
             let lookup_z_walk := LOOKUP_Z_COMMS_MPTR_BASE
-            {%- for chunks in lookup_chunks %}
-            // lookup {{ loop.index0 }}: {{ chunks }} helper(s) + 1 acc
-            for { let end := add(proof_cptr, {{ (chunks * 128)|hex() }}) }
+            {%- for lookup in codegen_layout.proof.lookups %}
+            // lookup {{ loop.index0 }}: {{ lookup.helpers.item_count }} helper(s) + 1 acc
+            for { let end := add(proof_cptr, {{ lookup.helpers.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(lookup_helper_walk, proof_cptr, 0x80)
+                calldatacopy(lookup_helper_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, lookup_helper_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                lookup_helper_walk := add(lookup_helper_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                lookup_helper_walk := add(lookup_helper_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-            calldatacopy(lookup_z_walk, proof_cptr, 0x80)
+            calldatacopy(lookup_z_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
             trace_point(proof_commit_trace_id, lookup_z_walk)
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            lookup_z_walk := add(lookup_z_walk, 0x80)
-            proof_cptr := add(proof_cptr, 0x80)
+            lookup_z_walk := add(lookup_z_walk, {{ template_constants.g1_bytes|hex() }})
+            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- endfor %}
             {%- endif %}
 
@@ -1204,17 +1204,17 @@ contract Halo2Verifier {
             {%- if num_trashcans != 0 %}
             // ---- trashcans ----
             let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_trashcans * 128)|hex() }}) }
+            for { let end := add(proof_cptr, {{ codegen_layout.proof.trash.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(trashcan_walk, proof_cptr, 0x80)
+                calldatacopy(trashcan_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, trashcan_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                trashcan_walk := add(trashcan_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                trashcan_walk := add(trashcan_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
             {%- endif %}
 
@@ -1231,17 +1231,17 @@ contract Halo2Verifier {
             // them back from memory. common_uncompressed_g1 absorbs the
             // 128-byte calldata form into the transcript verbatim.
             let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ (num_quotients * 128)|hex() }}) }
+            for { let end := add(proof_cptr, {{ codegen_layout.proof.quotient_limbs.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-                calldatacopy(quotient_walk, proof_cptr, 0x80)
+                calldatacopy(quotient_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
                 {%- if self.trace %}
                 trace_point(proof_commit_trace_id, quotient_walk)
                 proof_commit_trace_id := add(proof_commit_trace_id, 1)
                 {%- endif %}
-                quotient_walk := add(quotient_walk, 0x80)
-                proof_cptr := add(proof_cptr, 0x80)
+                quotient_walk := add(quotient_walk, {{ template_constants.g1_bytes|hex() }})
+                proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
 
             {%- if self.gas_checkpoints %}
@@ -1258,19 +1258,19 @@ contract Halo2Verifier {
             // it, so downstream references can use cheap mload.
             {
                 let eval_buf := REVERSED_EVALS_MPTR
-                for { let end := add(proof_cptr, {{ (num_evals * 32)|hex() }}) }
+                for { let end := add(proof_cptr, {{ codegen_layout.proof.evals.byte_len|hex() }}) }
                     lt(proof_cptr, end)
                     {} {
                     let eval := calldataload(proof_cptr)
                     if iszero(lt(eval, r)) { revert(0, 0) }
                     mstore(eval_buf, eval)
-                    eval_buf := add(eval_buf, 0x20)
+                    eval_buf := add(eval_buf, {{ template_constants.word_bytes|hex() }})
                     buf_len := common_word(buf_len, eval)
                     {%- if self.trace %}
                     trace_u256(proof_eval_trace_id, eval)
                     proof_eval_trace_id := add(proof_eval_trace_id, 1)
                     {%- endif %}
-                    proof_cptr := add(proof_cptr, 0x20)
+                    proof_cptr := add(proof_cptr, {{ template_constants.word_bytes|hex() }})
                 }
             }
 
@@ -1280,12 +1280,12 @@ contract Halo2Verifier {
 
             // ---- f_com (1 uncompressed G1) ----
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-            calldatacopy(F_COM_MPTR, proof_cptr, 0x80)
+            calldatacopy(F_COM_MPTR, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
             trace_point(proof_commit_trace_id, F_COM_MPTR)
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            proof_cptr := add(proof_cptr, 0x80)
+            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
 
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
@@ -1304,7 +1304,7 @@ contract Halo2Verifier {
 
             // ---- q_evals (one Fq per point set) ----
             mstore(Q_EVAL_CPTR_MPTR, proof_cptr)
-            for { let end := add(proof_cptr, {{ (num_point_sets * 32)|hex() }}) }
+            for { let end := add(proof_cptr, {{ codegen_layout.proof.q_evals.byte_len|hex() }}) }
                 lt(proof_cptr, end)
                 {} {
                 let eval := calldataload(proof_cptr)
@@ -1314,7 +1314,7 @@ contract Halo2Verifier {
                 trace_u256(proof_eval_trace_id, eval)
                 proof_eval_trace_id := add(proof_eval_trace_id, 1)
                 {%- endif %}
-                proof_cptr := add(proof_cptr, 0x20)
+                proof_cptr := add(proof_cptr, {{ template_constants.word_bytes|hex() }})
             }
 
             // ---- x4 ----
@@ -1322,12 +1322,12 @@ contract Halo2Verifier {
 
             // ---- pi (1 uncompressed G1) ----
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-            calldatacopy(PI_MPTR, proof_cptr, 0x80)
+            calldatacopy(PI_MPTR, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
             trace_point(proof_commit_trace_id, PI_MPTR)
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            proof_cptr := add(proof_cptr, 0x80)
+            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
 
             // The hand-rolled proof parser must consume exactly the ABI
             // `proof` bytes before the `instances` length word. This is

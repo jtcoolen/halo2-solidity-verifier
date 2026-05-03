@@ -44,15 +44,13 @@ pub(crate) struct RepackedProofLayoutPlan {
 }
 
 impl RepackedProofLayoutPlan {
-    pub(crate) fn from_protocol(
-        protocol: &crate::codegen::protocol::ProtocolPlan,
-        num_evals: usize,
-        num_point_sets: usize,
+    pub(crate) fn from_proof_layout(
+        layout: &crate::codegen::proof_layout::ProofCalldataLayout,
     ) -> Self {
         Self {
-            g1_groups: protocol.commitment_read_groups(),
-            num_evals,
-            num_point_sets,
+            g1_groups: layout.commitment_read_groups(),
+            num_evals: layout.evals.item_count,
+            num_point_sets: layout.q_evals.item_count,
         }
     }
 

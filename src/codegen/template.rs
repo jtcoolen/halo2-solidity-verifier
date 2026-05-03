@@ -4,6 +4,7 @@ use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
     layout,
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
+    proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -367,10 +368,20 @@ impl Halo2VerifyingKey {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UserPhase {
     pub(crate) num_advices: usize,
+    pub(crate) advice_bytes: usize,
     pub(crate) num_challenges: usize,
     /// Starting offset (in 32-byte words) into the CHALLENGE_MPTR area
     /// where this phase's challenges should be written.
     pub(crate) challenge_offset: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifierCodegenLayout {
+    pub(crate) proof: ProofCalldataLayout,
+    pub(crate) memory: VerifierMemoryLayout,
+    pub(crate) vk_header: VkHeaderTemplateSlots,
+    pub(crate) transcript: TranscriptBufferLayout,
+    pub(crate) quotient_external: Option<QuotientExternal>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -393,23 +404,23 @@ pub(crate) struct VkHeaderTemplateSlots {
 
 impl Default for VkHeaderTemplateSlots {
     fn default() -> Self {
-        use crate::codegen::layout::VkHeaderSlot as Slot;
+        use crate::codegen::layout::{VkHeaderLayout, VkHeaderSlot as Slot};
 
         Self {
-            vk_digest: Slot::VkDigest.word(),
-            num_instances: Slot::NumInstances.word(),
-            k: Slot::K.word(),
-            n_inv: Slot::NInv.word(),
-            omega: Slot::Omega.word(),
-            omega_inv: Slot::OmegaInv.word(),
-            omega_inv_to_l: Slot::OmegaInvToL.word(),
-            has_accumulator: Slot::HasAccumulator.word(),
-            acc_offset: Slot::AccOffset.word(),
-            num_acc_limbs: Slot::NumAccLimbs.word(),
-            num_acc_limb_bits: Slot::NumAccLimbBits.word(),
-            g1_base: Slot::G1Base.word(),
-            g2_base: Slot::G2Base.word(),
-            neg_s_g2_base: Slot::NegSG2Base.word(),
+            vk_digest: VkHeaderLayout::field(Slot::VkDigest).slot.word(),
+            num_instances: VkHeaderLayout::field(Slot::NumInstances).slot.word(),
+            k: VkHeaderLayout::field(Slot::K).slot.word(),
+            n_inv: VkHeaderLayout::field(Slot::NInv).slot.word(),
+            omega: VkHeaderLayout::field(Slot::Omega).slot.word(),
+            omega_inv: VkHeaderLayout::field(Slot::OmegaInv).slot.word(),
+            omega_inv_to_l: VkHeaderLayout::field(Slot::OmegaInvToL).slot.word(),
+            has_accumulator: VkHeaderLayout::field(Slot::HasAccumulator).slot.word(),
+            acc_offset: VkHeaderLayout::field(Slot::AccOffset).slot.word(),
+            num_acc_limbs: VkHeaderLayout::field(Slot::NumAccLimbs).slot.word(),
+            num_acc_limb_bits: VkHeaderLayout::field(Slot::NumAccLimbBits).slot.word(),
+            g1_base: VkHeaderLayout::field(Slot::G1Base).slot.word(),
+            g2_base: VkHeaderLayout::field(Slot::G2Base).slot.word(),
+            neg_s_g2_base: VkHeaderLayout::field(Slot::NegSG2Base).slot.word(),
         }
     }
 }
@@ -433,6 +444,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
     pub(crate) proof_len: usize,
+    pub(crate) codegen_layout: VerifierCodegenLayout,
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_header: VkHeaderTemplateSlots,
     pub(crate) vk_mptr: Ptr,
@@ -661,10 +673,23 @@ impl Halo2Verifier {
         self.memory.validate()?;
 
         let proof_cptr = self.proof_cptr.value().as_usize();
-        if proof_cptr + self.proof_len != self.num_instance_cptr {
+        let proof_layout = &self.codegen_layout.proof;
+        if proof_layout.proof_cptr != proof_cptr {
             return Err(format!(
-                "proof calldata layout mismatch: proof_cptr({proof_cptr:#x}) + proof_len({:#x}) != num_instance_cptr({:#x})",
-                self.proof_len, self.num_instance_cptr
+                "proof calldata layout mismatch: template proof_cptr({proof_cptr:#x}) != layout proof_cptr({:#x})",
+                proof_layout.proof_cptr
+            ));
+        }
+        if proof_layout.proof_len != self.proof_len {
+            return Err(format!(
+                "proof length mismatch: template {:#x} != layout {:#x}",
+                self.proof_len, proof_layout.proof_len
+            ));
+        }
+        if proof_layout.proof_end != self.num_instance_cptr {
+            return Err(format!(
+                "proof calldata layout mismatch: proof_end({:#x}) != num_instance_cptr({:#x})",
+                proof_layout.proof_end, self.num_instance_cptr
             ));
         }
         if self.num_instance_cptr + WORD_BYTES != self.instance_cptr {
@@ -683,13 +708,7 @@ impl Halo2Verifier {
             ));
         }
 
-        let non_quotient_g1s = self.total_advices
-            + self.num_lookups
-            + self.num_permutation_zs
-            + self.lookup_helper_chunks_total
-            + self.num_lookups
-            + self.num_trashcans;
-        let expected_quotient_cptr = proof_cptr + non_quotient_g1s * G1_BYTES;
+        let expected_quotient_cptr = proof_layout.quotient_comm_cptr;
         let quotient_cptr = self.quotient_comm_cptr.value().as_usize();
         if quotient_cptr != expected_quotient_cptr {
             return Err(format!(
@@ -697,8 +716,7 @@ impl Halo2Verifier {
             ));
         }
 
-        let expected_proof_len = (non_quotient_g1s + self.num_quotients + 2) * G1_BYTES
-            + (self.num_evals + self.num_point_sets) * WORD_BYTES;
+        let expected_proof_len = proof_layout.proof_len;
         if self.proof_len != expected_proof_len {
             return Err(format!(
                 "proof length mismatch: got {:#x}, expected {expected_proof_len:#x}",
@@ -707,7 +725,7 @@ impl Halo2Verifier {
         }
 
         let comms_base = self.comms_mptr_base.value().as_usize();
-        let committed_g1s = non_quotient_g1s + self.num_quotients;
+        let committed_g1s = proof_layout.commitment_g1_count();
         let expected_selector_acc =
             (comms_base + committed_g1s * G1_BYTES).next_multiple_of(WORD_BYTES);
         if self.selector_acc_mptr != expected_selector_acc {
@@ -808,6 +826,8 @@ mod tests {
             PcsMemoryRequirements, VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES,
             WORD_BYTES,
         },
+        proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
+        protocol::ProtocolPlan,
         util::{ConstraintSystemMeta, Ptr},
     };
     use ruint::aliases::U256;
@@ -918,6 +938,17 @@ mod tests {
             VerifierMemoryLayoutConfig::default(),
         );
         let acc_msm_scratch = memory.acc_msm_scratch;
+        let protocol = ProtocolPlan {
+            num_user_advices: vec![total_advices],
+            lookup_chunks: vec![lookup_helper_chunks_total],
+            num_lookups,
+            num_permutation_zs,
+            num_trashcans,
+            num_quotients,
+            ..ProtocolPlan::default()
+        };
+        let proof_layout =
+            ProofCalldataLayout::from_protocol(&protocol, proof_cptr, num_evals, num_point_sets);
 
         Halo2Verifier {
             template_constants: Default::default(),
@@ -934,6 +965,13 @@ mod tests {
             expected_vk_codehash: Some(U256::from(1u64)),
             vk_len: 0,
             proof_len,
+            codegen_layout: super::VerifierCodegenLayout {
+                proof: proof_layout,
+                memory: memory.clone(),
+                vk_header: Default::default(),
+                transcript: TranscriptBufferLayout::default(),
+                quotient_external: None,
+            },
             memory,
             vk_header: Default::default(),
             vk_mptr: Ptr::memory(0x1000),

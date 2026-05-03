@@ -61,21 +61,61 @@ const ACCUMULATOR_PAIRING_BATCH_BYTES: usize =
 //   40..44      final_com G1
 //   44..48      pairing lhs G1
 //   48..52      pairing rhs G1
-const ROT_POINTS_OFFSET_WORDS: usize = theta_window::ROT_POINTS_WORD;
-const X1_POWERS_OFFSET_WORDS: usize = theta_window::X1_POWERS_WORD;
-const Q_COM_OFFSET_WORDS: usize = theta_window::Q_COM_WORD;
-const Q_EVAL_SET_OFFSET_WORDS: usize = theta_window::Q_EVAL_SET_WORD;
-const Q_EVAL_CPTR_OFFSET_WORDS: usize = theta_window::Q_EVAL_CPTR_WORD;
-const G1_IDENTITY_OFFSET_WORDS: usize = theta_window::G1_IDENTITY_WORD;
-const REVERSED_EVALS_OFFSET_WORDS: usize = theta_window::REVERSED_EVALS_WORD;
+const HISTORICAL_ROT_POINTS_CAP_WORDS: usize = 28;
+const HISTORICAL_X1_POWERS_CAP_WORDS: usize = 65;
+const HISTORICAL_Q_EVAL_SET_CAP_WORDS: usize = 56;
+const HISTORICAL_Q_EVAL_CPTR_PADDING_WORDS: usize = 7;
+const HISTORICAL_G1_IDENTITY_PADDING_WORDS: usize = 7;
 
-// Capacities of the historical PCS fixed windows above. Validation fails when
-// a circuit would exceed one of these windows rather than silently overwriting
-// the next planned slot.
-const ROT_POINTS_CAP_WORDS: usize = X1_POWERS_OFFSET_WORDS - ROT_POINTS_OFFSET_WORDS;
-const X1_POWERS_CAP_WORDS: usize = Q_EVAL_SET_OFFSET_WORDS - X1_POWERS_OFFSET_WORDS;
-const Q_COM_CAP_WORDS: usize = Q_EVAL_SET_OFFSET_WORDS - Q_COM_OFFSET_WORDS;
-const Q_EVAL_SET_CAP_WORDS: usize = Q_EVAL_CPTR_OFFSET_WORDS - Q_EVAL_SET_OFFSET_WORDS;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ThetaWindowLayout {
+    pub(crate) rot_points_word: usize,
+    pub(crate) x1_powers_word: usize,
+    pub(crate) q_com_word: usize,
+    pub(crate) q_eval_set_word: usize,
+    pub(crate) q_eval_cptr_word: usize,
+    pub(crate) g1_identity_word: usize,
+    pub(crate) reversed_evals_word: usize,
+    pub(crate) rot_points_cap_words: usize,
+    pub(crate) x1_powers_cap_words: usize,
+    pub(crate) q_com_cap_words: usize,
+    pub(crate) q_eval_set_cap_words: usize,
+}
+
+impl ThetaWindowLayout {
+    pub(crate) fn compatibility() -> Self {
+        let rot_points_word = ThetaSlot::PairingRhs.word() + G1_WORDS;
+        let x1_powers_word = rot_points_word + HISTORICAL_ROT_POINTS_CAP_WORDS;
+        let q_com_word = x1_powers_word + HISTORICAL_X1_POWERS_CAP_WORDS;
+        let q_eval_set_word = q_com_word;
+        let q_eval_cptr_word = q_eval_set_word + HISTORICAL_Q_EVAL_SET_CAP_WORDS;
+        let g1_identity_word = q_eval_cptr_word + 1 + HISTORICAL_Q_EVAL_CPTR_PADDING_WORDS;
+        let reversed_evals_word =
+            g1_identity_word + G1_WORDS + HISTORICAL_G1_IDENTITY_PADDING_WORDS;
+
+        debug_assert_eq!(rot_points_word, theta_window::ROT_POINTS_WORD);
+        debug_assert_eq!(x1_powers_word, theta_window::X1_POWERS_WORD);
+        debug_assert_eq!(q_com_word, theta_window::Q_COM_WORD);
+        debug_assert_eq!(q_eval_set_word, theta_window::Q_EVAL_SET_WORD);
+        debug_assert_eq!(q_eval_cptr_word, theta_window::Q_EVAL_CPTR_WORD);
+        debug_assert_eq!(g1_identity_word, theta_window::G1_IDENTITY_WORD);
+        debug_assert_eq!(reversed_evals_word, theta_window::REVERSED_EVALS_WORD);
+
+        Self {
+            rot_points_word,
+            x1_powers_word,
+            q_com_word,
+            q_eval_set_word,
+            q_eval_cptr_word,
+            g1_identity_word,
+            reversed_evals_word,
+            rot_points_cap_words: HISTORICAL_ROT_POINTS_CAP_WORDS,
+            x1_powers_cap_words: HISTORICAL_X1_POWERS_CAP_WORDS,
+            q_com_cap_words: q_eval_set_word - q_com_word,
+            q_eval_set_cap_words: HISTORICAL_Q_EVAL_SET_CAP_WORDS,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MemoryPhase {
@@ -359,6 +399,7 @@ pub(crate) struct PcsMemoryRequirements {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierMemoryLayout {
     pub(crate) map: MemoryMap,
+    pub(crate) theta_windows: ThetaWindowLayout,
     /// Start of the copied or embedded verifying-key payload.
     pub(crate) vk_mptr: Ptr,
     /// Start of the variable-length user-challenge block after the VK payload.
@@ -465,6 +506,7 @@ impl VerifierMemoryLayout {
         let batch_invert_len = batch_invert_scratch_bytes(meta, config.num_instances);
 
         let mut arena = MemoryArena::default();
+        let theta_windows = ThetaWindowLayout::compatibility();
 
         // Low-memory helpers are phase-scoped because the transcript buffer is
         // no longer live once algebra/precompile work begins.
@@ -520,7 +562,7 @@ impl VerifierMemoryLayout {
             "theta_scalar_and_g1_slots",
             challenge_start,
             meta.challenge_indices.len() * WORD_BYTES,
-            ROT_POINTS_OFFSET_WORDS * WORD_BYTES,
+            theta_windows.rot_points_word * WORD_BYTES,
             MemoryLifetime::Permanent,
         );
         let challenge_mptr = Ptr::memory(challenge_start);
@@ -539,43 +581,43 @@ impl VerifierMemoryLayout {
         let committed_g1s = non_quotient_g1s + meta.num_quotients;
         let rot_points_mptr = Ptr::memory(arena.alloc_fixed(
             "rot_points",
-            at_theta(ROT_POINTS_OFFSET_WORDS),
+            at_theta(theta_windows.rot_points_word),
             config.pcs.rot_points_words * WORD_BYTES,
             MemoryLifetime::Phase(MemoryPhase::PcsFixed),
         ));
         let x1_powers_mptr = Ptr::memory(arena.alloc_fixed(
             "x1_powers",
-            at_theta(X1_POWERS_OFFSET_WORDS),
+            at_theta(theta_windows.x1_powers_word),
             config.pcs.x1_powers_words * WORD_BYTES,
             MemoryLifetime::Phase(MemoryPhase::PcsFixed),
         ));
         let q_com_mptr = Ptr::memory(arena.alloc_fixed(
             "q_com_fixed_window",
-            at_theta(Q_COM_OFFSET_WORDS),
+            at_theta(theta_windows.q_com_word),
             config.pcs.q_com_words * WORD_BYTES,
             MemoryLifetime::Phase(MemoryPhase::PcsFixed),
         ));
         let q_eval_set_mptr = Ptr::memory(arena.alloc_fixed(
             "q_eval_set",
-            at_theta(Q_EVAL_SET_OFFSET_WORDS),
+            at_theta(theta_windows.q_eval_set_word),
             config.pcs.q_eval_set_words * WORD_BYTES,
             MemoryLifetime::Phase(MemoryPhase::PcsFixed),
         ));
         let q_eval_cptr_mptr = Ptr::memory(arena.alloc_fixed(
             "q_eval_cptr_slot",
-            at_theta(Q_EVAL_CPTR_OFFSET_WORDS),
+            at_theta(theta_windows.q_eval_cptr_word),
             WORD_BYTES,
             MemoryLifetime::Permanent,
         ));
         let g1_identity_mptr = Ptr::memory(arena.alloc_fixed(
             "g1_identity",
-            at_theta(G1_IDENTITY_OFFSET_WORDS),
+            at_theta(theta_windows.g1_identity_word),
             G1_BYTES,
             MemoryLifetime::Permanent,
         ));
         let reversed_evals_mptr = Ptr::memory(arena.alloc_fixed(
             "decoded_evals",
-            at_theta(REVERSED_EVALS_OFFSET_WORDS),
+            at_theta(theta_windows.reversed_evals_word),
             meta.num_evals * WORD_BYTES,
             MemoryLifetime::Permanent,
         ));
@@ -670,7 +712,7 @@ impl VerifierMemoryLayout {
         let trace_u256_mptr = [
             vk_start + vk.len(),
             challenge_start + meta.challenge_indices.len() * WORD_BYTES,
-            theta_start + ROT_POINTS_OFFSET_WORDS * WORD_BYTES,
+            theta_start + theta_windows.rot_points_word * WORD_BYTES,
             g1_identity_mptr.value().as_usize() + G1_BYTES,
             reversed_evals_mptr.value().as_usize() + meta.num_evals * WORD_BYTES,
             comms_mptr_base.value().as_usize() + commitments_len,
@@ -696,6 +738,7 @@ impl VerifierMemoryLayout {
 
         Self {
             map: arena.into_map(),
+            theta_windows,
             vk_mptr,
             challenge_mptr,
             theta_mptr,
@@ -754,28 +797,29 @@ impl VerifierMemoryLayout {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.pcs.rot_points_words > ROT_POINTS_CAP_WORDS {
+        let windows = self.theta_windows;
+        if self.pcs.rot_points_words > windows.rot_points_cap_words {
             return Err(format!(
-                "PCS scratch layout mismatch: ROT_POINTS_MPTR needs {} word(s), capacity is {ROT_POINTS_CAP_WORDS}",
-                self.pcs.rot_points_words
+                "PCS scratch layout mismatch: ROT_POINTS_MPTR needs {} word(s), capacity is {}",
+                self.pcs.rot_points_words, windows.rot_points_cap_words
             ));
         }
-        if self.pcs.x1_powers_words > X1_POWERS_CAP_WORDS {
+        if self.pcs.x1_powers_words > windows.x1_powers_cap_words {
             return Err(format!(
-                "PCS scratch layout mismatch: X1_POWERS_MPTR needs {} word(s), capacity is {X1_POWERS_CAP_WORDS}",
-                self.pcs.x1_powers_words
+                "PCS scratch layout mismatch: X1_POWERS_MPTR needs {} word(s), capacity is {}",
+                self.pcs.x1_powers_words, windows.x1_powers_cap_words
             ));
         }
-        if self.pcs.q_com_words > Q_COM_CAP_WORDS {
+        if self.pcs.q_com_words > windows.q_com_cap_words {
             return Err(format!(
-                "PCS scratch layout mismatch: Q_COM_MPTR needs {} word(s), capacity is {Q_COM_CAP_WORDS}",
-                self.pcs.q_com_words
+                "PCS scratch layout mismatch: Q_COM_MPTR needs {} word(s), capacity is {}",
+                self.pcs.q_com_words, windows.q_com_cap_words
             ));
         }
-        if self.pcs.q_eval_set_words > Q_EVAL_SET_CAP_WORDS {
+        if self.pcs.q_eval_set_words > windows.q_eval_set_cap_words {
             return Err(format!(
-                "PCS scratch layout mismatch: Q_EVAL_SET_MPTR needs {} word(s), capacity is {Q_EVAL_SET_CAP_WORDS}",
-                self.pcs.q_eval_set_words
+                "PCS scratch layout mismatch: Q_EVAL_SET_MPTR needs {} word(s), capacity is {}",
+                self.pcs.q_eval_set_words, windows.q_eval_set_cap_words
             ));
         }
 
@@ -966,34 +1010,44 @@ mod tests {
             VerifierMemoryLayoutConfig::default(),
         );
         let theta = layout.theta_mptr.value().as_usize();
+        let windows = layout.theta_windows;
 
         assert_eq!(
             layout.rot_points_mptr.value().as_usize(),
-            theta + theta_window::ROT_POINTS_WORD * WORD_BYTES
+            theta + windows.rot_points_word * WORD_BYTES
         );
         assert_eq!(
             layout.x1_powers_mptr.value().as_usize(),
-            theta + theta_window::X1_POWERS_WORD * WORD_BYTES
+            theta + windows.x1_powers_word * WORD_BYTES
         );
         assert_eq!(
             layout.q_eval_set_mptr.value().as_usize(),
-            theta + theta_window::Q_EVAL_SET_WORD * WORD_BYTES
+            theta + windows.q_eval_set_word * WORD_BYTES
         );
         assert_eq!(
             layout.q_eval_cptr_mptr.value().as_usize(),
-            theta + theta_window::Q_EVAL_CPTR_WORD * WORD_BYTES
+            theta + windows.q_eval_cptr_word * WORD_BYTES
         );
         assert_eq!(
             layout.g1_identity_mptr.value().as_usize(),
-            theta + theta_window::G1_IDENTITY_WORD * WORD_BYTES
+            theta + windows.g1_identity_word * WORD_BYTES
         );
         assert_eq!(
             layout.reversed_evals_mptr.value().as_usize(),
-            theta + theta_window::REVERSED_EVALS_WORD * WORD_BYTES
+            theta + windows.reversed_evals_word * WORD_BYTES
         );
         assert_eq!(
             layout.comms_mptr_base.value().as_usize(),
-            theta + (theta_window::REVERSED_EVALS_WORD + meta.num_evals) * WORD_BYTES
+            theta + (windows.reversed_evals_word + meta.num_evals) * WORD_BYTES
+        );
+        assert_eq!(windows.rot_points_word, theta_window::ROT_POINTS_WORD);
+        assert_eq!(windows.x1_powers_word, theta_window::X1_POWERS_WORD);
+        assert_eq!(windows.q_eval_set_word, theta_window::Q_EVAL_SET_WORD);
+        assert_eq!(windows.q_eval_cptr_word, theta_window::Q_EVAL_CPTR_WORD);
+        assert_eq!(windows.g1_identity_word, theta_window::G1_IDENTITY_WORD);
+        assert_eq!(
+            windows.reversed_evals_word,
+            theta_window::REVERSED_EVALS_WORD
         );
     }
 
@@ -1001,18 +1055,19 @@ mod tests {
     fn pcs_fixed_window_overflows_fail_with_clear_messages() {
         let meta = ConstraintSystemMeta::default();
         let vk = synthetic_vk();
+        let windows = ThetaWindowLayout::compatibility();
         let mut config = VerifierMemoryLayoutConfig::default();
-        config.pcs.rot_points_words = ROT_POINTS_CAP_WORDS + 1;
+        config.pcs.rot_points_words = windows.rot_points_cap_words + 1;
         let layout = VerifierMemoryLayout::new(&meta, &vk, Ptr::memory(0x1000), config);
         assert!(layout.validate().unwrap_err().contains("ROT_POINTS_MPTR"));
 
         let mut config = VerifierMemoryLayoutConfig::default();
-        config.pcs.x1_powers_words = X1_POWERS_CAP_WORDS + 1;
+        config.pcs.x1_powers_words = windows.x1_powers_cap_words + 1;
         let layout = VerifierMemoryLayout::new(&meta, &vk, Ptr::memory(0x1000), config);
         assert!(layout.validate().unwrap_err().contains("X1_POWERS_MPTR"));
 
         let mut config = VerifierMemoryLayoutConfig::default();
-        config.pcs.q_eval_set_words = Q_EVAL_SET_CAP_WORDS + 1;
+        config.pcs.q_eval_set_words = windows.q_eval_set_cap_words + 1;
         let layout = VerifierMemoryLayout::new(&meta, &vk, Ptr::memory(0x1000), config);
         assert!(layout.validate().unwrap_err().contains("Q_EVAL_SET_MPTR"));
     }

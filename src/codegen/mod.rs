@@ -2,9 +2,10 @@ use crate::codegen::{
     artifact::{PackedProgramCodec, PayloadSectionKind, VkPayloadLayout},
     evaluator::Evaluator,
     memory::{VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES, WORD_BYTES},
+    proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
-        QuotientProgram, UserPhase,
+        QuotientProgram, UserPhase, VerifierCodegenLayout,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
@@ -41,6 +42,7 @@ mod generator;
 mod layout;
 mod memory;
 mod pcs;
+mod proof_layout;
 mod protocol;
 mod quotient;
 mod template;

@@ -548,8 +548,10 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     fn generate_base_vk(&self) -> Halo2VerifyingKey {
-        let mut constants: Vec<(&'static str, U256)> = Vec::new();
+        let constants: Vec<(&'static str, U256)>;
         {
+            use layout::VkHeaderSlot as Slot;
+
             let domain = self.vk.get_domain();
             // BLS12-381 scalar Fq is 32 bytes wide (256 bits) so the same
             // little-endian-to-u256 conversion that worked for BN254 Fr
@@ -593,50 +595,76 @@ impl<'a> SolidityGenerator<'a> {
             let g2 = g2_to_u256s(g2_pt);
             let neg_s_g2 = g2_to_u256s(neg_s_g2_pt);
 
-            constants.extend([
-                ("vk_digest", vk_digest),
-                ("num_instances", num_instances),
-                ("k", k),
-                ("n_inv", n_inv),
-                ("omega", omega),
-                ("omega_inv", omega_inv),
-                ("omega_inv_to_l", omega_inv_to_l),
-                ("has_accumulator", has_accumulator),
-                ("acc_offset", acc_offset),
-                ("num_acc_limbs", num_acc_limbs),
-                ("num_acc_limb_bits", num_acc_limb_bits),
-            ]);
-            constants.extend([
-                ("g1_x_hi", g1[0]),
-                ("g1_x_lo", g1[1]),
-                ("g1_y_hi", g1[2]),
-                ("g1_y_lo", g1[3]),
-            ]);
-            constants.extend([
-                ("g2_x_c0_hi", g2[0]),
-                ("g2_x_c0_lo", g2[1]),
-                ("g2_x_c1_hi", g2[2]),
-                ("g2_x_c1_lo", g2[3]),
-                ("g2_y_c0_hi", g2[4]),
-                ("g2_y_c0_lo", g2[5]),
-                ("g2_y_c1_hi", g2[6]),
-                ("g2_y_c1_lo", g2[7]),
-            ]);
-            constants.extend([
-                ("neg_s_g2_x_c0_hi", neg_s_g2[0]),
-                ("neg_s_g2_x_c0_lo", neg_s_g2[1]),
-                ("neg_s_g2_x_c1_hi", neg_s_g2[2]),
-                ("neg_s_g2_x_c1_lo", neg_s_g2[3]),
-                ("neg_s_g2_y_c0_hi", neg_s_g2[4]),
-                ("neg_s_g2_y_c0_lo", neg_s_g2[5]),
-                ("neg_s_g2_y_c1_hi", neg_s_g2[6]),
-                ("neg_s_g2_y_c1_lo", neg_s_g2[7]),
-            ]);
-            assert_eq!(
-                constants.len(),
-                layout::VK_HEADER_WORDS,
-                "VK header layout constants must match layout::VK_HEADER_WORDS"
-            );
+            let mut header = layout::VkHeaderLayout::builder();
+            header
+                .scalar(Slot::VkDigest, "vk_digest", vk_digest)
+                .unwrap();
+            header
+                .scalar(Slot::NumInstances, "num_instances", num_instances)
+                .unwrap();
+            header.scalar(Slot::K, "k", k).unwrap();
+            header.scalar(Slot::NInv, "n_inv", n_inv).unwrap();
+            header.scalar(Slot::Omega, "omega", omega).unwrap();
+            header
+                .scalar(Slot::OmegaInv, "omega_inv", omega_inv)
+                .unwrap();
+            header
+                .scalar(Slot::OmegaInvToL, "omega_inv_to_l", omega_inv_to_l)
+                .unwrap();
+            header
+                .scalar(Slot::HasAccumulator, "has_accumulator", has_accumulator)
+                .unwrap();
+            header
+                .scalar(Slot::AccOffset, "acc_offset", acc_offset)
+                .unwrap();
+            header
+                .scalar(Slot::NumAccLimbs, "num_acc_limbs", num_acc_limbs)
+                .unwrap();
+            header
+                .scalar(Slot::NumAccLimbBits, "num_acc_limb_bits", num_acc_limb_bits)
+                .unwrap();
+            header
+                .g1(
+                    Slot::G1Base,
+                    ["g1_x_hi", "g1_x_lo", "g1_y_hi", "g1_y_lo"],
+                    g1,
+                )
+                .unwrap();
+            header
+                .g2(
+                    Slot::G2Base,
+                    [
+                        "g2_x_c0_hi",
+                        "g2_x_c0_lo",
+                        "g2_x_c1_hi",
+                        "g2_x_c1_lo",
+                        "g2_y_c0_hi",
+                        "g2_y_c0_lo",
+                        "g2_y_c1_hi",
+                        "g2_y_c1_lo",
+                    ],
+                    g2,
+                )
+                .unwrap();
+            header
+                .g2(
+                    Slot::NegSG2Base,
+                    [
+                        "neg_s_g2_x_c0_hi",
+                        "neg_s_g2_x_c0_lo",
+                        "neg_s_g2_x_c1_hi",
+                        "neg_s_g2_x_c1_lo",
+                        "neg_s_g2_y_c0_hi",
+                        "neg_s_g2_y_c0_lo",
+                        "neg_s_g2_y_c1_hi",
+                        "neg_s_g2_y_c1_lo",
+                    ],
+                    neg_s_g2,
+                )
+                .unwrap();
+            constants = header
+                .finish()
+                .unwrap_or_else(|err| panic!("invalid VK header layout: {err}"));
         }
 
         // Convert each commitment from G1Projective to G1Affine before
@@ -825,7 +853,8 @@ impl<'a> SolidityGenerator<'a> {
         vk_mptr: Ptr,
         mut config: VerifierMemoryLayoutConfig,
     ) -> VerifierMemoryLayout {
-        config.transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
+        config.transcript_words =
+            Self::transcript_buffer_layout_for_meta(meta, self.num_instances).words;
         config.num_instances = self.num_instances;
         VerifierMemoryLayout::new(meta, vk, vk_mptr, config)
     }
@@ -934,14 +963,14 @@ impl<'a> SolidityGenerator<'a> {
         vk_mptr: Ptr,
         vk_len: usize,
         meta: &ConstraintSystemMeta,
-        data: &Data,
+        memory: &VerifierMemoryLayout,
         simple_selector_count: usize,
     ) -> QuotientExternal {
         let frame_base = vk_mptr.value().as_usize();
         Self::quotient_external_frame_from_bounds(
             frame_base,
             vk_len,
-            data.reversed_evals_mptr.value().as_usize(),
+            memory.reversed_evals_mptr.value().as_usize(),
             meta.num_evals,
             simple_selector_count,
         )
@@ -2528,6 +2557,8 @@ impl<'a> SolidityGenerator<'a> {
             .chain(std::iter::once(&quotient_native_trash_computation))
             .flat_map(|block| block.iter())
             .any(|line| line.contains("q_limb7_wide("));
+        let quotient_external =
+            Self::quotient_external_frame(vk_mptr, vk_len, &meta, &memory, sorted_simple.len());
 
         Halo2QuotientEvaluator {
             template_constants: Default::default(),
@@ -2545,13 +2576,7 @@ impl<'a> SolidityGenerator<'a> {
             return_mptr: layout::QUOTIENT_RETURN_BUFFER_START,
             reversed_evals_mptr: data.reversed_evals_mptr,
             selector_acc_mptr,
-            quotient_external: Self::quotient_external_frame(
-                vk_mptr,
-                vk_len,
-                &meta,
-                &data,
-                sorted_simple.len(),
-            ),
+            quotient_external,
             quotient_inline_computations,
             quotient_eval_numer_computations,
             quotient_post_vm_computations,
@@ -2639,8 +2664,15 @@ impl<'a> SolidityGenerator<'a> {
         });
         let vk_len = vk.len();
         let quotient_tmp_mptr = memory.quotient_tmp_mptr;
+        let proof_layout = ProofCalldataLayout::from_protocol(
+            &meta.protocol,
+            proof_cptr.value().as_usize(),
+            meta.num_evals,
+            meta.num_point_sets,
+        );
+        let transcript_layout = Self::transcript_buffer_layout_for_meta(&meta, self.num_instances);
         let quotient_external = external_quotient.then(|| {
-            Self::quotient_external_frame(vk_mptr, vk_len, &meta, &data, sorted_simple.len())
+            Self::quotient_external_frame(vk_mptr, vk_len, &meta, &memory, sorted_simple.len())
         });
         let (expected_quotient_len, expected_quotient_codehash) = expected_quotient
             .map(|(len, codehash)| (Some(len), Some(codehash)))
@@ -2826,9 +2858,11 @@ impl<'a> SolidityGenerator<'a> {
             .num_user_advices
             .iter()
             .zip(meta.num_user_challenges.iter())
-            .map(|(&n_a, &n_c)| {
+            .enumerate()
+            .map(|(idx, (&n_a, &n_c))| {
                 let phase = UserPhase {
                     num_advices: n_a,
+                    advice_bytes: proof_layout.advice_phases[idx].byte_len,
                     num_challenges: n_c,
                     challenge_offset,
                 };
@@ -2923,6 +2957,13 @@ impl<'a> SolidityGenerator<'a> {
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,
+            codegen_layout: VerifierCodegenLayout {
+                proof: proof_layout.clone(),
+                memory: memory.clone(),
+                vk_header: Default::default(),
+                transcript: transcript_layout,
+                quotient_external: quotient_external.clone(),
+            },
             memory,
             vk_header: Default::default(),
             vk_mptr,
@@ -2955,10 +2996,10 @@ impl<'a> SolidityGenerator<'a> {
             abi_selector_bytes: layout::abi::SELECTOR_BYTES,
             abi_proof_head_offset: layout::abi::VERIFY_PROOF_PROOF_HEAD_OFFSET,
             abi_instances_head_cptr: layout::abi::SELECTOR_BYTES + WORD_BYTES,
-            num_instance_cptr: proof_cptr.value().as_usize() + meta.proof_len(),
-            instance_cptr: proof_cptr.value().as_usize() + meta.proof_len() + WORD_BYTES,
-            quotient_comm_cptr: data.quotient_comm_cptr,
-            proof_len: meta.proof_len(),
+            num_instance_cptr: proof_layout.proof_end,
+            instance_cptr: proof_layout.proof_end + WORD_BYTES,
+            quotient_comm_cptr: Ptr::calldata(proof_layout.quotient_comm_cptr),
+            proof_len: proof_layout.proof_len,
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
             quotient_inline_computations,
@@ -3140,13 +3181,20 @@ impl<'a> SolidityGenerator<'a> {
         let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let vk = self.generate_vk();
         let (_, meta, _data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
+        let proof_layout = ProofCalldataLayout::from_protocol(
+            &meta.protocol,
+            layout::abi::VERIFY_PROOF_PROOF_CPTR,
+            meta.num_evals,
+            meta.num_point_sets,
+        );
 
-        RepackedProofLayoutPlan::from_protocol(&meta.protocol, meta.num_evals, meta.num_point_sets)
+        RepackedProofLayoutPlan::from_proof_layout(&proof_layout)
     }
 
     fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
         let pcs_computation = pcs::static_working_memory_size();
-        let transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
+        let transcript_words =
+            Self::transcript_buffer_layout_for_meta(meta, self.num_instances).words;
         let transcript_end = layout::TRANSCRIPT_BUFFER_START + transcript_words * WORD_BYTES;
         let pcs_end = layout::PCS_PAIRING_SCRATCH_START + pcs_computation * WORD_BYTES;
         let final_pairing_end =
@@ -3174,10 +3222,18 @@ impl<'a> SolidityGenerator<'a> {
         .unwrap()
     }
 
+    #[cfg(test)]
     pub(super) fn transcript_buffer_words_bound(
         meta: &ConstraintSystemMeta,
         num_instances: usize,
     ) -> usize {
+        Self::transcript_buffer_layout_for_meta(meta, num_instances).words
+    }
+
+    pub(super) fn transcript_buffer_layout_for_meta(
+        meta: &ConstraintSystemMeta,
+        num_instances: usize,
+    ) -> TranscriptBufferLayout {
         // The Step 6 transcript model is a streaming Keccak256 buffer rooted
         // at TRANSCRIPT_BUFFER_START. The buffer monotonically grows between
         // two challenge squeezes and is reset to one seed word after each
@@ -3204,47 +3260,12 @@ impl<'a> SolidityGenerator<'a> {
         // causes the keccak buffer to overrun `VK_MPTR` mid-verify and
         // silently corrupt `K_MPTR`, `OMEGA_MPTR`, etc., producing a
         // multi-billion-gas spin in the Lagrange block.
-        let word_absorb = layout::transcript::WORD_ABSORB_BYTES;
-        let g1_absorb = layout::transcript::G1_ABSORB_BYTES;
-        let squeeze_cushion = layout::transcript::POST_SQUEEZE_CUSHION_WORDS * WORD_BYTES;
-
-        // (a) initial run: vk_digest + committed_pi + num_instances scalar
-        //     + num_instances committed-instance scalars + phase-1 advices
-        //     + post-squeeze seed cushion.
-        let phase_1_advices = meta.num_user_advices.first().copied().unwrap_or(0);
-        let initial_run = word_absorb
-            + g1_absorb
-            + word_absorb
-            + num_instances * word_absorb
-            + phase_1_advices * g1_absorb
-            + squeeze_cushion;
-
-        // (b) eval-block run: quotient limbs + num_evals scalars
-        //     + num_point_sets scalars + 32 cushion.
-        let eval_run = meta.num_quotients * g1_absorb
-            + meta.num_evals * word_absorb
-            + meta.num_point_sets * word_absorb
-            + squeeze_cushion;
-
-        // Catch-all: any other phase. We bound it by every G1 + every
-        // scalar absorbed across the whole transcript; this is a strict
-        // overestimate but cheap and finite.
-        let total_g1: usize = meta.num_user_advices.iter().sum::<usize>()
-            + meta.num_lookups
-            + meta.num_permutation_zs
-            + meta.lookup_chunks.iter().sum::<usize>()
-            + meta.num_lookups
-            + meta.num_trashcans
-            + meta.num_quotients
-            + 2; // f_com + pi
-        let total_scalar =
-            meta.num_evals + meta.num_point_sets + layout::transcript::POST_SQUEEZE_CUSHION_WORDS;
-        let total_run =
-            word_absorb + total_g1 * g1_absorb + total_scalar * word_absorb + squeeze_cushion;
-
-        initial_run
-            .max(eval_run)
-            .max(total_run)
-            .div_ceil(WORD_BYTES)
+        let proof_layout = ProofCalldataLayout::from_protocol(
+            &meta.protocol,
+            0,
+            meta.num_evals,
+            meta.num_point_sets,
+        );
+        TranscriptBufferLayout::from_proof_layout(&proof_layout, num_instances)
     }
 }

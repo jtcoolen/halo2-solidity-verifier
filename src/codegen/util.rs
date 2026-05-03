@@ -6,6 +6,7 @@
 use crate::codegen::{
     layout::{BLS_FP_BYTES, EIP2537_FP_PAD_BYTES},
     memory::{VerifierMemoryLayout, G1_BYTES, G1_WORDS, WORD_BYTES},
+    proof_layout::ProofCalldataLayout,
     protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
 };
@@ -256,16 +257,8 @@ impl ConstraintSystemMeta {
     pub(crate) fn proof_len(&self) -> usize {
         self.validate_against_protocol()
             .expect("constraint-system metadata must match protocol plan before proof sizing");
-        // Each G1 commitment in verifier calldata is 128 bytes (uncompressed,
-        // EIP-2537 padded form: 4 words = x_hi, x_lo, y_hi, y_lo). Each
-        // Fq evaluation is 32 bytes. The off-chain proof shim repacks
-        // midnight-proofs' native 48-byte compressed commitments into this
-        // padded form before calling `verifyProof`, and the Yul transcript
-        // hashes those padded bytes directly.
-        let g1_count: usize = self.num_advices().iter().sum::<usize>() + self.batch_open_g1_count();
-        g1_count * G1_BYTES
-            + self.num_evals * WORD_BYTES
-            + self.batch_open_extra_evals() * WORD_BYTES
+        ProofCalldataLayout::from_protocol(&self.protocol, 0, self.num_evals, self.num_point_sets)
+            .proof_len
     }
 
     pub(crate) fn batch_open_proof_len(&self) -> usize {
@@ -416,31 +409,21 @@ impl Data {
         // emitted in `templates/Halo2Verifier.sol`. Each base anchors a
         // contiguous run of 4-word slots (one per G1).
         // ------------------------------------------------------------
-        let lookup_helper_total: usize = meta.lookup_chunks.iter().sum();
-
-        // -- calldata cursor (uncompressed, 0x80 byte stride per G1) --
-        // Each G1 commitment in calldata is 128 bytes (4 words = x_hi,
-        // x_lo, y_hi, y_lo in EIP-2537 padded form). The test-side
-        // `repack_proof_uncompressed` helper decompresses the
-        // midnight-proofs prover's 48-byte zcash form before passing
-        // the proof to `verifyProof`.
+        // -- calldata cursor (uncompressed, G1_BYTES stride per G1) --
+        // Section starts come from `ProofCalldataLayout`, shared with the
+        // verifier template and off-chain proof repacker.
         let proof_cptr_bytes = match proof_cptr.value() {
             Value::Integer(b) => b as usize,
             _ => unreachable!("proof_cptr must be a literal byte offset"),
         };
-        let mut cd_byte = proof_cptr_bytes;
-        cd_byte += G1_BYTES * meta.advice_indices.len();
-        cd_byte += G1_BYTES * meta.num_lookups;
-        cd_byte += G1_BYTES * meta.num_permutation_zs;
-        cd_byte += G1_BYTES * lookup_helper_total;
-        cd_byte += G1_BYTES * meta.num_lookups;
-        cd_byte += G1_BYTES * meta.num_trashcans;
-        let quotient_limb_cd = cd_byte;
-        cd_byte += G1_BYTES * meta.num_quotients;
-        let eval_cd = cd_byte;
-
-        let quotient_comm_start = Ptr::calldata(quotient_limb_cd);
-        let w_cptr = Ptr::calldata(eval_cd) + meta.num_evals;
+        let proof_layout = ProofCalldataLayout::from_protocol(
+            &meta.protocol,
+            proof_cptr_bytes,
+            meta.num_evals,
+            meta.num_point_sets,
+        );
+        let quotient_comm_start = Ptr::calldata(proof_layout.quotient_comm_cptr);
+        let w_cptr = Ptr::calldata(proof_layout.w_cptr);
 
         // -- memory bases for EIP-2537-padded commitments (4 words each) --
         // The template emits a named Solidity constant for each base so
@@ -683,7 +666,7 @@ impl Data {
             trashcan_evals,
             computed_quotient_eval,
             comms_mptr_base,
-            quotient_limb_cptr: Ptr::calldata(quotient_limb_cd),
+            quotient_limb_cptr: Ptr::calldata(proof_layout.quotient_comm_cptr),
             reversed_evals_mptr,
             // Default: no dummy queries (fewer-point-sets disabled).
             // The caller can populate this via `set_dummy_eval_words`

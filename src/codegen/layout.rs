@@ -6,6 +6,8 @@
 //! intentionally stable compatibility anchors; call sites should use the named
 //! facts here instead of repeating raw literals.
 
+use ruint::aliases::U256;
+
 /// EVM word size. BLS12-381 Fr values are rendered as one canonical
 /// big-endian EVM word in calldata/memory.
 pub(crate) const WORD_BYTES: usize = 0x20;
@@ -185,6 +187,215 @@ impl VkHeaderSlot {
 pub(crate) const VK_HEADER_WORDS: usize = 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VkHeaderFieldSpec {
+    pub(crate) slot: VkHeaderSlot,
+    pub(crate) name: &'static str,
+    pub(crate) width_words: usize,
+}
+
+pub(crate) const VK_HEADER_FIELDS: [VkHeaderFieldSpec; 14] = [
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::VkDigest,
+        name: "vk_digest",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::NumInstances,
+        name: "num_instances",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::K,
+        name: "k",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::NInv,
+        name: "n_inv",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::Omega,
+        name: "omega",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::OmegaInv,
+        name: "omega_inv",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::OmegaInvToL,
+        name: "omega_inv_to_l",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::HasAccumulator,
+        name: "has_accumulator",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::AccOffset,
+        name: "acc_offset",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::NumAccLimbs,
+        name: "num_acc_limbs",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::NumAccLimbBits,
+        name: "num_acc_limb_bits",
+        width_words: 1,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::G1Base,
+        name: "G1_BASE",
+        width_words: G1_WORDS,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::G2Base,
+        name: "G2_BASE",
+        width_words: G2_WORDS,
+    },
+    VkHeaderFieldSpec {
+        slot: VkHeaderSlot::NegSG2Base,
+        name: "NEG_S_G2_BASE",
+        width_words: G2_WORDS,
+    },
+];
+
+pub(crate) struct VkHeaderLayout;
+
+impl VkHeaderLayout {
+    pub(crate) const fn header_words() -> usize {
+        VK_HEADER_WORDS
+    }
+
+    pub(crate) fn fields() -> &'static [VkHeaderFieldSpec] {
+        &VK_HEADER_FIELDS
+    }
+
+    pub(crate) fn field(slot: VkHeaderSlot) -> VkHeaderFieldSpec {
+        let fields = Self::fields();
+        let mut idx = 0;
+        while idx < fields.len() {
+            if fields[idx].slot as usize == slot as usize {
+                return fields[idx];
+            }
+            idx += 1;
+        }
+        panic!("unknown VK header slot")
+    }
+
+    pub(crate) fn builder() -> VkHeaderBuilder {
+        VkHeaderBuilder::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VkHeaderBuilder {
+    words: Vec<Option<(&'static str, U256)>>,
+}
+
+impl VkHeaderBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            words: vec![None; VkHeaderLayout::header_words()],
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        slot: VkHeaderSlot,
+        expected_width: usize,
+        values: &[(&'static str, U256)],
+    ) -> Result<(), String> {
+        let spec = VkHeaderLayout::field(slot);
+        if spec.width_words != expected_width {
+            return Err(format!(
+                "VK header field {} width mismatch: descriptor={} caller={expected_width}",
+                spec.name, spec.width_words
+            ));
+        }
+        if values.len() != spec.width_words {
+            return Err(format!(
+                "VK header field {} expected {} word(s), got {}",
+                spec.name,
+                spec.width_words,
+                values.len()
+            ));
+        }
+        let start = spec.slot.word();
+        let end = start + spec.width_words;
+        if end > self.words.len() {
+            return Err(format!(
+                "VK header field {} overflows header: range {start}..{end}, header={}",
+                spec.name,
+                self.words.len()
+            ));
+        }
+        for (offset, value) in values.iter().copied().enumerate() {
+            let word = start + offset;
+            if self.words[word].is_some() {
+                return Err(format!(
+                    "VK header field {} overlaps already-written word {word}",
+                    spec.name
+                ));
+            }
+            self.words[word] = Some(value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scalar(
+        &mut self,
+        slot: VkHeaderSlot,
+        name: &'static str,
+        value: U256,
+    ) -> Result<(), String> {
+        self.insert(slot, 1, &[(name, value)])
+    }
+
+    pub(crate) fn g1(
+        &mut self,
+        slot: VkHeaderSlot,
+        names: [&'static str; G1_WORDS],
+        values: [U256; G1_WORDS],
+    ) -> Result<(), String> {
+        let words = names
+            .into_iter()
+            .zip(values)
+            .collect::<Vec<(&'static str, U256)>>();
+        self.insert(slot, G1_WORDS, &words)
+    }
+
+    pub(crate) fn g2(
+        &mut self,
+        slot: VkHeaderSlot,
+        names: [&'static str; G2_WORDS],
+        values: [U256; G2_WORDS],
+    ) -> Result<(), String> {
+        let words = names
+            .into_iter()
+            .zip(values)
+            .collect::<Vec<(&'static str, U256)>>();
+        self.insert(slot, G2_WORDS, &words)
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<(&'static str, U256)>, String> {
+        self.words
+            .into_iter()
+            .enumerate()
+            .map(|(word, value)| {
+                value.ok_or_else(|| format!("VK header word {word} was not written"))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum ThetaSlot {
     Theta = 0,
@@ -245,8 +456,9 @@ pub(crate) mod trace {
 mod tests {
     use super::{
         abi, accumulator, modexp_frame, precompile, quotient_limb, theta_window, trace, transcript,
-        ThetaSlot, VkHeaderSlot,
+        ThetaSlot, VkHeaderLayout, VkHeaderSlot,
     };
+    use ruint::aliases::U256;
 
     #[test]
     fn abi_offsets_match_verify_proof_calldata_layout() {
@@ -272,7 +484,44 @@ mod tests {
         assert_eq!(VkHeaderSlot::G1Base.word(), 11);
         assert_eq!(VkHeaderSlot::G2Base.word(), 15);
         assert_eq!(VkHeaderSlot::NegSG2Base.word(), 23);
-        assert_eq!(super::VK_HEADER_WORDS, 31);
+        assert_eq!(VkHeaderLayout::header_words(), 31);
+        assert_eq!(
+            VkHeaderLayout::fields()
+                .iter()
+                .map(|field| field.width_words)
+                .sum::<usize>(),
+            31
+        );
+    }
+
+    #[test]
+    fn vk_header_builder_rejects_missing_duplicate_and_width_errors() {
+        let builder = VkHeaderLayout::builder();
+        assert!(builder.finish().unwrap_err().contains("word 0"));
+
+        let mut builder = VkHeaderLayout::builder();
+        builder
+            .scalar(VkHeaderSlot::VkDigest, "vk_digest", U256::from(1u64))
+            .unwrap();
+        let err = builder
+            .scalar(VkHeaderSlot::VkDigest, "vk_digest", U256::from(2u64))
+            .unwrap_err();
+        assert!(err.contains("overlaps"));
+
+        let mut builder = VkHeaderLayout::builder();
+        let err = builder
+            .insert(VkHeaderSlot::G1Base, 8, &[("too_wide", U256::ZERO)])
+            .unwrap_err();
+        assert!(err.contains("width mismatch"));
+
+        let mut builder = super::VkHeaderBuilder {
+            words: vec![None; super::VK_HEADER_WORDS - 1],
+        };
+        let words = [("neg_s_g2", U256::ZERO); super::G2_WORDS];
+        let err = builder
+            .insert(VkHeaderSlot::NegSG2Base, super::G2_WORDS, &words)
+            .unwrap_err();
+        assert!(err.contains("overflows"));
     }
 
     #[test]

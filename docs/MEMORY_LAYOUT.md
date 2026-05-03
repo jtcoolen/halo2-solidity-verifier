@@ -10,8 +10,10 @@ as the monolithic verifier. The cost is that memory safety has to be proven by
 codegen, not by Solidity's free-memory pointer.
 
 The current planner is conservative. It preserves the existing generated
-addresses and only centralizes naming, sizing, and validation. It is not a
-deterministic repacker yet.
+addresses, but the offsets are now derived by Rust compatibility manifests
+(`VerifierMemoryLayout`, `ThetaWindowLayout`, and the proof/VK layout helpers)
+before being rendered into Solidity/Yul. It is not a deterministic repacker
+yet.
 
 ## Solidity Memory Model Boundary
 
@@ -128,7 +130,7 @@ which changes the transcript-buffer bound. The verifier reserves:
 1. transient transcript buffer below `VK_MPTR`;
 2. VK payload at `VK_MPTR`;
 3. user challenge slots after the VK payload;
-4. fixed theta-relative slots;
+4. computed compatibility theta-relative slots;
 5. decoded evals and decompressed commitments;
 6. phase-scoped scratch regions;
 7. one non-overlapping `trace_u256` log word after all live regions.
@@ -161,8 +163,10 @@ callee.
 
 ## Theta-Relative Offsets
 
-`THETA_MPTR` is the anchor for the historical fixed verifier state. The offsets
-below are in 32-byte words from `THETA_MPTR`.
+`THETA_MPTR` is the anchor for the historical fixed verifier state.
+`ThetaWindowLayout::compatibility()` computes the window starts from named slot
+sizes, historical capacities, and padding, then validation pins the resulting
+addresses. The offsets below are in 32-byte words from `THETA_MPTR`.
 
 | Offset | Region | Size | Justification |
 | ---: | --- | ---: | --- |
@@ -259,8 +263,8 @@ When changing generated memory usage:
 2. Register it through `MemoryArena` with the narrowest correct lifetime.
 3. Use named constants (`WORD_BYTES`, `G1_BYTES`, `G1_MSM_PAIR_BYTES`, etc.)
    instead of raw byte literals when the literal describes layout.
-4. If a fixed theta-relative offset changes, update this document and the
-   synthetic layout test.
+4. If a fixed theta-relative offset changes, update `ThetaWindowLayout`, this
+   document, and the synthetic layout test.
 5. If a scratch region can grow from circuit/VK shape, add it to
    `PcsMemoryRequirements` or `VerifierMemoryLayoutConfig`.
 6. Run `cargo test --lib --all-features` at minimum; for verifier-impacting

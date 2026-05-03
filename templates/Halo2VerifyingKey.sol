@@ -9,10 +9,11 @@ pragma solidity ^0.8.24;
 /// `midfall/proofs/src/plonk/mod.rs::VerifyingKey` and the transcript
 /// `vk.hash_into` behavior used by `midfall/proofs/src/plonk/verifier.rs`.
 ///
-/// Layout (in 32-byte words, big-endian). The byte offsets are absolute
-/// from the start of the VK contract's runtime bytecode. The verifier
-/// loads the entire VK via `extcodecopy(vk, VK_MPTR, 0x00, vk_len)` and
-/// then references each slot by `VK_MPTR + i`.
+/// Layout (in 32-byte words, big-endian). The header slots are generated from
+/// Rust's `VkHeaderLayout`; the byte offsets are absolute from the start of the
+/// VK contract's runtime bytecode. The verifier loads the entire VK via
+/// `extcodecopy(vk, VK_MPTR, 0x00, vk_len)` and then references each slot by
+/// `VK_MPTR + i`.
 ///
 ///   word  0  : vk_digest                    (Fq, transcript_repr of the CS)
 ///   word  1  : num_instances
