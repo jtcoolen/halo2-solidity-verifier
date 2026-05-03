@@ -238,14 +238,22 @@ fn mutated_separate_vk_contract_is_rejected() {
     }
 
     let fixture = create_property_poseidon_fixture();
+    let mut baseline = deployed_separate_verifier(&fixture);
+    assert_deployed_call_accepts(
+        &mut baseline,
+        &fixture,
+        &fixture.proof,
+        "valid proof before mutated separate vk",
+    );
+
     let mutated_vk_solidity = mutate_first_large_hex_literal(&fixture.vk_solidity, 0);
-    let output = call_separate_verifier(
+    assert_separate_verifier_rejects_vk_mutation(
         &fixture.separate_verifier_solidity,
         &mutated_vk_solidity,
         &fixture.proof,
         &fixture.instances,
+        "mutated separate vk",
     );
-    assert_solidity_rejects(output, "mutated separate vk");
 }
 
 #[test]
@@ -1030,42 +1038,29 @@ fn generate_poseidon_proof(
 
 fn run_property_poseidon_positive_case(separate: bool, seed: u64) {
     let fixture = create_property_poseidon_fixture();
-    let output = if separate {
-        call_separate_verifier(
-            &fixture.separate_verifier_solidity,
-            &fixture.vk_solidity,
-            &fixture.proof,
-            &fixture.instances,
-        )
-    } else {
-        call_embedded_verifier(
-            &fixture.embedded_verifier_solidity,
-            &fixture.proof,
-            &fixture.instances,
-        )
-    };
-    assert_solidity_accepts(output, &format!("seed={seed} separate={separate}"));
+    let mut deployed = deployed_property_poseidon_verifier(&fixture, separate);
+    assert_deployed_call_accepts(
+        &mut deployed,
+        &fixture,
+        &fixture.proof,
+        &format!("valid proof seed={seed} separate={separate}"),
+    );
 }
 
 fn run_property_poseidon_wrong_instance_case(separate: bool, seed: u64) {
     let fixture = create_property_poseidon_fixture();
+    let mut deployed = deployed_property_poseidon_verifier(&fixture, separate);
+    assert_deployed_call_accepts(
+        &mut deployed,
+        &fixture,
+        &fixture.proof,
+        &format!("valid proof before wrong-instance mutation seed={seed} separate={separate}"),
+    );
+
     let mut bad_instances = fixture.instances.clone();
     bad_instances[0] += F::ONE;
 
-    let output = if separate {
-        call_separate_verifier(
-            &fixture.separate_verifier_solidity,
-            &fixture.vk_solidity,
-            &fixture.proof,
-            &bad_instances,
-        )
-    } else {
-        call_embedded_verifier(
-            &fixture.embedded_verifier_solidity,
-            &fixture.proof,
-            &bad_instances,
-        )
-    };
+    let output = call_deployed_verifier(&mut deployed, &fixture.proof, &bad_instances);
     assert_solidity_rejects(
         output,
         &format!("wrong instance seed={seed} separate={separate}"),
@@ -1074,25 +1069,20 @@ fn run_property_poseidon_wrong_instance_case(separate: bool, seed: u64) {
 
 fn run_property_poseidon_malleated_proof_case(separate: bool, seed: u64, bit_idx: usize) {
     let fixture = create_property_poseidon_fixture();
+    let mut deployed = deployed_property_poseidon_verifier(&fixture, separate);
+    assert_deployed_call_accepts(
+        &mut deployed,
+        &fixture,
+        &fixture.proof,
+        &format!("valid proof before proof mutation seed={seed} separate={separate}"),
+    );
+
     let mut bad_proof = fixture.proof.clone();
     let byte_idx = bit_idx / 8 % bad_proof.len();
     let bit_mask = 1u8 << (bit_idx % 8);
     bad_proof[byte_idx] ^= bit_mask;
 
-    let output = if separate {
-        call_separate_verifier(
-            &fixture.separate_verifier_solidity,
-            &fixture.vk_solidity,
-            &bad_proof,
-            &fixture.instances,
-        )
-    } else {
-        call_embedded_verifier(
-            &fixture.embedded_verifier_solidity,
-            &bad_proof,
-            &fixture.instances,
-        )
-    };
+    let output = call_deployed_verifier(&mut deployed, &bad_proof, &fixture.instances);
     assert_solidity_rejects(
         output,
         &format!("malleated proof seed={seed} separate={separate}"),
@@ -1101,14 +1091,22 @@ fn run_property_poseidon_malleated_proof_case(separate: bool, seed: u64, bit_idx
 
 fn run_property_poseidon_wrong_vk_case(seed: u64) {
     let fixture = create_property_poseidon_fixture();
+    let mut baseline = deployed_separate_verifier(&fixture);
+    assert_deployed_call_accepts(
+        &mut baseline,
+        &fixture,
+        &fixture.proof,
+        &format!("valid proof before wrong-vk mutation seed={seed}"),
+    );
+
     let mutated_vk_solidity = mutate_first_large_hex_literal(&fixture.vk_solidity, seed as usize);
-    let output = call_separate_verifier(
+    assert_separate_verifier_rejects_vk_mutation(
         &fixture.separate_verifier_solidity,
         &mutated_vk_solidity,
         &fixture.proof,
         &fixture.instances,
+        &format!("wrong vk seed={seed}"),
     );
-    assert_solidity_rejects(output, &format!("wrong vk seed={seed}"));
 }
 
 fn run_separate_vk_digest_prefix_affects_verification_case(seed: u64) {
@@ -1121,14 +1119,11 @@ fn run_separate_vk_digest_prefix_affects_verification_case(seed: u64) {
     );
     assert_solidity_accepts(original, &format!("valid separate vk seed={seed}"));
 
-    let mutated = call_separate_verifier(
+    assert_separate_verifier_rejects_vk_mutation(
         &fixture.separate_verifier_solidity,
         &mutate_vk_digest_literal_only(&fixture.vk_solidity),
         &fixture.proof,
         &fixture.instances,
-    );
-    assert_solidity_rejects(
-        mutated,
         &format!("digest-only mutated separate vk seed={seed}"),
     );
 }
@@ -1142,12 +1137,8 @@ fn call_embedded_verifier(
 }
 
 fn call_embedded_verifier_raw(verifier_solidity: &str, calldata: Vec<u8>) -> Result<Vec<u8>, ()> {
-    let mut evm = Evm::default();
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let verifier_address = evm.create(compile_solidity(verifier_solidity));
-        evm.call(verifier_address, calldata).1
-    }))
-    .map_err(|_| ())
+    let mut deployed = deploy_embedded_verifier_from_source(verifier_solidity);
+    call_deployed_verifier_raw(&mut deployed, calldata)
 }
 
 fn call_separate_verifier(
@@ -1156,15 +1147,8 @@ fn call_separate_verifier(
     proof: &[u8],
     instances: &[F],
 ) -> Result<Vec<u8>, ()> {
-    let mut evm = Evm::default();
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let vk_address = evm.create(compile_solidity(vk_solidity));
-        let verifier_address =
-            evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
-        evm.call(verifier_address, encode_calldata(proof, instances))
-            .1
-    }))
-    .map_err(|_| ())
+    let mut deployed = deploy_separate_verifier_from_sources(verifier_solidity, vk_solidity);
+    call_deployed_verifier(&mut deployed, proof, instances)
 }
 
 fn assert_separate_verifier_rejects_vk_dependency(
@@ -1172,10 +1156,12 @@ fn assert_separate_verifier_rejects_vk_dependency(
     vk_solidity: &str,
     context: &str,
 ) {
+    let vk_creation_code = compile_solidity(vk_solidity);
+    let verifier_creation_code = compile_solidity(verifier_solidity);
+    let mut evm = Evm::default();
+    let vk_address = evm.create(vk_creation_code);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut evm = Evm::default();
-        let vk_address = evm.create(compile_solidity(vk_solidity));
-        evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
+        evm.create_with_address_arg(verifier_creation_code, vk_address);
     }));
     assert!(
         result.is_err(),
@@ -1228,12 +1214,37 @@ struct DeployedVerifier {
 }
 
 fn deployed_separate_verifier(fixture: &PropertyPoseidonFixture) -> DeployedVerifier {
+    deploy_separate_verifier_from_sources(&fixture.separate_verifier_solidity, &fixture.vk_solidity)
+}
+
+fn deployed_property_poseidon_verifier(
+    fixture: &PropertyPoseidonFixture,
+    separate: bool,
+) -> DeployedVerifier {
+    if separate {
+        deployed_separate_verifier(fixture)
+    } else {
+        deploy_embedded_verifier_from_source(&fixture.embedded_verifier_solidity)
+    }
+}
+
+fn deploy_embedded_verifier_from_source(verifier_solidity: &str) -> DeployedVerifier {
     let mut evm = Evm::default();
-    let vk_address = evm.create(compile_solidity(&fixture.vk_solidity));
-    let verifier_address = evm.create_with_address_arg(
-        compile_solidity(&fixture.separate_verifier_solidity),
-        vk_address,
-    );
+    let verifier_address = evm.create(compile_solidity(verifier_solidity));
+    DeployedVerifier {
+        evm,
+        verifier_address,
+    }
+}
+
+fn deploy_separate_verifier_from_sources(
+    verifier_solidity: &str,
+    vk_solidity: &str,
+) -> DeployedVerifier {
+    let mut evm = Evm::default();
+    let vk_address = evm.create(compile_solidity(vk_solidity));
+    let verifier_address =
+        evm.create_with_address_arg(compile_solidity(verifier_solidity), vk_address);
     DeployedVerifier {
         evm,
         verifier_address,
@@ -1265,8 +1276,7 @@ fn call_deployed_verifier_raw(
             Err(())
         }
         CallOutcome::Halt { gas_used, reason } => {
-            eprintln!("verifier halted with gas_used = {gas_used}, reason = {reason}");
-            Err(())
+            panic!("verifier halted with gas_used = {gas_used}, reason = {reason}");
         }
     }
 }
@@ -1279,6 +1289,16 @@ fn deployed_call_accepts(
 ) -> bool {
     let output = call_deployed_verifier(deployed, proof, &fixture.instances);
     solidity_output_is_true_or_skip(output, context)
+}
+
+fn assert_deployed_call_accepts(
+    deployed: &mut DeployedVerifier,
+    fixture: &PropertyPoseidonFixture,
+    proof: &[u8],
+    context: &str,
+) {
+    let output = call_deployed_verifier(deployed, proof, &fixture.instances);
+    assert_solidity_accepts(output, context);
 }
 
 fn deployed_raw_call_accepts(
@@ -1318,6 +1338,33 @@ fn assert_deployed_call_rejects(
 ) {
     let output = call_deployed_verifier(deployed, proof, &fixture.instances);
     assert_solidity_rejects(output, context);
+}
+
+fn assert_separate_verifier_rejects_vk_mutation(
+    verifier_solidity: &str,
+    vk_solidity: &str,
+    proof: &[u8],
+    instances: &[F],
+    context: &str,
+) {
+    let vk_creation_code = compile_solidity(vk_solidity);
+    let verifier_creation_code = compile_solidity(verifier_solidity);
+    let mut evm = Evm::default();
+    let vk_address = evm.create(vk_creation_code);
+    let verifier_address = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evm.create_with_address_arg(verifier_creation_code, vk_address)
+    })) {
+        Ok(address) => address,
+        Err(_) => return,
+    };
+    let mut deployed = DeployedVerifier {
+        evm,
+        verifier_address,
+    };
+    assert_solidity_rejects(
+        call_deployed_verifier(&mut deployed, proof, instances),
+        context,
+    );
 }
 
 fn assert_native_poseidon_rejects(
