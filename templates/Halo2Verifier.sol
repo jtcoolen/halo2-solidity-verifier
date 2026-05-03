@@ -1094,7 +1094,9 @@ contract Halo2Verifier {
 
             {%- for phase in user_phases %}
             // ---- User phase {{ loop.index }} ----
-            for { let end := add(proof_cptr, {{ phase.advice_bytes|hex() }}) }
+            if iszero(eq(proof_cptr, {{ phase.advice_read.cptr_start|hex() }})) { revert(0, 0) }
+            advice_walk := {{ phase.advice_read.mptr_start|hex() }}
+            for { let end := {{ phase.advice_read.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1120,8 +1122,9 @@ contract Halo2Verifier {
 
             {%- if num_lookups != 0 %}
             // ---- multiplicities (one G1 per lookup) ----
-            let lookup_m_walk := LOOKUP_M_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ codegen_layout.proof.lookup_multiplicities.byte_len|hex() }}) }
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.lookup_multiplicities.cptr_start|hex() }})) { revert(0, 0) }
+            let lookup_m_walk := {{ codegen_layout.proof_reads.lookup_multiplicities.mptr_start|hex() }}
+            for { let end := {{ codegen_layout.proof_reads.lookup_multiplicities.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1145,8 +1148,9 @@ contract Halo2Verifier {
 
             {%- if num_permutation_zs != 0 %}
             // ---- permutation Z products ----
-            let perm_z_walk := PERM_Z_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ codegen_layout.proof.permutation_products.byte_len|hex() }}) }
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.permutation_products.cptr_start|hex() }})) { revert(0, 0) }
+            let perm_z_walk := {{ codegen_layout.proof_reads.permutation_products.mptr_start|hex() }}
+            for { let end := {{ codegen_layout.proof_reads.permutation_products.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1168,9 +1172,11 @@ contract Halo2Verifier {
             // ---- lookup helpers + accumulators (per-lookup) ----
             let lookup_helper_walk := LOOKUP_HELPER_COMMS_MPTR_BASE
             let lookup_z_walk := LOOKUP_Z_COMMS_MPTR_BASE
-            {%- for lookup in codegen_layout.proof.lookups %}
-            // lookup {{ loop.index0 }}: {{ lookup.helpers.item_count }} helper(s) + 1 acc
-            for { let end := add(proof_cptr, {{ lookup.helpers.byte_len|hex() }}) }
+            {%- for lookup in codegen_layout.proof_reads.lookups %}
+            // lookup {{ lookup.lookup }}: {{ lookup.helpers.item_count }} helper(s) + 1 acc
+            if iszero(eq(proof_cptr, {{ lookup.helpers.cptr_start|hex() }})) { revert(0, 0) }
+            lookup_helper_walk := {{ lookup.helpers.mptr_start|hex() }}
+            for { let end := {{ lookup.helpers.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1182,14 +1188,15 @@ contract Halo2Verifier {
                 lookup_helper_walk := add(lookup_helper_walk, {{ template_constants.g1_bytes|hex() }})
                 proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
             }
+            if iszero(eq(proof_cptr, {{ lookup.accumulator.cptr_start|hex() }})) { revert(0, 0) }
+            lookup_z_walk := {{ lookup.accumulator.mptr_start|hex() }}
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
             calldatacopy(lookup_z_walk, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
             trace_point(proof_commit_trace_id, lookup_z_walk)
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            lookup_z_walk := add(lookup_z_walk, {{ template_constants.g1_bytes|hex() }})
-            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
+            proof_cptr := {{ lookup.accumulator.cptr_end|hex() }}
             {%- endfor %}
             {%- endif %}
 
@@ -1203,8 +1210,9 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, TRASH_CHALLENGE_MPTR)
             {%- if num_trashcans != 0 %}
             // ---- trashcans ----
-            let trashcan_walk := TRASHCAN_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ codegen_layout.proof.trash.byte_len|hex() }}) }
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.trash.cptr_start|hex() }})) { revert(0, 0) }
+            let trashcan_walk := {{ codegen_layout.proof_reads.trash.mptr_start|hex() }}
+            for { let end := {{ codegen_layout.proof_reads.trash.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1230,8 +1238,9 @@ contract Halo2Verifier {
             // QUOTIENT_LIMB_COMMS_MPTR_BASE; the Horner fold below reads
             // them back from memory. common_uncompressed_g1 absorbs the
             // 128-byte calldata form into the transcript verbatim.
-            let quotient_walk := QUOTIENT_LIMB_COMMS_MPTR_BASE
-            for { let end := add(proof_cptr, {{ codegen_layout.proof.quotient_limbs.byte_len|hex() }}) }
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.quotient_limbs.cptr_start|hex() }})) { revert(0, 0) }
+            let quotient_walk := {{ codegen_layout.proof_reads.quotient_limbs.mptr_start|hex() }}
+            for { let end := {{ codegen_layout.proof_reads.quotient_limbs.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 buf_len := common_uncompressed_g1(buf_len, proof_cptr)
@@ -1257,8 +1266,9 @@ contract Halo2Verifier {
             // into REVERSED_EVALS_MPTR in the same iteration we range-check
             // it, so downstream references can use cheap mload.
             {
-                let eval_buf := REVERSED_EVALS_MPTR
-                for { let end := add(proof_cptr, {{ codegen_layout.proof.evals.byte_len|hex() }}) }
+                if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.evals.cptr_start|hex() }})) { revert(0, 0) }
+                let eval_buf := {{ codegen_layout.proof_reads.evals.mptr_start|hex() }}
+                for { let end := {{ codegen_layout.proof_reads.evals.cptr_end|hex() }} }
                     lt(proof_cptr, end)
                     {} {
                     let eval := calldataload(proof_cptr)
@@ -1279,13 +1289,14 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, X2_MPTR)
 
             // ---- f_com (1 uncompressed G1) ----
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.f_com.cptr_start|hex() }})) { revert(0, 0) }
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-            calldatacopy(F_COM_MPTR, proof_cptr, {{ template_constants.g1_bytes|hex() }})
+            calldatacopy({{ codegen_layout.proof_reads.f_com.mptr_start|hex() }}, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
-            trace_point(proof_commit_trace_id, F_COM_MPTR)
+            trace_point(proof_commit_trace_id, {{ codegen_layout.proof_reads.f_com.mptr_start|hex() }})
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
+            proof_cptr := {{ codegen_layout.proof_reads.f_com.cptr_end|hex() }}
 
             // ---- x3 ----
             buf_len := squeeze_to(buf_len, X3_MPTR)
@@ -1303,8 +1314,9 @@ contract Halo2Verifier {
             {%- endif %}
 
             // ---- q_evals (one Fq per point set) ----
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.q_evals.cptr_start|hex() }})) { revert(0, 0) }
             mstore(Q_EVAL_CPTR_MPTR, proof_cptr)
-            for { let end := add(proof_cptr, {{ codegen_layout.proof.q_evals.byte_len|hex() }}) }
+            for { let end := {{ codegen_layout.proof_reads.q_evals.cptr_end|hex() }} }
                 lt(proof_cptr, end)
                 {} {
                 let eval := calldataload(proof_cptr)
@@ -1321,13 +1333,14 @@ contract Halo2Verifier {
             buf_len := squeeze_to(buf_len, X4_MPTR)
 
             // ---- pi (1 uncompressed G1) ----
+            if iszero(eq(proof_cptr, {{ codegen_layout.proof_reads.pi.cptr_start|hex() }})) { revert(0, 0) }
             buf_len := common_uncompressed_g1(buf_len, proof_cptr)
-            calldatacopy(PI_MPTR, proof_cptr, {{ template_constants.g1_bytes|hex() }})
+            calldatacopy({{ codegen_layout.proof_reads.pi.mptr_start|hex() }}, proof_cptr, {{ template_constants.g1_bytes|hex() }})
             {%- if self.trace %}
-            trace_point(proof_commit_trace_id, PI_MPTR)
+            trace_point(proof_commit_trace_id, {{ codegen_layout.proof_reads.pi.mptr_start|hex() }})
             proof_commit_trace_id := add(proof_commit_trace_id, 1)
             {%- endif %}
-            proof_cptr := add(proof_cptr, {{ template_constants.g1_bytes|hex() }})
+            proof_cptr := {{ codegen_layout.proof_reads.pi.cptr_end|hex() }}
 
             // The hand-rolled proof parser must consume exactly the ABI
             // `proof` bytes before the `instances` length word. This is

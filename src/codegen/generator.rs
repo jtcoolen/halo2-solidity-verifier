@@ -3114,6 +3114,7 @@ impl<'a> SolidityGenerator<'a> {
             meta.num_evals,
             meta.num_point_sets,
         );
+        let proof_reads = VerifierProofReadPlan::from_layout(&proof_layout, &memory);
         let transcript_plan =
             TranscriptPlan::from_protocol(&meta.protocol, &proof_layout, self.num_instances);
         transcript_plan
@@ -3315,6 +3316,7 @@ impl<'a> SolidityGenerator<'a> {
                 let phase = UserPhase {
                     num_advices: n_a,
                     advice_bytes: proof_layout.advice_phases[idx].byte_len,
+                    advice_read: proof_reads.user_phase_advice[idx],
                     num_challenges: n_c,
                     challenge_offset,
                 };
@@ -3411,6 +3413,7 @@ impl<'a> SolidityGenerator<'a> {
             vk_len,
             codegen_layout: VerifierCodegenLayout {
                 proof: proof_layout.clone(),
+                proof_reads,
                 memory: memory.clone(),
                 vk_header: Default::default(),
                 transcript: transcript_layout,

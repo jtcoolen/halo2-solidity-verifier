@@ -4,7 +4,7 @@ use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
     layout,
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
-    proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
+    proof_layout::{ProofCalldataLayout, ProofSection, TranscriptBufferLayout},
     util::Ptr,
 };
 use askama::{Error, Template};
@@ -362,6 +362,158 @@ impl Halo2VerifyingKey {
     }
 }
 
+/// Planned proof G1 read from calldata into verifier memory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProofG1ReadRange {
+    pub(crate) cptr_start: usize,
+    pub(crate) cptr_end: usize,
+    pub(crate) mptr_start: usize,
+    pub(crate) item_count: usize,
+    pub(crate) byte_len: usize,
+}
+
+impl ProofG1ReadRange {
+    fn from_section(section: ProofSection, mptr_start: usize) -> Self {
+        Self {
+            cptr_start: section.start,
+            cptr_end: section.end(),
+            mptr_start,
+            item_count: section.item_count,
+            byte_len: section.byte_len,
+        }
+    }
+}
+
+/// Planned proof scalar read from calldata, optionally into verifier memory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProofScalarReadRange {
+    pub(crate) cptr_start: usize,
+    pub(crate) cptr_end: usize,
+    pub(crate) mptr_start: usize,
+    pub(crate) item_count: usize,
+    pub(crate) byte_len: usize,
+}
+
+impl ProofScalarReadRange {
+    fn from_section(section: ProofSection, mptr_start: usize) -> Self {
+        Self {
+            cptr_start: section.start,
+            cptr_end: section.end(),
+            mptr_start,
+            item_count: section.item_count,
+            byte_len: section.byte_len,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProofLookupReadPlan {
+    pub(crate) lookup: usize,
+    pub(crate) helpers: ProofG1ReadRange,
+    pub(crate) accumulator: ProofG1ReadRange,
+}
+
+/// Typed verifier proof-read plan: every calldata proof section paired with
+/// the memory destination used by the Solidity parser.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VerifierProofReadPlan {
+    pub(crate) user_phase_advice: Vec<ProofG1ReadRange>,
+    pub(crate) lookup_multiplicities: ProofG1ReadRange,
+    pub(crate) permutation_products: ProofG1ReadRange,
+    pub(crate) lookups: Vec<ProofLookupReadPlan>,
+    pub(crate) trash: ProofG1ReadRange,
+    pub(crate) quotient_limbs: ProofG1ReadRange,
+    pub(crate) evals: ProofScalarReadRange,
+    pub(crate) f_com: ProofG1ReadRange,
+    pub(crate) q_evals: ProofScalarReadRange,
+    pub(crate) pi: ProofG1ReadRange,
+}
+
+impl VerifierProofReadPlan {
+    pub(crate) fn from_layout(proof: &ProofCalldataLayout, memory: &VerifierMemoryLayout) -> Self {
+        let mut advice_mptr = memory.advice_comms_mptr_base.value().as_usize();
+        let user_phase_advice = proof
+            .advice_phases
+            .iter()
+            .copied()
+            .map(|section| {
+                let read = ProofG1ReadRange::from_section(section, advice_mptr);
+                advice_mptr += section.byte_len;
+                read
+            })
+            .collect();
+
+        let mut lookup_helper_mptr = memory.lookup_helper_comms_mptr_base.value().as_usize();
+        let mut lookup_z_mptr = memory.lookup_z_comms_mptr_base.value().as_usize();
+        let lookups = proof
+            .lookups
+            .iter()
+            .map(|lookup| {
+                let helpers = ProofG1ReadRange::from_section(lookup.helpers, lookup_helper_mptr);
+                lookup_helper_mptr += lookup.helpers.byte_len;
+                let accumulator = ProofG1ReadRange::from_section(lookup.accumulator, lookup_z_mptr);
+                lookup_z_mptr += lookup.accumulator.byte_len;
+                ProofLookupReadPlan {
+                    lookup: lookup.lookup,
+                    helpers,
+                    accumulator,
+                }
+            })
+            .collect();
+
+        Self {
+            user_phase_advice,
+            lookup_multiplicities: ProofG1ReadRange::from_section(
+                proof.lookup_multiplicities,
+                memory.lookup_m_comms_mptr_base.value().as_usize(),
+            ),
+            permutation_products: ProofG1ReadRange::from_section(
+                proof.permutation_products,
+                memory.perm_z_comms_mptr_base.value().as_usize(),
+            ),
+            lookups,
+            trash: ProofG1ReadRange::from_section(
+                proof.trash,
+                memory.trashcan_comms_mptr_base.value().as_usize(),
+            ),
+            quotient_limbs: ProofG1ReadRange::from_section(
+                proof.quotient_limbs,
+                memory.quotient_limb_comms_mptr_base.value().as_usize(),
+            ),
+            evals: ProofScalarReadRange::from_section(
+                proof.evals,
+                memory.reversed_evals_mptr.value().as_usize(),
+            ),
+            f_com: ProofG1ReadRange::from_section(
+                proof.f_com,
+                memory.f_com_mptr.value().as_usize(),
+            ),
+            q_evals: ProofScalarReadRange::from_section(proof.q_evals, 0),
+            pi: ProofG1ReadRange::from_section(proof.pi, memory.pi_mptr.value().as_usize()),
+        }
+    }
+
+    pub(crate) fn validate_against_layout(
+        &self,
+        proof: &ProofCalldataLayout,
+        memory: &VerifierMemoryLayout,
+    ) -> Result<(), String> {
+        let expected = Self::from_layout(proof, memory);
+        if self != &expected {
+            return Err(format!(
+                "proof read plan mismatch: got {self:?}, expected {expected:?}"
+            ));
+        }
+        if self.pi.cptr_end != proof.proof_end {
+            return Err(format!(
+                "proof read plan end mismatch: got {:#x}, expected proof_end {:#x}",
+                self.pi.cptr_end, proof.proof_end
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Per-user-phase summary: how many advice commitments to absorb in this
 /// phase, how many challenges to squeeze afterwards, and the index of
 /// the first challenge within `CHALLENGE_MPTR[..]`.
@@ -369,6 +521,7 @@ impl Halo2VerifyingKey {
 pub(crate) struct UserPhase {
     pub(crate) num_advices: usize,
     pub(crate) advice_bytes: usize,
+    pub(crate) advice_read: ProofG1ReadRange,
     pub(crate) num_challenges: usize,
     /// Starting offset (in 32-byte words) into the CHALLENGE_MPTR area
     /// where this phase's challenges should be written.
@@ -378,6 +531,7 @@ pub(crate) struct UserPhase {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierCodegenLayout {
     pub(crate) proof: ProofCalldataLayout,
+    pub(crate) proof_reads: VerifierProofReadPlan,
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_header: VkHeaderTemplateSlots,
     pub(crate) transcript: TranscriptBufferLayout,
@@ -674,6 +828,29 @@ impl Halo2Verifier {
 
         let proof_cptr = self.proof_cptr.value().as_usize();
         let proof_layout = &self.codegen_layout.proof;
+        self.codegen_layout
+            .proof_reads
+            .validate_against_layout(proof_layout, &self.memory)?;
+        if self.user_phases.len() != self.codegen_layout.proof_reads.user_phase_advice.len() {
+            return Err(format!(
+                "user phase proof read count mismatch: phases={} reads={}",
+                self.user_phases.len(),
+                self.codegen_layout.proof_reads.user_phase_advice.len()
+            ));
+        }
+        for (idx, (phase, read)) in self
+            .user_phases
+            .iter()
+            .zip(self.codegen_layout.proof_reads.user_phase_advice.iter())
+            .enumerate()
+        {
+            if phase.advice_read != *read || phase.advice_bytes != read.byte_len {
+                return Err(format!(
+                    "user phase {idx} advice read mismatch: phase={:?}, planned={read:?}",
+                    phase.advice_read
+                ));
+            }
+        }
         if proof_layout.proof_cptr != proof_cptr {
             return Err(format!(
                 "proof calldata layout mismatch: template proof_cptr({proof_cptr:#x}) != layout proof_cptr({:#x})",
@@ -921,23 +1098,6 @@ mod tests {
         let num_quotients = 3usize;
         let num_evals = 5usize;
         let num_point_sets = 2usize;
-        let non_quotient_g1s = total_advices
-            + num_lookups
-            + num_permutation_zs
-            + lookup_helper_chunks_total
-            + num_lookups
-            + num_trashcans;
-        let proof_len = (non_quotient_g1s + num_quotients + 2) * G1_BYTES
-            + (num_evals + num_point_sets) * WORD_BYTES;
-        let comms_mptr_base = 0x2000usize;
-        let selector_acc_mptr = comms_mptr_base + (non_quotient_g1s + num_quotients) * G1_BYTES;
-        let memory = VerifierMemoryLayout::new(
-            &ConstraintSystemMeta::default(),
-            &synthetic_vk(0, 0),
-            Ptr::memory(0x1000),
-            VerifierMemoryLayoutConfig::default(),
-        );
-        let acc_msm_scratch = memory.acc_msm_scratch;
         let protocol = ProtocolPlan {
             num_user_advices: vec![total_advices],
             lookup_chunks: vec![lookup_helper_chunks_total],
@@ -947,8 +1107,30 @@ mod tests {
             num_quotients,
             ..ProtocolPlan::default()
         };
+        let meta = ConstraintSystemMeta {
+            protocol: protocol.clone(),
+            num_user_advices: vec![total_advices],
+            lookup_chunks: vec![lookup_helper_chunks_total],
+            num_lookups,
+            num_permutation_zs,
+            num_trashcans,
+            num_quotients,
+            num_evals,
+            num_point_sets,
+            ..ConstraintSystemMeta::default()
+        };
+        let vk = synthetic_vk(0, 0);
+        let memory = VerifierMemoryLayout::new(
+            &meta,
+            &vk,
+            Ptr::memory(0x1000),
+            VerifierMemoryLayoutConfig::default(),
+        );
+        let acc_msm_scratch = memory.acc_msm_scratch;
         let proof_layout =
             ProofCalldataLayout::from_protocol(&protocol, proof_cptr, num_evals, num_point_sets);
+        let proof_reads = super::VerifierProofReadPlan::from_layout(&proof_layout, &memory);
+        let proof_len = proof_layout.proof_len;
 
         Halo2Verifier {
             template_constants: Default::default(),
@@ -963,20 +1145,21 @@ mod tests {
             fr_delta: crate::codegen::quotient::fr_delta_literal(),
             embedded_vk: None,
             expected_vk_codehash: Some(U256::from(1u64)),
-            vk_len: 0,
+            vk_len: vk.len(),
             proof_len,
             codegen_layout: super::VerifierCodegenLayout {
-                proof: proof_layout,
+                proof: proof_layout.clone(),
+                proof_reads: proof_reads.clone(),
                 memory: memory.clone(),
                 vk_header: Default::default(),
                 transcript: TranscriptBufferLayout::default(),
                 quotient_external: None,
             },
-            memory,
+            memory: memory.clone(),
             vk_header: Default::default(),
             vk_mptr: Ptr::memory(0x1000),
-            challenge_mptr: Ptr::memory(0x1200),
-            theta_mptr: Ptr::memory(0x1300),
+            challenge_mptr: memory.challenge_mptr,
+            theta_mptr: memory.theta_mptr,
             constructor_smoke_scratch_mptr: crate::codegen::layout::LOW_MEMORY_SCRATCH_START,
             transcript_mptr: crate::codegen::layout::TRANSCRIPT_BUFFER_START,
             final_pairing_scratch_mptr: crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
@@ -987,9 +1170,15 @@ mod tests {
             abi_instances_head_cptr: crate::codegen::layout::abi::SELECTOR_BYTES + WORD_BYTES,
             num_instance_cptr: proof_cptr + proof_len,
             instance_cptr: proof_cptr + proof_len + WORD_BYTES,
-            quotient_comm_cptr: Ptr::calldata(proof_cptr + non_quotient_g1s * G1_BYTES),
+            quotient_comm_cptr: Ptr::calldata(proof_layout.quotient_comm_cptr),
             num_neg_lagranges: 0,
-            user_phases: vec![],
+            user_phases: vec![super::UserPhase {
+                num_advices: total_advices,
+                advice_bytes: proof_layout.advice_phases[0].byte_len,
+                advice_read: proof_reads.user_phase_advice[0],
+                num_challenges: 0,
+                challenge_offset: 0,
+            }],
             num_user_challenges: 0,
             num_lookups,
             num_permutation_zs,
@@ -1001,11 +1190,11 @@ mod tests {
             total_advices,
             lookup_helper_chunks_total,
             lookup_chunks: vec![lookup_helper_chunks_total],
-            comms_mptr_base: Ptr::memory(comms_mptr_base),
-            reversed_evals_mptr: Ptr::memory(0x3000),
+            comms_mptr_base: memory.comms_mptr_base,
+            reversed_evals_mptr: memory.reversed_evals_mptr,
             pcs_memory_requirements: PcsMemoryRequirements::default(),
-            selector_acc_mptr,
-            batch_invert_scratch_mptr: selector_acc_mptr,
+            selector_acc_mptr: memory.selector_acc_mptr,
+            batch_invert_scratch_mptr: memory.batch_invert_scratch_mptr,
             quotient_external: None,
             expected_quotient_len: None,
             expected_quotient_codehash: None,
@@ -1134,6 +1323,45 @@ mod tests {
     }
 
     #[test]
+    fn verifier_proof_read_plan_pins_sections_to_memory_destinations() {
+        let verifier = synthetic_verifier();
+        let proof = &verifier.codegen_layout.proof;
+        let reads = &verifier.codegen_layout.proof_reads;
+
+        assert_eq!(
+            reads.user_phase_advice[0].cptr_start,
+            proof.advice_phases[0].start
+        );
+        assert_eq!(
+            reads.user_phase_advice[0].mptr_start,
+            verifier.memory.advice_comms_mptr_base.value().as_usize()
+        );
+        assert_eq!(
+            reads.lookup_multiplicities.cptr_start,
+            proof.lookup_multiplicities.start
+        );
+        assert_eq!(
+            reads.permutation_products.cptr_start,
+            proof.permutation_products.start
+        );
+        assert_eq!(
+            reads.lookups[0].helpers.cptr_start,
+            proof.lookups[0].helpers.start
+        );
+        assert_eq!(
+            reads.lookups[0].accumulator.cptr_start,
+            proof.lookups[0].accumulator.start
+        );
+        assert_eq!(reads.evals.cptr_start, proof.evals.start);
+        assert_eq!(
+            reads.evals.mptr_start,
+            verifier.memory.reversed_evals_mptr.value().as_usize()
+        );
+        assert_eq!(reads.q_evals.cptr_start, proof.q_evals.start);
+        assert_eq!(reads.pi.cptr_end, proof.proof_end);
+    }
+
+    #[test]
     fn verifier_layout_validation_rejects_cursor_drift() {
         let mut verifier = synthetic_verifier();
         verifier.num_instance_cptr += 0x20;
@@ -1145,9 +1373,29 @@ mod tests {
     }
 
     #[test]
+    fn verifier_layout_validation_rejects_proof_read_plan_drift() {
+        let mut verifier = synthetic_verifier();
+        verifier.codegen_layout.proof_reads.evals.cptr_start += WORD_BYTES;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("proof read plan mismatch"),
+            "unexpected layout error: {err}"
+        );
+
+        let mut verifier = synthetic_verifier();
+        verifier.user_phases[0].advice_read.cptr_start += G1_BYTES;
+        let err = verifier.validate_layout().unwrap_err();
+        assert!(
+            err.contains("user phase 0 advice read mismatch"),
+            "unexpected layout error: {err}"
+        );
+    }
+
+    #[test]
     fn verifier_layout_validation_rejects_vk_challenge_overlap() {
         let mut verifier = synthetic_verifier();
-        verifier.vk_len = 0x220;
+        verifier.vk_len =
+            verifier.challenge_mptr.value().as_usize() - verifier.vk_mptr.value().as_usize() + 0x20;
         let err = verifier.validate_layout().unwrap_err();
         assert!(
             err.contains("VK memory layout mismatch"),
