@@ -207,13 +207,12 @@ pub(crate) fn compute_dummy_queries(queries: &[Query]) -> Vec<DummyQuery> {
             Some((_, points)) if !points.contains(&q.rotation) => {
                 points.push(q.rotation);
             }
-            Some(_) => {
-                panic!(
-                    "duplicate (commitment, rotation) query at index {i}: \
-                     compute_dummy_queries cannot run on a non-deduplicated \
-                     query list"
-                );
-            }
+            // Same `(commitment, rotation)` already recorded. Eval consistency
+            // is enforced upstream in `construct_intermediate_sets_impl`, so
+            // here we silently skip the redundant rotation rather than panic;
+            // this matters when several queries (e.g. multiple committed-
+            // instance columns) legally share `G1_IDENTITY_MPTR` at rotation 0.
+            Some(_) => continue,
             None => groups.push((i, vec![q.rotation])),
         }
     }
@@ -311,10 +310,20 @@ fn construct_intermediate_sets_impl(queries: &[Query]) -> IntermediateSets {
         };
 
         if let Some(slot) = commitment_map.iter_mut().find(|(c, _, _)| *c == query.comm) {
-            assert!(
-                !slot.1.contains(&point_idx),
-                "duplicate (commitment, rotation) query"
-            );
+            // Two queries can share `(commitment, rotation)` legally when the
+            // protocol points multiple columns at the same slot (e.g. every
+            // committed-instance column shares `G1_IDENTITY_MPTR` in the
+            // zk_stdlib `verify` path). Collapse them into the existing entry
+            // when their evals also agree; otherwise the proof claims the
+            // same polynomial opens to two different values, which is a
+            // protocol bug and must be rejected.
+            if let Some(existing_pos) = slot.1.iter().position(|pi| *pi == point_idx) {
+                assert_eq!(
+                    slot.2[existing_pos], query.eval,
+                    "duplicate (commitment, rotation) query with conflicting evals"
+                );
+                continue;
+            }
             slot.1.push(point_idx);
             slot.2.push(query.eval);
         } else {
@@ -356,9 +365,14 @@ fn construct_intermediate_sets_impl(queries: &[Query]) -> IntermediateSets {
         });
     }
 
-    // Step 4: turn point_idx sets into actual rotation lists, in the
-    // ordering BTreeMap iterates (which is by Vec<usize> lex order). We
-    // rely on this ordering for tiebreak when sorting by cardinality.
+    // Step 4: turn point_idx sets into actual rotation lists. The slot
+    // assigned to each set is its *insertion* order, captured at
+    // `or_insert(n)` above. The BTreeMap iteration here is by `Vec<usize>`
+    // lex order purely so we visit every entry once; the index that lands
+    // in `point_sets[..]` is `set_idx` (insertion order), which is also
+    // the tiebreak key used by `sort_sets`. Anyone replacing this map
+    // with a `HashMap` must preserve that insertion-order capture, not
+    // the iteration order itself.
     let mut point_sets: Vec<Vec<i32>> = vec![Vec::new(); point_idx_sets.len()];
     for (idx_set, &set_idx) in point_idx_sets.iter() {
         let rotations: Vec<i32> = idx_set.iter().map(|i| point_index_of[*i]).collect();
@@ -701,6 +715,12 @@ pub(super) fn computations(
         }
 
         if trace {
+            // Trace-only serialization of each point set's rotation values.
+            // We borrow `Q_EVAL_SET_MPTR` as scratch for the `log1` payload
+            // because Block 3 unconditionally rewrites those words with the
+            // real `q_eval_set[s][k]` folds before any later block reads
+            // them. Any future reader of `Q_EVAL_SET_MPTR` between this
+            // block and Block 3 must move the trace scratch elsewhere.
             for (set_idx, points) in sets.point_sets.iter().enumerate() {
                 lines.push(format!(
                     "// trace serialized PCS point set {set_idx} ({} point(s))",
@@ -947,14 +967,20 @@ pub(super) fn computations(
         }
     }
 
-    {
+    if trace {
+        // Trace-only block: per-set q_com materialization that re-runs the
+        // same MSM Block 5 emits, so the trace stream can log each
+        // intermediate q_com point. In production (`trace == false`) this
+        // block is fully skipped because the staged data is never read by
+        // the verifier itself; Block 5 stages its own copy into
+        // `pcs_final_msm_scratch_mptr`.
         let mut lines: Vec<String> = Vec::new();
         let g1_identity = EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR"));
         let linearization_comm = data.computed_quotient_comm;
         let simple_selector_cols: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         let linearization_term_count = linearization_term_count(meta);
         let trace_scratch = memory.pcs_q_com_trace_scratch_mptr;
-        lines.push("// materialize per-set q_com inputs before the fused final MSM".to_string());
+        lines.push("// materialize per-set q_com inputs for trace logging".to_string());
         for (set_idx, commitments_in_set) in by_set.iter().enumerate() {
             let non_identity_terms = commitments_in_set
                 .iter()
@@ -972,12 +998,10 @@ pub(super) fn computations(
                 lines.push(format!(
                     "mcopy({trace_scratch:#x}, G1_IDENTITY_MPTR, {G1_BYTES:#x})"
                 ));
-                if trace {
-                    lines.push(format!(
-                        "trace_point({}, {trace_scratch:#x})",
-                        40000 + set_idx
-                    ));
-                }
+                lines.push(format!(
+                    "trace_point({}, {trace_scratch:#x})",
+                    40000 + set_idx
+                ));
                 continue;
             }
 
@@ -1051,22 +1075,20 @@ pub(super) fn computations(
                 "q_com trace MSM input term count changed during emission"
             );
             let msm_len = non_identity_terms * G1_MSM_PAIR_BYTES;
-            if trace {
-                lines.push(format!(
-                    "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, {G1_BYTES:#x})"
-                ));
-                lines.push(format!(
-                    "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), {G1_BYTES:#x}))"
-                ));
-                lines.push(format!(
-                    "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, {WORD_BYTES:#x}) }}",
-                    40000 + set_idx
-                ));
-                lines.push(format!(
-                    "trace_point({}, {trace_scratch:#x})",
-                    40000 + set_idx
-                ));
-            }
+            lines.push(format!(
+                "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, {G1_BYTES:#x})"
+            ));
+            lines.push(format!(
+                "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), {G1_BYTES:#x}))"
+            ));
+            lines.push(format!(
+                "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, {WORD_BYTES:#x}) }}",
+                40000 + set_idx
+            ));
+            lines.push(format!(
+                "trace_point({}, {trace_scratch:#x})",
+                40000 + set_idx
+            ));
         }
         blocks.push(lines);
     }
@@ -1346,8 +1368,9 @@ pub(super) fn computations(
         // each emitted power is truncated to 128 bits.
         if truncated_challenges {
             lines.push("let x4_pow_full := 1".to_string());
+        } else {
+            lines.push("let x4_pow_0 := 1".to_string());
         }
-        lines.push("let x4_pow_0 := 1".to_string());
         for s in 1..=n_sets {
             if truncated_challenges {
                 lines.push("x4_pow_full := mulmod(x4_pow_full, x4, r)".to_string());
@@ -1675,7 +1698,7 @@ mod tests {
         found_sizes.sort();
         assert_eq!(found_sizes, vec![1, 2, 3]);
 
-        // Now sort and verify ordering.
+        // Now sort and verify ordering and content.
         let sorted = sort_sets(raw);
         assert_eq!(
             sorted
@@ -1685,6 +1708,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+        // Sets sorted by ascending cardinality must hold the expected
+        // rotation values, regardless of the within-set order. Compare
+        // by sorted content to avoid coupling the test to the internal
+        // `point_index_of` ordering.
+        let mut s0 = sorted.point_sets[0].clone();
+        s0.sort_unstable();
+        assert_eq!(s0, vec![0]);
+        let mut s1 = sorted.point_sets[1].clone();
+        s1.sort_unstable();
+        assert_eq!(s1, vec![0, 1]);
+        let mut s2 = sorted.point_sets[2].clone();
+        s2.sort_unstable();
+        assert_eq!(s2, vec![-1, 0, 1]);
+
+        // Eval alignment: each commitment's `evals[k]` must correspond to
+        // the rotation at `sorted.point_sets[c.set_index][k]`.
+        let mut found_c0 = false;
+        let mut found_c3 = false;
+        for c in &sorted.commitments {
+            let pts = &sorted.point_sets[c.set_index];
+            assert_eq!(c.evals.len(), pts.len(), "evals/points length mismatch");
+            if c.comm == pt(0x100) {
+                found_c0 = true;
+                assert_eq!(c.evals, vec![ev(0x200)]);
+            }
+            if c.comm == pt(0x130) {
+                found_c3 = true;
+                // c3's evals are aligned with the set's sorted point list;
+                // use the protocol-level pairs (rotation -> eval) for a
+                // location-independent check.
+                let pairs: Vec<(i32, Word)> = pts.iter().copied().zip(c.evals.iter().copied()).collect();
+                assert!(pairs.contains(&(0, ev(0x270))));
+                assert!(pairs.contains(&(1, ev(0x290))));
+                assert!(pairs.contains(&(-1, ev(0x2b0))));
+            }
+        }
+        assert!(found_c0 && found_c3, "expected c0 and c3 entries in commitments");
     }
 
     #[test]
