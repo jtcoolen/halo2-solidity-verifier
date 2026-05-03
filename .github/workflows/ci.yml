@@ -5,129 +5,149 @@ on:
   push:
     branches:
       - main
+      - "codex/**"
+  workflow_dispatch:
 
 env:
-  SOLC_VERSION: 0.8.24
+  CARGO_TERM_COLOR: always
+  SOLC_INSTALL_DIR: ${{ github.workspace }}/.solc
+  SRS_DIR: ${{ github.workspace }}/.srs
 
 jobs:
-  test:
-    name: Test
+  default-rust-tests:
+    name: default Rust tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup default "$toolchain"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@master
         with:
-          cache-on-failure: true
-
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
       - name: Install pinned solc
         run: |
-          hash svm 2>/dev/null || cargo install svm-rs@0.5.4
-          svm install "$SOLC_VERSION"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "SOLC=$HOME/.cargo/bin/solc" >> "$GITHUB_ENV"
-          "$HOME/.cargo/bin/solc" --version | grep "Version: $SOLC_VERSION"
+          echo "SOLC=$(scripts/install_pinned_solc.sh "$SOLC_INSTALL_DIR" | tail -1)" >> "$GITHUB_ENV"
+      - run: cargo test --workspace --all-features --all-targets -- --nocapture
 
-      - name: Run test
-        run: cargo test --workspace --all-features --all-targets
+  real-evm-pbt-and-poseidon:
+    name: real EVM, PBT, Poseidon fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache SRS assets
+        uses: actions/cache@v4
+        with:
+          path: .srs
+          key: srs-poseidon-ivc-v1
+      - name: Install pinned solc
+        run: |
+          echo "SOLC=$(scripts/install_pinned_solc.sh "$SOLC_INSTALL_DIR" | tail -1)" >> "$GITHUB_ENV"
+      - name: Ensure SRS assets
+        run: scripts/ensure_srs_assets.sh
+      - name: Real EVM PBT
+        run: |
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 \
+          cargo test --release --all-features pbt_ -- --nocapture
+      - name: Poseidon fixture
+        run: |
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 \
+          cargo test --release --features evm,truncated-challenges --test poseidon_fixture -- --nocapture
 
-  solidity-variants:
-    name: Solidity Variants
+  poseidon-trace-equivalence:
+    name: Poseidon native/Solidity trace equivalence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache SRS assets
+        uses: actions/cache@v4
+        with:
+          path: .srs
+          key: srs-poseidon-ivc-v1
+      - name: Install pinned solc
+        run: |
+          echo "SOLC=$(scripts/install_pinned_solc.sh "$SOLC_INSTALL_DIR" | tail -1)" >> "$GITHUB_ENV"
+      - name: Ensure SRS assets
+        run: scripts/ensure_srs_assets.sh
+      - name: Poseidon trace equivalence
+        run: |
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 \
+          cargo test --release \
+            --features evm,truncated-challenges,rust-verifier-trace,solidity-trace \
+            --lib native_midfall_verifier_trace_matches_solidity_trace \
+            -- --nocapture
+
+  full-ivc-bench:
+    name: full IVC bench and release bytecode sizes
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup default "$toolchain"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@master
         with:
-          cache-on-failure: true
-
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache SRS assets
+        uses: actions/cache@v4
+        with:
+          path: .srs
+          key: srs-poseidon-ivc-v1
       - name: Install pinned solc
         run: |
-          hash svm 2>/dev/null || cargo install svm-rs@0.5.4
-          svm install "$SOLC_VERSION"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "SOLC=$HOME/.cargo/bin/solc" >> "$GITHUB_ENV"
-          "$HOME/.cargo/bin/solc" --version | grep "Version: $SOLC_VERSION"
+          echo "SOLC=$(scripts/install_pinned_solc.sh "$SOLC_INSTALL_DIR" | tail -1)" >> "$GITHUB_ENV"
+      - name: Ensure SRS assets
+        run: scripts/ensure_srs_assets.sh
+      - name: Full IVC bench
+        run: scripts/run_ivc_bench.sh --skip-srs-download
+      - name: Release bytecode size/hash checks
+        run: scripts/check_release_bytecode_sizes.sh
+      - name: Upload IVC artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ivc-keccak-solidity-dump
+          path: target/ivc-keccak-solidity-dump
 
-      - name: Prepare SRS assets and compile IVC bench
-        run: scripts/run_ivc_bench.sh --check-only
-
-      - name: Compile Poseidon verifier variants
+  ivc-trace-equivalence:
+    name: IVC native/Solidity trace equivalence
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache SRS assets
+        uses: actions/cache@v4
+        with:
+          path: .srs
+          key: srs-poseidon-ivc-v1
+      - name: Install pinned solc
         run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges \
-            poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --nocapture
-
-      - name: Compile Poseidon verifier variants with gas checkpoints
-        run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges,solidity-gas-checkpoints \
-            poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --nocapture
-
-      - name: Compile Poseidon verifier variants with fewer point sets
-        run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges,outer-fewer-point-sets \
-            poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --nocapture
-
-      - name: Compile Poseidon gas variants with fewer point sets
-        run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges,outer-fewer-point-sets,solidity-gas-checkpoints \
-            poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --nocapture
-
-      - name: Poseidon native/Solidity trace equivalence
-        run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges,rust-verifier-trace,solidity-trace \
-            native_midfall_verifier_trace_matches_solidity_trace \
-            -- --nocapture
-
-      - name: Supported-shape native/Solidity trace equivalence
-        run: |
-          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
-            --features evm,truncated-challenges,rust-verifier-trace,solidity-trace \
-            supported_shape_circuit_fuzz_e2e \
-            -- --nocapture
-
-      - name: IVC trace-equivalence gas bench
+          echo "SOLC=$(scripts/install_pinned_solc.sh "$SOLC_INSTALL_DIR" | tail -1)" >> "$GITHUB_ENV"
+      - name: Ensure SRS assets
+        run: scripts/ensure_srs_assets.sh
+      - name: IVC trace equivalence
         run: scripts/run_ivc_bench.sh --trace --skip-srs-download
 
   lint:
-    name: Lint
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
-          rustup default "$toolchain"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@master
         with:
-          cache-on-failure: true
-
-      - name: Run fmt
+          toolchain: 1.90.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust format
         run: cargo fmt --all -- --check
-
-      - name: Run clippy
+      - name: Clippy
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
