@@ -161,12 +161,46 @@ return-frame magic immediately before returning. It must not use the verifier's
 high `trace_u256_mptr`, which can overlap the evaluator's VM stack in the
 callee.
 
+## Codegen Validation Path
+
+The offsets below are not only documented constants. The normal verifier
+generation path constructs typed layout manifests and validates them before
+returning Solidity:
+
+1. `SolidityGenerator::generate_base_vk()` writes the VK header through
+   `VkHeaderLayout::builder()`. The builder rejects missing words, duplicate
+   writes, wrong-width G1/G2 fields, and header overflows before the VK payload is
+   used.
+2. `Halo2VerifyingKey::validate_payload_layout()` checks that quotient constants,
+   quotient program words, fixed commitments, and permutation commitments match
+   `VkPayloadLayout::for_vk()` and the rendered byte length.
+3. `SolidityGenerator::meta_data_for_stable_static_layout()` iterates proof-shape
+   planning until `VK_MPTR` is stable, then builds `VerifierMemoryLayout` from the
+   final metadata and VK payload shape.
+4. `SolidityGenerator::generate_verifier()` calls
+   `Halo2Verifier::validate_layout()` and panics with
+   `invalid generated verifier layout` if validation fails.
+5. `Halo2Verifier::validate_layout()` calls `VerifierMemoryLayout::validate()`,
+   then checks proof calldata cursors, proof length, instance cursor, VK/challenge
+   separation, quotient commitment cursor, selector accumulator location, and
+   external quotient frame ranges.
+6. `VerifierMemoryLayout::validate()` rejects unaligned regions, writes inside
+   Solidity-reserved memory `[0x00..0x80)`, live memory overlaps, and PCS
+   fixed-window capacity overflows.
+
+Some compatibility facts are additionally pinned by tests and debug assertions:
+the VK header word count, theta-relative window starts, trace namespaces, and
+synthetic memory offsets. Documentation is not parsed by codegen, so when an
+offset changes the source constants, this document, and the corresponding tests
+must be updated together.
+
 ## Theta-Relative Offsets
 
 `THETA_MPTR` is the anchor for the historical fixed verifier state.
 `ThetaWindowLayout::compatibility()` computes the window starts from named slot
-sizes, historical capacities, and padding, then validation pins the resulting
-addresses. The offsets below are in 32-byte words from `THETA_MPTR`.
+sizes, historical capacities, and padding. Tests and debug assertions pin the
+historical starts, while codegen validation enforces capacity and overlap safety.
+The offsets below are in 32-byte words from `THETA_MPTR`.
 
 | Offset | Region | Size | Justification |
 | ---: | --- | ---: | --- |
