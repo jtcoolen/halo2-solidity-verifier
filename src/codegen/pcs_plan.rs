@@ -60,6 +60,106 @@ pub(crate) struct PcsPointSetPlan {
     pub(crate) q_eval_source_table_words: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PcsRenderPlan {
+    pub(crate) blocks: Vec<PcsRenderBlock>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PcsRenderBlock {
+    pub(crate) kind: PcsRenderBlockKind,
+    pub(crate) lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PcsRenderBlockKind {
+    RotationPoints,
+    X1Powers,
+    QEvalSet {
+        set: usize,
+        strategy: PcsQEvalStrategy,
+    },
+    QComTrace,
+    FEval,
+    FinalMsm,
+    PairingInputs,
+}
+
+impl PcsRenderBlockKind {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::RotationPoints => "rotation_points",
+            Self::X1Powers => "x1_powers",
+            Self::QEvalSet { .. } => "q_eval_set",
+            Self::QComTrace => "q_com_trace",
+            Self::FEval => "f_eval",
+            Self::FinalMsm => "final_msm",
+            Self::PairingInputs => "pairing_inputs",
+        }
+    }
+}
+
+impl PcsRenderPlan {
+    pub(crate) fn from_blocks(
+        pcs: &PcsPlan,
+        blocks: Vec<Vec<String>>,
+        trace: bool,
+    ) -> Result<Self, String> {
+        let kinds = Self::expected_block_kinds(pcs, trace);
+        if blocks.len() != kinds.len() {
+            return Err(format!(
+                "PCS render block count mismatch: got {} block(s), expected {} ({:?})",
+                blocks.len(),
+                kinds.len(),
+                kinds
+            ));
+        }
+
+        Ok(Self {
+            blocks: kinds
+                .into_iter()
+                .zip(blocks)
+                .map(|(kind, lines)| PcsRenderBlock { kind, lines })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn expected_block_kinds(pcs: &PcsPlan, trace: bool) -> Vec<PcsRenderBlockKind> {
+        if pcs.point_set_count == 0 {
+            return Vec::new();
+        }
+
+        let mut kinds = Vec::with_capacity(4 + pcs.point_sets.len() + usize::from(trace));
+        kinds.push(PcsRenderBlockKind::RotationPoints);
+        if pcs.memory.x1_powers_words > 0 {
+            kinds.push(PcsRenderBlockKind::X1Powers);
+        }
+        kinds.extend(
+            pcs.point_sets
+                .iter()
+                .map(|set| PcsRenderBlockKind::QEvalSet {
+                    set: set.index,
+                    strategy: set.q_eval_strategy,
+                }),
+        );
+        if trace {
+            kinds.push(PcsRenderBlockKind::QComTrace);
+        }
+        kinds.push(PcsRenderBlockKind::FEval);
+        kinds.push(PcsRenderBlockKind::FinalMsm);
+        kinds.push(PcsRenderBlockKind::PairingInputs);
+        kinds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_kinds(&self) -> Vec<&'static str> {
+        self.blocks
+            .iter()
+            .map(|block| block.kind.as_str())
+            .collect()
+    }
+}
+
 impl PcsPlan {
     pub(crate) fn new(meta: &ConstraintSystemMeta, data: &Data) -> Self {
         let queries = pcs::queries(meta, data);
@@ -258,5 +358,33 @@ mod tests {
         assert_eq!(plan.final_msm, memory_requirements.final_msm);
         assert_eq!(plan.q_com_trace_msm, memory_requirements.q_com_trace_msm);
         assert!(plan.validate_against_memory(&memory_requirements).is_ok());
+
+        let render = PcsRenderPlan::from_blocks(
+            &plan,
+            vec![
+                vec!["rotation".to_string()],
+                vec!["x1".to_string()],
+                vec!["q0".to_string()],
+                vec!["q1".to_string()],
+                vec!["f_eval".to_string()],
+                vec!["final_msm".to_string()],
+                vec!["pairing".to_string()],
+            ],
+            false,
+        )
+        .expect("PCS render plan block order");
+        assert_eq!(
+            render.block_kinds(),
+            vec![
+                "rotation_points",
+                "x1_powers",
+                "q_eval_set",
+                "q_eval_set",
+                "f_eval",
+                "final_msm",
+                "pairing_inputs"
+            ]
+        );
+        assert!(PcsRenderPlan::from_blocks(&plan, vec![vec![]], true).is_err());
     }
 }

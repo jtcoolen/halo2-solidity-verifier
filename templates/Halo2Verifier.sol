@@ -1226,9 +1226,9 @@ contract Halo2Verifier {
             // PCS computation (multi-prepare emitter from Step 5).
             // ===============================================================
             {
-                {%- for code_block in pcs_computations %}
+                {%- for code_block in pcs_render.blocks %}
                 {
-                    {%- for line in code_block %}
+                    {%- for line in code_block.lines %}
                     {{ line }}
                     {%- endfor %}
                 }

@@ -4,6 +4,7 @@ use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
     layout,
     memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
+    pcs_plan::PcsRenderPlan,
     proof_layout::{ProofCalldataLayout, ProofSection, TranscriptBufferLayout},
     transcript_plan::{
         BatchOpenCommitmentKind, TranscriptChallenge, TranscriptEvent, TranscriptPlan,
@@ -1177,7 +1178,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) quotient_native_identity_computations: Vec<Vec<String>>,
     pub(crate) quotient_native_trash_computation: Vec<String>,
     pub(crate) quotient_program: Option<QuotientProgram>,
-    pub(crate) pcs_computations: Vec<Vec<String>>,
+    pub(crate) pcs_render: PcsRenderPlan,
     /// Sorted simple-selector fixed-column indices. Each is rendered
     /// into a Yul snippet that adds `S_i_com * sel_acc_i` to the
     /// linearization commitment after Q_folded is scaled by (1-x^n).
@@ -1497,7 +1498,7 @@ mod filters {
 
 #[cfg(test)]
 mod tests {
-    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
+    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey, PcsRenderPlan};
     use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{
         memory::{
@@ -1724,7 +1725,7 @@ mod tests {
             quotient_native_identity_computations: vec![],
             quotient_native_trash_computation: vec![],
             quotient_program: None,
-            pcs_computations: vec![],
+            pcs_render: PcsRenderPlan::default(),
             simple_selector_cols: vec![],
             proof_commit_trace_base: crate::codegen::layout::trace::PROOF_COMMIT_BASE,
             proof_eval_trace_base: crate::codegen::layout::trace::PROOF_EVAL_BASE,

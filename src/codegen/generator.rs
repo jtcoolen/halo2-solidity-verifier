@@ -3297,7 +3297,7 @@ impl<'a> SolidityGenerator<'a> {
                 .flat_map(|block| block.iter())
                 .any(|line| line.contains("q_limb7_wide("));
 
-        let pcs_computations = pcs::computations_from_intermediate_sets(
+        let pcs_blocks = pcs::computations_from_intermediate_sets(
             &meta,
             &data,
             &memory,
@@ -3305,6 +3305,8 @@ impl<'a> SolidityGenerator<'a> {
             trace,
             pcs_plan.intermediate_sets(),
         );
+        let pcs_render = PcsRenderPlan::from_blocks(&pcs_plan, pcs_blocks, trace)
+            .unwrap_or_else(|err| panic!("invalid PCS render plan: {err}"));
 
         // Per-user-phase breakdown (advices + user challenges).
         let mut challenge_offset = 0usize;
@@ -3481,7 +3483,7 @@ impl<'a> SolidityGenerator<'a> {
             } else {
                 quotient_program
             },
-            pcs_computations,
+            pcs_render,
             simple_selector_cols: sorted_simple.clone(),
             proof_commit_trace_base: layout::trace::PROOF_COMMIT_BASE,
             proof_eval_trace_base: layout::trace::PROOF_EVAL_BASE,

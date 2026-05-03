@@ -55,7 +55,7 @@ pub(crate) mod util;
 
 use config::*;
 use manifest::*;
-use pcs_plan::PcsPlan;
+use pcs_plan::{PcsPlan, PcsRenderPlan};
 #[cfg(test)]
 pub(crate) use quotient::RepackedProofScalarLayout;
 use quotient::*;
