@@ -978,6 +978,26 @@ fn ivc_final_keccak_solidity_e2e() {
                 "non-canonical accumulator limb packing",
             );
 
+            let lhs_scalar_word = first_acc_word + 4 * 0x20;
+            let rhs_first_word = lhs_scalar_word + 0x20;
+            let rhs_scalar_word = rhs_first_word + 4 * 0x20;
+
+            let mut malformed_lhs_zero_scalar = calldata.clone();
+            malformed_lhs_zero_scalar[first_acc_word + 31] ^= 0x01;
+            overwrite_u256_word_for_test(&mut malformed_lhs_zero_scalar, lhs_scalar_word, 0);
+            assert_call_reverts(
+                evm.try_call_with_gas(verifier_address, malformed_lhs_zero_scalar, 5_000_000_000),
+                "malformed LHS accumulator point with zero scalar",
+            );
+
+            let mut malformed_rhs_zero_scalar = calldata.clone();
+            malformed_rhs_zero_scalar[rhs_first_word + 31] ^= 0x01;
+            overwrite_u256_word_for_test(&mut malformed_rhs_zero_scalar, rhs_scalar_word, 0);
+            assert_call_reverts(
+                evm.try_call_with_gas(verifier_address, malformed_rhs_zero_scalar, 5_000_000_000),
+                "malformed RHS accumulator point with zero scalar",
+            );
+
             let mut bad_proof_head = calldata.clone();
             overwrite_u256_word_for_test(&mut bad_proof_head, 0x04, 0x60);
             let mut bad_instances_head = calldata.clone();

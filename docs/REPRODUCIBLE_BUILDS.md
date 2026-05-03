@@ -32,10 +32,10 @@ Published deployed-runtime hashes:
 
 | Artifact | Runtime bytes | Runtime `keccak256` |
 | --- | ---: | --- |
-| `Halo2Verifier` | 13,885 | `0xbbc033200a10a22a30dd7c2ae55f382bd23e8ee53d0c4175153ced5115eb698a` |
+| `Halo2Verifier` | 11,331 | `0x444068b6e8ac2ca2a505890f2c1b6c1b92f8695de069562de4c9e7caf26a3640` |
 | `Halo2VerifyingKey` | 15,136 | `0x3e935334ddb91f56e302e88a8331e5e639b936e6d2ab1a570cc11f353fb427ce` |
 | `Halo2QuotientEvaluator` | 18,329 | `0x414011cf401e996940275baaba5b30fb4bb1fd92d4b440a2f5a17c6d0fc10c59` |
 
-Total deployed runtime bytes: `47,350`.
+Total deployed runtime bytes: `44,796`.
 
-The same run accepted the final IVC Keccak proof on-chain in `1,793,791` gas.
+The same run accepted the final IVC Keccak proof on-chain in `1,817,890` gas.

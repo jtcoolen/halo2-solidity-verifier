@@ -1541,6 +1541,9 @@ contract Halo2Verifier {
             {%- if self.trace %}
             trace_point(27, PAIRING_LHS_MPTR)
             trace_point(28, PAIRING_RHS_MPTR)
+            {%- for _ in simple_selector_cols %}
+            trace_u256({{ selector_trace_base + loop.index0 }}, mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 32)|hex() }})))
+            {%- endfor %}
             {%- endif %}
 
             // Rebuild the public IVC accumulator from `instances` and batch
@@ -1577,25 +1580,19 @@ contract Halo2Verifier {
                 let lhs_ok, lhs_is_id := load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
                 success := and(success, lhs_ok)
                 let acc_scratch := {{ memory.acc_msm_scratch|hex() }}
-                if iszero(lhs_is_id) {
+                {
                     let lhs_scalar := calldataload(lhs_scalar_ptr)
-                    switch lhs_scalar
-                    case 0 {
-                        mstore(ACC_LHS_MPTR, 0)
-                        mstore(add(ACC_LHS_MPTR, 0x20), 0)
-                        mstore(add(ACC_LHS_MPTR, 0x40), 0)
-                        mstore(add(ACC_LHS_MPTR, 0x60), 0)
-                    }
-                    case 1 {
-                        // ACC_LHS_MPTR already holds 1 * point.
-                    }
-                    default {
-                        mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
-                        mstore(add(acc_scratch, 0x80), lhs_scalar)
-                        if success {
-                            success := staticcall(g1msm_gas_cap(0xa0), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
-                            success := and(success, eq(returndatasize(), 0x80))
-                        }
+                    pop(lhs_is_id)
+                    // Always route the decoded carried point through G1MSM,
+                    // even for identity points and zero/one scalars. The
+                    // precompile is the on-curve/subgroup validator for this
+                    // public-input point; skipping it would let a malformed
+                    // non-identity point hide behind scalar 0.
+                    mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
+                    mstore(add(acc_scratch, 0x80), lhs_scalar)
+                    if success {
+                        success := staticcall(g1msm_gas_cap(0xa0), 0x0c, acc_scratch, 0xa0, ACC_LHS_MPTR, 0x80)
+                        success := and(success, eq(returndatasize(), 0x80))
                     }
                 }
 
@@ -1616,29 +1613,16 @@ contract Halo2Verifier {
                 let rhs_ok, rhs_is_id := load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
                 success := and(success, rhs_ok)
                 let acc_pair_ptr := acc_scratch
-                let rhs_kept_direct := 0
-                if iszero(rhs_is_id) {
+                {
                     let rhs_scalar := calldataload(rhs_scalar_ptr)
-                    switch rhs_scalar
-                    case 0 {
-                        // No variable-base RHS contribution.
-                    }
-                    case 1 {
-                        {%- if acc_fixed_bases.len() == 0 %}
-                        // With no fixed-base tail, ACC_RHS_MPTR already
-                        // holds the complete 1 * point result.
-                        rhs_kept_direct := 1
-                        {%- else %}
-                        mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
-                        mstore(add(acc_pair_ptr, 0x80), 1)
-                        acc_pair_ptr := add(acc_pair_ptr, 0xa0)
-                        {%- endif %}
-                    }
-                    default {
-                        mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
-                        mstore(add(acc_pair_ptr, 0x80), rhs_scalar)
-                        acc_pair_ptr := add(acc_pair_ptr, 0xa0)
-                    }
+                    pop(rhs_is_id)
+                    // Keep the carried RHS point in the MSM input even when
+                    // it is encoded as identity or has scalar 0/1, so EIP-2537
+                    // validates every decoded public accumulator point before
+                    // it can affect, or be erased from, the pairing batch.
+                    mcopy(acc_pair_ptr, ACC_RHS_MPTR, 0x80)
+                    mstore(add(acc_pair_ptr, 0x80), rhs_scalar)
+                    acc_pair_ptr := add(acc_pair_ptr, 0xa0)
                 }
                 {%- if acc_fixed_bases.len() > 0 %}
                 let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
@@ -1668,12 +1652,6 @@ contract Halo2Verifier {
                         )
                         success := and(success, eq(returndatasize(), 0x80))
                     }
-                }
-                if and(iszero(acc_msm_len), iszero(rhs_kept_direct)) {
-                    mstore(ACC_RHS_MPTR, 0)
-                    mstore(add(ACC_RHS_MPTR, 0x20), 0)
-                    mstore(add(ACC_RHS_MPTR, 0x40), 0)
-                    mstore(add(ACC_RHS_MPTR, 0x60), 0)
                 }
 
                 {
@@ -1781,9 +1759,6 @@ contract Halo2Verifier {
             trace_u256(32, mload(V_MPTR))
             trace_point(33, FINAL_COM_MPTR)
             trace_u256(35, success)
-            {%- for _ in simple_selector_cols %}
-            trace_u256({{ selector_trace_base + loop.index0 }}, mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 32)|hex() }})))
-            {%- endfor %}
             if mload(HAS_ACCUMULATOR_MPTR) {
                 trace_point(29, ACC_LHS_MPTR)
                 trace_point(30, ACC_RHS_MPTR)

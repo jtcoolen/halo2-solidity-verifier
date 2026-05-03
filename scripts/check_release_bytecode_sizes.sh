@@ -47,7 +47,7 @@ check_size "Halo2Verifier deployed runtime bytes"
 check_size "Halo2VerifyingKey deployed runtime bytes"
 check_size "Halo2QuotientEvaluator deployed runtime bytes"
 
-check_hash "Halo2Verifier deployed runtime keccak256" "0xbbc033200a10a22a30dd7c2ae55f382bd23e8ee53d0c4175153ced5115eb698a"
+check_hash "Halo2Verifier deployed runtime keccak256" "0x444068b6e8ac2ca2a505890f2c1b6c1b92f8695de069562de4c9e7caf26a3640"
 check_hash "Halo2VerifyingKey deployed runtime keccak256" "0x3e935334ddb91f56e302e88a8331e5e639b936e6d2ab1a570cc11f353fb427ce"
 check_hash "Halo2QuotientEvaluator deployed runtime keccak256" "0x414011cf401e996940275baaba5b30fb4bb1fd92d4b440a2f5a17c6d0fc10c59"
 
