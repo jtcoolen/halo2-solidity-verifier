@@ -22,9 +22,8 @@
 //! `in-circuit-fewer-point-sets` and `outer-fewer-point-sets` by default;
 //! omit only `outer-fewer-point-sets` to benchmark the non-fewer final proof
 //! layout while the recursive verifier remains on fewer point sets.
-//! Midnight crates are pulled from the published midfall `keccak` branch
-//! configured in `Cargo.toml`; `SRS_DIR` still needs to point at local SRS
-//! assets.
+//! Midnight crates are pulled from the immutable Midfall revision pinned in
+//! `Cargo.toml`; `SRS_DIR` still needs to point at local SRS assets.
 //! Run:
 //!
 //! ```text
@@ -80,8 +79,9 @@ use midnight_zk_stdlib::{
 use rand::rngs::OsRng;
 
 use halo2_solidity_verifier::{
-    compile_solidity_with_runs, encode_calldata_bls_padded, AccumulatorEncoding, CallOutcome, Evm,
-    ProofEvaluationCounts, SolidityGenerator,
+    compile_solidity_with_runs, encode_calldata_bls_padded, pinned_solc_available, solc_version,
+    AccumulatorEncoding, CallOutcome, Evm, ProofEvaluationCounts, SolidityGenerator,
+    PINNED_SOLC_VERSION,
 };
 
 type S = BlstrsEmulation;
@@ -604,14 +604,9 @@ fn ivc_final_keccak_solidity_e2e() {
         return;
     }
 
-    // Bail out cleanly when solc isn't on PATH.
-    let solc = std::env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
-    if std::process::Command::new(&solc)
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        println!("[ivc-keccak-solidity] {solc} not found on PATH; skipping");
+    // Bail out cleanly when the pinned solc isn't available.
+    if !pinned_solc_available() {
+        println!("[ivc-keccak-solidity] pinned solc not available; skipping");
         return;
     }
     if !has_required_srs_assets() {
@@ -872,6 +867,8 @@ fn ivc_final_keccak_solidity_e2e() {
         evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
     let vk_runtime_size = evm.code_size(vk_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
+    let vk_codehash = evm.code_hash(vk_address);
+    let verifier_codehash = evm.code_hash(verifier_address);
     for (name, runtime_size) in [
         ("Halo2Verifier", verifier_runtime_size),
         ("Halo2VerifyingKey", vk_runtime_size),
@@ -883,7 +880,9 @@ fn ivc_final_keccak_solidity_e2e() {
         );
     }
     let contract_size_summary = format!(
-        "solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
+        "solc version: {}\n\
+         solc pinned version: {PINNED_SOLC_VERSION}\n\
+         solc optimize runs: {SOLC_OPTIMIZE_RUNS}\n\
          solc CBOR metadata: omitted\n\
          Halo2Verifier.sol source bytes: {}\n\
          Halo2VerifyingKey.sol source bytes: {}\n\
@@ -894,7 +893,11 @@ fn ivc_final_keccak_solidity_e2e() {
          Halo2Verifier deployed runtime bytes: {verifier_runtime_size}\n\
          Halo2VerifyingKey deployed runtime bytes: {vk_runtime_size}\n\
          Halo2QuotientEvaluator deployed runtime bytes: {quotient_runtime_size}\n\
-         total deployed runtime bytes: {}\n",
+         total deployed runtime bytes: {}\n\
+         Halo2Verifier deployed runtime keccak256: 0x{verifier_codehash:064x}\n\
+         Halo2VerifyingKey deployed runtime keccak256: 0x{vk_codehash:064x}\n\
+         Halo2QuotientEvaluator deployed runtime keccak256: 0x{quotient_codehash:064x}\n",
+        solc_version().expect("pinned solc version already checked"),
         verifier_solidity.len(),
         vk_solidity.len(),
         quotient_solidity.len(),
@@ -911,6 +914,9 @@ fn ivc_final_keccak_solidity_e2e() {
     println!(
         "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, quotient runtime = {quotient_runtime_size} bytes, total runtime = {} bytes",
         verifier_runtime_size + vk_runtime_size + quotient_runtime_size
+    );
+    println!(
+        "[ivc-keccak-solidity] runtime hashes: verifier = 0x{verifier_codehash:064x}, vk = 0x{vk_codehash:064x}, quotient = 0x{quotient_codehash:064x}"
     );
 
     // ----------------------------------------------------------

@@ -19,7 +19,7 @@
 //! Yul renders cleanly and the Prague-spec EVM accepts the proof.
 //!
 //! NOTE: this test depends on `midnight-zk-stdlib` + `midnight-circuits`
-//! from the published midfall branch configured in `Cargo.toml`. The
+//! from the immutable Midfall revision configured in `Cargo.toml`. The
 //! `[patch]` blocks redirect every `midnight-*` reference to that same
 //! Git source so cargo resolves a single canonical crate copy across
 //! the whole dep graph.
@@ -45,7 +45,7 @@ use rand_chacha::ChaCha8Rng;
 use sha3::Keccak256;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, Evm, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, pinned_solc_available, Evm, SolidityGenerator,
 };
 
 type F = Fq;
@@ -193,14 +193,9 @@ fn poseidon_renders_compiles_and_verifies() {
         verifier_solidity.len()
     );
 
-    // Skip the EVM portion if `solc` is not on PATH.
-    let solc = env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
-    if std::process::Command::new(&solc)
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("skipping poseidon end-to-end smoke: {solc} not found");
+    // Skip the EVM portion if the pinned solc is not available.
+    if !pinned_solc_available() {
+        eprintln!("skipping poseidon end-to-end smoke: pinned solc not available");
         return;
     }
 

@@ -49,7 +49,8 @@ pub const OUTER_FEWER_POINT_SETS_ENABLED: bool = cfg!(feature = "outer-fewer-poi
 
 #[cfg(feature = "evm")]
 pub use evm::test::{
-    compile_solidity, compile_solidity_with_runs, revm, CallOutcome, Evm, DEFAULT_OPTIMIZE_RUNS,
+    compile_solidity, compile_solidity_with_runs, pinned_solc_available, revm, solc_version,
+    CallOutcome, Evm, DEFAULT_OPTIMIZE_RUNS, PINNED_SOLC_VERSION,
 };
 
 /// Test-only helper that exposes the internal BLS12-381 G1 to EIP-2537

@@ -2098,3 +2098,335 @@ Recommendation:
 
 - Return a typed `Result<Vec<u8>, RepackError>` and keep a panicking wrapper
   only for tests/examples.
+
+## 2026-05-03 time-boxed manual audit: posted verifier review
+
+Scope: verifier as posted for manual review.
+
+This pass was not compiled or run against a native verifier. Treat it as a
+manual review, not a proof of correctness.
+
+### Overall Assessment
+
+The design has several good hardening choices: exact ABI-layout checks, exact
+proof length checks, canonical scalar checks for public instances and proof
+evals, canonical BLS12-381 coordinate checks before transcript absorption,
+dependency `code.length` + `codehash` pinning, and return-size checks on
+precompiles.
+
+The highest-risk area is the IVC accumulator public-input decoding, especially
+the branches that skip precompile validation when an accumulator scalar is
+zero. This is exactly the kind of boundary where previous verifier audits have
+found issues: missing proof-point/scalar validation, non-canonical encodings,
+transcript deviations, and off-curve witnesses are recurring themes in
+PLONK/Halo2 verifier audits. OpenZeppelin's Linea PLONK audit explicitly called
+out missing validation of openings, public witness values, proof commitments,
+and subgroup membership as verifier risk areas. Common Prefix's PLONK verifier
+audit similarly flags canonical field representations and transcript/SRS
+binding as important verifier concerns. Trail of Bits' Axiom Halo2 audit shows
+how off-curve point witnesses can become proof-forgery hazards when later
+arithmetic assumes valid curve points.
+
+### TA-1. Accumulator Points With Scalar Zero Bypass Curve/Subgroup Validation
+
+Severity: Medium/High, depending on circuit assumptions.
+
+In `load_acc_point`, accumulator coordinates are decoded from public instances
+into `ACC_LHS_MPTR` and `ACC_RHS_MPTR`. The decoded point is range/canonical
+encoding checked, but not independently checked to be on-curve or in the
+correct subgroup. The code appears to rely on EIP-2537 precompiles to validate
+points later.
+
+That reliance has an exception:
+
+```solidity
+switch lhs_scalar
+case 0 {
+    mstore(ACC_LHS_MPTR, 0)
+    ...
+}
+```
+
+and similarly for the RHS path:
+
+```solidity
+if and(iszero(acc_msm_len), iszero(rhs_kept_direct)) {
+    mstore(ACC_RHS_MPTR, 0)
+    ...
+}
+```
+
+If `lhs_scalar == 0` or `rhs_scalar == 0`, a non-identity accumulator point can
+be decoded from public inputs and then overwritten with the identity before any
+precompile sees it. This means invalid/off-curve public accumulator coordinates
+can be accepted when their scalar is zero.
+
+Why this matters: if the circuit expects the Solidity verifier to validate
+public accumulator points, a malicious prover can potentially publish malformed
+accumulator limbs while setting the corresponding scalar to zero. The pairing
+equation no longer checks that malformed point. Even if this does not forge the
+final KZG proof, it can accept an invalid public IVC accumulator statement.
+
+Recommendation:
+
+- Validate every non-identity decoded accumulator point before considering its
+  scalar. For example, immediately after `load_acc_point` succeeds, call a
+  validating precompile path with scalar `1` and ignore the result:
+
+  ```yul
+  function validate_g1_point(mptr) {
+      let scratch := 0x100
+      mcopy(scratch, mptr, 0x80)
+      mstore(add(scratch, 0x80), 1)
+
+      if iszero(staticcall(g1msm_gas_cap(0xa0), 0x0c, scratch, 0xa0, scratch, 0x80)) {
+          revert(0, 0)
+      }
+      if iszero(eq(returndatasize(), 0x80)) {
+          revert(0, 0)
+      }
+  }
+  ```
+
+- Then:
+
+  ```yul
+  if and(success, iszero(lhs_is_id)) {
+      validate_g1_point(ACC_LHS_MPTR)
+  }
+  if and(success, iszero(rhs_is_id)) {
+      validate_g1_point(ACC_RHS_MPTR)
+  }
+  ```
+
+- Add a circuit-side on-curve/subgroup constraint for accumulator public points
+  if the circuit currently emits only raw limbs.
+
+### TA-2. Transcript Must Be Proven To Bind Every Verifier-Side Fixed Input
+
+Severity: Medium.
+
+The verifier absorbs `vk_digest` rather than the full VK payload:
+
+```yul
+buf_len := common_word(buf_len, mload(VK_DIGEST_MPTR))
+```
+
+This is fine only if `vk_digest` is specified to commit to all fixed verifier
+data that affects verification, including:
+
+- fixed commitments;
+- permutation commitments;
+- quotient VM constants and bytecode;
+- SRS material such as `G1_BASE`, `G2_BASE`, and `NEG_S_G2_BASE`;
+- accumulator schema and packing parameters;
+- protocol version and transcript encoding version.
+
+The VK comments say `vk_digest` is `transcript_repr` of the CS, which is
+ambiguous. If it is only a circuit/constraint-system digest and not a digest of
+the full verifier key/runtime payload, then Fiat-Shamir challenges are not
+explicitly bound to all verifier-side fixed data.
+
+The codehash pinning strongly mitigates this for a single deployed verifier,
+but the transcript specification should still be exact. This is the same class
+of issue as the Espresso PLONK verifier finding where the transcript did not
+include all common preprocessed input/SRS material.
+
+Recommendation:
+
+- Define `vk_digest` as something like:
+
+  ```text
+  vk_digest = H(
+    "midnight-halo2-bls12-381-v1",
+    vk_runtime_payload,
+    quotient_evaluator_runtime_hash,
+    proof_layout_id,
+    accumulator_layout_id,
+    transcript_encoding_id
+  )
+  ```
+
+- Or absorb `EXPECTED_VK_CODEHASH` and `EXPECTED_QUOTIENT_CODEHASH` directly
+  into the transcript before public instances.
+
+### TA-3. External Quotient Evaluator Is Pinned, But Not Transcript-Bound
+
+Severity: Low/Medium.
+
+`AUTHORIZED_QUOTIENT` is codehash-pinned, which is good. However, its output
+directly determines:
+
+```yul
+QUOTIENT_EVAL_MPTR
+SELECTOR_ACC_MPTR
+```
+
+and the transcript never absorbs the quotient evaluator identity. If the
+quotient evaluator is treated as part of the verifier key, this should be
+included in the VK digest or absorbed separately.
+
+Recommendation:
+
+- Include `EXPECTED_QUOTIENT_CODEHASH`, `EXPECTED_QUOTIENT_LENGTH`, and a
+  quotient evaluator version/magic in the same digest used for Fiat-Shamir
+  domain separation. The returned `QUOTIENT_MAGIC` is a good runtime guard, but
+  it does not bind challenges to the evaluator.
+
+### TA-4. Gas Checkpoint Logs Make This Unsuitable As A Production Verifier
+
+Severity: Low/Medium.
+
+`verifyProof` can include gas checkpoint logging:
+
+```yul
+function gas_checkpoint(id) {
+    log1(0, 0, or(shl(248, id), gas()))
+}
+```
+
+This has three consequences:
+
+1. It increases gas materially.
+2. It emits trace logs on every verification.
+3. It makes the verifier unusable through `STATICCALL`, because `LOG1` is
+   state-changing.
+
+Many application contracts expect proof verifiers to be `view`-like, even if
+the interface is not marked `view`. A gas-checkpoint artifact will fail in any
+static context.
+
+Recommendation:
+
+- Feature-gate this at codegen time. Production builds should make
+  `gas_checkpoint` a no-op:
+
+  ```yul
+  function gas_checkpoint(id) {
+      pop(id)
+  }
+  ```
+
+- Keep the logging version only in a dedicated gas/trace artifact with a
+  different contract name and codehash.
+
+### TA-5. Dangerous Reliance On `assembly ("memory-safe")` With Absolute Memory Ownership
+
+Severity: Low/Medium.
+
+The main assembly block is marked `"memory-safe"` while it intentionally owns
+the entire call-frame memory, writes to low memory, uses fixed absolute
+pointers, and returns from assembly.
+
+Because the block is terminal, this may be practically safe, but the annotation
+is fragile. It tells the Solidity optimizer that the assembly obeys Solidity's
+memory-safety rules. If future edits add Solidity code after the block, or if
+the compiler reasons across the block in an unexpected way, this becomes a
+miscompilation risk.
+
+Recommendation:
+
+- Prefer removing `"memory-safe"` from the terminal verifier block unless there
+  is a compiler-specific proof that this pattern is accepted.
+- Pin the exact compiler and EVM version. The Renegade audit's recommendation
+  to use fixed pragmas rather than floating `^0.8.x` is especially relevant for
+  generated verifier code.
+- Use:
+
+  ```solidity
+  pragma solidity 0.8.24;
+  ```
+
+  or the exact version tested and pinned in CI.
+
+### TA-6. Precompile Smoke Tests Are Too Weak For Deployment Confidence
+
+Severity: Low.
+
+The constructor checks identity inputs for G1ADD, G1MSM, and pairing. That
+catches absent precompiles and gross return-size issues, but it does not catch:
+
+- coordinate endianness mismatches;
+- non-identity arithmetic bugs;
+- subgroup-check differences;
+- invalid-point rejection behavior;
+- target-chain gas-schedule differences.
+
+Recommendation:
+
+- Add deployment/CI tests against the target chain or fork that exercise:
+  - nontrivial `G1ADD(P, Q)`;
+  - `G1MSM([(P, a), (Q, b)])`;
+  - invalid G1/G2 encodings must fail;
+  - known-valid and known-invalid pairing equations;
+  - boundary scalars `0`, `1`, `r - 1`, `r`.
+
+### TA-7. Root-Of-Unity / Zero-Denominator Cases Revert Rather Than Being Specified
+
+Severity: Informational/Low.
+
+The Lagrange and PCS blocks intentionally batch-invert values like:
+
+```yul
+x - omega^i
+x^n - 1
+x3 - rotation_point
+```
+
+If a challenge lands on a denominator-zero case, the verifier reverts. This is
+probably acceptable because the probability is negligible, but it should be
+explicitly specified as "reject on exceptional Fiat-Shamir challenge."
+
+The Espresso audit had a high-severity PLONK verifier issue around incorrect
+Lagrange/public-input behavior when `zeta` is a root of unity, so this edge case
+deserves explicit tests even if the intended behavior here is rejection.
+
+Recommendation:
+
+- Add negative tests with a harness that overrides transcript challenges to
+  force:
+  - `x^n = 1`;
+  - `x = omega^i`;
+  - `x3 = x * omega^rotation`.
+- Expected result: revert, not accept.
+
+### TA-8. Raw Verifier Integration Can Still Be Replayed/Misused By Application Contracts
+
+Severity: Integration risk.
+
+The verifier correctly says application contracts must bind the meaning of
+public instances separately. That warning is important. This raw verifier
+accepts any proof for the pinned circuit and supplied instances; it does not
+enforce:
+
+- chain ID;
+- application contract address;
+- program ID;
+- state root freshness;
+- nullifier use;
+- proof purpose;
+- expected IVC output;
+- caller authorization.
+
+Recommendation:
+
+- Application contracts should not expose a generic "verify and trust all
+  instances" flow. They should decode the public instances and explicitly check
+  every semantic field before acting on the proof.
+
+### Time-Boxed Audit Priorities Before Production
+
+1. Fix accumulator zero-scalar point validation.
+2. Formally define and test `vk_digest` coverage.
+3. Remove `gas_checkpoint` from production artifacts.
+4. Pin compiler + EVM version; reconsider `"memory-safe"` on the terminal
+   block.
+5. Run a differential test suite against the native Midnight/Halo2 verifier.
+6. Add mutation tests that remove each range check, point check, codehash check,
+   and proof-length check; the tests should fail.
+
+A strong negative test suite should include malformed ABI offsets, short/long
+proof bytes, non-canonical scalars, `x_hi`/`y_hi` high-bit pollution, `x = p`,
+`y = p`, off-curve G1s, wrong-subgroup G1s if available, zero-scalar
+accumulator malformed points, VK codehash mismatch, quotient codehash mismatch,
+and forced zero-denominator transcript challenges.

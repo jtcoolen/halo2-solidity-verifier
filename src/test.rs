@@ -1,5 +1,6 @@
 use crate::{
-    compile_solidity, encode_calldata, CallOutcome, Evm, SolidityGenerator, FN_SIG_VERIFY_PROOF,
+    compile_solidity, encode_calldata, pinned_solc_available, CallOutcome, Evm, SolidityGenerator,
+    FN_SIG_VERIFY_PROOF,
 };
 use ff::Field;
 use group::Group as _;
@@ -2345,11 +2346,7 @@ fn poseidon_srs_available() -> bool {
 }
 
 fn solc_available() -> bool {
-    let solc = env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
-    std::process::Command::new(solc)
-        .arg("--version")
-        .output()
-        .is_ok()
+    pinned_solc_available()
 }
 
 fn srs_dir() -> String {

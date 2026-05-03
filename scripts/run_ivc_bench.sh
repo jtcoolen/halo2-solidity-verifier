@@ -18,6 +18,7 @@ MIDFALL_DIR="${MIDFALL_DIR:-"$ROOT_DIR/../midfall"}"
 FILECOIN_SRS_URL="https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19"
 MIDNIGHT_SRS_2P19_URL="https://srs.midnight.network/midnight-srs-2p19"
 MIDNIGHT_SRS_2P20_URL="https://srs.midnight.network/midnight-srs-2p20"
+PINNED_SOLC_VERSION="0.8.30+commit.73712a01"
 
 usage() {
   cat <<'USAGE'
@@ -66,6 +67,14 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found on PATH: $1"
+}
+
+require_pinned_solc() {
+  local solc_bin="${SOLC:-solc}"
+  command -v "$solc_bin" >/dev/null 2>&1 || die "required command not found: $solc_bin"
+  local actual
+  actual="$("$solc_bin" --version | awk '/^Version: / { print $2; exit }')"
+  [[ "$actual" == "$PINNED_SOLC_VERSION"* ]] || die "solc version $actual does not match pinned $PINNED_SOLC_VERSION"
 }
 
 abs_path() {
@@ -205,7 +214,7 @@ run_solidity_bench() {
   features="$(cargo_features)"
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
-    require_cmd solc
+    require_pinned_solc
   fi
 
   echo "[ivc-bench] compiling IVC Keccak Solidity verifier bench (Poseidon-chain leaves)"

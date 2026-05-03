@@ -1555,7 +1555,7 @@ Minimum validation for a reimplementation:
   - trash arguments;
   - simple selectors.
 - Unit-test PCS intermediate-set construction and dummy-query generation.
-- Run Solidity compile tests with `solc 0.8.24`, `--via-ir`,
+- Run Solidity compile tests with `solc 0.8.30+commit.73712a01`, `--via-ir`,
   `--evm-version cancun`, and no CBOR metadata.
 - Run end-to-end EVM verification on a Prague/EIP-2537 VM.
 - Run negative tests for:

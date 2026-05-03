@@ -824,7 +824,7 @@ remaining identities:    q_program VM
 ```
 
 This default was selected because every verifier variant must compile under the
-pinned CI compiler (`solc 0.8.24 --via-ir`):
+pinned CI compiler (`solc 0.8.30+commit.73712a01 --via-ir`):
 
 - every deployed runtime is below `24,576` bytes;
 - embedded, separate-VK, trace, gas-checkpoint, and external-quotient variants

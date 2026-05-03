@@ -3,8 +3,9 @@
 > ⚠️ This repo has NOT been audited and is NOT intended for a production environment yet.
 
 Solidity verifier generator for `midnight-proofs` / Midfall verifier proofs with
-the KZG polynomial commitment scheme on BLS12-381. Generated verifiers target
-Solidity `>=0.8.24` and the EIP-2537 BLS12-381 precompiles.
+the KZG polynomial commitment scheme on BLS12-381. Generated verifiers use
+Solidity `^0.8.24` source pragmas, and reproducible test/bench bytecode is
+compiled with pinned `solc 0.8.30+commit.73712a01`.
 
 For audited solidity verifier generator and proof aggregation toolkits, please refer to [`snark-verifier`](http://github.com/axiom-crypto/snark-verifier).
 
@@ -58,8 +59,11 @@ decompression probes.
 ### Requirements
 
 The workspace is pinned to the toolchain in
-[`rust-toolchain.toml`](./rust-toolchain.toml). Solidity-touching tests require
-`solc >=0.8.24` on `PATH` or via the `SOLC` environment variable.
+[`rust-toolchain.toml`](./rust-toolchain.toml). Midfall dependencies are pinned
+to immutable revision `53dc872f495104046d96bdac0a690f903dc0c537`, without
+repository-local `.cargo/config.toml` path overrides. Solidity-touching tests
+require `solc 0.8.30+commit.73712a01` on `PATH` or via the `SOLC` environment
+variable.
 
 The heavy proof/EVM tests also need Filecoin/Midnight SRS assets. Set
 `SRS_DIR` when they are not available at the default adjacent Midfall checkout
@@ -85,7 +89,12 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 ```
 
 > [!NOTE]
-> CI compiles Solidity with `solc 0.8.24`.
+> CI and reproducible benches compile Solidity with
+> `solc 0.8.30+commit.73712a01`.
+
+The pinned Midfall revision, solc version, canonical IVC bench command, and
+published verifier/VK/quotient runtime hashes are recorded in
+[`docs/REPRODUCIBLE_BUILDS.md`](./docs/REPRODUCIBLE_BUILDS.md).
 
 Run one test by name:
 

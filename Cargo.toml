@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Depend on Midfall's Midnight proof stack from the published keccak branch.
+# Depend on Midfall's Midnight proof stack from an immutable keccak revision.
 # midnight-proofs ships logup, the trash argument, the Midnight KZG
 # multi-prepare PCS, and a Keccak256 transcript with a domain separator plus
 # 64-byte squeeze. midnight-curves carries BLS12-381 natively.
-midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", default-features = false, features = ["keccak-transcript", "committed-instances", "circuit-params"] }
-midnight-curves = { version = "0.2.0" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537", default-features = false, features = ["keccak-transcript", "committed-instances", "circuit-params"] }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
 ff = "0.13"
 group = "0.13"
 askama = { version = "0.12.0", features = ["config"], default-features = false }
@@ -37,35 +37,35 @@ rand_chacha = "0.3.1"
 # type the poseidon fixture (midfall/proofs/solidity-verifier/fixtures/
 # poseidon/{proof.bin, vk.bin, instance.be}) was generated against, which
 # we need to deserialize the VK and rebuild the SolidityGenerator.
-midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
-midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537", features = ["testing"] }
+midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537", features = ["testing"] }
 # IVC Poseidon-chain final-step Keccak proof end-to-end test
 # (tests/ivc_keccak_solidity.rs).
 # The local aggregation crate currently builds in truncated mode, so Solidity
 # tests that exercise it require this crate's matching feature too.
-midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = [
+midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537", features = [
     "keccak-transcript",
     "truncated-challenges",
 ] }
 
-# Keep Midfall subcrates on the same published `keccak` branch without
-# committing machine-local path overrides. Local development overrides belong
-# in `.cargo/config.toml` (see `.cargo/config.toml.example`).
+# Keep Midfall subcrates on the same immutable keccak revision. Do not use
+# repository-local `.cargo/config.toml` path overrides; they make the verifier
+# output depend on whichever checkout happens to exist on one machine.
 [patch.crates-io]
-midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
-midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
-midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
 
 [patch."https://github.com/midnightntwrk/midnight-zk"]
-midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
-midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
-midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
+midnight-curves = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
+midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
 
 [patch."https://github.com/eryxcoop/blake2b_halo2"]
-blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
 
 [patch."https://github.com/eryxcoop/blake2b_halo2?rev=5f979f"]
-blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak" }
+blake2b_halo2 = { git = "https://github.com/EYBlockchain/midfall.git", rev = "53dc872f495104046d96bdac0a690f903dc0c537" }
 
 [features]
 default = []
@@ -103,9 +103,9 @@ outer-fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
 # `fewer-point-sets` retain the previous "everything on" behavior.
 fewer-point-sets = ["in-circuit-fewer-point-sets", "outer-fewer-point-sets"]
 # Enables native Midfall verifier trace hooks used by the Rust/Solidity
-# differential coverage tests. This requires a Midfall checkout that exposes
-# `midnight-proofs/solidity-verifier-trace`; the ignored local
-# `.cargo/config.toml` override is the intended way to run it.
+# differential coverage tests. The pinned Midfall revision above exposes
+# `midnight-proofs/solidity-verifier-trace`; keep trace builds on that
+# immutable dependency graph.
 rust-verifier-trace = ["midnight-proofs/solidity-verifier-trace", "truncated-challenges"]
 
 [[example]]
