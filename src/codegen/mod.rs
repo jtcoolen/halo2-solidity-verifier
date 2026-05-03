@@ -5,8 +5,8 @@ use crate::codegen::{
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
-        QuotientProgram, TranscriptRenderPlan, UserPhase, VerifierCodegenLayout,
-        VerifierProofReadPlan,
+        QuotientProgram, QuotientRenderParts, QuotientRenderPlan, TranscriptRenderPlan, UserPhase,
+        VerifierCodegenLayout, VerifierProofReadPlan,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,

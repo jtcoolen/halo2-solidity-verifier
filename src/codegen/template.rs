@@ -1081,6 +1081,231 @@ impl Default for VkHeaderTemplateSlots {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct QuotientRenderPlan {
+    pub(crate) inline_computations: Vec<QuotientRenderBlock>,
+    pub(crate) eval_numer_computations: Vec<QuotientRenderBlock>,
+    pub(crate) post_vm_computations: Vec<QuotientRenderBlock>,
+    pub(crate) native_permutation_computation: QuotientRenderBlock,
+    pub(crate) native_identity_computations: Vec<QuotientRenderBlock>,
+    pub(crate) native_trash_computation: QuotientRenderBlock,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QuotientRenderParts {
+    pub(crate) inline_computations: Vec<Vec<String>>,
+    pub(crate) eval_numer_computations: Vec<Vec<String>>,
+    pub(crate) post_vm_computations: Vec<Vec<String>>,
+    pub(crate) native_permutation_computation: Vec<String>,
+    pub(crate) native_identity_computations: Vec<Vec<String>>,
+    pub(crate) native_trash_computation: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuotientRenderBlock {
+    pub(crate) kind: QuotientRenderBlockKind,
+    pub(crate) lines: Vec<String>,
+}
+
+impl Default for QuotientRenderBlock {
+    fn default() -> Self {
+        Self {
+            kind: QuotientRenderBlockKind::Empty,
+            lines: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuotientRenderBlockKind {
+    Empty,
+    InlinePrefix { index: usize },
+    EvalNumerator { index: usize },
+    PostVm { index: usize },
+    NativePermutation,
+    NativeIdentity { index: usize },
+    NativeTrash,
+}
+
+impl QuotientRenderBlockKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::InlinePrefix { .. } => "inline_prefix",
+            Self::EvalNumerator { .. } => "eval_numerator",
+            Self::PostVm { .. } => "post_vm",
+            Self::NativePermutation => "native_permutation",
+            Self::NativeIdentity { .. } => "native_identity",
+            Self::NativeTrash => "native_trash",
+        }
+    }
+}
+
+impl QuotientRenderPlan {
+    pub(crate) fn from_parts(parts: QuotientRenderParts, external: bool) -> Result<Self, String> {
+        let plan = Self {
+            inline_computations: wrap_quotient_blocks(
+                QuotientRenderBlockKind::InlinePrefix { index: 0 },
+                parts.inline_computations,
+            )?,
+            eval_numer_computations: wrap_quotient_blocks(
+                QuotientRenderBlockKind::EvalNumerator { index: 0 },
+                parts.eval_numer_computations,
+            )?,
+            post_vm_computations: wrap_quotient_blocks(
+                QuotientRenderBlockKind::PostVm { index: 0 },
+                parts.post_vm_computations,
+            )?,
+            native_permutation_computation: wrap_quotient_block(
+                QuotientRenderBlockKind::NativePermutation,
+                parts.native_permutation_computation,
+            )?,
+            native_identity_computations: wrap_quotient_blocks(
+                QuotientRenderBlockKind::NativeIdentity { index: 0 },
+                parts.native_identity_computations,
+            )?,
+            native_trash_computation: wrap_quotient_block(
+                QuotientRenderBlockKind::NativeTrash,
+                parts.native_trash_computation,
+            )?,
+        };
+        plan.validate(external)?;
+        Ok(plan)
+    }
+
+    pub(crate) fn contains_line(&self, needle: &str) -> bool {
+        self.blocks()
+            .into_iter()
+            .flat_map(|block| block.lines.iter())
+            .any(|line| line.contains(needle))
+    }
+
+    fn validate(&self, external: bool) -> Result<(), String> {
+        if external
+            && self
+                .blocks()
+                .into_iter()
+                .any(|block| !block.lines.is_empty())
+        {
+            return Err(
+                "external verifier quotient render plan must not carry inline/native blocks"
+                    .to_string(),
+            );
+        }
+
+        for block in self.blocks() {
+            validate_quotient_block(block)?;
+        }
+        Ok(())
+    }
+
+    fn blocks(&self) -> Vec<&QuotientRenderBlock> {
+        self.inline_computations
+            .iter()
+            .chain(self.eval_numer_computations.iter())
+            .chain(self.post_vm_computations.iter())
+            .chain(std::iter::once(&self.native_permutation_computation))
+            .chain(self.native_identity_computations.iter())
+            .chain(std::iter::once(&self.native_trash_computation))
+            .collect()
+    }
+}
+
+fn wrap_quotient_blocks(
+    kind_template: QuotientRenderBlockKind,
+    blocks: Vec<Vec<String>>,
+) -> Result<Vec<QuotientRenderBlock>, String> {
+    blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, lines)| {
+            let kind = match kind_template {
+                QuotientRenderBlockKind::InlinePrefix { .. } => {
+                    QuotientRenderBlockKind::InlinePrefix { index }
+                }
+                QuotientRenderBlockKind::EvalNumerator { .. } => {
+                    QuotientRenderBlockKind::EvalNumerator { index }
+                }
+                QuotientRenderBlockKind::PostVm { .. } => QuotientRenderBlockKind::PostVm { index },
+                QuotientRenderBlockKind::NativeIdentity { .. } => {
+                    QuotientRenderBlockKind::NativeIdentity { index }
+                }
+                _ => kind_template.clone(),
+            };
+            wrap_quotient_block(kind, lines)
+        })
+        .collect()
+}
+
+fn wrap_quotient_block(
+    kind: QuotientRenderBlockKind,
+    lines: Vec<String>,
+) -> Result<QuotientRenderBlock, String> {
+    let block = QuotientRenderBlock { kind, lines };
+    validate_quotient_block(&block)?;
+    Ok(block)
+}
+
+fn validate_quotient_block(block: &QuotientRenderBlock) -> Result<(), String> {
+    if block.lines.is_empty() {
+        return Ok(());
+    }
+    let require = |needle: &str| {
+        if block.lines.iter().any(|line| line.contains(needle)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "quotient {} block is missing expected marker `{needle}`",
+                block.kind.as_str()
+            ))
+        }
+    };
+
+    match block.kind {
+        QuotientRenderBlockKind::Empty => Err("empty quotient block has lines".to_string()),
+        QuotientRenderBlockKind::InlinePrefix { .. }
+        | QuotientRenderBlockKind::NativeIdentity { .. } => require("trace_u256"),
+        QuotientRenderBlockKind::EvalNumerator { .. } => {
+            if block.lines.iter().any(|line| {
+                line.contains("quotient_eval_numer")
+                    || line.contains("trace_u256")
+                    || line.contains("SELECTOR_ACC_MPTR")
+                    || line.contains("q_sel_")
+            }) {
+                Ok(())
+            } else {
+                Err(
+                    "quotient eval numerator block has no fold, trace, or selector marker"
+                        .to_string(),
+                )
+            }
+        }
+        QuotientRenderBlockKind::PostVm { .. } => {
+            if block.lines.iter().any(|line| {
+                line.contains("q_trash_")
+                    || line.contains("quotient_eval_numer")
+                    || line.contains("trace_u256")
+                    || line.contains("SELECTOR_ACC_MPTR")
+            }) {
+                Ok(())
+            } else {
+                Err(
+                    "quotient post-VM block has no trash, fold, trace, or selector marker"
+                        .to_string(),
+                )
+            }
+        }
+        QuotientRenderBlockKind::NativePermutation => {
+            require("q_perm_")?;
+            require("trace_u256")
+        }
+        QuotientRenderBlockKind::NativeTrash => {
+            require("q_trash_")?;
+            require("trace_u256")
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "Halo2Verifier.sol")]
 pub(crate) struct Halo2Verifier {
@@ -1171,12 +1396,7 @@ pub(crate) struct Halo2Verifier {
     pub(crate) quotient_external: Option<QuotientExternal>,
     pub(crate) expected_quotient_len: Option<usize>,
     pub(crate) expected_quotient_codehash: Option<U256>,
-    pub(crate) quotient_inline_computations: Vec<Vec<String>>,
-    pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
-    pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,
-    pub(crate) quotient_native_permutation_computation: Vec<String>,
-    pub(crate) quotient_native_identity_computations: Vec<Vec<String>>,
-    pub(crate) quotient_native_trash_computation: Vec<String>,
+    pub(crate) quotient_render: QuotientRenderPlan,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) pcs_render: PcsRenderPlan,
     /// Sorted simple-selector fixed-column indices. Each is rendered
@@ -1286,12 +1506,7 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) reversed_evals_mptr: Ptr,
     pub(crate) selector_acc_mptr: usize,
     pub(crate) quotient_external: QuotientExternal,
-    pub(crate) quotient_inline_computations: Vec<Vec<String>>,
-    pub(crate) quotient_eval_numer_computations: Vec<Vec<String>>,
-    pub(crate) quotient_post_vm_computations: Vec<Vec<String>>,
-    pub(crate) quotient_native_permutation_computation: Vec<String>,
-    pub(crate) quotient_native_identity_computations: Vec<Vec<String>>,
-    pub(crate) quotient_native_trash_computation: Vec<String>,
+    pub(crate) quotient_render: QuotientRenderPlan,
     pub(crate) quotient_program: Option<QuotientProgram>,
     pub(crate) simple_selector_cols: Vec<usize>,
     pub(crate) quotient_identity_trace_base: u64,
@@ -1498,7 +1713,10 @@ mod filters {
 
 #[cfg(test)]
 mod tests {
-    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey, PcsRenderPlan};
+    use super::{
+        G1Words, Halo2Verifier, Halo2VerifyingKey, PcsRenderPlan, QuotientRenderParts,
+        QuotientRenderPlan,
+    };
     use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{
         memory::{
@@ -1718,12 +1936,7 @@ mod tests {
             quotient_external: None,
             expected_quotient_len: None,
             expected_quotient_codehash: None,
-            quotient_inline_computations: vec![],
-            quotient_eval_numer_computations: vec![],
-            quotient_post_vm_computations: vec![],
-            quotient_native_permutation_computation: vec![],
-            quotient_native_identity_computations: vec![],
-            quotient_native_trash_computation: vec![],
+            quotient_render: QuotientRenderPlan::default(),
             quotient_program: None,
             pcs_render: PcsRenderPlan::default(),
             simple_selector_cols: vec![],
@@ -1742,6 +1955,61 @@ mod tests {
             acc_fixed_bases: vec![],
             acc_msm_scratch,
         }
+    }
+
+    #[test]
+    fn quotient_render_plan_accepts_structural_init_and_tail_blocks() {
+        let plan = QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                eval_numer_computations: vec![
+                    vec!["let quotient_eval_numer := 0".to_string()],
+                    vec!["mstore(add(SELECTOR_ACC_MPTR, 0x0), 0)".to_string()],
+                ],
+                post_vm_computations: vec![vec![
+                    "let q_trash_eval := addmod(1, 2, r)".to_string(),
+                    "trace_u256(q_trace_id, q_trash_eval)".to_string(),
+                ]],
+                ..QuotientRenderParts::default()
+            },
+            false,
+        )
+        .expect("structural quotient render blocks are valid");
+
+        assert_eq!(plan.eval_numer_computations.len(), 2);
+        assert!(plan.contains_line("q_trash_eval"));
+    }
+
+    #[test]
+    fn quotient_render_plan_rejects_external_blocks_and_missing_markers() {
+        assert!(QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                eval_numer_computations: vec![vec!["let quotient_eval_numer := 0".to_string()]],
+                ..QuotientRenderParts::default()
+            },
+            true,
+        )
+        .is_err());
+
+        assert!(QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                inline_computations: vec![vec!["let q_gate := 1".to_string()]],
+                ..QuotientRenderParts::default()
+            },
+            false,
+        )
+        .is_err());
+
+        assert!(QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                native_permutation_computation: vec![
+                    "let q_eval := 1".to_string(),
+                    "trace_u256(q_trace_id, q_eval)".to_string(),
+                ],
+                ..QuotientRenderParts::default()
+            },
+            false,
+        )
+        .is_err());
     }
 
     #[test]

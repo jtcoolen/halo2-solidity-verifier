@@ -50,6 +50,7 @@ use crate::codegen::{
         FinalMsmShape, PcsMemoryRequirements, VerifierMemoryLayout, G1ADD_INPUT_BYTES, G1_BYTES,
         G1_MSM_PAIR_BYTES, PCS_STATIC_WORKING_WORDS, WORD_BYTES,
     },
+    pcs_plan::{PcsQEvalStrategy, PcsRenderBlock, PcsRenderBlockKind},
     protocol::{PcsQuerySource, PermutationZEval},
     util::{ConstraintSystemMeta, Data, EcPoint, Location, Ptr, Word},
 };
@@ -620,9 +621,12 @@ pub(super) fn static_working_memory_size() -> usize {
     PCS_STATIC_WORKING_WORDS
 }
 
-/// Emit the multi-prepare Yul body. The output is the same vec-of-vec-of-strings
-/// shape the rest of the codegen uses; each inner `Vec<String>` is a discrete
-/// Yul code block (rendered between `{` and `}` in the template).
+/// Emit the multi-prepare Yul body as legacy anonymous line blocks.
+///
+/// New verifier rendering should prefer [`render_blocks_from_intermediate_sets`]
+/// so the PCS block kind is carried by the emitter rather than inferred after
+/// the fact. This compatibility helper remains for focused tests and any
+/// older internal callers.
 #[allow(clippy::vec_init_then_push)]
 pub(super) fn computations(
     meta: &ConstraintSystemMeta,
@@ -643,6 +647,20 @@ pub(super) fn computations_from_intermediate_sets(
     trace: bool,
     sets: &IntermediateSets,
 ) -> Vec<Vec<String>> {
+    render_blocks_from_intermediate_sets(meta, data, memory, truncated_challenges, trace, sets)
+        .into_iter()
+        .map(|block| block.lines)
+        .collect()
+}
+
+pub(super) fn render_blocks_from_intermediate_sets(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    memory: &VerifierMemoryLayout,
+    truncated_challenges: bool,
+    trace: bool,
+    sets: &IntermediateSets,
+) -> Vec<PcsRenderBlock> {
     /// 128-bit mask for `truncate(scalar)` in midnight-proofs:
     /// `truncate` keeps the lower `ceil(NUM_BITS/8)/2 = 16` bytes
     /// of the LE Fr representation, which is the lower 128 bits.
@@ -670,7 +688,7 @@ pub(super) fn computations_from_intermediate_sets(
     distinct_rotations.sort_unstable();
     distinct_rotations.dedup();
 
-    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut blocks: Vec<PcsRenderBlock> = Vec::new();
 
     // ------------------------------------------------------------------
     // Block 1: pre-compute rotation points (x * omega^rot).
@@ -767,7 +785,10 @@ pub(super) fn computations_from_intermediate_sets(
             }
         }
 
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::RotationPoints,
+            lines,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -821,7 +842,10 @@ pub(super) fn computations_from_intermediate_sets(
             }
             lines.push("}".to_string());
         }
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::X1Powers,
+            lines,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -984,7 +1008,13 @@ pub(super) fn computations_from_intermediate_sets(
                 }
             }
 
-            blocks.push(lines);
+            blocks.push(PcsRenderBlock {
+                kind: PcsRenderBlockKind::QEvalSet {
+                    set: set_idx,
+                    strategy: PcsQEvalStrategy::from(q_eval_strategy(commitments_in_set)),
+                },
+                lines,
+            });
             let _ = q_eval_base; // not needed at this layer, kept for symmetry.
         }
     }
@@ -1112,7 +1142,10 @@ pub(super) fn computations_from_intermediate_sets(
                 40000 + set_idx
             ));
         }
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::QComTrace,
+            lines,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1342,7 +1375,10 @@ pub(super) fn computations_from_intermediate_sets(
         }
 
         lines.push("mstore(F_EVAL_MPTR, f_eval)".to_string());
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::FEval,
+            lines,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1523,7 +1559,10 @@ pub(super) fn computations_from_intermediate_sets(
         ));
         lines.push("mstore(V_MPTR, v)".to_string());
 
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::FinalMsm,
+            lines,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1605,7 +1644,10 @@ pub(super) fn computations_from_intermediate_sets(
             "mcopy(PAIRING_RHS_MPTR, {scratch:#x}, {G1_BYTES:#x})"
         ));
 
-        blocks.push(lines);
+        blocks.push(PcsRenderBlock {
+            kind: PcsRenderBlockKind::PairingInputs,
+            lines,
+        });
     }
 
     blocks
@@ -1760,13 +1802,17 @@ mod tests {
                 // c3's evals are aligned with the set's sorted point list;
                 // use the protocol-level pairs (rotation -> eval) for a
                 // location-independent check.
-                let pairs: Vec<(i32, Word)> = pts.iter().copied().zip(c.evals.iter().copied()).collect();
+                let pairs: Vec<(i32, Word)> =
+                    pts.iter().copied().zip(c.evals.iter().copied()).collect();
                 assert!(pairs.contains(&(0, ev(0x270))));
                 assert!(pairs.contains(&(1, ev(0x290))));
                 assert!(pairs.contains(&(-1, ev(0x2b0))));
             }
         }
-        assert!(found_c0 && found_c3, "expected c0 and c3 entries in commitments");
+        assert!(
+            found_c0 && found_c3,
+            "expected c0 and c3 entries in commitments"
+        );
     }
 
     #[test]

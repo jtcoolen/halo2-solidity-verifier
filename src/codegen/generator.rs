@@ -2670,30 +2670,21 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
 
-        let quotient_pow5_helper = quotient_inline_computations
-            .iter()
-            .chain(quotient_post_vm_computations.iter())
-            .chain(std::iter::once(&quotient_native_permutation_computation))
-            .chain(quotient_native_identity_computations.iter())
-            .chain(std::iter::once(&quotient_native_trash_computation))
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_pow5("));
-        let quotient_limb7_helper = quotient_inline_computations
-            .iter()
-            .chain(quotient_post_vm_computations.iter())
-            .chain(std::iter::once(&quotient_native_permutation_computation))
-            .chain(quotient_native_identity_computations.iter())
-            .chain(std::iter::once(&quotient_native_trash_computation))
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_limb7("));
-        let quotient_wide_limb7_helper = quotient_inline_computations
-            .iter()
-            .chain(quotient_post_vm_computations.iter())
-            .chain(std::iter::once(&quotient_native_permutation_computation))
-            .chain(quotient_native_identity_computations.iter())
-            .chain(std::iter::once(&quotient_native_trash_computation))
-            .flat_map(|block| block.iter())
-            .any(|line| line.contains("q_limb7_wide("));
+        let quotient_render = QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                inline_computations: quotient_inline_computations,
+                eval_numer_computations: quotient_eval_numer_computations,
+                post_vm_computations: quotient_post_vm_computations,
+                native_permutation_computation: quotient_native_permutation_computation,
+                native_identity_computations: quotient_native_identity_computations,
+                native_trash_computation: quotient_native_trash_computation,
+            },
+            false,
+        )
+        .unwrap_or_else(|err| panic!("invalid quotient render plan: {err}"));
+        let quotient_pow5_helper = quotient_render.contains_line("q_pow5(");
+        let quotient_limb7_helper = quotient_render.contains_line("q_limb7(");
+        let quotient_wide_limb7_helper = quotient_render.contains_line("q_limb7_wide(");
         let quotient_external =
             Self::quotient_external_frame(vk_mptr, vk_len, &meta, &memory, sorted_simple.len());
 
@@ -2714,12 +2705,7 @@ impl<'a> SolidityGenerator<'a> {
             reversed_evals_mptr: data.reversed_evals_mptr,
             selector_acc_mptr,
             quotient_external,
-            quotient_inline_computations,
-            quotient_eval_numer_computations,
-            quotient_post_vm_computations,
-            quotient_native_permutation_computation,
-            quotient_native_identity_computations,
-            quotient_native_trash_computation,
+            quotient_render,
             quotient_program,
             simple_selector_cols: sorted_simple,
             quotient_identity_trace_base: layout::trace::QUOTIENT_IDENTITY_BASE,
@@ -2974,38 +2960,24 @@ impl<'a> SolidityGenerator<'a> {
             }
         }
 
-        let quotient_pow5_helper = !external_quotient
-            && quotient_eval_numer_computations
-                .iter()
-                .chain(quotient_inline_computations.iter())
-                .chain(quotient_post_vm_computations.iter())
-                .chain(std::iter::once(&quotient_native_permutation_computation))
-                .chain(quotient_native_identity_computations.iter())
-                .chain(std::iter::once(&quotient_native_trash_computation))
-                .flat_map(|block| block.iter())
-                .any(|line| line.contains("q_pow5("));
-        let quotient_limb7_helper = !external_quotient
-            && quotient_eval_numer_computations
-                .iter()
-                .chain(quotient_inline_computations.iter())
-                .chain(quotient_post_vm_computations.iter())
-                .chain(std::iter::once(&quotient_native_permutation_computation))
-                .chain(quotient_native_identity_computations.iter())
-                .chain(std::iter::once(&quotient_native_trash_computation))
-                .flat_map(|block| block.iter())
-                .any(|line| line.contains("q_limb7("));
-        let quotient_wide_limb7_helper = !external_quotient
-            && quotient_eval_numer_computations
-                .iter()
-                .chain(quotient_inline_computations.iter())
-                .chain(quotient_post_vm_computations.iter())
-                .chain(std::iter::once(&quotient_native_permutation_computation))
-                .chain(quotient_native_identity_computations.iter())
-                .chain(std::iter::once(&quotient_native_trash_computation))
-                .flat_map(|block| block.iter())
-                .any(|line| line.contains("q_limb7_wide("));
+        let quotient_render = QuotientRenderPlan::from_parts(
+            QuotientRenderParts {
+                inline_computations: quotient_inline_computations,
+                eval_numer_computations: quotient_eval_numer_computations,
+                post_vm_computations: quotient_post_vm_computations,
+                native_permutation_computation: quotient_native_permutation_computation,
+                native_identity_computations: quotient_native_identity_computations,
+                native_trash_computation: quotient_native_trash_computation,
+            },
+            external_quotient,
+        )
+        .unwrap_or_else(|err| panic!("invalid quotient render plan: {err}"));
+        let quotient_pow5_helper = !external_quotient && quotient_render.contains_line("q_pow5(");
+        let quotient_limb7_helper = !external_quotient && quotient_render.contains_line("q_limb7(");
+        let quotient_wide_limb7_helper =
+            !external_quotient && quotient_render.contains_line("q_limb7_wide(");
 
-        let pcs_blocks = pcs::computations_from_intermediate_sets(
+        let pcs_blocks = pcs::render_blocks_from_intermediate_sets(
             &meta,
             &data,
             &memory,
@@ -3013,7 +2985,7 @@ impl<'a> SolidityGenerator<'a> {
             trace,
             pcs_plan.intermediate_sets(),
         );
-        let pcs_render = PcsRenderPlan::from_blocks(&pcs_plan, pcs_blocks, trace)
+        let pcs_render = PcsRenderPlan::from_emitted_blocks(&pcs_plan, pcs_blocks, trace)
             .unwrap_or_else(|err| panic!("invalid PCS render plan: {err}"));
 
         // Per-user-phase breakdown (advices + user challenges).
@@ -3180,12 +3152,7 @@ impl<'a> SolidityGenerator<'a> {
             proof_len: proof_layout.proof_len,
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
-            quotient_inline_computations,
-            quotient_eval_numer_computations,
-            quotient_post_vm_computations,
-            quotient_native_permutation_computation,
-            quotient_native_identity_computations,
-            quotient_native_trash_computation,
+            quotient_render,
             quotient_program: if external_quotient {
                 None
             } else {

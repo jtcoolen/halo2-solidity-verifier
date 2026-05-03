@@ -90,8 +90,8 @@
                 // Direct inline prefix. These identities are generated as Yul
                 // before entering the VM. They use the same fold snippets as
                 // VM/native identities, so they occupy the same y-batch order.
-                {%- for code_block in quotient_inline_computations %}
-                {%- for line in code_block %}
+                {%- for code_block in quotient_render.inline_computations %}
+                {%- for line in code_block.lines %}
                 {{ line }}
                 {%- endfor %}
                 {%- endfor %}
@@ -291,7 +291,7 @@
                         mstore(add(q_tmp_mptr, shl(5, q_arg)), q_top)
                     }
                     {%- endif %}
-                    {%- if quotient_native_permutation_computation.len() > 0 %}
+                    {%- if quotient_render.native_permutation_computation.lines.len() > 0 %}
                     // Native permutation callback. It evaluates the
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
@@ -305,12 +305,12 @@
                         // words for structured_permutation_scratch_words(meta)
                         // whenever this opcode can appear.
                         q_sp := {{ program.stack_mptr|hex() }}
-                        {%- for line in quotient_native_permutation_computation %}
+                        {%- for line in quotient_render.native_permutation_computation.lines %}
                         {{ line }}
                         {%- endfor %}
                     }
                     {%- endif %}
-                    {%- if quotient_native_identity_computations.len() > 0 %}
+                    {%- if quotient_render.native_identity_computations.len() > 0 %}
                     // Native heavy-gate callback. The VM stream contains this
                     // opcode at the identity's original position, so the
                     // native Yul block keeps the same y-batching order as the
@@ -321,9 +321,9 @@
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
                         switch q_native_idx
-                        {%- for code_block in quotient_native_identity_computations %}
+                        {%- for code_block in quotient_render.native_identity_computations %}
                         case {{ loop.index0 }} {
-                            {%- for line in code_block %}
+                            {%- for line in code_block.lines %}
                             {{ line }}
                             {%- endfor %}
                         }
@@ -691,7 +691,7 @@
                         q_top := q_acc
                         q_has_top := 1
                     }
-                    {%- if quotient_native_permutation_computation.len() > 0 %}
+                    {%- if quotient_render.native_permutation_computation.lines.len() > 0 %}
                     // Native permutation callback. It evaluates the
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
@@ -705,12 +705,12 @@
                         // words for structured_permutation_scratch_words(meta)
                         // whenever this opcode can appear.
                         q_sp := {{ program.stack_mptr|hex() }}
-                        {%- for line in quotient_native_permutation_computation %}
+                        {%- for line in quotient_render.native_permutation_computation.lines %}
                         {{ line }}
                         {%- endfor %}
                     }
                     {%- endif %}
-                    {%- if quotient_native_identity_computations.len() > 0 %}
+                    {%- if quotient_render.native_identity_computations.len() > 0 %}
                     // Native callbacks are generated only for the heaviest
                     // recognized Midfall gate identities. All other gate,
                     // lookup, and non-native identity arithmetic remains in
@@ -723,9 +723,9 @@
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
                         switch q_native_idx
-                        {%- for code_block in quotient_native_identity_computations %}
+                        {%- for code_block in quotient_render.native_identity_computations %}
                         case {{ loop.index0 }} {
-                            {%- for line in code_block %}
+                            {%- for line in code_block.lines %}
                             {{ line }}
                             {%- endfor %}
                         }
@@ -776,8 +776,8 @@
                 // Structured post-VM suffix. The current default uses this for
                 // regular trash constraints: it is smaller than fully unrolled
                 // Yul and cheaper than interpreting every trash operation.
-                {%- for code_block in quotient_post_vm_computations %}
-                {%- for line in code_block %}
+                {%- for code_block in quotient_render.post_vm_computations %}
+                {%- for line in code_block.lines %}
                 {{ line }}
                 {%- endfor %}
                 {%- endfor %}
@@ -807,8 +807,8 @@
                 let y := mload(Y_MPTR)
                 let q_trace_id := {{ quotient_identity_trace_base }}
 
-                {%- for code_block in quotient_eval_numer_computations %}
-                {%- for line in code_block %}
+                {%- for code_block in quotient_render.eval_numer_computations %}
+                {%- for line in code_block.lines %}
                 {{ line }}
                 {%- endfor %}
                 {%- endfor %}

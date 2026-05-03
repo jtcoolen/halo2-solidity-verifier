@@ -100,6 +100,7 @@ impl PcsRenderBlockKind {
 }
 
 impl PcsRenderPlan {
+    #[allow(dead_code)]
     pub(crate) fn from_blocks(
         pcs: &PcsPlan,
         blocks: Vec<Vec<String>>,
@@ -118,9 +119,39 @@ impl PcsRenderPlan {
         let blocks = kinds
             .into_iter()
             .zip(blocks)
-            .map(|(kind, lines)| {
-                Self::validate_block(&kind, &lines)?;
-                Ok(PcsRenderBlock { kind, lines })
+            .map(|(kind, lines)| PcsRenderBlock { kind, lines })
+            .collect::<Vec<_>>();
+
+        Self::from_emitted_blocks(pcs, blocks, trace)
+    }
+
+    pub(crate) fn from_emitted_blocks(
+        pcs: &PcsPlan,
+        blocks: Vec<PcsRenderBlock>,
+        trace: bool,
+    ) -> Result<Self, String> {
+        let kinds = Self::expected_block_kinds(pcs, trace);
+        if blocks.len() != kinds.len() {
+            return Err(format!(
+                "PCS render block count mismatch: got {} block(s), expected {} ({:?})",
+                blocks.len(),
+                kinds.len(),
+                kinds
+            ));
+        }
+
+        let blocks = blocks
+            .into_iter()
+            .zip(kinds)
+            .map(|(block, expected)| {
+                if block.kind != expected {
+                    return Err(format!(
+                        "PCS render block kind mismatch: got {:?}, expected {:?}",
+                        block.kind, expected
+                    ));
+                }
+                Self::validate_block(&block.kind, &block.lines)?;
+                Ok(block)
             })
             .collect::<Result<Vec<_>, String>>()?;
 
@@ -451,6 +482,11 @@ mod tests {
                 "pairing_inputs"
             ]
         );
+
+        let mut wrong_emitted_kind = render.blocks.clone();
+        wrong_emitted_kind[2].kind = PcsRenderBlockKind::FEval;
+        assert!(PcsRenderPlan::from_emitted_blocks(&plan, wrong_emitted_kind, false).is_err());
+
         assert!(PcsRenderPlan::from_blocks(&plan, vec![vec![]], true).is_err());
 
         let mut missing_marker = blocks.clone();
