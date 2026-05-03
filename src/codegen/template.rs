@@ -48,6 +48,7 @@ pub(crate) type G1Words = (U256, U256, U256, U256);
 #[derive(Template)]
 #[template(path = "Halo2VerifyingKey.sol")]
 pub(crate) struct Halo2VerifyingKey {
+    pub(crate) constructor_payload_mptr: usize,
     pub(crate) constants: Vec<(&'static str, U256)>,
     pub(crate) fixed_comms: Vec<G1Words>,
     pub(crate) permutation_comms: Vec<G1Words>,
@@ -211,6 +212,10 @@ pub(crate) struct Halo2Verifier {
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
+    pub(crate) constructor_smoke_scratch_mptr: usize,
+    pub(crate) transcript_mptr: usize,
+    pub(crate) final_pairing_scratch_mptr: usize,
+    pub(crate) return_mptr: usize,
     pub(crate) proof_cptr: Ptr,
     pub(crate) abi_selector_bytes: usize,
     pub(crate) abi_proof_head_offset: usize,
@@ -353,6 +358,7 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
+    pub(crate) return_mptr: usize,
     pub(crate) reversed_evals_mptr: Ptr,
     pub(crate) selector_acc_mptr: usize,
     pub(crate) quotient_external: QuotientExternal,
@@ -578,6 +584,7 @@ mod tests {
             })
             .collect();
         Halo2VerifyingKey {
+            constructor_payload_mptr: crate::codegen::layout::VK_CONSTRUCTOR_PAYLOAD_START,
             constants,
             fixed_comms,
             permutation_comms,
@@ -635,6 +642,10 @@ mod tests {
             vk_mptr: Ptr::memory(0x1000),
             challenge_mptr: Ptr::memory(0x1200),
             theta_mptr: Ptr::memory(0x1300),
+            constructor_smoke_scratch_mptr: crate::codegen::layout::LOW_MEMORY_SCRATCH_START,
+            transcript_mptr: crate::codegen::layout::TRANSCRIPT_BUFFER_START,
+            final_pairing_scratch_mptr: crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
+            return_mptr: crate::codegen::layout::VERIFIER_RETURN_BUFFER_START,
             proof_cptr: Ptr::calldata(proof_cptr),
             abi_selector_bytes: crate::codegen::layout::abi::SELECTOR_BYTES,
             abi_proof_head_offset: crate::codegen::layout::abi::VERIFY_PROOF_PROOF_HEAD_OFFSET,
@@ -849,27 +860,35 @@ mod tests {
         let vk = synthetic_vk(2, 3);
         let mut s = String::new();
         vk.render(&mut s).expect("VK render");
-        // The constructor must `return(0, len)` with the exact byte length
-        // the verifier loads via `extcodecopy`. Our `hex` filter
-        // left-pads odd-length hex literals with a leading zero, so 0x660
-        // (3 hex digits) renders as "0x0660".
+        // The constructor must return exactly the byte length the verifier
+        // loads via `extcodecopy`, but the transient payload buffer starts at
+        // 0x80 so it preserves Solidity's reserved memory words. Our `hex`
+        // filter left-pads odd-length hex literals with a leading zero, so
+        // 0x660 (3 hex digits) renders as "0x0660".
         let raw_hex = format!("{:x}", vk.len());
         let padded_hex = if raw_hex.len() % 2 == 1 {
             format!("0{raw_hex}")
         } else {
             raw_hex
         };
-        let expected_return = format!("return(0, 0x{padded_hex})");
+        let expected_return = format!("return(payload, 0x{padded_hex})");
         assert!(
             s.contains(&expected_return),
             "rendered VK missing expected return statement {expected_return} in:\n{s}"
         );
-        // It should `mstore` the very first scalar (vk_digest) at offset 0.
-        assert!(s.contains("mstore(0x0000,"), "vk_digest mstore at offset 0");
+        assert!(
+            s.contains("let payload := 0x80"),
+            "VK constructor payload must start after Solidity's reserved words"
+        );
+        // It should `mstore` the very first scalar (vk_digest) at payload + 0.
+        assert!(
+            s.contains("mstore(add(payload, 0x0000),"),
+            "vk_digest mstore at payload offset 0"
+        );
         // The first permutation commitment is at byte offset 0x4e0
         // (39 * 32 = 1248 = 0x4e0).
         assert!(
-            s.contains("mstore(0x04e0,"),
+            s.contains("mstore(add(payload, 0x04e0),"),
             "permutation_comms[0].x_hi at byte offset 0x4e0"
         );
     }

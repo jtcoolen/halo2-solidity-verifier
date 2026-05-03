@@ -26,8 +26,10 @@ use std::collections::BTreeMap;
 
 pub(crate) use crate::codegen::layout::{
     ACC_MSM_MIN_SCRATCH_BYTES, G1ADD_INPUT_BYTES, G1_BYTES, G1_MSM_PAIR_BYTES, G1_WORDS,
-    MODEXP_FRAME_BYTES, MODEXP_SCRATCH_BYTES, PAIRING_PAIR_BYTES, PAIRING_TWO_PAIR_BYTES,
-    PCS_STATIC_WORKING_WORDS, WORD_BYTES,
+    LOW_MEMORY_SCRATCH_START, MODEXP_FRAME_BYTES, MODEXP_SCRATCH_BYTES, PAIRING_PAIR_BYTES,
+    PAIRING_TWO_PAIR_BYTES, PCS_PAIRING_SCRATCH_START, PCS_STATIC_WORKING_WORDS,
+    SOLIDITY_FREE_MEMORY_POINTER_SLOT, SOLIDITY_RESERVED_MEMORY_BYTES,
+    SOLIDITY_SCRATCH_SPACE_BYTES, SOLIDITY_ZERO_SLOT, TRANSCRIPT_BUFFER_START, WORD_BYTES,
 };
 /// Accumulator pairing-batch hash frame.
 ///
@@ -180,6 +182,23 @@ impl MemoryMap {
         // precompile input lengths. Byte-granular ranges would be a bug, not a
         // clever packing opportunity.
         for region in &self.regions {
+            if region.len != 0 && region.start < SOLIDITY_RESERVED_MEMORY_BYTES {
+                let reserved_name = if region.start < SOLIDITY_SCRATCH_SPACE_BYTES {
+                    "scratch space"
+                } else if region.start < SOLIDITY_ZERO_SLOT {
+                    debug_assert_eq!(
+                        SOLIDITY_FREE_MEMORY_POINTER_SLOT,
+                        SOLIDITY_SCRATCH_SPACE_BYTES
+                    );
+                    "free-memory pointer"
+                } else {
+                    "zero slot"
+                };
+                return Err(format!(
+                    "memory region {} starts at {:#x}, inside Solidity-reserved {reserved_name} memory [0x00..{:#x})",
+                    region.name, region.start, SOLIDITY_RESERVED_MEMORY_BYTES
+                ));
+            }
             if region.start % WORD_BYTES != 0 {
                 return Err(format!(
                     "memory region {} starts at unaligned byte offset {:#x}",
@@ -451,25 +470,25 @@ impl VerifierMemoryLayout {
         // no longer live once algebra/precompile work begins.
         arena.alloc_phase_scratch(
             "constructor_smoke_scratch",
-            G1_BYTES,
+            LOW_MEMORY_SCRATCH_START,
             PAIRING_PAIR_BYTES,
             MemoryPhase::ConstructorSmoke,
         );
         arena.alloc_phase_scratch(
             "transcript_buffer",
-            0,
+            TRANSCRIPT_BUFFER_START,
             config.transcript_words * WORD_BYTES,
             MemoryPhase::Transcript,
         );
         arena.alloc_phase_scratch(
             "pcs_pairing_tmp",
-            0,
+            PCS_PAIRING_SCRATCH_START,
             G1_BYTES + G1_MSM_PAIR_BYTES,
             MemoryPhase::PcsPairing,
         );
         arena.alloc_phase_scratch(
             "final_pairing_scratch",
-            PAIRING_TWO_PAIR_BYTES,
+            crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
             PAIRING_TWO_PAIR_BYTES,
             MemoryPhase::FinalPairing,
         );
@@ -849,6 +868,31 @@ mod tests {
     }
 
     #[test]
+    fn reserved_solidity_memory_regions_fail() {
+        let mut map = MemoryMap::default();
+        map.push(region(
+            "free_memory_pointer",
+            crate::codegen::layout::SOLIDITY_FREE_MEMORY_POINTER_SLOT,
+            WORD_BYTES,
+            MemoryPhase::Transcript,
+        ));
+        let err = map.validate().unwrap_err();
+        assert!(
+            err.contains("Solidity-reserved") && err.contains("free-memory pointer"),
+            "unexpected validation error: {err}"
+        );
+
+        let mut map = MemoryMap::default();
+        map.push(region(
+            "zero_slot",
+            crate::codegen::layout::SOLIDITY_ZERO_SLOT,
+            WORD_BYTES,
+            MemoryPhase::Transcript,
+        ));
+        assert!(map.validate().unwrap_err().contains("Solidity-reserved"));
+    }
+
+    #[test]
     fn arena_alloc_after_aligns_after_anchor() {
         let mut arena = MemoryArena::default();
         let after = arena.alloc_after(
@@ -889,6 +933,7 @@ mod tests {
     fn synthetic_vk() -> Halo2VerifyingKey {
         let fixed: Vec<G1Words> = vec![(U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO)];
         Halo2VerifyingKey {
+            constructor_payload_mptr: crate::codegen::layout::VK_CONSTRUCTOR_PAYLOAD_START,
             constants: (0..crate::codegen::layout::VK_HEADER_WORDS)
                 .map(|_| ("c", U256::ZERO))
                 .collect(),

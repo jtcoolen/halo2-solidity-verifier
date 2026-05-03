@@ -653,6 +653,7 @@ impl<'a> SolidityGenerator<'a> {
             .map(|[a, b, c, d]| (a, b, c, d))
             .collect();
         Halo2VerifyingKey {
+            constructor_payload_mptr: layout::VK_CONSTRUCTOR_PAYLOAD_START,
             constants,
             fixed_comms,
             permutation_comms,
@@ -2514,6 +2515,7 @@ impl<'a> SolidityGenerator<'a> {
             vk_mptr,
             challenge_mptr: data.challenge_mptr,
             theta_mptr: data.theta_mptr,
+            return_mptr: layout::QUOTIENT_RETURN_BUFFER_START,
             reversed_evals_mptr: data.reversed_evals_mptr,
             selector_acc_mptr,
             quotient_external: Self::quotient_external_frame(
@@ -2897,6 +2899,10 @@ impl<'a> SolidityGenerator<'a> {
             vk_header: Default::default(),
             vk_mptr,
             num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
+            constructor_smoke_scratch_mptr: layout::LOW_MEMORY_SCRATCH_START,
+            transcript_mptr: layout::TRANSCRIPT_BUFFER_START,
+            final_pairing_scratch_mptr: layout::FINAL_PAIRING_SCRATCH_START,
+            return_mptr: layout::VERIFIER_RETURN_BUFFER_START,
             user_phases,
             num_user_challenges,
             num_lookups: meta.num_lookups,
@@ -3143,6 +3149,12 @@ impl<'a> SolidityGenerator<'a> {
     fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
         let pcs_computation = pcs::static_working_memory_size();
         let transcript_words = Self::transcript_buffer_words_bound(meta, self.num_instances);
+        let transcript_end = layout::TRANSCRIPT_BUFFER_START + transcript_words * WORD_BYTES;
+        let pcs_end = layout::PCS_PAIRING_SCRATCH_START + pcs_computation * WORD_BYTES;
+        let final_pairing_end =
+            layout::FINAL_PAIRING_SCRATCH_START + layout::PAIRING_STATIC_WORKING_WORDS * WORD_BYTES;
+        let modexp_end = layout::LOW_MEMORY_SCRATCH_START
+            + layout::MODEXP_DECOMPRESSION_WORKING_WORDS * WORD_BYTES;
 
         itertools::max([
             // Transcript buffer (streaming Keccak256). The buffer must
@@ -3150,30 +3162,31 @@ impl<'a> SolidityGenerator<'a> {
             // assumes the VK contract bytes copied via `extcodecopy`
             // remain intact, and the buffer would otherwise overwrite
             // them as it grows past the start of the VK area.
-            transcript_words,
+            transcript_end,
             // PCS computation scratch
-            pcs_computation,
-            // Pairing: 2 G1 points + 2 G2 points, plus 1-word output buffer.
-            layout::PAIRING_STATIC_WORKING_WORDS,
+            pcs_end,
+            // Pairing: two-pair input frame plus output word, rooted above
+            // Solidity's reserved memory prefix.
+            final_pairing_end,
             // Modexp scratch for decompression (240 bytes input + 48
             // bytes output = 9 words; we round up to 16 to leave room
             // for separate scratch areas).
-            layout::MODEXP_DECOMPRESSION_WORKING_WORDS,
+            modexp_end,
         ])
         .unwrap()
-            * WORD_BYTES
     }
 
     pub(super) fn transcript_buffer_words_bound(
         meta: &ConstraintSystemMeta,
         num_instances: usize,
     ) -> usize {
-        // The Step 6 transcript model is a streaming Keccak256 buffer at
-        // memory `[0..buf_len)`. The buffer monotonically grows between
-        // two challenge squeezes and is reset to 32 bytes after each
-        // squeeze, so the *peak* buf_len equals the longest absorb run
-        // between two consecutive squeezes. For midnight-proofs verifiers
-        // the dominating run is whichever of the following is largest:
+        // The Step 6 transcript model is a streaming Keccak256 buffer rooted
+        // at TRANSCRIPT_BUFFER_START. The buffer monotonically grows between
+        // two challenge squeezes and is reset to one seed word after each
+        // squeeze. This function returns the number of words needed above
+        // that root; the caller adds the 0x80 base when choosing VK_MPTR. For
+        // midnight-proofs verifiers the dominating run is whichever of the
+        // following is largest:
         //   (a) initial absorbs (vk_digest + committed_pi + num_instances
         //       + all instance scalars + all phase-1 advices) before the
         //       first user-phase challenge squeeze (`theta`), or

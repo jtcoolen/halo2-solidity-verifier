@@ -1320,7 +1320,8 @@ The codegen memory planner must ensure:
 - Permanent regions never overlap.
 - Scratch regions overlap only when their lifetimes are disjoint.
 - PCS fixed windows cannot overflow.
-- The transcript buffer lives below `VK_MPTR`.
+- Solidity-reserved memory `[0x00..0x80)` is not used for generated writes.
+- The transcript buffer starts at `0x80` and lives below `VK_MPTR`.
 - The VK payload remains live until all quotient/PCS code that references it
   has finished.
 - External quotient evaluator frames cover every memory word the evaluator
@@ -1329,7 +1330,10 @@ The codegen memory planner must ensure:
 High-level memory order:
 
 ```text
-0x00..VK_MPTR:
+0x00..0x7f:
+    Solidity-reserved scratch, free-memory pointer, and zero slot
+
+0x80..VK_MPTR:
     transient transcript buffer and low precompile scratch
 
 VK_MPTR:

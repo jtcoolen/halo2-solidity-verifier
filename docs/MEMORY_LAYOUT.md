@@ -24,12 +24,18 @@ Solidity reserves the first four words of memory for compiler conventions:
 - `0x80`: the initial allocatable memory pointer.
 
 The generated verifier intentionally does not follow Solidity allocation by
-reading and bumping `mload(0x40)`. In particular, the streaming transcript
-buffer starts at `0x00` and grows until the next transcript squeeze. For large
-absorbs, that buffer can overwrite the free-memory pointer word at `0x40`, the
-zero slot at `0x60`, and memory at or above `0x80`.
+reading and bumping `mload(0x40)`. Instead, every generated absolute memory
+region is planned at or above `0x80`. The streaming transcript buffer, the main
+verifier return word, the split quotient return frame, the VK constructor
+payload buffer, and low-memory precompile scratch all start from named
+Rust-side layout constants rooted at `SOLIDITY_ALLOCATABLE_MEMORY_START`.
 
-That is acceptable only under the current generated-contract shape:
+The code generator treats `[0x00..0x80)` as off limits for generated writes:
+`VerifierMemoryLayout::validate()` rejects any registered region inside that
+reserved prefix, and template tests pin the remaining hand-written return and
+scratch frames to `0x80` or above.
+
+The verifier still has a constrained generated-contract shape:
 
 1. `verifyProof` is an external entrypoint with `calldata` arguments, so the
    proof and instances are not eagerly decoded into Solidity-managed memory.
@@ -37,21 +43,19 @@ That is acceptable only under the current generated-contract shape:
    value-type dependency checks. Accepted executions then enter the generated
    `assembly ("memory-safe")` body.
 3. The main verifier assembly body is terminal: every path either reverts or
-   ends with `return(0x00, 0x20)`. It does not return to high-level Solidity
-   code that could observe the overwritten free-memory pointer or zero slot.
+   ends with `return(RETURN_MPTR, 0x20)`.
 4. The split `Halo2QuotientEvaluator` fallback has its own fresh EVM memory
    frame, copies the verifier frame into generated absolute addresses, writes
-   its compact return frame at low memory, and immediately returns.
-5. The `Halo2VerifyingKey` constructor writes the runtime payload from memory
-   zero and immediately returns that payload as contract code.
+   its compact return frame at `0x80`, and immediately returns.
+5. The `Halo2VerifyingKey` constructor writes the runtime payload starting at
+   `0x80` and immediately returns that payload as contract code.
 
 Do not move the generated verifier assembly into a reusable internal Solidity
 function, library routine, or wrapper that continues executing high-level
-Solidity after the block. Do not add Solidity code before the main assembly
-body that allocates memory unless the verifier is changed to either use dynamic
-allocation from `mload(0x40)` or explicitly guard the current standalone
-assumption, for example by reverting unless `mload(0x40) == 0x80` at verifier
-entry.
+Solidity after the block without reviewing the absolute-memory strategy. Future
+dynamic-allocation work should use `mload(0x40)`/`mstore(0x40, ...)` instead of
+hard-coded high-water marks, but the current generator at least preserves
+Solidity's reserved prefix.
 
 Relevant Solidity references:
 
@@ -132,6 +136,7 @@ which changes the transcript-buffer bound. The verifier reserves:
 `VerifierMemoryLayout::validate()` rejects:
 
 - unaligned starts or lengths;
+- any generated region inside Solidity-reserved memory `[0x00..0x80)`;
 - overlapping permanent regions;
 - overlapping scratch regions that are live in the same `MemoryPhase`;
 - PCS fixed-window overflows.
@@ -148,10 +153,11 @@ region. This avoids the old failure mode where a diagnostic log buffer inside a
 large VK payload corrupted a later G1MSM input.
 
 The external quotient evaluator has a separate EVM memory space. Its trace hook
-is logless because the evaluator is called through `STATICCALL`, so it uses
-callee-local word `0x00` and overwrites that word with the return-frame magic
-immediately before returning. It must not use the verifier's high
-`trace_u256_mptr`, which can overlap the evaluator's VM stack in the callee.
+is logless because the evaluator is called through `STATICCALL`, so it uses the
+callee-local quotient return buffer at `0x80` and overwrites that word with the
+return-frame magic immediately before returning. It must not use the verifier's
+high `trace_u256_mptr`, which can overlap the evaluator's VM stack in the
+callee.
 
 ## Theta-Relative Offsets
 

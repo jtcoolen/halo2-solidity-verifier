@@ -1505,14 +1505,17 @@ pub(super) fn computations(
         // PAIRING_LHS = pi (paired against G2_BASE).
         lines.push(format!("mcopy(PAIRING_LHS_MPTR, PI_MPTR, {G1_BYTES:#x})"));
 
-        // tmp = (-v) * G  =>  load G into 0x00, scale by (r - v).
-        lines.push(format!("mcopy(0x0, G1_BASE_MPTR, {G1_BYTES:#x})"));
+        // tmp = (-v) * G  =>  load G into planned scratch, scale by (r - v).
+        let scratch = crate::codegen::layout::PCS_PAIRING_SCRATCH_START;
+        let scratch_g1_b = scratch + G1_BYTES;
+        let scratch_g1add_scalar = scratch + G1ADD_INPUT_BYTES;
+        lines.push(format!("mcopy({scratch:#x}, G1_BASE_MPTR, {G1_BYTES:#x})"));
         lines.push(format!(
-            "mstore({G1_BYTES:#x}, addmod(0, sub(r, mload(V_MPTR)), r))"
+            "mstore({scratch_g1_b:#x}, addmod(0, sub(r, mload(V_MPTR)), r))"
         ));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, 0x00, {G1_MSM_PAIR_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {scratch:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1521,11 +1524,11 @@ pub(super) fn computations(
 
         // tmp += final_com.
         lines.push(format!(
-            "mcopy({G1_BYTES:#x}, FINAL_COM_MPTR, {G1_BYTES:#x})"
+            "mcopy({scratch_g1_b:#x}, FINAL_COM_MPTR, {G1_BYTES:#x})"
         ));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, {G1ADD_INPUT_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+            "    success := staticcall(g1add_gas_cap(), 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1533,11 +1536,11 @@ pub(super) fn computations(
         lines.push("}".to_string());
 
         // tmp += x3 * pi.
-        lines.push(format!("mcopy({G1_BYTES:#x}, PI_MPTR, {G1_BYTES:#x})"));
-        lines.push(format!("mstore({G1ADD_INPUT_BYTES:#x}, mload(X3_MPTR))"));
+        lines.push(format!("mcopy({scratch_g1_b:#x}, PI_MPTR, {G1_BYTES:#x})"));
+        lines.push(format!("mstore({scratch_g1add_scalar:#x}, mload(X3_MPTR))"));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {G1_BYTES:#x}, {G1_MSM_PAIR_BYTES:#x}, {G1_BYTES:#x}, {G1_BYTES:#x})"
+            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {scratch_g1_b:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch_g1_b:#x}, {G1_BYTES:#x})"
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1545,7 +1548,7 @@ pub(super) fn computations(
         lines.push("}".to_string());
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, 0x00, {G1ADD_INPUT_BYTES:#x}, 0x00, {G1_BYTES:#x})"
+            "    success := staticcall(g1add_gas_cap(), 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1553,7 +1556,9 @@ pub(super) fn computations(
         lines.push("}".to_string());
 
         // Persist as PAIRING_RHS = final_com - v*G + x3*pi.
-        lines.push(format!("mcopy(PAIRING_RHS_MPTR, 0x0, {G1_BYTES:#x})"));
+        lines.push(format!(
+            "mcopy(PAIRING_RHS_MPTR, {scratch:#x}, {G1_BYTES:#x})"
+        ));
 
         blocks.push(lines);
     }

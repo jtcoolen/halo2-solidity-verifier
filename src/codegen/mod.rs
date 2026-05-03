@@ -1049,8 +1049,54 @@ mod tests {
             "trace and production epilogues must not diverge into false-return semantics"
         );
         assert!(
-            verifier_template.contains("mstore(0x00, 1)\n            return(0x00, 0x20)"),
+            verifier_template
+                .contains("mstore(RETURN_MPTR, 1)\n            return(RETURN_MPTR, 0x20)"),
             "generated verifier must only return literal true after the reverting pairing helper"
+        );
+    }
+
+    #[test]
+    fn templates_do_not_write_solidity_reserved_memory_slots() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient_template = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let vk_template = include_str!("../../templates/Halo2VerifyingKey.sol");
+        let pcs_source = include_str!("pcs.rs");
+
+        for (name, source) in [
+            ("Halo2Verifier.sol", verifier_template),
+            ("Halo2QuotientEvaluator.sol", quotient_template),
+            ("Halo2VerifyingKey.sol", vk_template),
+        ] {
+            for needle in [
+                "mstore(0x00,",
+                "mstore(0x20,",
+                "mstore(0x40,",
+                "mstore(0x60,",
+                "mstore(add(0x00,",
+                "mstore(add(0x20,",
+                "mstore(add(0x40,",
+                "mstore(add(0x60,",
+                "mcopy(0x00,",
+                "mcopy(0x20,",
+                "mcopy(0x40,",
+                "mcopy(0x60,",
+                "calldatacopy(0x00,",
+                "calldatacopy(0x20,",
+                "calldatacopy(0x40,",
+                "calldatacopy(0x60,",
+                "return(0x00,",
+            ] {
+                assert!(
+                    !source.contains(needle),
+                    "{name} must not write or return from Solidity-reserved memory words: found {needle}"
+                );
+            }
+        }
+        assert!(
+            !pcs_source.contains("mcopy(0x0,")
+                && !pcs_source.contains(", 0x00, {G1_MSM_PAIR_BYTES:#x}")
+                && !pcs_source.contains(", 0x00, {G1ADD_INPUT_BYTES:#x}"),
+            "generated PCS helper scratch must not be rooted at memory 0"
         );
     }
 

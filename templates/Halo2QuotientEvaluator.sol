@@ -83,9 +83,10 @@ contract Halo2QuotientEvaluator {
     // fallback copies those buckets into the compact return frame.
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
     // Callee-local scratch for logless trace hooks. This evaluator is invoked
-    // through STATICCALL, so trace hooks cannot emit LOG records; word 0 is
+    // through STATICCALL, so trace hooks cannot emit LOG records; this word is
     // overwritten with QUOTIENT_MAGIC immediately before returning.
-    uint256 internal constant        TRACE_U256_MPTR = 0x00;
+    uint256 internal constant        TRACE_U256_MPTR = {{ return_mptr|hex() }};
+    uint256 internal constant    QUOTIENT_OUTPUT_MPTR = {{ return_mptr|hex() }};
 
     // External-call frame metadata. The main verifier staticcalls this
     // contract with exactly QUOTIENT_FRAME_LEN bytes starting at
@@ -98,9 +99,8 @@ contract Halo2QuotientEvaluator {
     /// @notice Evaluate the generated quotient numerator block for one verifier memory frame.
     /// @dev Calldata is exactly the raw frame, not ABI-encoded arguments. Returns `QUOTIENT_MAGIC`, the linearization expected eval, and selector buckets.
     /// @dev This fallback also uses generated absolute memory addresses and
-    /// returns directly from assembly. Its low-memory return frame may write
-    /// Solidity-reserved words such as `0x40`, which is safe only because the
-    /// fallback does not return to high-level Solidity code.
+    /// returns directly from assembly. Its compact return frame starts at
+    /// `0x80`, preserving Solidity's reserved memory words.
     fallback() external {
         assembly ("memory-safe") {
             // Reject malformed calls. This contract is not a general-purpose
@@ -224,14 +224,14 @@ contract Halo2QuotientEvaluator {
             // Return the compact output frame. Halo2Verifier checks the magic,
             // stores word 1 as the linearization expected eval, then expands
             // selector buckets into the fused final PCS MSM.
-            mstore(0x00, QUOTIENT_MAGIC)
-            mstore(0x20, mload(QUOTIENT_EVAL_MPTR))
+            mstore(QUOTIENT_OUTPUT_MPTR, QUOTIENT_MAGIC)
+            mstore(add(QUOTIENT_OUTPUT_MPTR, 0x20), mload(QUOTIENT_EVAL_MPTR))
             {%- if simple_selector_cols.len() > 0 %}
             for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
-                mstore(add(0x40, shl(5, q_i)), mload(add(SELECTOR_ACC_MPTR, shl(5, q_i))))
+                mstore(add(QUOTIENT_OUTPUT_MPTR, add(0x40, shl(5, q_i))), mload(add(SELECTOR_ACC_MPTR, shl(5, q_i))))
             }
             {%- endif %}
-            return(0x00, QUOTIENT_OUTPUT_LEN)
+            return(QUOTIENT_OUTPUT_MPTR, QUOTIENT_OUTPUT_LEN)
         }
     }
 }

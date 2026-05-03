@@ -9,6 +9,23 @@
 /// EVM word size. BLS12-381 Fr values are rendered as one canonical
 /// big-endian EVM word in calldata/memory.
 pub(crate) const WORD_BYTES: usize = 0x20;
+/// Solidity's scratch space reserved for hashing and short-lived compiler use.
+pub(crate) const SOLIDITY_SCRATCH_SPACE_BYTES: usize = 0x40;
+/// Solidity free-memory pointer slot.
+pub(crate) const SOLIDITY_FREE_MEMORY_POINTER_SLOT: usize = 0x40;
+/// Solidity zero slot used as the initial value for dynamic memory arrays.
+pub(crate) const SOLIDITY_ZERO_SLOT: usize = 0x60;
+/// First byte not reserved by Solidity's memory conventions.
+pub(crate) const SOLIDITY_ALLOCATABLE_MEMORY_START: usize = 0x80;
+/// The full reserved prefix: scratch, free-memory pointer, and zero slot.
+pub(crate) const SOLIDITY_RESERVED_MEMORY_BYTES: usize = SOLIDITY_ALLOCATABLE_MEMORY_START;
+/// Generated verifier transcript and low-memory precompile scratch base.
+pub(crate) const LOW_MEMORY_SCRATCH_START: usize = SOLIDITY_ALLOCATABLE_MEMORY_START;
+pub(crate) const TRANSCRIPT_BUFFER_START: usize = LOW_MEMORY_SCRATCH_START;
+pub(crate) const PCS_PAIRING_SCRATCH_START: usize = LOW_MEMORY_SCRATCH_START;
+pub(crate) const VERIFIER_RETURN_BUFFER_START: usize = LOW_MEMORY_SCRATCH_START;
+pub(crate) const QUOTIENT_RETURN_BUFFER_START: usize = LOW_MEMORY_SCRATCH_START;
+pub(crate) const VK_CONSTRUCTOR_PAYLOAD_START: usize = LOW_MEMORY_SCRATCH_START;
 /// Number of EVM words in one Fr scalar.
 pub(crate) const FR_WORDS: usize = 1;
 /// EIP-2537 padded G1 encoding: x_hi, x_lo, y_hi, y_lo.
@@ -43,6 +60,8 @@ pub(crate) const ACC_MSM_MIN_SCRATCH_BYTES: usize = 0x7000;
 pub(crate) const PCS_STATIC_WORKING_WORDS: usize = 32;
 /// Static two-pair KZG pairing scratch plus one return word.
 pub(crate) const PAIRING_STATIC_WORKING_WORDS: usize = PAIRING_TWO_PAIR_BYTES / WORD_BYTES + 1;
+/// Low-memory frame used by the final two-pair KZG pairing helper.
+pub(crate) const FINAL_PAIRING_SCRATCH_START: usize = PAIRING_TWO_PAIR_BYTES;
 /// Conservative low-memory decompression/modexp scratch words.
 pub(crate) const MODEXP_DECOMPRESSION_WORKING_WORDS: usize = 16;
 
@@ -153,6 +172,16 @@ mod tests {
         assert_eq!(abi::VERIFY_PROOF_HEAD_BYTES, 0x40);
         assert_eq!(abi::VERIFY_PROOF_PROOF_CPTR, 0x64);
         assert_eq!(abi::VERIFY_PROOF_PROOF_HEAD_OFFSET, 0x40);
+    }
+
+    #[test]
+    fn solidity_reserved_memory_constants_match_compiler_conventions() {
+        assert_eq!(super::SOLIDITY_SCRATCH_SPACE_BYTES, 0x40);
+        assert_eq!(super::SOLIDITY_FREE_MEMORY_POINTER_SLOT, 0x40);
+        assert_eq!(super::SOLIDITY_ZERO_SLOT, 0x60);
+        assert_eq!(super::SOLIDITY_RESERVED_MEMORY_BYTES, 0x80);
+        assert_eq!(super::TRANSCRIPT_BUFFER_START, 0x80);
+        assert_eq!(super::VK_CONSTRUCTOR_PAYLOAD_START, 0x80);
     }
 
     #[test]

@@ -65,6 +65,8 @@ contract Halo2Verifier {
     uint256 internal constant        PROOF_CPTR = {{ proof_cptr }};
     uint256 internal constant NUM_INSTANCE_CPTR = {{ num_instance_cptr|hex_padded(2) }};
     uint256 internal constant     INSTANCE_CPTR = {{ instance_cptr|hex_padded(2) }};
+    uint256 internal constant    TRANSCRIPT_MPTR = {{ transcript_mptr|hex() }};
+    uint256 internal constant        RETURN_MPTR = {{ return_mptr|hex() }};
 
     // ----------------------------------------------------------------------
     // Verifying-key memory map. The VK header lives at VK_MPTR, followed
@@ -201,7 +203,7 @@ contract Halo2Verifier {
     /// @dev Uses identity inputs to catch absent EIP-2537 implementations, short return data, and incompatible pairing semantics at deployment.
     function require_eip2537_precompiles() private view {
         assembly ("memory-safe") {
-            let scratch := 0x80
+            let scratch := {{ constructor_smoke_scratch_mptr|hex() }}
             for { let off := 0 } lt(off, 0x180) { off := add(off, 0x20) } {
                 mstore(add(scratch, off), 0)
             }
@@ -317,11 +319,12 @@ contract Halo2Verifier {
     /// precompiles, or mismatched pinned dependency code revert. Trace and gas
     /// renders keep the same failure policy.
     /// @dev The generated verifier uses absolute Yul memory addresses instead
-    /// of Solidity's free-memory pointer. The main assembly block is therefore
-    /// expected to be terminal: accepted proofs return from assembly and all
-    /// rejected inputs revert. Do not inline this body into Solidity code that
-    /// continues executing after verification without changing the memory
-    /// strategy; see `docs/MEMORY_LAYOUT.md`.
+    /// of Solidity's free-memory pointer, but generated scratch starts at
+    /// `0x80` so Solidity's reserved memory prefix is preserved. The main
+    /// assembly block remains terminal: accepted proofs return from assembly
+    /// and all rejected inputs revert. Do not inline this body into Solidity
+    /// code that continues executing after verification without reviewing the
+    /// memory strategy; see `docs/MEMORY_LAYOUT.md`.
     /// @param proof Solidity-facing proof bytes, with G1 elements repacked into EIP-2537 padded uncompressed form.
     /// @param instances Public instance scalars encoded as canonical BLS12-381 scalar-field words.
     /// @return Always `true` for accepted proofs; invalid proofs revert instead of returning `false`.
@@ -359,10 +362,10 @@ contract Halo2Verifier {
         {%- when None %}
         {%- endmatch %}
         assembly ("memory-safe") {
-            // This block owns the call-frame memory and must remain terminal.
-            // The transcript buffer starts at 0x00 and can overwrite
-            // Solidity's free-memory pointer and zero slot before the final
-            // return/revert. See docs/MEMORY_LAYOUT.md.
+            // This block owns the call-frame memory and remains terminal.
+            // Generated scratch starts at TRANSCRIPT_MPTR (0x80), preserving
+            // Solidity's reserved scratch, free-memory-pointer, and zero-slot
+            // words. See docs/MEMORY_LAYOUT.md.
             // ===============================================================
             // Helpers: modexp, transcript, EIP-2537 calls
             // ===============================================================
@@ -473,14 +476,15 @@ contract Halo2Verifier {
             {%- endif %}
             // ---------- Streaming Keccak256 transcript helpers ----------
             //
-            // The transcript buffer lives at memory[0x00..buf_len). On
-            // verifier entry it starts empty. Each common(input) appends
-            // raw bytes. squeeze_*(buf_len) computes one Keccak digest,
-            // reseeds the buffer with that 32-byte digest, and samples a
-            // Fq element as uint256(digest_be) mod r.
+            // The transcript buffer lives at
+            // memory[TRANSCRIPT_MPTR..buf_len). On verifier entry it starts
+            // empty. Each common(input) appends raw bytes. squeeze_*(buf_len)
+            // computes one Keccak digest, reseeds the buffer with that
+            // 32-byte digest, and samples a Fq element as
+            // uint256(digest_be) mod r.
 
             function transcript_init() -> buf_len {
-                buf_len := 0
+                buf_len := TRANSCRIPT_MPTR
             }
 
             // Append word[0..32] at the current end of the transcript
@@ -544,23 +548,24 @@ contract Halo2Verifier {
             }
 
             // One Keccak finalization + reseed. Returns the new buffer
-            // length (= 32) and stores the squeezed Fq at `mptr`.
+            // cursor (= TRANSCRIPT_MPTR + 32) and stores the squeezed Fq at
+            // `mptr`.
             function squeeze_to(buf_len, mptr) -> ret {
-                let h0 := keccak256(0x00, buf_len)
+                let h0 := keccak256(TRANSCRIPT_MPTR, sub(buf_len, TRANSCRIPT_MPTR))
                 // Reseed: write the 32-byte digest at start of buffer.
-                mstore(0x00, h0)
+                mstore(TRANSCRIPT_MPTR, h0)
                 let r := FR_MODULUS
                 // Sample Fq as uint256(keccak_digest_be) mod r.
                 mstore(mptr, mod(h0, r))
-                ret := 32
+                ret := add(TRANSCRIPT_MPTR, 32)
             }
 
             // ---------- EC primitives (EIP-2537 wrappers) ----------
             //
             // These mirror the BN254 helpers but operate on 4-word G1
-            // points. They use the [0x100..0x500) memory window as
-            // scratch; the streaming transcript buffer at [0x00..buf_len)
-            // is no longer needed once all challenges are squeezed.
+            // points. They use planned memory windows above Solidity's
+            // reserved prefix; the streaming transcript buffer is no longer
+            // needed once all challenges are squeezed.
 
             function batch_invert(success, mptr_start, mptr_end, scratch_mptr, r) -> ret {
                 ret := success
@@ -791,7 +796,7 @@ contract Halo2Verifier {
                 // be a 4-step mstore chain for each G1 (~60 gas) and an
                 // 8-iter mstore loop for each G2 (~240 gas). Net saving
                 // here is ~500 gas per ec_pairing call.
-                let scratch := 0x300
+                let scratch := {{ final_pairing_scratch_mptr|hex() }}
                 mcopy(scratch,              lhs_mptr,                 0x80)
                 mcopy(add(scratch, 0x80),   G2_BASE_MPTR,             0x100)
                 mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
@@ -1785,8 +1790,8 @@ contract Halo2Verifier {
             }
             {%- endif %}
 
-            mstore(0x00, 1)
-            return(0x00, 0x20)
+            mstore(RETURN_MPTR, 1)
+            return(RETURN_MPTR, 0x20)
         }
     }
 }
