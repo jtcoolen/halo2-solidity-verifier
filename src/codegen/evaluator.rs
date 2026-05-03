@@ -28,10 +28,9 @@
 //! var, r)` (the y-power-fold accumulator).
 //!
 //! All emitters reference well-known Yul memory pointers that the
-//! verifier prologue (Step 6) will populate before invoking the
-//! quotient-numerator block. Names follow the original
-//! halo2-solidity-verifier convention except for `TRASH_CHALLENGE_MPTR`,
-//! which is new in midnight-proofs.
+//! verifier prologue populates before invoking the quotient-numerator block.
+//! Names follow the generated-verifier memory convention, including
+//! `TRASH_CHALLENGE_MPTR` for the Midnight trash argument.
 
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap};
 

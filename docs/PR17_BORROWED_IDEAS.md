@@ -61,10 +61,11 @@ cargo test --lib \
 
 ```bash
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+HALO2_SOLIDITY_RUN_EVM_TESTS=1 \
 cargo test --lib \
   --features evm,rust-verifier-trace,truncated-challenges,in-circuit-fewer-point-sets \
   vk_payload_section_mutations_are_rejected \
-  -- --ignored --nocapture
+  -- --nocapture
 ```
 
 Then run the full IVC trace-equivalence and detailed bench commands from

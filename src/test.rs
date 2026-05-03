@@ -37,6 +37,7 @@ type PoseidonVerifierParams =
     midnight_proofs::poly::kzg::params::ParamsVerifierKZG<midnight_curves::Bls12>;
 
 const POSEIDON_K: u32 = 6;
+const RUN_EVM_TESTS_ENV: &str = "HALO2_SOLIDITY_RUN_EVM_TESTS";
 
 #[test]
 fn function_signature() {
@@ -47,7 +48,7 @@ fn function_signature() {
 }
 
 /// Direct EIP-2537 precompile smoke tests against the bundled Prague-spec
-/// revm. Exercises the runner path independently of the halo2 codegen so a
+/// revm. Exercises the runner path independently of the verifier codegen so a
 /// regression in `src/evm.rs` shows up here first.
 #[test]
 fn prague_evm_runs_eip2537_identity_smoke_tests() {
@@ -114,7 +115,6 @@ fn prague_evm_runs_eip2537_identity_smoke_tests() {
 }
 
 #[test]
-#[ignore = "expensive Poseidon property test; run explicitly"]
 fn pbt_solidity_verifies_standard_plonk_embedded_vk_proofs() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -130,7 +130,6 @@ fn pbt_solidity_verifies_standard_plonk_embedded_vk_proofs() {
 }
 
 #[test]
-#[ignore = "expensive Poseidon property test; run explicitly"]
 fn pbt_solidity_rejects_wrong_instances() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -147,7 +146,6 @@ fn pbt_solidity_rejects_wrong_instances() {
 }
 
 #[test]
-#[ignore = "expensive Poseidon property test; run explicitly"]
 fn pbt_solidity_rejects_malleated_proofs() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -164,7 +162,6 @@ fn pbt_solidity_rejects_malleated_proofs() {
 }
 
 #[test]
-#[ignore = "expensive Poseidon property test; run explicitly"]
 fn pbt_solidity_rejects_wrong_verifying_keys() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -180,7 +177,6 @@ fn pbt_solidity_rejects_wrong_verifying_keys() {
 }
 
 #[test]
-#[ignore = "expensive Poseidon property test; run explicitly"]
 fn pbt_separate_vk_digest_prefix_affects_verification() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -196,7 +192,6 @@ fn pbt_separate_vk_digest_prefix_affects_verification() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn malformed_embedded_calldata_variants_are_rejected() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -237,7 +232,6 @@ fn malformed_embedded_calldata_variants_are_rejected() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn mutated_separate_vk_contract_is_rejected() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -255,7 +249,6 @@ fn mutated_separate_vk_contract_is_rejected() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn vk_payload_section_mutations_are_rejected() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -286,7 +279,6 @@ fn vk_payload_section_mutations_are_rejected() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn pinned_quotient_verifier_rejects_wrong_vk_and_quotient_contracts() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -328,7 +320,6 @@ fn pinned_quotient_verifier_rejects_wrong_vk_and_quotient_contracts() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn verifier_constructor_rejects_missing_or_mismatched_eip2537_precompiles() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -367,7 +358,6 @@ fn verifier_constructor_rejects_missing_or_mismatched_eip2537_precompiles() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn production_renders_do_not_emit_gas_checkpoints() {
     if crate::SOLIDITY_GAS_CHECKPOINTS_ENABLED {
         return;
@@ -401,7 +391,6 @@ fn production_renders_do_not_emit_gas_checkpoints() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn standard_plonk_render_is_deterministic_for_same_seed() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -424,7 +413,6 @@ fn standard_plonk_render_is_deterministic_for_same_seed() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn compile_solidity_is_deterministic_for_same_source() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -438,7 +426,6 @@ fn compile_solidity_is_deterministic_for_same_source() {
 }
 
 #[test]
-#[ignore = "solidity compile-matrix heavy; run explicitly in CI"]
 fn poseidon_verifier_variants_compile_with_pinned_solc() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -499,7 +486,6 @@ fn poseidon_verifier_variants_compile_with_pinned_solc() {
 
 #[cfg(feature = "rust-verifier-trace")]
 #[test]
-#[ignore = "solidity/EVM-heavy differential trace; run explicitly"]
 fn native_midfall_verifier_trace_matches_solidity_trace() {
     use group::Group;
     use midnight_curves::{Bls12, G1Projective};
@@ -798,7 +784,6 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn every_proof_scalar_rejects_fr_modulus() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -830,7 +815,6 @@ fn every_proof_scalar_rejects_fr_modulus() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn separate_verifier_adversarial_calldata_variants_are_rejected() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -899,7 +883,6 @@ fn separate_verifier_adversarial_calldata_variants_are_rejected() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn every_proof_g1_rejects_noncanonical_coordinates() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -949,7 +932,6 @@ fn every_proof_g1_rejects_noncanonical_coordinates() {
 }
 
 #[test]
-#[ignore = "solidity/EVM-heavy; run explicitly"]
 fn every_proof_g1_rejects_off_curve_coordinates() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -1567,6 +1549,10 @@ fn calldata_with_shifted_dynamic_heads(valid: &[u8], proof: &[u8]) -> Vec<u8> {
 }
 
 fn poseidon_inputs_available_for_evm() -> bool {
+    if !env_flag_enabled(RUN_EVM_TESTS_ENV) {
+        eprintln!("skipping Poseidon Solidity property test: set {RUN_EVM_TESTS_ENV}=1 to run it");
+        return false;
+    }
     if !poseidon_srs_available() {
         return false;
     }
@@ -1575,6 +1561,17 @@ fn poseidon_inputs_available_for_evm() -> bool {
         return false;
     }
     true
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn poseidon_srs_available() -> bool {

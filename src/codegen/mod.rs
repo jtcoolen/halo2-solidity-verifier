@@ -11,13 +11,11 @@ use crate::codegen::{
         Word,
     },
 };
-// midnight-proofs migration: VerifyingKey is generic over (F, CS), where F
-// = midnight_curves::Fq (BLS12-381 scalar) and CS = KZGCommitmentScheme<Bls12>.
-// All embedded commitments are now `G1Projective`; we convert them to
-// affine before EIP-2537 packing. ParamsKZG carries the SRS in the same
-// form as halo2 v0.4 (bare G1/G2 fields), but the public accessors only
-// expose `g_lagrange()`, `g2()`, `s_g2()`. The G1 generator is read from
-// `G1Affine::generator()` directly.
+// Midnight verifier inputs are generic over (F, CS), where F =
+// midnight_curves::Fq and CS = KZGCommitmentScheme<Bls12>. Embedded
+// commitments are converted to affine form before EIP-2537 packing. The SRS
+// accessors expose `g_lagrange()`, `g2()`, and `s_g2()`; the G1 generator is
+// read from `G1Affine::generator()` directly.
 use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve};
 use itertools::chain;
@@ -55,12 +53,9 @@ use quotient::*;
 /// Solidity verifier generator for midnight-proofs (logup + trash + KZG
 /// multi-prepare PCS) on BLS12-381 EIP-2537.
 ///
-/// **Migration status (Steps 1-3, 2026-04-26)**: this struct now binds to
-/// `midnight_proofs::plonk::VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>`
-/// and `ParamsKZG<Bls12>` instead of halo2-proofs v0.4 + halo2curves
-/// `bls12381::Bls12381`. The generated Yul still reflects the old halo2
-/// schema (no logup helpers / trashcans / multi-prepare PCS); Steps 4-9
-/// of MIGRATION.md track the Yul rewrite.
+/// The supported protocol shape is intentionally narrow: Midfall/Midnight
+/// KZG proofs with one committed identity instance column and one
+/// non-committed public-input column.
 #[derive(Debug)]
 pub struct SolidityGenerator<'a> {
     params: &'a ParamsKZG<Bls12>,

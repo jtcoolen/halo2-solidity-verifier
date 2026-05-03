@@ -49,6 +49,7 @@ use halo2_solidity_verifier::{
 };
 
 type F = Fq;
+const RUN_EVM_TESTS_ENV: &str = "HALO2_SOLIDITY_RUN_EVM_TESTS";
 
 #[derive(Clone, Default)]
 struct PoseidonExample;
@@ -100,17 +101,21 @@ fn srs_dir() -> String {
     })
 }
 
-/// Step 8 end-to-end smoke. Marked `#[ignore]` because it depends on
-/// the Filecoin SRS asset, solc, and Prague EIP-2537 precompile
-/// support. Run explicitly via
-///   cargo test --features evm,truncated-challenges --test poseidon_fixture -- --ignored --nocapture
+/// Step 8 end-to-end smoke. It depends on the Filecoin SRS asset, solc, and
+/// Prague EIP-2537 precompile support, so default CI skips it unless
+/// `HALO2_SOLIDITY_RUN_EVM_TESTS=1` is set. Run explicitly via:
+///   HALO2_SOLIDITY_RUN_EVM_TESTS=1 cargo test --features evm,truncated-challenges --test poseidon_fixture -- --nocapture
 /// Enable Solidity trace logs with:
-///   cargo test --features evm,truncated-challenges,solidity-trace --test poseidon_fixture -- --ignored --nocapture
+///   HALO2_SOLIDITY_RUN_EVM_TESTS=1 cargo test --features evm,truncated-challenges,solidity-trace --test poseidon_fixture -- --nocapture
 #[cfg(feature = "truncated-challenges")]
 #[test]
-#[ignore = "requires local midfall assets and Prague EIP-2537 precompiles"]
 fn poseidon_renders_compiles_and_verifies() {
     const K: u32 = 6;
+
+    if !env_flag_enabled(RUN_EVM_TESTS_ENV) {
+        eprintln!("skipping poseidon end-to-end smoke: set {RUN_EVM_TESTS_ENV}=1 to run it");
+        return;
+    }
 
     // The Filecoin SRS file is loaded by `srs_for_test` via the
     // `SRS_DIR` env var. Skip the test cleanly if the asset is
@@ -253,6 +258,17 @@ fn poseidon_renders_compiles_and_verifies() {
             panic!("verifier halted with gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn dump_trace_logs(logs: &[halo2_solidity_verifier::revm::primitives::Log]) {

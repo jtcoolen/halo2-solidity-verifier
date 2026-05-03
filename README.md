@@ -2,7 +2,7 @@
 
 > ⚠️ This repo has NOT been audited and is NOT intended for a production environment yet.
 
-Solidity verifier generator for `midnight-proofs` / Midfall Halo2 proofs with
+Solidity verifier generator for `midnight-proofs` / Midfall verifier proofs with
 the KZG polynomial commitment scheme on BLS12-381. Generated verifiers target
 Solidity `>=0.8.24` and the EIP-2537 BLS12-381 precompiles.
 
@@ -44,9 +44,16 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 > The workspace is pinned to the toolchain in [rust-toolchain.toml](./rust-toolchain.toml)
 > and CI compiles Solidity with `solc 0.8.24`.
 
-Only maintained examples are registered in `Cargo.toml`; stale pre-Midnight
-diagnostic examples under `examples/` are kept out of default builds by
-`autoexamples = false`.
+The maintained example is `examples/ivc_replay.rs`; obsolete legacy diagnostic
+examples have been removed so default example discovery stays green.
+
+Resource-heavy Solidity/EVM tests are ordinary tests, not permanently ignored.
+They skip unless the relevant opt-in gate is set:
+
+```bash
+HALO2_SOLIDITY_RUN_EVM_TESTS=1 cargo test --features evm,truncated-challenges poseidon_verifier_variants_compile_with_pinned_solc -- --nocapture
+HALO2_SOLIDITY_RUN_IVC_BENCH=1 scripts/run_ivc_bench.sh --trace --skip-srs-download
+```
 
 ### IVC detailed bench
 
@@ -69,7 +76,10 @@ Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
 - It currently supports the Midfall verifier shape used by this repo: exactly
   one committed identity instance column and one non-committed public-input
   column, no rotated instance queries, and KZG on BLS12-381.
-- Currently even the `configure` is same, the [selector compression](https://github.com/privacy-scaling-explorations/halo2/blob/7a2165617195d8baa422ca7b2b364cef02380390/halo2_proofs/src/plonk/circuit/compress_selectors.rs#L51) might lead to different configuration when selector assignments are different. To avoid this, please use [`keygen_vk_custom`](https://github.com/privacy-scaling-explorations/halo2/blob/6fc6d7ca018f3899b030618cb18580249b1e7c82/halo2_proofs/src/plonk/keygen.rs#L223) with `compress_selectors: false` to do key generation without selector compression.
+- Verifying-key generation must be reproducible for the circuit shape being
+  rendered. If selector assignments can differ between proving and verifier
+  generation, disable selector compression or use the Midfall keygen path that
+  preserves the same selector layout.
 
 ## Compatibility
 

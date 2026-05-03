@@ -67,38 +67,38 @@ jobs:
 
       - name: Compile Poseidon verifier variants
         run: |
-          SRS_DIR="$PWD/.srs" cargo test --release \
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
             --features evm,truncated-challenges \
             poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --ignored --nocapture
+            -- --nocapture
 
       - name: Compile Poseidon verifier variants with gas checkpoints
         run: |
-          SRS_DIR="$PWD/.srs" cargo test --release \
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
             --features evm,truncated-challenges,solidity-gas-checkpoints \
             poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --ignored --nocapture
+            -- --nocapture
 
       - name: Compile Poseidon verifier variants with fewer point sets
         run: |
-          SRS_DIR="$PWD/.srs" cargo test --release \
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
             --features evm,truncated-challenges,outer-fewer-point-sets \
             poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --ignored --nocapture
+            -- --nocapture
 
       - name: Compile Poseidon gas variants with fewer point sets
         run: |
-          SRS_DIR="$PWD/.srs" cargo test --release \
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
             --features evm,truncated-challenges,outer-fewer-point-sets,solidity-gas-checkpoints \
             poseidon_verifier_variants_compile_with_pinned_solc \
-            -- --ignored --nocapture
+            -- --nocapture
 
       - name: Poseidon native/Solidity trace equivalence
         run: |
-          SRS_DIR="$PWD/.srs" cargo test --release \
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
             --features evm,truncated-challenges,rust-verifier-trace,solidity-trace \
             native_midfall_verifier_trace_matches_solidity_trace \
-            -- --ignored --nocapture
+            -- --nocapture
 
       - name: IVC trace-equivalence gas bench
         run: scripts/run_ivc_bench.sh --trace --skip-srs-download

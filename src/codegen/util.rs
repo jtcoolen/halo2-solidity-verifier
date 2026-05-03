@@ -1,7 +1,6 @@
-// Step 1-3 migration: most of the Yul-emission helpers in this module are
-// only consumed by the codegen tree once Steps 4-9 are completed. We
-// keep them here (rather than gating them with `cfg(test)`) so the
-// post-migration emitter has them available without a re-import dance.
+// Some Yul-emission helpers in this module are shared by production codegen
+// and tests. Keep them available without `cfg(test)` gates so the emitter can
+// reuse a single metadata model.
 #![allow(dead_code)]
 
 use crate::codegen::{
@@ -24,10 +23,8 @@ use std::{
 type LookupEvalSlots = (Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Word>);
 
 // ----------------------------------------------------------------------------
-// Migration note (Steps 1-3, 2026-04-26): the old `ConstraintSystemMeta` was
-// driven by halo2-proofs v0.4 backend types (`ConstraintSystemBack`,
-// `ColumnMid`, halo2 grand-product lookup). We now walk the
-// `midnight_proofs::plonk::ConstraintSystem<Fq>` directly, which exposes:
+// `ConstraintSystemMeta` walks `midnight_proofs::plonk::ConstraintSystem<Fq>`
+// directly, which exposes:
 //
 //   * `cs.lookups()` -> `Vec<logup::BatchedArgument<F>>` (with `chunk_by_degree`,
 //     `num_chunks`)
@@ -318,10 +315,8 @@ impl ConstraintSystemMeta {
 }
 
 // ----------------------------------------------------------------------------
-// Memory-layout helpers (Data, Ptr, EcPoint, Word, ...). Keep mostly as-is
-// from the halo2 era; the BLS12-381 layout (4 words per G1) does not
-// change. Only the type that keys `permutation_comms` flips from
-// `ColumnMid` to `Column<Any>`.
+// Memory-layout helpers (Data, Ptr, EcPoint, Word, ...). The BLS12-381 layout
+// uses four words per G1 and `Column<Any>` keys for permutation commitments.
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -1057,9 +1052,8 @@ pub(crate) fn group_backward_adjacent_ec_points<'a>(
 }
 
 // ----------------------------------------------------------------------------
-// BLS12-381 EIP-2537 encoding helpers (post-migration: types come from
-// `midnight_curves` instead of `halo2curves::bls12381`). The shape of the
-// encoded U256 array is unchanged.
+// BLS12-381 EIP-2537 encoding helpers. The shape of the encoded U256 array
+// matches the padded precompile calldata expected by the generated verifier.
 // ----------------------------------------------------------------------------
 
 fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {

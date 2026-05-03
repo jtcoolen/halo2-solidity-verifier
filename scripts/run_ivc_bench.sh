@@ -204,13 +204,13 @@ run_solidity_bench() {
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
     echo "[ivc-bench] running IVC Keccak Solidity verifier bench"
-    echo "+ SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --ignored --nocapture"
+    echo "+ HALO2_SOLIDITY_RUN_IVC_BENCH=1 SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --nocapture"
     (
       cd "$ROOT_DIR"
-      SRS_DIR="$SRS_DIR" cargo test --release \
+      HALO2_SOLIDITY_RUN_IVC_BENCH=1 SRS_DIR="$SRS_DIR" cargo test --release \
         --features "$features" \
         --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-        -- --ignored --nocapture
+        -- --nocapture
     )
 
     local dump_dir="$ROOT_DIR/target/ivc-keccak-solidity-dump"

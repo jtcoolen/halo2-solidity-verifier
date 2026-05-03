@@ -26,21 +26,23 @@
 //! Run:
 //!
 //! ```text
-//! SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
+//! HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
+//!   SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
 //!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets \
 //!     --test ivc_keccak_solidity \
-//!     -- --ignored --nocapture
+//!     -- --nocapture
 //! ```
 //!
 //! Enable the detailed gas benchmark with:
 //!
 //! ```text
-//! SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
+//! HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
+//!   SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
 //!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints \
 //!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-//!     -- --ignored --nocapture
+//!     -- --nocapture
 //! ```
 //!
 //! Native Rust/Solidity trace equivalence needs a local Midfall checkout that
@@ -90,6 +92,8 @@ type S = BlstrsEmulation;
 type F = <S as SelfEmulation>::F;
 type C = <S as SelfEmulation>::C;
 type E = <S as SelfEmulation>::Engine;
+
+const RUN_IVC_BENCH_ENV: &str = "HALO2_SOLIDITY_RUN_IVC_BENCH";
 
 // ---------------------------------------------------------------------------
 // Inner SHA-256 preimage circuit (mirror of
@@ -801,12 +805,16 @@ fn print_proof_evaluation_counts(counts: &ProofEvaluationCounts) {
 }
 
 #[test]
-#[ignore = "slow IVC proving + solc + revm; ~10 min total. Run with --ignored --nocapture"]
 fn ivc_final_keccak_solidity_e2e() {
     const IVC_K: u32 = 19;
     const DECIDER_K: u32 = 20;
     const SOLC_OPTIMIZE_RUNS: u32 = 1;
     const EIP170_MAX_RUNTIME_SIZE: usize = 0x6000;
+
+    if !env_flag_enabled(RUN_IVC_BENCH_ENV) {
+        println!("[ivc-keccak-solidity] set {RUN_IVC_BENCH_ENV}=1 to run the full bench");
+        return;
+    }
 
     // Bail out cleanly when solc isn't on PATH.
     let solc = std::env::var("SOLC").unwrap_or_else(|_| "solc".to_string());
@@ -1233,6 +1241,17 @@ fn ivc_final_keccak_solidity_e2e() {
             panic!("verifier halted at gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn overwrite_u256_word_for_test(bytes: &mut [u8], start: usize, value: u64) {

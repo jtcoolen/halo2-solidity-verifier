@@ -2,19 +2,12 @@
 name = "halo2_solidity_verifier"
 version = "0.1.0"
 edition = "2021"
-autoexamples = false
 
 [dependencies]
-# Migration target: depend on midnight-proofs (the midfall fork of halo2 v0.4)
-# from the published GitHub branch. midnight-proofs ships logup, the trash
-# argument, the midnight KZG multi-prepare PCS, and a Keccak256 transcript with
-# a domain-separator + 64-byte squeeze. midnight-curves carries BLS12-381
-# natively (Fq scalar = midnight_curves::Fq, G1 = midnight_curves::G1Affine,
-# pairing engine = midnight_curves::Bls12).
-#
-# The vendored halo2 v0.4 tree under vendor/halo2/ is now obsolete and is
-# kept on disk only for the transcript / codegen tests that have not yet
-# been ported (see MIGRATION.md). It is no longer in the build graph.
+# Depend on Midfall's Midnight proof stack from the published keccak branch.
+# midnight-proofs ships logup, the trash argument, the Midnight KZG
+# multi-prepare PCS, and a Keccak256 transcript with a domain separator plus
+# 64-byte squeeze. midnight-curves carries BLS12-381 natively.
 midnight-proofs = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", default-features = false, features = ["keccak-transcript", "committed-instances", "circuit-params"] }
 midnight-curves = { version = "0.2.0" }
 ff = "0.13"
@@ -47,19 +40,13 @@ rand_chacha = "0.3.1"
 midnight-circuits = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = ["testing"] }
 # IVC final-step Keccak proof end-to-end test (tests/ivc_keccak_solidity.rs).
-# The local aggregation crate currently builds in truncated mode, so ignored
-# Solidity tests that exercise it require this crate's matching feature too.
+# The local aggregation crate currently builds in truncated mode, so Solidity
+# tests that exercise it require this crate's matching feature too.
 midnight-aggregation = { git = "https://github.com/EYBlockchain/midfall.git", branch = "keccak", features = [
     "keccak-transcript",
     "truncated-challenges",
 ] }
 sha2 = "0.10"
-# halo2_maingate is upstream maingate from halo2wrong, pinned to v0.3-shaped
-# halo2_proofs. It does not compile against halo2 v0.4 (which we now use), so
-# the maingate-backed render tests in src/test.rs are commented out for the
-# duration of the migration. Once a v0.4-compatible maingate is available the
-# dep can be re-enabled.
-# halo2_maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", tag = "v2024_01_31", package = "maingate" }
 
 # Keep Midfall subcrates on the same published `keccak` branch without
 # committing machine-local path overrides. Local development overrides belong

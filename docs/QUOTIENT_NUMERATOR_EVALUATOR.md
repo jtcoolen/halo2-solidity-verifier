@@ -843,8 +843,9 @@ Run the full IVC Rust/Solidity trace-equivalence test:
 
 ```bash
 SRS_DIR=/Users/Julien.Coolen/midfall/zk_stdlib/examples/assets \
+HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
 cargo test --release \
   --features evm,rust-verifier-trace,truncated-challenges,in-circuit-fewer-point-sets \
   --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
-  -- --ignored --nocapture
+  -- --nocapture
 ```
