@@ -316,7 +316,7 @@ impl<'a> SolidityGenerator<'a> {
             &memory,
             Some(&quotient_build),
             &transcript_plan,
-            pcs_plan.memory,
+            &pcs_plan,
             ManifestFeatures::current(),
             ManifestDependencyHashes::new(Some(vk_codehash), None),
         )
@@ -3297,12 +3297,13 @@ impl<'a> SolidityGenerator<'a> {
                 .flat_map(|block| block.iter())
                 .any(|line| line.contains("q_limb7_wide("));
 
-        let pcs_computations = pcs::computations(
+        let pcs_computations = pcs::computations_from_intermediate_sets(
             &meta,
             &data,
             &memory,
             cfg!(feature = "truncated-challenges"),
             trace,
+            pcs_plan.intermediate_sets(),
         );
 
         // Per-user-phase breakdown (advices + user challenges).

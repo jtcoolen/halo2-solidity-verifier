@@ -7,8 +7,11 @@
 
 use ruint::aliases::U256;
 
+#[cfg(test)]
+use crate::codegen::memory::PcsMemoryRequirements;
 use crate::codegen::{
-    memory::{PcsMemoryRequirements, VerifierMemoryLayout},
+    memory::VerifierMemoryLayout,
+    pcs_plan::PcsPlan,
     proof_layout::{ProofCalldataLayout, ProofSection},
     quotient::QuotientProgramBuild,
     transcript_plan::TranscriptPlan,
@@ -35,7 +38,7 @@ impl CodegenManifest {
         memory: &VerifierMemoryLayout,
         quotient: Option<&QuotientProgramBuild>,
         transcript: &TranscriptPlan,
-        pcs: PcsMemoryRequirements,
+        pcs: &PcsPlan,
         features: ManifestFeatures,
         dependency_hashes: ManifestDependencyHashes,
     ) -> Self {
@@ -46,7 +49,7 @@ impl CodegenManifest {
             memory: ManifestMemory::from_layout(memory),
             quotient: ManifestQuotient::from_build(quotient),
             transcript_events: transcript.events.len(),
-            pcs: ManifestPcs::from_requirements(pcs),
+            pcs: ManifestPcs::from_plan(pcs),
             features,
             dependency_hashes,
         }
@@ -212,34 +215,93 @@ impl ManifestQuotient {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManifestPcs {
+    pub(crate) raw_query_count: usize,
+    pub(crate) query_count: usize,
+    pub(crate) dummy_query_count: usize,
+    pub(crate) point_set_count: usize,
+    pub(crate) point_set_sizes: Vec<usize>,
+    pub(crate) commitments_per_set: Vec<usize>,
+    pub(crate) q_eval_strategies: Vec<&'static str>,
     pub(crate) rot_points_words: usize,
     pub(crate) x1_powers_words: usize,
     pub(crate) q_eval_set_words: usize,
     pub(crate) q_eval_source_table_words: usize,
+    pub(crate) q_com_trace_msm_terms: usize,
     pub(crate) final_msm_terms: usize,
+    pub(crate) final_msm_input_bytes: usize,
 }
 
 impl ManifestPcs {
+    fn from_plan(plan: &PcsPlan) -> Self {
+        Self {
+            raw_query_count: plan.raw_query_count,
+            query_count: plan.query_count,
+            dummy_query_count: plan.dummy_query_count,
+            point_set_count: plan.point_set_count,
+            point_set_sizes: plan
+                .point_sets
+                .iter()
+                .map(|set| set.rotations.len())
+                .collect(),
+            commitments_per_set: plan
+                .point_sets
+                .iter()
+                .map(|set| set.commitment_count)
+                .collect(),
+            q_eval_strategies: plan
+                .point_sets
+                .iter()
+                .map(|set| set.q_eval_strategy.as_str())
+                .collect(),
+            rot_points_words: plan.memory.rot_points_words,
+            x1_powers_words: plan.memory.x1_powers_words,
+            q_eval_set_words: plan.memory.q_eval_set_words,
+            q_eval_source_table_words: plan.memory.q_eval_source_table_words,
+            q_com_trace_msm_terms: plan.q_com_trace_msm.terms,
+            final_msm_terms: plan.final_msm.terms,
+            final_msm_input_bytes: plan.final_msm.input_bytes,
+        }
+    }
+
+    #[cfg(test)]
     fn from_requirements(pcs: PcsMemoryRequirements) -> Self {
         Self {
+            raw_query_count: 0,
+            query_count: 0,
+            dummy_query_count: 0,
+            point_set_count: 0,
+            point_set_sizes: Vec::new(),
+            commitments_per_set: Vec::new(),
+            q_eval_strategies: Vec::new(),
             rot_points_words: pcs.rot_points_words,
             x1_powers_words: pcs.x1_powers_words,
             q_eval_set_words: pcs.q_eval_set_words,
             q_eval_source_table_words: pcs.q_eval_source_table_words,
+            q_com_trace_msm_terms: pcs.q_com_trace_msm.terms,
             final_msm_terms: pcs.final_msm.terms,
+            final_msm_input_bytes: pcs.final_msm.input_bytes,
         }
     }
 
     fn to_json(&self) -> String {
         format!(
-            "{{\"rot_points_words\":{},\"x1_powers_words\":{},\"q_eval_set_words\":{},\"q_eval_source_table_words\":{},\"final_msm_terms\":{}}}",
+            "{{\"raw_query_count\":{},\"query_count\":{},\"dummy_query_count\":{},\"point_set_count\":{},\"point_set_sizes\":{},\"commitments_per_set\":{},\"q_eval_strategies\":{},\"rot_points_words\":{},\"x1_powers_words\":{},\"q_eval_set_words\":{},\"q_eval_source_table_words\":{},\"q_com_trace_msm_terms\":{},\"final_msm_terms\":{},\"final_msm_input_bytes\":{}}}",
+            self.raw_query_count,
+            self.query_count,
+            self.dummy_query_count,
+            self.point_set_count,
+            json_usize_array(&self.point_set_sizes),
+            json_usize_array(&self.commitments_per_set),
+            json_str_array(&self.q_eval_strategies),
             self.rot_points_words,
             self.x1_powers_words,
             self.q_eval_set_words,
             self.q_eval_source_table_words,
-            self.final_msm_terms
+            self.q_com_trace_msm_terms,
+            self.final_msm_terms,
+            self.final_msm_input_bytes
         )
     }
 }
@@ -356,6 +418,32 @@ fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn json_usize_array(values: &[usize]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx != 0 {
+            out.push(',');
+        }
+        out.push_str(&value.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn json_str_array(values: &[&str]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx != 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(value));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +523,8 @@ mod tests {
         assert!(json.contains("\"program_bytes\":384"));
         assert!(json.contains("\"const_words\":64"));
         assert!(json.contains("\"transcript_events\": 12"));
+        assert!(json.contains("\"point_set_sizes\":[]"));
+        assert!(json.contains("\"final_msm_input_bytes\":1440"));
     }
 
     #[test]
@@ -484,6 +574,8 @@ mod tests {
         assert!(json.contains("\"program_bytes\":1600"));
         assert!(json.contains("\"const_words\":288"));
         assert!(json.contains("\"transcript_events\": 31"));
+        assert!(json.contains("\"q_eval_set_words\":5"));
+        assert!(json.contains("\"final_msm_terms\":9"));
     }
 
     fn manifest_protocol_shape(
@@ -562,11 +654,20 @@ mod tests {
             },
             transcript_events,
             pcs: ManifestPcs {
+                raw_query_count: 0,
+                query_count: 0,
+                dummy_query_count: 0,
+                point_set_count: 0,
+                point_set_sizes: Vec::new(),
+                commitments_per_set: Vec::new(),
+                q_eval_strategies: Vec::new(),
                 rot_points_words: 3,
                 x1_powers_words: 4,
                 q_eval_set_words: proof.q_evals.item_count,
                 q_eval_source_table_words: 0,
+                q_com_trace_msm_terms: 0,
                 final_msm_terms: 9,
+                final_msm_input_bytes: 9 * crate::codegen::memory::G1_MSM_PAIR_BYTES,
             },
             features: ManifestFeatures::current(),
             dependency_hashes: ManifestDependencyHashes::default(),

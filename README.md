@@ -137,15 +137,23 @@ cargo test --test fcom_decompress -- --ignored --nocapture
 
 ### IVC detailed bench
 
-Run the Keccak IVC Solidity verifier bench over Poseidon hash-chain leaves with per-section gas checkpoints:
+Run the production Keccak IVC Solidity verifier bench over Poseidon hash-chain leaves:
+
+```bash
+SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
+scripts/run_ivc_bench.sh --no-gas-checkpoints
+```
+
+This prints deployed runtime sizes and production transaction gas. The
+canonical release-mode path is the non-trace, non-gas-checkpoint verifier; the
+current IVC Keccak proof verifies at about `1.8M` gas on Prague-spec revm.
+
+For a per-section gas attribution run, omit `--no-gas-checkpoints`:
 
 ```bash
 SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 scripts/run_ivc_bench.sh
 ```
-
-This prints the detailed checkpoint table, deployed runtime sizes, total
-transaction gas, and real checkpointed section work.
 
 To keep the recursive verifier on fewer point sets but benchmark the outer
 decider proof without dummy PCS evals:
@@ -155,8 +163,9 @@ scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
 ```
 
 Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
-`scripts/run_ivc_bench.sh --trace`. Custom Midfall overrides must expose the
-`midnight-proofs/solidity-verifier-trace` feature for that leg.
+`scripts/run_ivc_bench.sh --trace`. That path renders a trace verifier and
+therefore reports debug gas, not production gas. Custom Midfall overrides must
+expose the `midnight-proofs/solidity-verifier-trace` feature for that leg.
 
 Compile-check the IVC bench without running the full proof:
 

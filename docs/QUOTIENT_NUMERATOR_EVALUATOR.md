@@ -809,7 +809,8 @@ Defaulting summary:
 
 The trace/gas-checkpoint build includes debug logs, so its total gas is not
 identical to the non-checkpoint production render. Use it for section deltas
-and regression comparison, not as the production gas number.
+and regression comparison, not as the production gas number. The production
+IVC verifier path is tracked separately in `docs/REPRODUCIBLE_BUILDS.md`.
 
 ## Defaulting Policy
 

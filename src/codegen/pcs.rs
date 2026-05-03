@@ -433,7 +433,10 @@ pub(super) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize 
     intermediate_sets(meta, data).point_sets.len()
 }
 
-fn commitments_by_set(sets: &IntermediateSets, n_sets: usize) -> Vec<Vec<&CommitmentEntry>> {
+pub(crate) fn commitments_by_set(
+    sets: &IntermediateSets,
+    n_sets: usize,
+) -> Vec<Vec<&CommitmentEntry>> {
     let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
     for c in &sets.commitments {
         by_set[c.set_index].push(c);
@@ -514,12 +517,12 @@ fn final_msm_shape(
 pub(super) const Q_EVAL_ROLL_THRESHOLD: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QEvalStrategy {
+pub(crate) enum QEvalStrategy {
     Rolled,
     Unrolled,
 }
 
-fn q_eval_strategy(commitments: &[&CommitmentEntry]) -> QEvalStrategy {
+pub(crate) fn q_eval_strategy(commitments: &[&CommitmentEntry]) -> QEvalStrategy {
     let Some(first) = commitments.first() else {
         return QEvalStrategy::Unrolled;
     };
@@ -620,11 +623,22 @@ pub(super) fn computations(
     truncated_challenges: bool,
     trace: bool,
 ) -> Vec<Vec<String>> {
+    let sets = intermediate_sets(meta, data);
+    computations_from_intermediate_sets(meta, data, memory, truncated_challenges, trace, &sets)
+}
+
+pub(super) fn computations_from_intermediate_sets(
+    meta: &ConstraintSystemMeta,
+    data: &Data,
+    memory: &VerifierMemoryLayout,
+    truncated_challenges: bool,
+    trace: bool,
+    sets: &IntermediateSets,
+) -> Vec<Vec<String>> {
     /// 128-bit mask for `truncate(scalar)` in midnight-proofs:
     /// `truncate` keeps the lower `ceil(NUM_BITS/8)/2 = 16` bytes
     /// of the LE Fr representation, which is the lower 128 bits.
     const TRUNC_MASK_128: &str = "0xffffffffffffffffffffffffffffffff";
-    let sets = intermediate_sets(meta, data);
     let n_sets = sets.point_sets.len();
     if n_sets == 0 {
         return Vec::new();
