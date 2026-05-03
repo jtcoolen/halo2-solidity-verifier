@@ -179,6 +179,9 @@ impl<'a> SolidityGenerator<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct QuotientStateSlots {
+    // Persistent VM state words stored after the optional CSE temp area. The
+    // Yul interpreter and native callbacks all share these addresses so inline
+    // prefixes, bytecode identities, and callbacks advance the same y-batch.
     eval_numer_mptr: usize,
     trace_id_mptr: usize,
     sel_scale_mptr: usize,
@@ -188,6 +191,12 @@ struct QuotientStateSlots {
 
 impl QuotientStateSlots {
     fn new(tmp_mptr: usize, cse_temps: usize) -> Self {
+        // Layout at `quotient_tmp_mptr`:
+        //   [0 .. cse_temps)        VM STORE_TEMP/PUSH_TEMP scratch
+        //   [cse_temps .. +5 words) accumulator and selector-fold state
+        //
+        // Keeping state after CSE temps lets the same template work whether
+        // VM CSE is enabled or not.
         let base = tmp_mptr + cse_temps * WORD_BYTES;
         Self {
             eval_numer_mptr: base,
@@ -864,6 +873,9 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> (QuotientProgramBuild, Vec<usize>) {
+        // Build the exact compact program carried by the VK. This helper is
+        // also used during static-layout convergence, so its output must be
+        // deterministic for a fixed VK base and proof shape.
         let plan = self.quotient_program_plan(meta, data);
         let sorted_simple = plan.sorted_simple.clone();
         let quotient_program_build = self.build_quotient_program_items(&plan.items);
@@ -876,6 +888,12 @@ impl<'a> SolidityGenerator<'a> {
         meta: &ConstraintSystemMeta,
         data: &Data,
     ) -> QuotientProgramPlan {
+        // Preserve the Rust identity order while choosing an execution form for
+        // each identity:
+        //   * a small gate prefix can stay inline,
+        //   * ordinary identities become compact VM bytecode,
+        //   * recognized expensive gates/permutation products become native
+        //     callback markers in the same stream.
         let parts = self.quotient_identity_parts(meta, data);
         let inline_count = hybrid_quotient_inline_count(&parts.gates);
         let inline_identities = parts.gates[..inline_count].to_vec();
@@ -1753,6 +1771,10 @@ impl<'a> SolidityGenerator<'a> {
 
         let num_cols = meta.permutation_columns.len();
         let num_sets = meta.num_permutation_zs;
+        // Native permutation code materializes the terms for every permutation
+        // set into a contiguous scratch table rooted at the callback scratch
+        // pointer. This is separate from VM operand-stack depth even when both
+        // regions currently use `quotient_stack_mptr` as their base.
         // permutation values, permutation sigma values, z_cur, z_next,
         // z_last for every non-final set, and one spill slot for the
         // running delta base used by the native permutation callback.
@@ -2420,6 +2442,12 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
+        // FIXME(audit): `quotient_stack_words` only reserves the interpreted
+        // VM operand stack. When the plan contains a native permutation
+        // callback, that callback also writes
+        // `structured_permutation_scratch_words(meta)` words starting at the
+        // same `quotient_stack_mptr`. The reserved region must be the max of
+        // both requirements, or the callback needs a dedicated scratch region.
         let memory = self.memory_layout_for(
             &meta,
             &vk,
@@ -2481,6 +2509,10 @@ impl<'a> SolidityGenerator<'a> {
         let mut quotient_native_identity_computations = Vec::new();
         let quotient_native_trash_computation = Vec::new();
 
+        // Inline/native quotient blocks reuse the VM stack base as expression
+        // scratch. For native permutation this means the planner's
+        // `quotient_stack_words` reservation must cover the structured table
+        // size, not just the interpreted stack high-water mark.
         let eval_scratch_slot = quotient_stack_mptr;
         let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
         for identity in &quotient_plan.inline_identities {
@@ -2644,6 +2676,11 @@ impl<'a> SolidityGenerator<'a> {
             .as_ref()
             .map(|build| build.max_stack)
             .unwrap_or(0);
+        // FIXME(audit): this monolithic compact-VM path has the same memory
+        // invariant as the external evaluator above. If native permutation is
+        // enabled, `quotient_stack_mptr` is reused as callback scratch and must
+        // be sized for `structured_permutation_scratch_words(meta)`, not only
+        // for `build.max_stack`.
         let memory = self.memory_layout_for(
             &meta,
             &vk,
@@ -2756,6 +2793,9 @@ impl<'a> SolidityGenerator<'a> {
                 trace,
             );
         } else {
+            // The compact VM, inline prefix, and native callbacks share the
+            // same stack/scratch base in this path. Keep memory sizing tied to
+            // both `max_stack` and callback-specific scratch needs.
             let eval_scratch_slot = quotient_stack_mptr;
             let evaluator = Evaluator::new(self.vk.cs(), &meta, &data).with_pow5_helper(true);
 
@@ -3038,6 +3078,10 @@ impl<'a> SolidityGenerator<'a> {
 
     fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
+        // Lower the logical plan into bytecode in one pass. CSE planning looks
+        // at all interpreted identities first, but native callbacks remain
+        // opaque markers because their arithmetic is emitted as separate Yul
+        // kernels in the template.
         // Mirror snark-verifier's loader cache shape: when VM CSE is enabled,
         // choose repeated expression temps across the whole quotient program,
         // not just within one identity.

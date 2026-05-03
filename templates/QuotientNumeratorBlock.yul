@@ -104,6 +104,10 @@
                 //   q_has_top whether q_top currently holds a stack value
                 //
                 // The cached top reduces memory traffic in the interpreter.
+                // q_sp's registered range must cover the interpreted operand
+                // stack plus any native callback scratch that reuses this base
+                // pointer. In particular, the native permutation callback
+                // writes a structured scratch table at program.stack_mptr.
                 let q_pc := q_program_mptr
                 let q_end := add(q_program_mptr, {{ program.len|hex() }})
                 let q_sp := {{ program.stack_mptr|hex() }}
@@ -295,6 +299,11 @@
                     case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
+                        // The generated loop below uses program.stack_mptr as
+                        // its scratch-table base, not as a conventional VM
+                        // stack. The Rust memory planner must reserve enough
+                        // words for structured_permutation_scratch_words(meta)
+                        // whenever this opcode can appear.
                         q_sp := {{ program.stack_mptr|hex() }}
                         {%- for line in quotient_native_permutation_computation %}
                         {{ line }}
@@ -690,6 +699,11 @@
                     case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
+                        // The generated loop below uses program.stack_mptr as
+                        // its scratch-table base, not as a conventional VM
+                        // stack. The Rust memory planner must reserve enough
+                        // words for structured_permutation_scratch_words(meta)
+                        // whenever this opcode can appear.
                         q_sp := {{ program.stack_mptr|hex() }}
                         {%- for line in quotient_native_permutation_computation %}
                         {{ line }}

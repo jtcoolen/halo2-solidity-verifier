@@ -1,23 +1,46 @@
 use super::*;
 
-// Compact quotient-identity bytecode interpreted by the generated Yul verifier.
-// The identities are still derived from the same evaluator output; this only
-// changes how the arithmetic is represented in deployed bytecode.
+// Producer-side definition of the compact quotient VM.
+//
+// `partially_evaluate_identities` still decides the actual Halo2 identities;
+// this module only changes the representation used by generated Solidity.
+// The Rust builder below lowers those identities into a VK-resident bytecode
+// stream, and `templates/QuotientNumeratorBlock.yul` interprets that stream at
+// verification time. Any opcode, operand, memory-token, or fold-order change
+// must therefore be made in lockstep across this module, the Yul template, the
+// spec docs, and the VM tests.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum QuotientTarget {
+    // Fully evaluated identity. Its value contributes to the scalar stored in
+    // QUOTIENT_EVAL_MPTR after the final negation.
     Main,
+    // Simple-selector identity. Its value is accumulated into the matching
+    // selector commitment bucket while still advancing the global y-batch.
     Selector(usize),
 }
 
+// Complete artifact produced by `QuotientProgramBuilder` and consumed by the
+// generator memory planner plus the Yul VM template.
 #[derive(Debug)]
 pub(super) struct QuotientProgramBuild {
+    // Encoded bytecode. This is either byte-oriented or packed32, depending on
+    // `packed32`.
     pub(super) bytes: Vec<u8>,
+    // Deduplicated Fr constants addressed by PUSH_CONST and fused opcodes.
     pub(super) consts: Vec<U256>,
+    // Maximum operand-stack depth of the pure interpreted bytecode. Native
+    // callbacks may need additional scratch; the generator must size that
+    // separately when such callbacks share the VM stack base.
     pub(super) max_stack: usize,
     pub(super) packed32: bool,
+    // Number of temporary words addressed by PUSH_TEMP/STORE_TEMP when VM CSE
+    // is enabled. State slots live immediately after these words.
     pub(super) cse_temps: usize,
 }
 
+// One Halo2 quotient identity after the normal evaluator has emitted its Yul
+// assignment lines. `expr` is the parsed form used by the compact VM; `lines`
+// and `var` remain available for native/direct Yul paths.
 #[derive(Clone, Debug)]
 pub(super) struct QuotientIdentity {
     pub(super) lines: Vec<String>,
@@ -117,6 +140,9 @@ pub(super) enum QuotientStructuredTailMode {
     Trash,
 }
 
+// Logical stream item before final bytecode lowering. Native items are markers
+// in the same identity order as interpreted items; the template replaces them
+// with generated Yul callbacks at runtime.
 #[derive(Clone, Debug)]
 pub(super) enum QuotientProgramItem {
     Identity(QuotientIdentity),
@@ -124,6 +150,9 @@ pub(super) enum QuotientProgramItem {
     NativeIdentity(usize),
 }
 
+// Hybrid execution plan for quotient numerator reconstruction. A small prefix
+// may stay inline, most identities become VM bytecode, and selected expensive
+// shapes can become native callbacks while preserving the original y-order.
 #[derive(Clone, Debug)]
 pub(super) struct QuotientProgramPlan {
     pub(super) inline_identities: Vec<QuotientIdentity>,
@@ -153,7 +182,11 @@ pub(super) const WIDE_LIMB7_YUL_COEFFS: [&str; layout::quotient_limb::LIN_COEFFS
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuotientProgramEncoding {
+    // Variable-length byte stream. This is the only encoding that supports the
+    // limb-aware opcodes and run-compacted fused add-mul instructions.
     Bytes,
+    // Four-byte instruction words: high byte opcode, low 24 bits operand.
+    // Easier to decode in Yul, but not every opcode shape fits this format.
     Packed32,
 }
 
@@ -167,6 +200,9 @@ pub(super) const QUOTIENT_VM_LIMBS: usize = layout::quotient_limb::LIMBS;
 pub(super) const QUOTIENT_VM_PAIRWISE_TERMS: usize = layout::quotient_limb::PAIRWISE_TERMS;
 pub(super) const QUOTIENT_VM_PAIRWISE_COEFFS: usize = layout::quotient_limb::PAIRWISE_COEFFS;
 
+// Opcode assignments are part of the verifier/VK ABI. Keep 0x1a reserved:
+// historical builds used it for an experimental native trash callback, but the
+// current VM intentionally has no operation at that value.
 pub(super) const Q_OP_PUSH_CONST: u8 = 0x01;
 pub(super) const Q_OP_PUSH_MEM_LITERAL: u8 = 0x02;
 pub(super) const Q_OP_PUSH_MEM_TOKEN: u8 = 0x03;
@@ -207,6 +243,8 @@ pub(super) const Q_MEM_THETA: u8 = 0x07;
 pub(super) const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
 pub(super) const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
 
+// Operand decoder classes shared by tests and docs. The Yul template is the
+// runtime decoder; this table is the compile-time/spec view of the same ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuotientOpcodeEncoding {
     None,
@@ -576,7 +614,12 @@ pub(super) enum QuotientLimbShape {
 
 #[derive(Debug, Default)]
 pub(super) struct QuotientCseState {
+    // Expression key -> temp slot chosen before emission. Slots are stable
+    // across the whole VM program, so repeated subexpressions can be shared
+    // between identities rather than only within one identity.
     pub(super) slots: HashMap<String, u16>,
+    // Expression key -> temp slot already materialized in bytecode. This
+    // prevents recursive emit from generating the same STORE_TEMP repeatedly.
     pub(super) emitted: HashMap<String, u16>,
 }
 
@@ -824,6 +867,8 @@ pub(super) enum QuotientProductAdd {
 
 #[derive(Default)]
 pub(super) struct QuotientProgramBuilder {
+    // Raw byte-oriented program before optional run compaction or packed32
+    // repacking. All stack-depth accounting happens against this stream.
     pub(super) bytes: Vec<u8>,
     pub(super) consts: Vec<U256>,
     pub(super) const_slots: HashMap<U256, u16>,
@@ -848,6 +893,9 @@ impl QuotientProgramBuilder {
         target: QuotientTarget,
         cse: Option<&mut QuotientCseState>,
     ) {
+        // Each identity is emitted as an isolated stack expression followed by
+        // one fold opcode. Native callbacks assert the same empty-stack
+        // boundary, which lets the Yul interpreter reset q_sp before them.
         self.vars.clear();
         self.stack_depth = 0;
 
@@ -884,6 +932,9 @@ impl QuotientProgramBuilder {
             self.stack_depth, 0,
             "native permutation expects empty VM stack"
         );
+        // The callback is not an arithmetic stack op: it is a placeholder in
+        // the y-batched identity stream. The generated Yul block performs its
+        // own scratch writes and fold calls at this exact program position.
         self.bytes.push(Q_OP_NATIVE_PERMUTATION);
     }
 
@@ -900,6 +951,9 @@ impl QuotientProgramBuilder {
     }
 
     pub(super) fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
+        // `max_stack` is the pure VM operand stack high-water mark. Do not use
+        // it as a proxy for callback scratch requirements; callbacks can share
+        // the same base pointer while needing a different word count.
         let cse_temps = self.cse_temps();
         if encoding == QuotientProgramEncoding::Packed32
             && quotient_program_uses_limb_ops(&self.bytes)
@@ -1508,6 +1562,9 @@ impl QuotientProgramBuilder {
 }
 
 pub(super) fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
+    // Run compaction is only a byte-encoding optimization. It preserves the
+    // logical operation stream by replacing long adjacent fused add-mul ops
+    // with one counted opcode followed by the same operands.
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0usize;
     while idx < bytes.len() {
@@ -1551,6 +1608,9 @@ pub(super) fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
+    // Packed32 is a second physical encoding of the same logical VM. Base
+    // instructions become one word `(opcode << 24) | operand`; opcodes with
+    // two memory operands append one extra packed pair word.
     if quotient_program_uses_limb_ops(bytes) {
         panic!("{QUOTIENT_LIMB_VM_OPS_ENV}=1 is only supported with {QUOTIENT_ENCODING_ENV}=bytes");
     }
