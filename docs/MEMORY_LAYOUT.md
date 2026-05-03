@@ -13,6 +13,57 @@ The current planner is conservative. It preserves the existing generated
 addresses and only centralizes naming, sizing, and validation. It is not a
 deterministic repacker yet.
 
+## Solidity Memory Model Boundary
+
+Solidity reserves the first four words of memory for compiler conventions:
+
+- `0x00..0x3f`: scratch space;
+- `0x40..0x5f`: the free-memory pointer;
+- `0x60..0x7f`: the zero slot used as the initial value for dynamic memory
+  arrays;
+- `0x80`: the initial allocatable memory pointer.
+
+The generated verifier intentionally does not follow Solidity allocation by
+reading and bumping `mload(0x40)`. In particular, the streaming transcript
+buffer starts at `0x00` and grows until the next transcript squeeze. For large
+absorbs, that buffer can overwrite the free-memory pointer word at `0x40`, the
+zero slot at `0x60`, and memory at or above `0x80`.
+
+That is acceptable only under the current generated-contract shape:
+
+1. `verifyProof` is an external entrypoint with `calldata` arguments, so the
+   proof and instances are not eagerly decoded into Solidity-managed memory.
+2. The high-level Solidity work before the main verifier block is limited to
+   value-type dependency checks. Accepted executions then enter the generated
+   `assembly ("memory-safe")` body.
+3. The main verifier assembly body is terminal: every path either reverts or
+   ends with `return(0x00, 0x20)`. It does not return to high-level Solidity
+   code that could observe the overwritten free-memory pointer or zero slot.
+4. The split `Halo2QuotientEvaluator` fallback has its own fresh EVM memory
+   frame, copies the verifier frame into generated absolute addresses, writes
+   its compact return frame at low memory, and immediately returns.
+5. The `Halo2VerifyingKey` constructor writes the runtime payload from memory
+   zero and immediately returns that payload as contract code.
+
+Do not move the generated verifier assembly into a reusable internal Solidity
+function, library routine, or wrapper that continues executing high-level
+Solidity after the block. Do not add Solidity code before the main assembly
+body that allocates memory unless the verifier is changed to either use dynamic
+allocation from `mload(0x40)` or explicitly guard the current standalone
+assumption, for example by reverting unless `mload(0x40) == 0x80` at verifier
+entry.
+
+Relevant Solidity references:
+
+- Layout in memory:
+  <https://docs.soliditylang.org/en/latest/internals/layout_in_memory.html>
+- Inline assembly memory safety:
+  <https://docs.soliditylang.org/en/latest/assembly.html#memory-safety>
+- Advanced safe use of memory:
+  <https://docs.soliditylang.org/en/latest/assembly.html#advanced-safe-use-of-memory>
+- EVM call memory is freshly cleared per message call:
+  <https://docs.soliditylang.org/en/latest/introduction-to-smart-contracts.html#storage-transient-storage-memory-and-the-stack>
+
 ## Planner APIs
 
 `MemoryArena` owns the memory map. It has three compatibility-mode allocation

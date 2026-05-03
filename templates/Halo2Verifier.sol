@@ -316,6 +316,12 @@ contract Halo2Verifier {
     /// `true`, while malformed calldata, invalid proof material, failed
     /// precompiles, or mismatched pinned dependency code revert. Trace and gas
     /// renders keep the same failure policy.
+    /// @dev The generated verifier uses absolute Yul memory addresses instead
+    /// of Solidity's free-memory pointer. The main assembly block is therefore
+    /// expected to be terminal: accepted proofs return from assembly and all
+    /// rejected inputs revert. Do not inline this body into Solidity code that
+    /// continues executing after verification without changing the memory
+    /// strategy; see `docs/MEMORY_LAYOUT.md`.
     /// @param proof Solidity-facing proof bytes, with G1 elements repacked into EIP-2537 padded uncompressed form.
     /// @param instances Public instance scalars encoded as canonical BLS12-381 scalar-field words.
     /// @return Always `true` for accepted proofs; invalid proofs revert instead of returning `false`.
@@ -353,6 +359,10 @@ contract Halo2Verifier {
         {%- when None %}
         {%- endmatch %}
         assembly ("memory-safe") {
+            // This block owns the call-frame memory and must remain terminal.
+            // The transcript buffer starts at 0x00 and can overwrite
+            // Solidity's free-memory pointer and zero slot before the final
+            // return/revert. See docs/MEMORY_LAYOUT.md.
             // ===============================================================
             // Helpers: modexp, transcript, EIP-2537 calls
             // ===============================================================

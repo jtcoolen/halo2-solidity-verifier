@@ -45,6 +45,8 @@ pragma solidity ^0.8.24;
 contract Halo2VerifyingKey {
     /// @notice Deploy the verifying-key payload as this contract's runtime bytecode.
     /// @dev The constructor writes generated words into memory and returns only that payload, so the runtime contains no callable code.
+    /// @dev This terminal constructor intentionally writes from memory zero
+    /// instead of using Solidity's free-memory pointer.
     constructor() {
         assembly {
             {%- for (name, chunk) in constants %}

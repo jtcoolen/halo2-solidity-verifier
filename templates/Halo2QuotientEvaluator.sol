@@ -97,6 +97,10 @@ contract Halo2QuotientEvaluator {
 
     /// @notice Evaluate the generated quotient numerator block for one verifier memory frame.
     /// @dev Calldata is exactly the raw frame, not ABI-encoded arguments. Returns `QUOTIENT_MAGIC`, the linearization expected eval, and selector buckets.
+    /// @dev This fallback also uses generated absolute memory addresses and
+    /// returns directly from assembly. Its low-memory return frame may write
+    /// Solidity-reserved words such as `0x40`, which is safe only because the
+    /// fallback does not return to high-level Solidity code.
     fallback() external {
         assembly ("memory-safe") {
             // Reject malformed calls. This contract is not a general-purpose
