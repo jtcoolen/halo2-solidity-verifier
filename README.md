@@ -104,6 +104,11 @@ See [`docs/MEMORY_LAYOUT.md`](./docs/MEMORY_LAYOUT.md) for the generated
 verifier memory planner, including the fixed theta-relative offsets,
 precompile-frame constants, scratch lifetimes, and update rules.
 
+See [`docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md`](./docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md)
+for a consolidated specification and architecture guide covering the ABI,
+proof layout, transcript, quotient reconstruction, KZG PCS check, VK payload,
+and split verifier contracts.
+
 ## Acknowledgement
 
 The template is heavily inspired by Aztec's [`BaseUltraVerifier.sol`](https://github.com/AztecProtocol/barretenberg/blob/4c456a2b196282160fd69bead6a1cea85289af37/sol/src/ultra/BaseUltraVerifier.sol).

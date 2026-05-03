@@ -1835,3 +1835,266 @@ Recommendation:
 - Validate decoded accumulator points before applying the scalar switch.
 - Or explicitly require the canonical identity encoding whenever the associated
   scalar is zero.
+
+## 2026-05-03 review findings: Midfall verifier translation
+
+Scope: `templates/Halo2Verifier.sol`, the Halo2/Midnight Solidity verifier
+code generator, and generated verifier behavior as a translation of the native
+Midfall verifier path in `../midfall/proofs/src/plonk/verifier.rs` and its
+dependencies.
+
+### Findings overview
+
+| ID | Severity | Title |
+| --- | --- | --- |
+| F-1 | Medium | Identity committed instance is an implicit security boundary |
+| F-2 | Low | Accumulator encoding accepts invalid limb sizes |
+| F-3 | Low | Proof commitment plan records phase-sorted advice columns ambiguously |
+
+### F-1. Identity committed instance is an implicit security boundary
+
+Severity: Medium.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol`: committed-instance transcript absorb block
+- `src/codegen/util.rs`: `committed_instance_comms` points at
+  `G1_IDENTITY_MPTR`
+
+The generated verifier always absorbs and opens the committed instance column as
+G1 identity. That matches the documented IVC shape, but the generator cannot
+prove from the VK that future proofs or call sites are using identity committed
+instances. If this code is reused for a Rust verifier path that supplies
+non-identity committed instance commitments, Solidity verifies a different
+transcript / PCS statement than the Rust verifier.
+
+Impact:
+
+- Non-identity committed public inputs are not represented in the Solidity ABI.
+- Reusing the generator outside the documented identity-committed-column shape
+  can silently change the verified statement.
+- The behavior is safe only while the integration boundary remains explicit and
+  enforced.
+
+Recommendation:
+
+- Make the identity-committed-instance mode explicit in the API/type name and
+  documentation.
+- Or extend the ABI/codegen to accept committed-instance commitments as verifier
+  inputs and use them in both transcript absorption and PCS queries.
+
+### F-2. Accumulator encoding accepts invalid limb sizes
+
+Severity: Low.
+
+Relevant code:
+
+- `src/codegen/mod.rs`: `AccumulatorEncoding::new`
+- `src/codegen/generator.rs`: accumulator layout calculations using
+  `254 / acc_encoding.num_limb_bits`
+
+`AccumulatorEncoding::new` stores `num_limb_bits` without validation, but render
+paths later compute `254 / num_limb_bits`. Passing zero panics during
+generation, and unsupported limb widths are only caught indirectly by generated
+code checks.
+
+Impact:
+
+- Invalid generator configuration can cause a render-time panic.
+- Unsupported accumulator encodings are rejected late and inconsistently.
+
+Recommendation:
+
+- Validate `num_limb_bits != 0` when constructing or setting accumulator
+  encoding.
+- Prefer validating the currently supported `7x56` encoding at
+  `AccumulatorEncoding::new` or `set_acc_encoding` time.
+
+### F-3. Proof commitment plan records phase-sorted advice columns ambiguously
+
+Severity: Low.
+
+Relevant code:
+
+- `src/codegen/protocol.rs`: `proof.commitments.extend(... Advice { column })`
+
+`advice_indices` is the phase-sorted proof order, but each entry is stored as
+`CommitmentRead::Advice { column }`. Today the vector appears to be used only
+for aggregate accounting, so this is latent. If future proof parsing, tracing,
+or validation iterates `proof.commitments` as canonical proof order, nontrivial
+advice phases can bind the wrong original column.
+
+Impact:
+
+- Current generated verifier behavior does not appear exploitable from this
+  vector alone.
+- Future consumers may misinterpret proof order versus original advice-column
+  index.
+
+Recommendation:
+
+- Store both proof-order index and original advice-column index, or rename the
+  field to make the phase-sorted interpretation explicit.
+- Add a regression test with nontrivial advice phases before introducing new
+  consumers of `ProofReadPlan::commitments`.
+
+## 2026-05-03 Rust codebase review findings
+
+Scope: Rust correctness, performance, idioms, maintainability, error handling,
+and security review of the current verifier-generator codebase.
+
+### Findings overview
+
+| ID | Severity | Area | Summary |
+| --- | --- | --- | --- |
+| RF-1 | P2 | Error handling | Return errors for malformed proof repacking |
+| RF-2 | P2 | Error handling | Propagate render planning failures |
+| RF-3 | P2 | Reproducibility | Pin verifier-critical Git dependencies |
+| RF-4 | P3 | Configuration | Reject malformed numeric codegen env vars |
+| RF-5 | P3 | API clarity | Use the generator parameter or remove it |
+| RF-6 | P3 | Performance | Cache the transcript modulus |
+
+### RF-1. Return errors for malformed proof repacking
+
+Severity: P2.
+
+Relevant code:
+
+- `src/codegen/generator.rs:2968`
+
+`repack_compressed_proof` is public and sits on the boundary between
+user-supplied native proof bytes and generated calldata, but length mismatches
+and bad compressed G1 encodings currently hit `assert_eq!` or `panic!`. A
+malformed proof can abort an off-chain service instead of producing a rejected
+proof result.
+
+Recommendation:
+
+- Return `Result<Vec<u8>, RepackError>` with offset and error-kind detail.
+
+### RF-2. Propagate render planning failures
+
+Severity: P2.
+
+Relevant code:
+
+- `src/codegen/generator.rs:2904`
+
+The public render methods return `Result<_, fmt::Error>`, but layout/planning
+failures are converted to panics here and in nearby VK layout paths. A large or
+unsupported circuit can unwind a library caller instead of yielding an
+actionable error.
+
+Recommendation:
+
+- Introduce a render/codegen error type and propagate layout, payload, and
+  config failures with `?`.
+
+### RF-3. Pin verifier-critical Git dependencies
+
+Severity: P2.
+
+Relevant code:
+
+- `Cargo.toml:11`
+
+The Midfall dependency is resolved from a mutable branch, and this repo ignores
+`Cargo.lock`, so verifier generation can change as the branch moves. The local
+`.cargo` path patch also means local checks may not match a clean clone.
+
+Recommendation:
+
+- Pin a `rev` and track the lockfile for repo CI, or vendor the exact audited
+  dependency set.
+
+### RF-4. Reject malformed numeric codegen env vars
+
+Severity: P3.
+
+Relevant code:
+
+- `src/codegen/config.rs:101`
+
+Invalid numeric codegen environment variables silently fall back to defaults
+because parse errors are discarded. A typo in
+`HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES` can render different verifier bytecode
+than intended with no signal.
+
+Recommendation:
+
+- Parse to `Result` and reject malformed values consistently with
+  `parse_bool_env`.
+
+### RF-5. Use the generator parameter or remove it
+
+Severity: P3.
+
+Relevant code:
+
+- `src/codegen/mod.rs:218`
+
+`encode_calldata_bls_padded` takes a generator but ignores it, so callers can
+pass a compressed proof or wrong instance count and still get calldata that
+only fails later on-chain.
+
+Recommendation:
+
+- Either remove the parameter to avoid a false shape-check signal, or use it to
+  validate expected repacked proof length and instance count and return
+  `Result`.
+
+### RF-6. Cache the transcript modulus
+
+Severity: P3.
+
+Relevant code:
+
+- `src/transcript.rs:108`
+
+Each challenge squeeze reparses `Fq::MODULUS` from hex into a `U256`. This is
+small but on the transcript hot path and easy to avoid.
+
+Recommendation:
+
+- Cache the modulus with `std::sync::LazyLock`, `OnceLock`, or constant limbs.
+
+## 2026-05-03 added review findings
+
+### Finding 1. Zero-scalar accumulator points skip curve validation
+
+Severity: P3.
+
+Relevant code:
+
+- `templates/Halo2Verifier.sol:1537-1545`
+
+`load_acc_point` only range-decodes accumulator public inputs; the EIP-2537
+curve/subgroup check happens later only when the point is sent to
+G1MSM/G1ADD/pairing. When `lhs_scalar` is zero the verifier overwrites the
+decoded point with identity, and when `rhs_scalar` is zero it omits the
+variable-base point, so malformed off-curve accumulator coordinates can be
+accepted as unused identity contributions.
+
+Recommendation:
+
+- If public accumulator encodings are part of the application statement,
+  require scalar-zero points to use the canonical identity encoding or validate
+  every decoded non-identity point with a cheap precompile call.
+
+### Finding 2. Public proof repacker panics on malformed input
+
+Severity: P3.
+
+Relevant code:
+
+- `src/codegen/generator.rs:3021-3045`
+
+`repack_compressed_proof` is a public helper and panics on wrong length or
+invalid compressed G1 bytes. That is fine for tests, but relayers or services
+that expose this helper to untrusted proof bytes can be crashed by a malformed
+request.
+
+Recommendation:
+
+- Return a typed `Result<Vec<u8>, RepackError>` and keep a panicking wrapper
+  only for tests/examples.
