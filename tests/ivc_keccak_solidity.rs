@@ -1206,13 +1206,10 @@ fn ivc_final_keccak_solidity_e2e() {
             // in the big-endian ABI word. Setting it keeps the value below
             // Fr but must be rejected by the accumulator packing check.
             bad_accumulator_packing[first_acc_word + 3] ^= 0x01;
-            match evm.try_call_with_gas(verifier_address, bad_accumulator_packing, 5_000_000_000) {
-                CallOutcome::Success { output, .. } => assert_ne!(
-                    output, expected,
-                    "verifier accepted non-canonical accumulator limb packing"
-                ),
-                CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => {}
-            }
+            assert_call_reverts(
+                evm.try_call_with_gas(verifier_address, bad_accumulator_packing, 5_000_000_000),
+                "non-canonical accumulator limb packing",
+            );
 
             let mut bad_proof_head = calldata.clone();
             overwrite_u256_word_for_test(&mut bad_proof_head, 0x04, 0x60);
@@ -1222,13 +1219,10 @@ fn ivc_final_keccak_solidity_e2e() {
                 ("wrong proof ABI head", bad_proof_head),
                 ("wrong instances ABI head", bad_instances_head),
             ] {
-                match evm.try_call_with_gas(verifier_address, malformed_calldata, 5_000_000_000) {
-                    CallOutcome::Success { output, .. } => assert_ne!(
-                        output, expected,
-                        "verifier accepted malformed calldata: {name}"
-                    ),
-                    CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => {}
-                }
+                assert_call_reverts(
+                    evm.try_call_with_gas(verifier_address, malformed_calldata, 5_000_000_000),
+                    name,
+                );
             }
         }
         CallOutcome::Revert { gas_used, output } => {
@@ -1239,6 +1233,21 @@ fn ivc_final_keccak_solidity_e2e() {
         }
         CallOutcome::Halt { gas_used, reason } => {
             panic!("verifier halted at gas_used = {gas_used}, reason = {reason}");
+        }
+    }
+}
+
+fn assert_call_reverts(outcome: CallOutcome, context: &str) {
+    match outcome {
+        CallOutcome::Revert { .. } => {}
+        CallOutcome::Success { output, .. } => {
+            panic!(
+                "invalid IVC verifier call returned instead of reverting ({context}): 0x{}",
+                hex::encode(output)
+            );
+        }
+        CallOutcome::Halt { gas_used, reason } => {
+            panic!("invalid IVC verifier call halted instead of reverting ({context}): gas_used = {gas_used}, reason = {reason}");
         }
     }
 }

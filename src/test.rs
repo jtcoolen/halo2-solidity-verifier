@@ -568,6 +568,35 @@ fn native_midfall_verifier_trace_matches_solidity_trace() {
     );
 }
 
+#[test]
+fn trace_verifiers_revert_on_final_pairing_failure() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let mut bad_instances = fixture.instances.clone();
+    bad_instances[0] += F::ONE;
+
+    assert_solidity_rejects(
+        call_embedded_verifier(
+            &fixture.embedded_trace_verifier_solidity,
+            &fixture.proof,
+            &bad_instances,
+        ),
+        "embedded trace verifier wrong instance",
+    );
+    assert_solidity_rejects(
+        call_separate_verifier(
+            &fixture.trace_verifier_solidity,
+            &fixture.trace_vk_solidity,
+            &fixture.proof,
+            &bad_instances,
+        ),
+        "separate trace verifier wrong instance",
+    );
+}
+
 #[cfg(feature = "rust-verifier-trace")]
 fn parse_solidity_trace_logs(logs: &[revm::primitives::Log]) -> BTreeMap<u64, Vec<u8>> {
     let mut trace = BTreeMap::new();
@@ -1425,10 +1454,10 @@ fn assert_solidity_accepts(output: Result<Vec<u8>, ()>, context: &str) {
 }
 
 fn assert_solidity_rejects(output: Result<Vec<u8>, ()>, context: &str) {
-    let expected_true = [vec![0; 31], vec![1]].concat();
-    if let Ok(bytes) = output {
-        assert_ne!(bytes, expected_true, "{context}");
-    }
+    assert!(
+        output.is_err(),
+        "invalid proof/calldata returned instead of reverting: {context}"
+    );
 }
 
 fn mutate_first_large_hex_literal(solidity: &str, ordinal_seed: usize) -> String {

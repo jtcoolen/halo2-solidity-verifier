@@ -291,9 +291,8 @@ contract Halo2Verifier {
     /// protocol-specific authorization are outside this raw verifier ABI.
     /// @dev Production renders are success-or-revert: accepted proofs return
     /// `true`, while malformed calldata, invalid proof material, failed
-    /// precompiles, or mismatched pinned dependency code revert. Trace renders
-    /// are diagnostic artifacts and may return the final success word for log
-    /// comparison.
+    /// precompiles, or mismatched pinned dependency code revert. Trace and gas
+    /// renders keep the same failure policy.
     function verifyProof(
         bytes calldata proof,
         uint256[] calldata instances
@@ -762,6 +761,8 @@ contract Halo2Verifier {
                 ret := staticcall(pairing_gas_cap(0x300), 0x0f, scratch, 0x300, scratch, 0x20)
                 ret := and(ret, eq(returndatasize(), 0x20))
                 ret := and(ret, mload(scratch))
+                if iszero(ret) { revert(0, 0) }
+                ret := 1
             }
 
             // ---------- IVC accumulator public-input decoding ----------
@@ -1687,17 +1688,11 @@ contract Halo2Verifier {
             // -- the historical "LHS"/"RHS" naming follows the dual MSM
             // accumulator (left = pi, right = combined) and *not* the
             // pairing argument order. Pass them swapped to ec_pairing.
+            if iszero(success) { revert(0, 0) }
             success := ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)
 
             {%- if self.gas_checkpoints %}
             gas_checkpoint(16) // after final ec_pairing
-            {%- endif %}
-
-            {%- if self.trace %}
-            // In trace builds we always run to the end so the host-side
-            // comparison can collect every emitted log.
-            {%- else %}
-            if iszero(success) { revert(0x00, 0x00) }
             {%- endif %}
 
             {%- if self.trace %}
@@ -1735,12 +1730,10 @@ contract Halo2Verifier {
                 trace_point(29, ACC_LHS_MPTR)
                 trace_point(30, ACC_RHS_MPTR)
             }
-            mstore(0x00, success)
-            return(0x00, 0x20)
-            {%- else %}
+            {%- endif %}
+
             mstore(0x00, 1)
             return(0x00, 0x20)
-            {%- endif %}
         }
     }
 }

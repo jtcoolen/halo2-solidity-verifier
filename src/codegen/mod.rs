@@ -486,8 +486,10 @@ mod tests {
             );
         }
         assert!(
-            verifier_template.contains("ret := success\n                if iszero(ret) { leave }"),
-            "ec_pairing should leave before staging/calling the pairing precompile when success is false"
+            verifier_template.contains(
+                "if iszero(success) { revert(0, 0) }\n            success := ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)"
+            ),
+            "final pairing block should revert before staging/calling the pairing precompile when success is already false"
         );
         assert!(
             pcs_codegen.contains("if success {")
@@ -770,6 +772,32 @@ mod tests {
         assert!(
             !verifier_template.contains("return false;"),
             "generated verifier should not mix false returns with revert-on-invalid semantics"
+        );
+        assert!(
+            !verifier_template.contains("mstore(0x00, success)"),
+            "generated verifier must not return a false boolean on invalid proofs"
+        );
+        assert!(
+            verifier_template.contains("function ec_pairing(success, lhs_mptr, rhs_mptr) -> ret")
+                && verifier_template
+                    .contains("ret := success\n                if iszero(ret) { leave }")
+                && verifier_template.contains(
+                    "ret := and(ret, mload(scratch))\n                if iszero(ret) { revert(0, 0) }\n                ret := 1",
+                ),
+            "final pairing helper must revert on pairing failure and normalize success to one"
+        );
+        assert!(
+            verifier_template
+                .contains("success := ec_pairing(success, PAIRING_RHS_MPTR, PAIRING_LHS_MPTR)"),
+            "final epilogue must route the pairing check through the reverting helper"
+        );
+        assert!(
+            !verifier_template.contains("return(0x00, 0x20)\n            {%- else %}"),
+            "trace and production epilogues must not diverge into false-return semantics"
+        );
+        assert!(
+            verifier_template.contains("mstore(0x00, 1)\n            return(0x00, 0x20)"),
+            "generated verifier must only return literal true after the reverting pairing helper"
         );
     }
 
