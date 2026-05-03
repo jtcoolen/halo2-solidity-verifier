@@ -382,7 +382,7 @@ impl<'a> QuotientInlineCseEmitter<'a> {
                 if self.helpers {
                     out.push(format!("let {var} := q_neg({inner})"));
                 } else {
-                    out.push(format!("let {var} := sub(r, {inner})"));
+                    out.push(format!("let {var} := addmod(0, sub(r, {inner}), r)"));
                 }
                 var
             }

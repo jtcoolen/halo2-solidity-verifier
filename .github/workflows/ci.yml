@@ -100,6 +100,13 @@ jobs:
             native_midfall_verifier_trace_matches_solidity_trace \
             -- --nocapture
 
+      - name: Supported-shape native/Solidity trace equivalence
+        run: |
+          HALO2_SOLIDITY_RUN_EVM_TESTS=1 SRS_DIR="$PWD/.srs" cargo test --release \
+            --features evm,truncated-challenges,rust-verifier-trace,solidity-trace \
+            supported_shape_circuit_fuzz_e2e \
+            -- --nocapture
+
       - name: IVC trace-equivalence gas bench
         run: scripts/run_ivc_bench.sh --trace --skip-srs-download
 

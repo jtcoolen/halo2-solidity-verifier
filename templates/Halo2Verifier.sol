@@ -423,7 +423,7 @@ contract Halo2Verifier {
                 z := mulmod(a, b, FR_MODULUS)
             }
             function q_neg(a) -> z {
-                z := sub(FR_MODULUS, a)
+                z := addmod(0, sub(FR_MODULUS, a), FR_MODULUS)
             }
             function q_madd(a, b, c) -> z {
                 z := addmod(mulmod(a, b, FR_MODULUS), c, FR_MODULUS)

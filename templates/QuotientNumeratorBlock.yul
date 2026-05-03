@@ -215,7 +215,7 @@
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
                     case 0x08 {
-                        q_top := sub(r, q_top)
+                        q_top := addmod(0, sub(r, q_top), r)
                     }
                     case 0x09 {
                         let qconst := q_arg
@@ -465,7 +465,7 @@
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
                     case 0x08 {
-                        q_top := sub(r, q_top)
+                        q_top := addmod(0, sub(r, q_top), r)
                     }
                     case 0x09 {
                         let qconst := byte(0, mload(q_pc))
@@ -807,7 +807,7 @@
                 // Fully evaluated identities are the constant-polynomial side
                 // of the linearization query. Rust subtracts that grouped
                 // scalar into expected_eval, so Solidity stores -nu_y(x).
-                let linearization_expected_eval := sub(r, mload({{ program.eval_numer_mptr|hex() }}))
+                let linearization_expected_eval := addmod(0, sub(r, mload({{ program.eval_numer_mptr|hex() }})), r)
                 mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 pop(y)
                 {%- when None %}
@@ -839,7 +839,7 @@
                 // The commitment side already includes the quotient-limb
                 // factor (1 - x^n), so this scalar is -nu_y(x), not
                 // h(x) = nu_y(x) / (x^n - 1).
-                let linearization_expected_eval := sub(r, quotient_eval_numer)
+                let linearization_expected_eval := addmod(0, sub(r, quotient_eval_numer), r)
                 mstore(QUOTIENT_EVAL_MPTR, linearization_expected_eval)
                 {%- endmatch %}
             }

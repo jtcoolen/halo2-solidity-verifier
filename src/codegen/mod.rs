@@ -767,6 +767,58 @@ mod tests {
     }
 
     #[test]
+    fn field_negations_used_by_traces_are_canonical() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient_template = include_str!("../../templates/QuotientNumeratorBlock.yul");
+        let evaluator_source = include_str!("evaluator.rs");
+        let pcs_source = include_str!("pcs.rs");
+        let quotient_source = include_str!("quotient/mod.rs");
+
+        for (name, source, needle) in [
+            (
+                "q_neg helper",
+                verifier_template,
+                "z := addmod(0, sub(FR_MODULUS, a), FR_MODULUS)",
+            ),
+            (
+                "packed quotient VM negation",
+                quotient_template,
+                "q_top := addmod(0, sub(r, q_top), r)",
+            ),
+            (
+                "linearization expected eval",
+                quotient_template,
+                "let linearization_expected_eval := addmod(0, sub(r, quotient_eval_numer), r)",
+            ),
+            (
+                "structured quotient linearization expected eval",
+                quotient_template,
+                "let linearization_expected_eval := addmod(0, sub(r, mload({{ program.eval_numer_mptr|hex() }})), r)",
+            ),
+            (
+                "native evaluator negation",
+                evaluator_source,
+                "addmod(0, sub(r, {var}), r)",
+            ),
+            (
+                "quotient inline CSE negation",
+                quotient_source,
+                "addmod(0, sub(r, {inner}), r)",
+            ),
+            (
+                "final pairing negative v scalar",
+                pcs_source,
+                "addmod(0, sub(r, mload(V_MPTR)), r)",
+            ),
+        ] {
+            assert!(
+                source.contains(needle),
+                "{name} should canonicalize zero negations with addmod"
+            );
+        }
+    }
+
+    #[test]
     fn batch_invert_handles_empty_and_singleton_ranges() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 

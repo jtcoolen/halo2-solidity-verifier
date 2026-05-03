@@ -403,12 +403,30 @@ fn supported_shape_circuit_fuzz_e2e() {
         .unwrap_or(cases.len())
         .min(cases.len());
 
+    #[cfg(feature = "rust-verifier-trace")]
+    let mut compared_selector_folds = false;
     for case in cases.iter().take(requested) {
-        run_supported_shape_fuzz_case(case);
+        let case_compared_selector_folds = run_supported_shape_fuzz_case(case);
+        #[cfg(feature = "rust-verifier-trace")]
+        {
+            compared_selector_folds |= case_compared_selector_folds;
+        }
+        #[cfg(not(feature = "rust-verifier-trace"))]
+        {
+            let _ = case_compared_selector_folds;
+        }
+    }
+
+    #[cfg(feature = "rust-verifier-trace")]
+    if requested > 0 {
+        assert!(
+            compared_selector_folds,
+            "shape fuzz trace suite should include at least one selector-fold comparison"
+        );
     }
 }
 
-fn run_supported_shape_fuzz_case(case: &ShapeFuzzCase) {
+fn run_supported_shape_fuzz_case(case: &ShapeFuzzCase) -> bool {
     let circuit = ShapeFuzzCircuit::new(case.spec, case.seed);
     let mut setup_rng = ChaCha8Rng::seed_from_u64(case.seed ^ 0x5eed_5eed);
     let params = PoseidonParams::unsafe_setup(case.k, &mut setup_rng);
@@ -471,6 +489,19 @@ fn run_supported_shape_fuzz_case(case: &ShapeFuzzCase) {
         &format!("shape fuzz `{}` valid proof", case.name),
     );
 
+    #[cfg(feature = "rust-verifier-trace")]
+    let compared_selector_folds = assert_shape_fuzz_trace_matches_native_midfall(
+        case,
+        &params,
+        pk.get_vk(),
+        &generator,
+        &compressed_proof,
+        &repacked_proof,
+        &public,
+    );
+    #[cfg(not(feature = "rust-verifier-trace"))]
+    let compared_selector_folds = false;
+
     let mut wrong_public = public.to_vec();
     wrong_public[0] += F::ONE;
     assert_solidity_rejects(
@@ -488,6 +519,8 @@ fn run_supported_shape_fuzz_case(case: &ShapeFuzzCase) {
             case.name
         ),
     );
+
+    compared_selector_folds
 }
 
 fn shape_fuzz_inputs_available_for_evm() -> bool {
@@ -500,6 +533,148 @@ fn shape_fuzz_inputs_available_for_evm() -> bool {
         return false;
     }
     true
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_shape_fuzz_trace_matches_native_midfall(
+    case: &ShapeFuzzCase,
+    params: &PoseidonParams,
+    vk: &midnight_proofs::plonk::VerifyingKey<F, KZGCommitmentScheme<Bls12>>,
+    generator: &SolidityGenerator<'_>,
+    compressed_proof: &[u8],
+    repacked_proof: &[u8],
+    public: &[F],
+) -> bool {
+    use midnight_proofs::plonk::solidity_trace;
+
+    solidity_trace::start();
+    let committed_pi = [G1Projective::identity()];
+    let public_columns: [&[F]; 1] = [public];
+    let mut transcript = CircuitTranscript::<sha3::Keccak256>::init_from_bytes(compressed_proof);
+    let guard = prepare::<F, KZGCommitmentScheme<Bls12>, CircuitTranscript<sha3::Keccak256>>(
+        vk,
+        &[&committed_pi],
+        &[&public_columns],
+        &mut transcript,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "shape fuzz `{}` native trace prepare failed: {err:?}",
+            case.name
+        )
+    });
+    transcript.assert_empty().unwrap_or_else(|_| {
+        panic!(
+            "shape fuzz `{}` native trace transcript had trailing bytes",
+            case.name
+        )
+    });
+    guard
+        .verify(&params.verifier_params())
+        .unwrap_or_else(|err| {
+            panic!(
+                "shape fuzz `{}` native trace guard failed: {err:?}",
+                case.name
+            )
+        });
+    let rust_trace = solidity_trace::take();
+
+    let (trace_verifier_solidity, trace_vk_solidity) = generator
+        .render_trace_separately()
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` trace render failed: {err:?}", case.name));
+    let mut deployed =
+        deploy_separate_verifier_from_sources(&trace_verifier_solidity, &trace_vk_solidity);
+    let (_gas, output, logs) = deployed.evm.call_with_logs(
+        deployed.verifier_address,
+        encode_calldata(repacked_proof, public),
+    );
+    let expected_true = [vec![0u8; 31], vec![1]].concat();
+    assert_eq!(
+        output, expected_true,
+        "shape fuzz `{}` trace verifier should accept the proof",
+        case.name
+    );
+
+    let mut rust_by_id = BTreeMap::new();
+    for event in rust_trace {
+        assert!(
+            rust_by_id
+                .insert(event.id, (event.name, event.data))
+                .is_none(),
+            "shape fuzz `{}` duplicate Rust trace id {}",
+            case.name,
+            event.id
+        );
+    }
+    let solidity_trace = parse_solidity_trace_logs(&logs);
+    let has_selector_folds = rust_by_id
+        .keys()
+        .chain(solidity_trace.keys())
+        .any(|id| (60_000..61_000).contains(id));
+    assert_trace_equivalence_and_required_coverage(
+        case.name,
+        &rust_by_id,
+        &solidity_trace,
+        has_selector_folds,
+    );
+    has_selector_folds
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_trace_equivalence_and_required_coverage(
+    context: &str,
+    rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
+    solidity_trace: &BTreeMap<u64, Vec<u8>>,
+    require_selector_folds: bool,
+) {
+    let missing = rust_trace
+        .keys()
+        .filter(|id| !solidity_trace.contains_key(id))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{context}: Solidity trace is missing native Rust trace ids {missing:?}"
+    );
+
+    let unexpected = solidity_trace
+        .keys()
+        .filter(|id| !rust_trace.contains_key(id))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "{context}: Solidity trace emitted ids without a native Rust oracle {unexpected:?}"
+    );
+
+    assert_required_diff_trace_coverage_with_options(
+        rust_trace,
+        solidity_trace,
+        require_selector_folds,
+    );
+
+    for (id, solidity_data) in solidity_trace {
+        let (name, rust_data) = rust_trace
+            .get(id)
+            .expect("missing Solidity trace ids were checked above");
+        assert_eq!(
+            rust_data,
+            solidity_data,
+            "{context}: trace mismatch id={id} name={name}: rust=0x{} solidity=0x{}",
+            hex::encode(rust_data),
+            hex::encode(solidity_data),
+        );
+    }
+}
+
+#[cfg(not(feature = "rust-verifier-trace"))]
+#[test]
+fn evm_gate_requires_native_solidity_trace_feature() {
+    if env_flag_enabled(RUN_EVM_TESTS_ENV) {
+        panic!(
+            "{RUN_EVM_TESTS_ENV}=1 now requires the `rust-verifier-trace` feature so native/Solidity trace equivalence is part of the EVM gate"
+        );
+    }
 }
 
 #[test]
@@ -1028,6 +1203,15 @@ fn assert_required_diff_trace_coverage(
     rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
     solidity_trace: &BTreeMap<u64, Vec<u8>>,
 ) {
+    assert_required_diff_trace_coverage_with_options(rust_trace, solidity_trace, true);
+}
+
+#[cfg(feature = "rust-verifier-trace")]
+fn assert_required_diff_trace_coverage_with_options(
+    rust_trace: &BTreeMap<u64, (&'static str, Vec<u8>)>,
+    solidity_trace: &BTreeMap<u64, Vec<u8>>,
+    require_selector_folds: bool,
+) {
     for (name, id) in [
         ("theta challenge", 7),
         ("beta challenge", 8),
@@ -1066,7 +1250,9 @@ fn assert_required_diff_trace_coverage(
         41_000..42_000,
         "serialized PCS point sets",
     );
-    assert_trace_range_present(rust_trace, solidity_trace, 60_000..61_000, "selector folds");
+    if require_selector_folds {
+        assert_trace_range_present(rust_trace, solidity_trace, 60_000..61_000, "selector folds");
+    }
 }
 
 #[cfg(feature = "rust-verifier-trace")]

@@ -1007,7 +1007,7 @@ impl<'a> Evaluator<'a> {
                 )
             },
             &|(mut acc, var)| {
-                let (lines, var) = self.init_var(format!("sub(r, {var})"), None);
+                let (lines, var) = self.init_var(format!("addmod(0, sub(r, {var}), r)"), None);
                 acc.extend(lines);
                 (acc, var)
             },

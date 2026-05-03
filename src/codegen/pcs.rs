@@ -1460,7 +1460,9 @@ pub(super) fn computations(
 
         // tmp = (-v) * G  =>  load G into 0x00, scale by (r - v).
         lines.push(format!("mcopy(0x0, G1_BASE_MPTR, {G1_BYTES:#x})"));
-        lines.push(format!("mstore({G1_BYTES:#x}, sub(r, mload(V_MPTR)))"));
+        lines.push(format!(
+            "mstore({G1_BYTES:#x}, addmod(0, sub(r, mload(V_MPTR)), r))"
+        ));
         lines.push("if success {".to_string());
         lines.push(format!(
             "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, 0x00, {G1_MSM_PAIR_BYTES:#x}, 0x00, {G1_BYTES:#x})"
