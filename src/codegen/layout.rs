@@ -100,7 +100,7 @@ pub(crate) mod precompile {
     pub(crate) const G1ADD_GAS_CAP: usize = 50_000;
     pub(crate) const G1MSM_SMOKE_GAS_CAP: usize = 60_000;
     pub(crate) const PAIRING_SMOKE_GAS_CAP: usize = 120_000;
-    /// EIP-2537 G1MSM gas formula: base + k * discount[k] * mul_cost / 1000.
+    /// EIP-2537 G1MSM gas formula: `base + k * discount[k] * mul_cost / 1000`.
     pub(crate) const G1MSM_BASE_GAS: usize = 50_000;
     pub(crate) const G1MSM_SCALAR_MULTIPLICATION_COST: usize = 12_000;
     pub(crate) const G1MSM_DISCOUNT_DENOMINATOR: usize = 1_000;

@@ -1,51 +1,117 @@
+//! Producer-side implementation of the compact quotient-numerator VM.
+//!
+//! The verifier does not ask the proof for a trusted evaluation of the
+//! quotient polynomial `h(x)`. Instead it reconstructs the batched numerator
+//! `nu_y(x)` from the polynomial evaluations that were already read after the
+//! Fiat-Shamir challenge `x`, and then opens the linearized commitment at the
+//! scalar `-nu_y(x)`. The commitment side contributes
+//! `(1 - x^n) * sum_i x_split^i * Q_i` for the quotient limbs, so the scalar
+//! stored in verifier memory is deliberately the negated numerator, not
+//! `h(x) = nu_y(x) / (x^n - 1)`.
+//!
+//! This module is the Rust producer for that reconstruction. It lowers Halo2
+//! quotient identities into a compact bytecode stream plus a constant table;
+//! `templates/QuotientNumeratorBlock.yul` is the only runtime consumer. The VM
+//! is therefore an ABI between generated VK data and generated Solidity: opcode
+//! numbers, operand widths, memory tokens, stack discipline, fold order, and
+//! native callback markers must change in lockstep with the Yul template and
+//! the tests that compare the tables.
+//!
+//! Correctness comes from preserving the same identity stream used by
+//! `midnight_proofs::plonk::partially_evaluate_identities` and
+//! `compute_linearization_commitment`:
+//!
+//! ```text
+//! identities: e_0, e_1, ..., e_(m-1)
+//! main accumulator scan: acc <- acc * y + e_i
+//! final main scalar: sum_i e_i * y^(m - 1 - i)
+//! ```
+//!
+//! The Rust linearization code computes the same scalar by reverse-folding
+//! powers of `y`; the Yul VM scans forward with Horner's rule because that is
+//! cheaper and streaming-friendly. A simple-selector identity still advances
+//! the global `y` position, but its value is sent to the selector commitment
+//! bucket instead of the fully evaluated numerator. During the forward scan the
+//! bucket stores `e_i * y^-(i+1)` and a final multiplication by `y^m` restores
+//! `e_i * y^(m-1-i)`, matching the grouped selector MSM.
+//!
+//! The VM is intentionally small rather than general-purpose. It has only Fr
+//! arithmetic, memory loads from generated verifier addresses, a deduplicated
+//! VK-resident constant table, optional common-subexpression temporaries, and a
+//! few fused opcodes for shapes that dominate Midfall quotient identities. The
+//! limb-aware opcodes are justified as structural compression of foreign-field
+//! limb expressions; they do not change the source of truth and they still
+//! evaluate the resulting PLONK identity over BLS12-381 Fr.
+
 use super::*;
 
-// Producer-side definition of the compact quotient VM.
-//
-// `partially_evaluate_identities` still decides the actual Halo2 identities;
-// this module only changes the representation used by generated Solidity.
-// The Rust builder below lowers those identities into a VK-resident bytecode
-// stream, and `templates/QuotientNumeratorBlock.yul` interprets that stream at
-// verification time. Any opcode, operand, memory-token, or fold-order change
-// must therefore be made in lockstep across this module, the Yul template, the
-// spec docs, and the VM tests.
+/// Destination of one evaluated quotient identity.
+///
+/// Each identity occupies exactly one position in the global `y` batch. The
+/// target only decides where the evaluated scalar is accumulated after that
+/// position has been consumed.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum QuotientTarget {
-    // Fully evaluated identity. Its value contributes to the scalar stored in
-    // QUOTIENT_EVAL_MPTR after the final negation.
+    /// Fully evaluated identity.
+    ///
+    /// The value contributes to the reconstructed numerator scalar. After the
+    /// whole stream has been consumed, the Yul runtime stores the negation in
+    /// `QUOTIENT_EVAL_MPTR`.
     Main,
-    // Simple-selector identity. Its value is accumulated into the matching
-    // selector commitment bucket while still advancing the global y-batch.
+    /// Simple-selector identity.
+    ///
+    /// The `usize` is an index into the sorted simple-selector column list,
+    /// not the fixed-column index itself. The value is accumulated into the
+    /// matching selector commitment bucket while still advancing the global
+    /// `y` batch.
     Selector(usize),
 }
 
-// Complete artifact produced by `QuotientProgramBuilder` and consumed by the
-// generator memory planner plus the Yul VM template.
+/// Complete VM artifact emitted into the generated verifying-key payload.
+///
+/// The generator memory planner uses this to reserve constant, bytecode, stack,
+/// and temporary regions; the Yul template uses the same values to interpret
+/// the program. The build is intentionally self-contained so the external
+/// quotient evaluator can execute with only the copied verifier frame plus VK
+/// payload data.
 #[derive(Debug)]
 pub(super) struct QuotientProgramBuild {
-    // Encoded bytecode. This is either byte-oriented or packed32, depending on
-    // `packed32`.
+    /// Encoded bytecode.
+    ///
+    /// This is either byte-oriented or packed32, depending on `packed32`.
     pub(super) bytes: Vec<u8>,
-    // Deduplicated Fr constants addressed by PUSH_CONST and fused opcodes.
+    /// Deduplicated Fr constants addressed by `PUSH_CONST` and fused opcodes.
     pub(super) consts: Vec<U256>,
-    // Maximum operand-stack depth of the pure interpreted bytecode. The
-    // generator folds native-callback scratch into the allocated stack region
-    // when such callbacks share the same base pointer.
+    /// Maximum operand-stack depth of the pure interpreted bytecode.
+    ///
+    /// Native callbacks may reuse the same stack base as structured scratch,
+    /// so the generator folds their scratch requirement into the final
+    /// allocation separately.
     pub(super) max_stack: usize,
+    /// Whether `bytes` is packed32 rather than byte-oriented.
     pub(super) packed32: bool,
-    // Number of temporary words addressed by PUSH_TEMP/STORE_TEMP when VM CSE
-    // is enabled. State slots live immediately after these words.
+    /// Number of temporary words addressed by `PUSH_TEMP` and `STORE_TEMP`.
+    ///
+    /// Persistent VM state slots are laid out immediately after these temps.
     pub(super) cse_temps: usize,
 }
 
-// One Halo2 quotient identity after the normal evaluator has emitted its Yul
-// assignment lines. `expr` is the parsed form used by the compact VM; `lines`
-// and `var` remain available for native/direct Yul paths.
+/// One Halo2 quotient identity in both legacy-Yul and VM-ready forms.
+///
+/// The normal evaluator still emits assignment lines because direct inline
+/// paths and native callbacks reuse them. The compact VM prefers `expr` when it
+/// is available because typed lowering avoids parsing generated Yul. For
+/// permutation, lookup, and trash identities the module can still reconstruct a
+/// `QuotientExpr` from `lines` and `var`.
 #[derive(Clone, Debug)]
 pub(super) struct QuotientIdentity {
+    /// Yul assignment lines emitted by the existing evaluator.
     pub(super) lines: Vec<String>,
+    /// Name of the Yul variable holding the final identity evaluation.
     pub(super) var: String,
+    /// Accumulator target for this identity.
     pub(super) target: QuotientTarget,
+    /// Typed expression form used by the VM when available.
     pub(super) expr: Option<QuotientExpr>,
 }
 
@@ -61,8 +127,11 @@ pub(crate) struct RepackedProofScalarLayout {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RepackedProofLayoutPlan {
+    /// Counts of compressed G1 commitments read before scalar evaluations.
     pub(crate) g1_groups: Vec<usize>,
+    /// Number of ordinary evaluation scalars.
     pub(crate) num_evals: usize,
+    /// Number of quotient-opening point-set scalars.
     pub(crate) num_point_sets: usize,
 }
 
@@ -115,10 +184,18 @@ impl RepackedProofLayoutPlan {
 
 #[derive(Clone, Debug)]
 pub(super) struct QuotientIdentityParts {
+    /// Gate identities, in the order returned by the upstream constraint system.
     pub(super) gates: Vec<QuotientIdentity>,
+    /// Permutation identities, after gates.
     pub(super) permutation: Vec<QuotientIdentity>,
+    /// Lookup identities, after permutation.
     pub(super) lookup: Vec<QuotientIdentity>,
+    /// Trashcan identities, after lookup.
     pub(super) trash: Vec<QuotientIdentity>,
+    /// Sorted fixed-column indices for simple selectors.
+    ///
+    /// VM selector targets use positions in this vector so generated memory
+    /// buckets are stable even if fixed-column numbers are sparse.
     pub(super) sorted_simple: Vec<usize>,
 }
 
@@ -136,33 +213,53 @@ impl QuotientIdentityParts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuotientStructuredTailMode {
+    /// Emit all non-inline identities through the selected VM/direct path.
     Off,
+    /// Emit the trash identity suffix as structured Yul after the VM program.
     Trash,
 }
 
-// Logical stream item before final bytecode lowering. Native items are markers
-// in the same identity order as interpreted items; the template replaces them
-// with generated Yul callbacks at runtime.
+/// Logical stream item before final bytecode lowering.
+///
+/// Native items are not arithmetic opcodes in the Rust builder. They are
+/// identity-position markers; the Yul template replaces them with generated
+/// callback blocks that perform their own evaluation and fold at exactly the
+/// same point in the global `y` batch.
 #[derive(Clone, Debug)]
 pub(super) enum QuotientProgramItem {
+    /// Identity interpreted by the compact VM.
     Identity(QuotientIdentity),
+    /// Generated callback for the whole permutation identity block.
     NativePermutation,
+    /// Generated callback for a selected heavy gate identity.
     NativeIdentity(usize),
 }
 
-// Hybrid execution plan for quotient numerator reconstruction. A small prefix
-// may stay inline, most identities become VM bytecode, and selected expensive
-// shapes can become native callbacks while preserving the original y-order.
+/// Hybrid execution plan for quotient numerator reconstruction.
+///
+/// A small prefix may stay inline, most identities become VM bytecode, and
+/// selected expensive shapes can become native callbacks. The plan is a
+/// representation choice only: it must preserve the original identity order and
+/// the target of every identity.
 #[derive(Clone, Debug)]
 pub(super) struct QuotientProgramPlan {
+    /// Gate prefix emitted directly before the VM loop.
     pub(super) inline_identities: Vec<QuotientIdentity>,
+    /// VM/native stream after the inline prefix.
     pub(super) items: Vec<QuotientProgramItem>,
+    /// Bodies for `NativeIdentity` markers, addressed by marker index.
     pub(super) native_identities: Vec<QuotientIdentity>,
+    /// Shared selector-column ordering.
     pub(super) sorted_simple: Vec<usize>,
+    /// Whether the stream contains a native permutation callback marker.
     pub(super) has_native_permutation: bool,
 }
 
 pub(super) const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
+// Coefficients used by generated limb helper snippets in direct/native Yul
+// paths. The VM limb opcodes do not hard-code these values; they load the
+// corresponding Fr constants from the VK payload so the bytecode remains a
+// representation of the actual lowered expression.
 pub(super) const LIMB7_YUL_COEFFS: [&str; layout::quotient_limb::LIN_COEFFS] = [
     "0x100000000000000",
     "0x10000000000000000000000000000",
@@ -182,11 +279,16 @@ pub(super) const WIDE_LIMB7_YUL_COEFFS: [&str; layout::quotient_limb::LIN_COEFFS
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuotientProgramEncoding {
-    // Variable-length byte stream. This is the only encoding that supports the
-    // limb-aware opcodes and run-compacted fused add-mul instructions.
+    /// Variable-length byte stream.
+    ///
+    /// This is the only encoding that supports limb-aware opcodes and
+    /// run-compacted fused add-mul instructions.
     Bytes,
-    // Four-byte instruction words: high byte opcode, low 24 bits operand.
-    // Easier to decode in Yul, but not every opcode shape fits this format.
+    /// Four-byte instruction words.
+    ///
+    /// The high byte is the opcode and the low 24 bits are the primary
+    /// operand. It is easier to decode in Yul, but not every opcode shape fits
+    /// this format.
     Packed32,
 }
 
@@ -200,7 +302,17 @@ pub(super) const QUOTIENT_VM_LIMBS: usize = layout::quotient_limb::LIMBS;
 pub(super) const QUOTIENT_VM_PAIRWISE_TERMS: usize = layout::quotient_limb::PAIRWISE_TERMS;
 pub(super) const QUOTIENT_VM_PAIRWISE_COEFFS: usize = layout::quotient_limb::PAIRWISE_COEFFS;
 
-// Opcode assignments are part of the verifier/VK ABI. Keep 0x1a reserved:
+// Opcode assignments are part of the verifier/VK ABI.
+//
+// Stack convention:
+//   * push opcodes place a value in q_top, spilling the previous top to the
+//     memory stack when needed;
+//   * generic ADD/MUL consume one spilled operand and q_top, leaving q_top;
+//   * accumulator opcodes mutate q_top in place and have zero stack effect;
+//   * FOLD_* consumes q_top and advances the quotient y-batch;
+//   * native callback markers require an empty stack at identity boundaries.
+//
+// The numeric assignments are intentionally sparse. Keep 0x1a reserved:
 // historical builds used it for an experimental native trash callback, but the
 // current VM intentionally has no operation at that value.
 pub(super) const Q_OP_PUSH_CONST: u8 = 0x01;
@@ -233,6 +345,10 @@ pub(super) const Q_OP_LIN7: u8 = 0x1c;
 pub(super) const Q_OP_BILIN7_ROW: u8 = 0x1d;
 pub(super) const Q_OP_BILIN7_PAIRWISE: u8 = 0x1e;
 
+// Memory tokens compress generated Yul symbols whose concrete addresses depend
+// on the memory planner. Literal pointers are used for most proof/VK evals;
+// tokens cover shared challenge/common-polynomial locations that are easier and
+// safer to address symbolically in generated code.
 pub(super) const Q_MEM_L0: u8 = 0x01;
 pub(super) const Q_MEM_L_LAST: u8 = 0x02;
 pub(super) const Q_MEM_L_BLIND: u8 = 0x03;
@@ -243,8 +359,11 @@ pub(super) const Q_MEM_THETA: u8 = 0x07;
 pub(super) const Q_MEM_TRASH_CHALLENGE: u8 = 0x08;
 pub(super) const Q_MEM_INSTANCE_EVAL: u8 = 0x09;
 
-// Operand decoder classes shared by tests and docs. The Yul template is the
-// runtime decoder; this table is the compile-time/spec view of the same ABI.
+/// Operand decoder classes shared by tests and docs.
+///
+/// The Yul template is the runtime decoder; this enum is the compile-time/spec
+/// view of the same ABI. Encodings with zero fixed byte length are dynamic
+/// byte-only forms and are rejected by packed32 lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuotientOpcodeEncoding {
     None,
@@ -264,29 +383,45 @@ pub(super) enum QuotientOpcodeEncoding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct QuotientOpcodeSpec {
+    /// Stable snake-case name rendered into template constants.
     pub(super) name: &'static str,
+    /// Stable opcode byte.
     pub(super) opcode: u8,
+    /// Byte length in byte-oriented encoding, or zero for dynamic run forms.
     pub(super) byte_len: usize,
+    /// Operand decoding class.
     pub(super) encoding: QuotientOpcodeEncoding,
+    /// Whether this logical opcode can be represented in packed32 form.
     pub(super) packed32: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct QuotientMemTokenSpec {
+    /// Generated Yul memory symbol.
     pub(super) name: &'static str,
+    /// Stable compact token used by VM bytecode.
     pub(super) token: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct QuotientVmSpec {
+    /// Complete opcode table, used by template constants and ABI tests.
     pub(super) opcodes: &'static [QuotientOpcodeSpec],
+    /// Complete memory-token table, used by template constants and ABI tests.
     pub(super) mem_tokens: &'static [QuotientMemTokenSpec],
+    /// Packed32 instruction width.
     pub(super) packed_instruction_bytes: usize,
+    /// Number of packed32 operand bits.
     pub(super) packed_arg_bits: usize,
+    /// Packed32 operand mask.
     pub(super) packed_arg_mask: u32,
+    /// Minimum adjacent fused-op run length worth compacting.
     pub(super) run_compaction_min_len: usize,
+    /// Number of foreign-field limbs recognized by limb opcodes.
     pub(super) limb_count: usize,
+    /// Number of products in a 7-by-7 pairwise convolution.
     pub(super) limb_pairwise_terms: usize,
+    /// Number of distinct `i + j` coefficients in that convolution.
     pub(super) limb_pairwise_coeffs: usize,
 }
 
@@ -556,10 +691,18 @@ pub(super) fn quotient_opcode_spec(opcode: u8) -> Option<&'static QuotientOpcode
         .find(|spec| spec.opcode == opcode)
 }
 
+/// Return the fixed byte length of an opcode in byte-oriented encoding.
+///
+/// Dynamic run opcodes intentionally return `None`; callers that need to walk
+/// bytecode containing those forms must decode the run count and operand width.
 pub(super) fn quotient_opcode_byte_len(opcode: u8) -> Option<usize> {
     quotient_opcode_spec(opcode).and_then(|spec| (spec.byte_len != 0).then_some(spec.byte_len))
 }
 
+/// Convert a little-endian proof scalar into the big-endian 32-byte EVM word.
+///
+/// Proof calldata uses scalar-byte order from the host encoding; EVM `mstore`
+/// and arithmetic consume canonical big-endian words.
 pub(super) fn scalar_le_to_be_word(bytes: &[u8]) -> [u8; 32] {
     assert_eq!(bytes.len(), 32, "scalar proof element must be 32 bytes");
     let mut scalar = [0u8; 32];
@@ -568,23 +711,48 @@ pub(super) fn scalar_le_to_be_word(bytes: &[u8]) -> [u8; 32] {
     scalar
 }
 
+/// Field-expression AST accepted by the quotient VM builder.
+///
+/// This is a deliberately tiny subset of Halo2 expressions and generated Yul:
+/// constants, verifier-memory loads, and Fr addition/multiplication/negation.
+/// Keeping the tree this small makes bytecode lowering auditable and lets the
+/// structural limb recognizers operate without depending on gate names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum QuotientExpr {
+    /// Native Fr constant encoded as a `U256`.
     Const(U256),
+    /// Memory-backed verifier value.
     Mem(QuotientMem),
+    /// Fr addition modulo the scalar field.
     Add(Box<QuotientExpr>, Box<QuotientExpr>),
+    /// Fr multiplication modulo the scalar field.
     Mul(Box<QuotientExpr>, Box<QuotientExpr>),
+    /// Fr negation modulo the scalar field.
     Neg(Box<QuotientExpr>),
 }
 
+/// Optional instrumentation counters for limb-specialized lowering.
+///
+/// The profile is emitted only under the tuning env flag; it is not part of
+/// the generated verifier ABI.
 #[derive(Clone, Debug, Default)]
 pub(super) struct QuotientShapeProfile {
+    /// Number of `LIN7` expressions emitted.
     pub(super) lin7: usize,
+    /// Number of `BILIN7_ROW` expressions emitted.
     pub(super) bilin7_row: usize,
+    /// Number of `BILIN7_PAIRWISE` expressions emitted.
     pub(super) bilin7_pairwise: usize,
+    /// Fallback non-limb VM operations emitted while limb profiling is active.
     pub(super) fallback_vm_ops: usize,
 }
 
+/// Structural foreign-field limb shapes compressed by dedicated opcodes.
+///
+/// These are recognized from the expression tree alone. That constraint is
+/// important: adding a limb opcode must never make correctness depend on a
+/// gate label or on a hand-maintained list of circuit gadgets. If a shape is
+/// not recognized exactly, the builder falls back to ordinary Fr VM opcodes.
 #[derive(Clone, Debug)]
 pub(super) enum QuotientLimbShape {
     // Structural forms from the Midfall foreign-field chips, not gate-name
@@ -624,6 +792,11 @@ pub(super) struct QuotientCseState {
 }
 
 impl QuotientCseState {
+    /// Pre-compute VM temporary slots for profitable repeated subexpressions.
+    ///
+    /// Slot assignment is deterministic: expressions are sorted by estimated
+    /// bytecode savings and then by key. That keeps VK bytecode stable across
+    /// hash-map iteration order and makes generated verifier hashes reproducible.
     pub(super) fn from_exprs(exprs: &[QuotientExpr]) -> Self {
         let mut counts = HashMap::new();
         let mut costs = HashMap::new();
@@ -661,20 +834,38 @@ impl QuotientCseState {
     }
 }
 
+/// Compact reference to a verifier memory word.
+///
+/// Literal pointers are encoded directly when they fit. Tokens represent
+/// generated Yul symbols whose concrete address can change with the memory
+/// layout; token offsets support structured regions rooted at those symbols.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum QuotientMem {
+    /// Absolute memory pointer.
     Literal(u32),
+    /// Generated memory symbol token.
     Token(u8),
+    /// Generated memory symbol token plus byte offset.
     TokenOffset(u8, u32),
 }
 
+/// Straight-line Yul CSE plan for the direct inline quotient path.
+///
+/// This is separate from VM CSE because it stores real generated Yul
+/// expressions rather than bytecode temps. The cost model is intentionally
+/// conservative: inline CSE increases memory traffic, so it is used only when
+/// duplicated arithmetic is large enough to pay for the extra `mstore` and
+/// `mload` instructions.
 #[derive(Debug)]
 pub(super) struct QuotientInlineCsePlan {
+    /// Expression key to temp slot.
     pub(super) slots: HashMap<String, u16>,
+    /// Expression key to expression body used to materialize the slot.
     pub(super) exprs: HashMap<String, QuotientExpr>,
 }
 
 impl QuotientInlineCsePlan {
+    /// Build a deterministic inline-CSE plan from identity expressions.
     pub(super) fn new(exprs: &[QuotientExpr]) -> Self {
         let mut counts = HashMap::new();
         let mut costs = HashMap::new();
@@ -719,12 +910,23 @@ impl QuotientInlineCsePlan {
     }
 }
 
+/// Emits direct Yul for `QuotientExpr` with optional CSE helpers.
+///
+/// This is used by non-VM modes and by small inline prefixes. The emitted code
+/// must obey the same Fr semantics and y-fold snippets as the VM path, so the
+/// representation choice does not change the linearization scalar.
 pub(super) struct QuotientInlineCseEmitter<'a> {
+    /// Chosen CSE plan.
     pub(super) plan: &'a QuotientInlineCsePlan,
+    /// Base memory pointer for inline CSE temps.
     pub(super) cse_mptr: usize,
+    /// Whether to call local helper functions such as `q_add` and `q_mul`.
     pub(super) helpers: bool,
+    /// CSE keys already materialized.
     pub(super) emitted: HashSet<String>,
+    /// CSE keys currently being materialized, used to catch accidental cycles.
     pub(super) emitting: HashSet<String>,
+    /// Monotonic suffix for generated temporary variable names.
     pub(super) next_var: usize,
 }
 
@@ -854,17 +1056,34 @@ impl<'a> QuotientInlineCseEmitter<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum QuotientLeaf {
+    /// Constant leaf.
     Const(U256),
+    /// Memory leaf.
     Mem(QuotientMem),
 }
 
+/// Fused `top += product` forms recognized during expression emission.
+///
+/// These are the most common small arithmetic kernels after sum/product
+/// flattening. Encoding them as accumulator operations avoids push/load/mul/add
+/// sequences and is still easy to reason about because the VM stack effect is
+/// exactly zero.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum QuotientProductAdd {
+    /// `top += mload(lhs) * mload(rhs) * const`.
     MemMemConstU8 { lhs: u16, rhs: u16, scalar: U256 },
+    /// `top += const * mload(ptr)`.
     ConstU8Mem { scalar: U256, ptr: u16 },
+    /// `top += mload(lhs) * mload(rhs)`.
     MemMem { lhs: u16, rhs: u16 },
 }
 
+/// Lowers quotient identities into VM bytecode and a constant table.
+///
+/// The builder owns stack-depth accounting and all byte-level encoding. It
+/// emits an expression as an isolated stack computation followed by exactly one
+/// fold opcode, so identity boundaries are explicit and native callback markers
+/// can be interleaved safely.
 #[derive(Default)]
 pub(super) struct QuotientProgramBuilder {
     // Raw byte-oriented program before optional run compaction or packed32
@@ -880,6 +1099,7 @@ pub(super) struct QuotientProgramBuilder {
 }
 
 impl QuotientProgramBuilder {
+    /// Create a builder, optionally enabling limb-specialized opcode emission.
     pub(super) fn with_limb_vm_ops(enabled: bool) -> Self {
         Self {
             limb_vm_ops: enabled,
@@ -887,6 +1107,12 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit one complete quotient identity and its fold target.
+    ///
+    /// The operand stack is reset at the start and must be empty at the end.
+    /// That invariant is the reason callbacks can share the same stream: the
+    /// Yul interpreter is allowed to clear `q_top` and reuse `q_sp` whenever a
+    /// native marker appears between identities.
     pub(super) fn identity_expr(
         &mut self,
         expr: &QuotientExpr,
@@ -927,6 +1153,11 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit the native permutation marker.
+    ///
+    /// The generated Yul callback evaluates the whole permutation block and
+    /// performs the same fold side effects that interpreted identities would
+    /// have performed one by one at this position.
     pub(super) fn native_permutation(&mut self) {
         assert_eq!(
             self.stack_depth, 0,
@@ -938,6 +1169,11 @@ impl QuotientProgramBuilder {
         self.bytes.push(Q_OP_NATIVE_PERMUTATION);
     }
 
+    /// Emit a native heavy-identity marker addressed by `native_idx`.
+    ///
+    /// The marker is an execution-plan choice, not a different identity. Its
+    /// callback body is generated from the same `QuotientIdentity` and must
+    /// trace and fold exactly once.
     pub(super) fn native_identity(&mut self, native_idx: usize) {
         assert_eq!(
             self.stack_depth, 0,
@@ -950,6 +1186,12 @@ impl QuotientProgramBuilder {
         self.u16(native_idx);
     }
 
+    /// Finalize bytecode into the requested physical encoding.
+    ///
+    /// The logical operation stream is emitted in byte-oriented form first so
+    /// stack accounting and CSE temp discovery have one canonical input.
+    /// `Bytes` may compact adjacent fused add-mul runs; `Packed32` repacks the
+    /// un-compacted stream into fixed 4-byte instruction words.
     pub(super) fn finish(self, encoding: QuotientProgramEncoding) -> QuotientProgramBuild {
         // `max_stack` is the pure VM operand-stack high-water mark. The memory
         // planner adds callback scratch requirements when callbacks share the
@@ -988,6 +1230,11 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Parse and remember one generated Yul assignment.
+    ///
+    /// This is the bridge for identities that do not yet have typed
+    /// `Expression<Fq>` lowering. Only the evaluator's simple arithmetic subset
+    /// is accepted; unsupported syntax is rejected during code generation.
     pub(super) fn assignment(&mut self, line: &str) {
         let assignment = yul_assignment(line)
             .unwrap_or_else(|| panic!("unsupported quotient assignment: {}", line.trim()));
@@ -995,6 +1242,11 @@ impl QuotientProgramBuilder {
         self.vars.insert(assignment.dst, expr);
     }
 
+    /// Parse a generated Yul expression into `QuotientExpr`.
+    ///
+    /// Supported operations are exactly the Fr operations emitted by
+    /// `Evaluator`: `addmod(_, _, r)`, `mulmod(_, _, r)`, `sub(r, _)`,
+    /// `mload(_)`, literals, and previously assigned variables.
     pub(super) fn parse_expr(&self, expr: &str) -> QuotientExpr {
         let expr = expr.trim();
         if let Some(args) = call_args(expr, "addmod") {
@@ -1028,6 +1280,11 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit a `QuotientExpr` using ordinary VM bytecode plus local peepholes.
+    ///
+    /// The method leaves the expression value on top of the VM stack. It first
+    /// tries structural limb compression, then falls back to accumulator-leaf
+    /// and fused product-add opcodes before using generic stack add/mul/neg.
     pub(super) fn emit_expr(&mut self, expr: &QuotientExpr) {
         if self.try_emit_limb_shape(expr) {
             return;
@@ -1082,6 +1339,12 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit an expression with cross-identity VM CSE enabled.
+    ///
+    /// The first use of a selected expression materializes it and stores the
+    /// top-of-stack into a temp slot. Later uses load the temp directly. The
+    /// stored value remains on the stack after `STORE_TEMP`, matching the
+    /// expression result expected by the caller.
     fn emit_expr_cse(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
         let key = quotient_expr_key(expr);
         if let Some(slot) = cse.slots.get(&key).copied() {
@@ -1102,6 +1365,8 @@ impl QuotientProgramBuilder {
         self.emit_expr_cse_inner(expr, cse);
     }
 
+    /// Recursive CSE emitter once the current expression has been ruled out as
+    /// an already-materialized temp.
     fn emit_expr_cse_inner(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
         if self.try_emit_limb_shape(expr) {
             return;
@@ -1160,6 +1425,12 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Try to replace a full expression with one limb-specialized opcode.
+    ///
+    /// The const-slot preflight is part of the ABI justification: limb opcodes
+    /// carry coefficient slots as single bytes, so either every coefficient can
+    /// be addressed by `u8` after deterministic insertion or the expression
+    /// must use the generic VM path.
     fn try_emit_limb_shape(&mut self, expr: &QuotientExpr) -> bool {
         if !self.limb_vm_ops {
             return false;
@@ -1176,6 +1447,8 @@ impl QuotientProgramBuilder {
         true
     }
 
+    /// Check whether all coefficients of a recognized limb shape fit `u8`
+    /// constant slots without mutating the builder.
     fn limb_shape_has_u8_const_slots(&self, shape: &QuotientLimbShape) -> bool {
         let coeffs = match shape {
             QuotientLimbShape::Lin7 { terms } => terms.iter().map(|(coeff, _)| *coeff).collect(),
@@ -1187,6 +1460,7 @@ impl QuotientProgramBuilder {
         self.peek_u8_const_slots(&coeffs).is_some()
     }
 
+    /// Emit the byte-level representation of a pre-validated limb shape.
     fn emit_limb_shape(&mut self, shape: QuotientLimbShape) {
         match shape {
             QuotientLimbShape::Lin7 { terms } => {
@@ -1242,6 +1516,7 @@ impl QuotientProgramBuilder {
         self.push_stack();
     }
 
+    /// Emit a constant load, choosing the shortest constant-slot operand.
     fn emit_const(&mut self, value: U256) {
         self.record_fallback_vm_op();
         let slot = self.const_slot(value);
@@ -1254,6 +1529,7 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit a memory load, choosing the shortest literal-pointer operand.
     fn emit_mem_literal(&mut self, ptr: u32) {
         self.record_fallback_vm_op();
         if let Ok(ptr) = u16::try_from(ptr) {
@@ -1265,6 +1541,7 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Try to emit `base + product` as a fused accumulator opcode.
     fn try_emit_add_product(&mut self, base: &QuotientExpr, product: &QuotientExpr) -> bool {
         let mut leaves = Vec::new();
         if !collect_product_leaves(product, &mut leaves) {
@@ -1279,6 +1556,7 @@ impl QuotientProgramBuilder {
         true
     }
 
+    /// CSE-aware variant of `try_emit_add_product`.
     fn try_emit_add_product_cse(
         &mut self,
         base: &QuotientExpr,
@@ -1298,6 +1576,12 @@ impl QuotientProgramBuilder {
         true
     }
 
+    /// Recognize product leaves that can be encoded as one fused add-mul op.
+    ///
+    /// The fused forms require literal `u16` memory pointers and, where a
+    /// constant is present, a coefficient that can fit a `u8` const slot. Token
+    /// memory is kept on the generic path because the fused byte layout stores
+    /// raw pointers only.
     fn product_add_macro(&self, leaves: &[QuotientLeaf]) -> Option<QuotientProductAdd> {
         let mut mems = Vec::new();
         let mut consts = Vec::new();
@@ -1335,6 +1619,7 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit one fused add-mul accumulator operation.
     fn emit_product_add(&mut self, product: QuotientProductAdd) {
         self.record_fallback_vm_op();
         match product {
@@ -1361,6 +1646,12 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit a binary expression with accumulator-leaf peepholes.
+    ///
+    /// If one side is a constant or short memory load, the VM can update the
+    /// other side's top-of-stack directly with `ADD_CONST`, `MUL_MEM_U16`, and
+    /// related opcodes. Otherwise both operands are pushed and a generic stack
+    /// operation combines them.
     fn emit_binary_expr(
         &mut self,
         lhs: &QuotientExpr,
@@ -1395,6 +1686,7 @@ impl QuotientProgramBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// CSE-aware variant of `emit_binary_expr`.
     fn emit_binary_expr_cse(
         &mut self,
         lhs: &QuotientExpr,
@@ -1429,6 +1721,7 @@ impl QuotientProgramBuilder {
         self.op_binary(stack_op);
     }
 
+    /// Try to apply a constant or short-memory accumulator opcode to `q_top`.
     fn emit_acc_leaf(
         &mut self,
         leaf: QuotientLeaf,
@@ -1462,28 +1755,33 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Emit a zero-operand opcode and count it in the fallback profile.
     fn op0(&mut self, op: u8) {
         self.record_fallback_vm_op();
         self.bytes.push(op);
     }
 
+    /// Emit a binary stack opcode and update stack-depth accounting.
     fn op_binary(&mut self, op: u8) {
         self.record_fallback_vm_op();
         self.bytes.push(op);
         self.pop_stack();
     }
 
+    /// Count non-limb opcodes when shape profiling is enabled.
     fn record_fallback_vm_op(&mut self) {
         if self.limb_vm_ops {
             self.profile.fallback_vm_ops += 1;
         }
     }
 
+    /// Record one pushed stack value and update the high-water mark.
     fn push_stack(&mut self) {
         self.stack_depth += 1;
         self.max_stack = self.max_stack.max(self.stack_depth);
     }
 
+    /// Record one consumed stack value.
     fn pop_stack(&mut self) {
         self.stack_depth = self
             .stack_depth
@@ -1491,15 +1789,18 @@ impl QuotientProgramBuilder {
             .expect("quotient VM stack underflow");
     }
 
+    /// Append a big-endian `u16` operand.
     fn u16(&mut self, value: usize) {
         assert!(value <= u16::MAX as usize, "quotient VM u16 overflow");
         self.bytes.extend_from_slice(&(value as u16).to_be_bytes());
     }
 
+    /// Append a big-endian `u32` operand.
     fn u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
+    /// Return the stable constant-table slot for `value`, inserting if needed.
     fn const_slot(&mut self, value: U256) -> u16 {
         if let Some(slot) = self.const_slots.get(&value) {
             *slot
@@ -1512,6 +1813,7 @@ impl QuotientProgramBuilder {
         }
     }
 
+    /// Check whether `value` can be addressed by a one-byte constant slot.
     fn const_fits_u8_slot(&self, value: U256) -> bool {
         self.const_slots
             .get(&value)
@@ -1519,6 +1821,11 @@ impl QuotientProgramBuilder {
             || (!self.const_slots.contains_key(&value) && self.consts.len() <= u8::MAX as usize)
     }
 
+    /// Predict one-byte constant slots for a batch of values without insertion.
+    ///
+    /// This lets limb opcode recognition fail cleanly before mutating the
+    /// constant table, so fallback lowering sees the same builder state it
+    /// would have seen if recognition had never been attempted.
     fn peek_u8_const_slots(&self, values: &[U256]) -> Option<Vec<u8>> {
         let mut next_slot = self.consts.len();
         let mut pending = HashMap::new();
@@ -1539,6 +1846,7 @@ impl QuotientProgramBuilder {
         Some(slots)
     }
 
+    /// Recover the number of VM temp slots actually referenced by bytecode.
     fn cse_temps(&self) -> usize {
         if !quotient_vm_cse_enabled() {
             return 0;
@@ -1607,6 +1915,11 @@ pub(super) fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Repack byte-oriented quotient bytecode into packed32 encoding.
+///
+/// Packed32 is a physical encoding optimization only. It is allowed only for
+/// fixed-size opcodes whose operands can be represented in a primary 24-bit
+/// word plus, for two-pointer fused forms, one extra packed pair word.
 pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
     // Packed32 is a second physical encoding of the same logical VM. Base
     // instructions become one word `(opcode << 24) | operand`; opcodes with
@@ -1691,6 +2004,7 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Return whether the logical byte stream contains byte-only limb opcodes.
 pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
     let mut idx = 0usize;
     while idx < bytes.len() {
@@ -1705,6 +2019,7 @@ pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
     false
 }
 
+/// Append one packed32 instruction word.
 pub(super) fn push_packed_quotient_op(out: &mut Vec<u8>, op: u8, arg: u32) {
     assert!(
         arg <= QUOTIENT_VM_SPEC.packed_arg_mask,
@@ -1713,6 +2028,7 @@ pub(super) fn push_packed_quotient_op(out: &mut Vec<u8>, op: u8, arg: u32) {
     out.extend_from_slice(&(((op as u32) << 24) | arg).to_be_bytes());
 }
 
+/// Read a big-endian `u16` operand from bytecode.
 pub(super) fn read_u16(bytes: &[u8], idx: usize) -> u16 {
     u16::from_be_bytes(
         bytes[idx..idx + 2]
@@ -1721,6 +2037,7 @@ pub(super) fn read_u16(bytes: &[u8], idx: usize) -> u16 {
     )
 }
 
+/// Read a big-endian `u32` operand from bytecode.
 pub(super) fn read_u32(bytes: &[u8], idx: usize) -> u32 {
     u32::from_be_bytes(
         bytes[idx..idx + 4]
@@ -1729,54 +2046,70 @@ pub(super) fn read_u32(bytes: &[u8], idx: usize) -> u32 {
     )
 }
 
+/// Configured number of leading identities emitted as direct Yul.
 pub(super) fn hybrid_quotient_inline_count(identities: &[QuotientIdentity]) -> usize {
     identities
         .len()
         .min(config::CodegenOptions::from_env().hybrid_quotient_inline_identities)
 }
 
+/// Configured number of gate identities selected for native callbacks.
 pub(super) fn quotient_native_gate_count(gates: &[QuotientIdentity]) -> usize {
     gates
         .len()
         .min(config::CodegenOptions::from_env().quotient_native_gates)
 }
 
+/// Configured physical VM encoding.
 pub(super) fn quotient_program_encoding() -> QuotientProgramEncoding {
     config::CodegenOptions::from_env().quotient_encoding
 }
 
+/// Whether the direct inline quotient path uses memory-backed CSE.
 pub(super) fn quotient_inline_cse_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_inline_cse
 }
 
+/// Whether compact VM bytecode may use `PUSH_TEMP` and `STORE_TEMP`.
 pub(super) fn quotient_vm_cse_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_vm_cse
 }
 
+/// Whether direct Yul emission may call local quotient helper functions.
 pub(super) fn quotient_yul_helpers_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_yul_helpers
 }
 
+/// Whether recognized identity runs may become structured loops.
 pub(super) fn quotient_structured_loops_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_structured_loops
 }
 
+/// Configured structured suffix mode.
 pub(super) fn quotient_structured_tail_mode() -> QuotientStructuredTailMode {
     config::CodegenOptions::from_env().quotient_structured_tail
 }
 
+/// Whether the permutation identity block may be a native VM callback.
 pub(super) fn quotient_native_permutation_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_native_permutation
 }
 
+/// Whether byte-oriented VM lowering may emit limb-specialized opcodes.
 pub(super) fn quotient_limb_vm_ops_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_limb_vm_ops
 }
 
+/// Whether codegen prints limb-shape profile counters to stderr.
 pub(super) fn quotient_shape_profile_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_shape_profile
 }
 
+/// Count expression occurrences and estimate bytecode cost for VM CSE.
+///
+/// The cost is measured in byte-oriented VM bytes, not gas. That is the right
+/// proxy because VM CSE's main job is reducing generated VK payload size while
+/// keeping interpreter behavior identical.
 pub(super) fn count_quotient_exprs(
     expr: &QuotientExpr,
     counts: &mut HashMap<String, usize>,
@@ -1805,6 +2138,7 @@ pub(super) fn count_quotient_exprs(
     cost
 }
 
+/// Count expression occurrences, costs, and bodies for inline Yul CSE.
 pub(super) fn collect_quotient_expr_stats(
     expr: &QuotientExpr,
     counts: &mut HashMap<String, usize>,
@@ -1837,6 +2171,7 @@ pub(super) fn collect_quotient_expr_stats(
     cost
 }
 
+/// Decide whether a repeated expression is worth a VM temp slot.
 pub(super) fn quotient_cse_candidate(count: usize, cost: usize) -> bool {
     if count <= 1 || cost <= 3 {
         return false;
@@ -1846,6 +2181,7 @@ pub(super) fn quotient_cse_candidate(count: usize, cost: usize) -> bool {
     (count - 1) * (cost - 3) > 3
 }
 
+/// Decide whether a repeated expression is worth an inline Yul CSE slot.
 pub(super) fn quotient_inline_cse_candidate(count: usize, cost: usize) -> bool {
     if count <= 1 || cost <= 6 {
         return false;
@@ -1856,6 +2192,10 @@ pub(super) fn quotient_inline_cse_candidate(count: usize, cost: usize) -> bool {
     (count - 1) * cost > 12
 }
 
+/// Deterministic sort key for CSE slot assignment.
+///
+/// Better estimated savings sort first, then larger individual expressions,
+/// then the canonical expression key for reproducibility.
 pub(super) fn quotient_cse_sort_key(key: &str, count: usize, cost: usize) -> (usize, usize, &str) {
     let score = count.saturating_sub(1).saturating_mul(cost);
     (
@@ -1865,6 +2205,11 @@ pub(super) fn quotient_cse_sort_key(key: &str, count: usize, cost: usize) -> (us
     )
 }
 
+/// Canonical key for CSE and deduplication.
+///
+/// Addition and multiplication are keyed commutatively because all arithmetic
+/// is over Fr and these rewrites do not alter evaluation order side effects:
+/// `QuotientExpr` has no side effects.
 pub(super) fn quotient_expr_key(expr: &QuotientExpr) -> String {
     match expr {
         QuotientExpr::Const(value) => format!("c:{value:x}"),
@@ -1879,10 +2224,12 @@ pub(super) fn quotient_expr_key(expr: &QuotientExpr) -> String {
     }
 }
 
+/// Render a memory reference as a Yul `mload` expression.
 pub(super) fn quotient_mem_load_expr(mem: QuotientMem) -> String {
     format!("mload({})", quotient_mem_ptr_expr(mem))
 }
 
+/// Render a memory reference as a Yul pointer expression.
 pub(super) fn quotient_mem_ptr_expr(mem: QuotientMem) -> String {
     match mem {
         QuotientMem::Literal(ptr) => format!("{ptr:#x}"),
@@ -1893,6 +2240,7 @@ pub(super) fn quotient_mem_ptr_expr(mem: QuotientMem) -> String {
     }
 }
 
+/// Resolve a memory token to the generated Yul symbol name.
 pub(super) fn quotient_mem_token_name(token: u8) -> &'static str {
     QUOTIENT_MEM_TOKEN_TABLE
         .iter()
@@ -1900,12 +2248,17 @@ pub(super) fn quotient_mem_token_name(token: u8) -> &'static str {
         .unwrap_or_else(|| panic!("unknown quotient memory token {token:#x}"))
 }
 
+/// Resolve a generated Yul memory symbol name to its compact token.
 pub(super) fn quotient_mem_token_from_name(name: &str) -> Option<u8> {
     QUOTIENT_MEM_TOKEN_TABLE
         .iter()
         .find_map(|spec| (spec.name == name).then_some(spec.token))
 }
 
+/// Environment needed to lower Halo2 `Expression<Fq>` leaves.
+///
+/// The VM lowerer is independent of the concrete verifier memory layout; this
+/// trait supplies the memory-backed expression for each kind of query.
 pub(super) trait QuotientExpressionEnv {
     fn selector(&self, selector: Selector) -> QuotientExpr;
     fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr;
@@ -1914,6 +2267,7 @@ pub(super) trait QuotientExpressionEnv {
     fn challenge(&self, index: usize) -> QuotientExpr;
 }
 
+/// Lower a Halo2 expression into the compact quotient AST.
 pub(super) fn quotient_expr_from_expression<E: QuotientExpressionEnv>(
     env: &E,
     expression: &Expression<Fq>,
@@ -1937,8 +2291,11 @@ pub(super) fn quotient_expr_from_expression<E: QuotientExpressionEnv>(
     )
 }
 
+/// Production expression environment backed by generated verifier data.
 pub(super) struct DataQuotientExpressionEnv<'a> {
+    /// Constraint-system metadata used to classify selectors and instances.
     pub(super) meta: &'a ConstraintSystemMeta,
+    /// Concrete generated memory locations for proof/VK/challenge values.
     pub(super) data: &'a Data,
 }
 
@@ -1999,6 +2356,7 @@ pub(super) fn word_to_quotient_expr(word: Word) -> QuotientExpr {
     QuotientExpr::Mem(ptr_to_quotient_mem(word.ptr()))
 }
 
+/// Convert a generated memory pointer into the compact VM pointer form.
 pub(super) fn ptr_to_quotient_mem(ptr: Ptr) -> QuotientMem {
     assert_eq!(
         ptr.loc(),
@@ -2023,6 +2381,7 @@ pub(super) fn ptr_to_quotient_mem(ptr: Ptr) -> QuotientMem {
     }
 }
 
+/// Canonical key helper for commutative binary operations.
 pub(super) fn quotient_commutative_expr_key(
     op: &str,
     lhs: &QuotientExpr,
@@ -2037,12 +2396,17 @@ pub(super) fn quotient_commutative_expr_key(
     }
 }
 
+/// Fixed byte length of the opcode at `idx` in an un-compacted stream.
+///
+/// This helper is intentionally used only where dynamic run opcodes cannot be
+/// present or where the caller handles them through a table with fixed lengths.
 pub(super) fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
     let op = bytes[idx];
     quotient_opcode_byte_len(op)
         .unwrap_or_else(|| panic!("unknown quotient op {op:#x} at byte {idx}"))
 }
 
+/// Return the leaf form of an expression, if it has no arithmetic children.
 pub(super) fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
     match expr {
         QuotientExpr::Const(value) => Some(QuotientLeaf::Const(*value)),
@@ -2051,6 +2415,11 @@ pub(super) fn quotient_leaf(expr: &QuotientExpr) -> Option<QuotientLeaf> {
     }
 }
 
+/// Flatten a pure multiplication tree into constant/memory leaves.
+///
+/// This intentionally rejects sums and negations. Additive structure is handled
+/// by sum collection or by the generic emitter; fused product-add opcodes need
+/// a product that can be encoded directly.
 pub(super) fn collect_product_leaves(expr: &QuotientExpr, leaves: &mut Vec<QuotientLeaf>) -> bool {
     match expr {
         QuotientExpr::Mul(lhs, rhs) => {
@@ -2086,6 +2455,11 @@ pub(super) fn quotient_limb_shape(expr: &QuotientExpr) -> Option<QuotientLimbSha
         .or_else(|| try_quotient_lin7_shape(&terms))
 }
 
+/// Collect additive terms as `(coefficient, expression)` pairs over Fr.
+///
+/// Constant-only terms must reduce to zero for a limb shape to match; non-zero
+/// standalone constants would require an additional VM add and therefore are
+/// left to the generic emitter.
 pub(super) fn collect_quotient_sum_terms<'a>(
     expr: &'a QuotientExpr,
     coeff: Fq,
@@ -2130,6 +2504,11 @@ pub(super) fn collect_quotient_sum_terms<'a>(
     }
 }
 
+/// Recognize a seven-limb linear combination.
+///
+/// The resulting terms are sorted by memory pointer so equivalent expressions
+/// have deterministic bytecode even when the source expression tree orders
+/// additions differently.
 pub(super) fn try_quotient_lin7_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<QuotientLimbShape> {
     // Matches:
     //   circuits/src/field/foreign/gates/norm.rs
@@ -2155,6 +2534,10 @@ pub(super) fn try_quotient_lin7_shape(terms: &[(Fq, &QuotientExpr)]) -> Option<Q
     })
 }
 
+/// Recognize one limb multiplied across a seven-limb vector.
+///
+/// The recognizer tries both sides of the first pair as the repeated limb so it
+/// is insensitive to multiplication commutativity in the lowered expression.
 pub(super) fn try_quotient_bilin7_row_shape(
     terms: &[(Fq, &QuotientExpr)],
 ) -> Option<QuotientLimbShape> {
@@ -2201,6 +2584,13 @@ pub(super) fn try_quotient_bilin7_row_shape(
     None
 }
 
+/// Recognize a full seven-by-seven foreign-field product convolution.
+///
+/// The memory pointers must contain two contiguous seven-word limb vectors. For
+/// each product term the coefficient is accumulated into its row-major slot and
+/// then checked to depend only on `i + j`, exactly matching the
+/// `double_base_powers` shape. If any slot is missing or coefficients disagree,
+/// the shape is rejected and the generic VM remains the source of truth.
 pub(super) fn try_quotient_bilin7_pairwise_shape(
     terms: &[(Fq, &QuotientExpr)],
 ) -> Option<QuotientLimbShape> {
@@ -2280,6 +2670,7 @@ pub(super) fn try_quotient_bilin7_pairwise_shape(
     None
 }
 
+/// Return `(coefficient, ptr)` for a product with exactly one memory factor.
 pub(super) fn quotient_mem_term(expr: &QuotientExpr) -> Option<(Fq, u16)> {
     let (coeff, ptrs) = quotient_product_mem_factors(expr)?;
     if ptrs.len() == 1 {
@@ -2289,6 +2680,7 @@ pub(super) fn quotient_mem_term(expr: &QuotientExpr) -> Option<(Fq, u16)> {
     }
 }
 
+/// Return `(coefficient, lhs_ptr, rhs_ptr)` for a product with two memory factors.
 pub(super) fn quotient_product_mem_pair(expr: &QuotientExpr) -> Option<(Fq, u16, u16)> {
     let (coeff, ptrs) = quotient_product_mem_factors(expr)?;
     if ptrs.len() == 2 {
@@ -2298,6 +2690,10 @@ pub(super) fn quotient_product_mem_pair(expr: &QuotientExpr) -> Option<(Fq, u16,
     }
 }
 
+/// Factor a product into its Fr coefficient and literal memory pointers.
+///
+/// Token memory references are rejected because limb opcodes and fused product
+/// forms store compact literal `u16` pointers.
 pub(super) fn quotient_product_mem_factors(expr: &QuotientExpr) -> Option<(Fq, Vec<u16>)> {
     let mut leaves = Vec::new();
     if !collect_product_leaves(expr, &mut leaves) {
@@ -2317,6 +2713,7 @@ pub(super) fn quotient_product_mem_factors(expr: &QuotientExpr) -> Option<(Fq, V
     Some((coeff, ptrs))
 }
 
+/// Add a coefficient into a grouped limb term.
 pub(super) fn add_grouped_limb_coeff(grouped: &mut Vec<(u16, Fq)>, ptr: u16, coeff: Fq) {
     if let Some((_, existing)) = grouped.iter_mut().find(|(existing, _)| *existing == ptr) {
         *existing += coeff;
@@ -2325,6 +2722,7 @@ pub(super) fn add_grouped_limb_coeff(grouped: &mut Vec<(u16, Fq)>, ptr: u16, coe
     }
 }
 
+/// Find all base pointers that cover a contiguous seven-limb vector.
 pub(super) fn limb7_base_candidates(ptrs: &HashSet<u16>) -> Vec<u16> {
     let mut bases = ptrs
         .iter()
@@ -2341,6 +2739,7 @@ pub(super) fn limb7_base_candidates(ptrs: &HashSet<u16>) -> Vec<u16> {
     bases
 }
 
+/// Return the limb index of `ptr` relative to `base`, if it is in the vector.
 pub(super) fn limb7_index(base: u16, ptr: u16) -> Option<usize> {
     let diff = ptr.checked_sub(base)?;
     let word_bytes = layout::WORD_BYTES as u16;
@@ -2351,16 +2750,22 @@ pub(super) fn limb7_index(base: u16, ptr: u16) -> Option<usize> {
     (idx < QUOTIENT_VM_LIMBS).then_some(idx)
 }
 
+/// Interpret a `U256` as a canonical BLS12-381 scalar field element.
+///
+/// Values outside the field modulus are rejected; that is important when
+/// folding parsed Yul literals back into Fr coefficients for shape recognition.
 pub(super) fn quotient_fq_from_u256(value: U256) -> Option<Fq> {
     let bytes = value.to_le_bytes::<32>();
     let repr = <Fq as PrimeField>::Repr::from(bytes);
     Option::<Fq>::from(Fq::from_repr(repr))
 }
 
+/// Encode a BLS12-381 scalar field element as a `U256`.
 pub(super) fn quotient_fq_to_u256(value: Fq) -> U256 {
     fe_to_u256::<Fq>(&value)
 }
 
+/// Parse a generated Yul memory pointer expression into a VM memory reference.
 pub(super) fn parse_mem(ptr: &str) -> QuotientMem {
     let ptr = ptr.trim();
     if let Some(value) = parse_u32_literal(ptr) {
@@ -2379,6 +2784,7 @@ pub(super) fn parse_mem(ptr: &str) -> QuotientMem {
     }
 }
 
+/// Return whether a string is a decimal or hexadecimal integer literal.
 pub(super) fn is_literal(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("0x")
@@ -2388,6 +2794,7 @@ pub(super) fn is_literal(value: &str) -> bool {
             .is_some_and(|byte| byte.is_ascii_digit())
 }
 
+/// Parse a decimal or hexadecimal `U256` literal.
 pub(super) fn parse_u256(value: &str) -> U256 {
     let value = value.trim();
     if let Some(hex) = value.strip_prefix("0x") {
@@ -2399,6 +2806,7 @@ pub(super) fn parse_u256(value: &str) -> U256 {
     }
 }
 
+/// Render a `U256` as the shortest stable hexadecimal Yul literal.
 pub(super) fn u256_string(value: U256) -> String {
     if value.bit_len() < 64 {
         format!("0x{:x}", value.as_limbs()[0])
@@ -2407,10 +2815,12 @@ pub(super) fn u256_string(value: U256) -> String {
     }
 }
 
+/// Render BLS12-381 Fr `DELTA` for legacy/direct Yul paths.
 pub(super) fn fr_delta_literal() -> String {
     u256_string(fe_to_u256::<Fq>(&Fq::DELTA))
 }
 
+/// Parse a literal if it fits in `u32`.
 pub(super) fn parse_u32_literal(value: &str) -> Option<u32> {
     if !is_literal(value) {
         return None;
@@ -2419,6 +2829,7 @@ pub(super) fn parse_u32_literal(value: &str) -> Option<u32> {
     parsed.try_into().ok()
 }
 
+/// Parse a literal if it fits in `usize`.
 pub(super) fn parse_usize_literal(value: &str) -> Option<usize> {
     if !is_literal(value) {
         return None;
@@ -2427,17 +2838,28 @@ pub(super) fn parse_usize_literal(value: &str) -> Option<usize> {
     parsed.try_into().ok()
 }
 
+/// Resolve a generated Yul memory symbol to a VM token.
 pub(super) fn mem_token(name: &str) -> Option<u8> {
     quotient_mem_token_from_name(name)
 }
 
+/// Parsed form of the simple Yul assignments emitted by `Evaluator`.
+///
+/// The parser is deliberately shallow. It is not a Yul parser; it accepts only
+/// assignment syntax that this generator emits, which makes unsupported changes
+/// fail loudly during code generation instead of silently changing verifier
+/// semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct YulAssignment {
+    /// Destination variable name.
     pub(super) dst: String,
+    /// Right-hand expression as source text.
     pub(super) expr: String,
+    /// Whether the assignment was introduced with `let`.
     pub(super) has_let: bool,
 }
 
+/// Parse a generated Yul assignment line.
 pub(super) fn yul_assignment(line: &str) -> Option<YulAssignment> {
     let line = line.trim();
     let (has_let, rest) = if let Some(rest) = line.strip_prefix("let") {
@@ -2461,6 +2883,7 @@ pub(super) fn yul_assignment(line: &str) -> Option<YulAssignment> {
     })
 }
 
+/// Parse a generated `let dst := expr` assignment.
 pub(super) fn yul_let_assignment(line: &str) -> Option<(String, String)> {
     let assignment = yul_assignment(line)?;
     assignment
@@ -2468,6 +2891,7 @@ pub(super) fn yul_let_assignment(line: &str) -> Option<(String, String)> {
         .then_some((assignment.dst, assignment.expr))
 }
 
+/// Resolve a literal or previously bound constant variable to canonical text.
 pub(super) fn yul_const_value(value: &str, const_vars: &HashMap<String, String>) -> Option<String> {
     let value = value.trim();
     if is_literal(value) {
@@ -2477,6 +2901,7 @@ pub(super) fn yul_const_value(value: &str, const_vars: &HashMap<String, String>)
     }
 }
 
+/// Parse `let dst := mulmod(lhs, rhs, r)`.
 pub(super) fn yul_mulmod_assignment(line: &str) -> Option<(String, String, String)> {
     let (dst, expr) = yul_let_assignment(line)?;
     let args = call_args(&expr, "mulmod")?;
@@ -2487,6 +2912,7 @@ pub(super) fn yul_mulmod_assignment(line: &str) -> Option<(String, String, Strin
     }
 }
 
+/// Parse `let dst := addmod(lhs, rhs, r)`.
 pub(super) fn yul_addmod_assignment(line: &str) -> Option<(String, String, String)> {
     let (dst, expr) = yul_let_assignment(line)?;
     let args = call_args(&expr, "addmod")?;
@@ -2497,11 +2923,13 @@ pub(super) fn yul_addmod_assignment(line: &str) -> Option<(String, String, Strin
     }
 }
 
+/// Parse `let dst := mload(literal_ptr)`.
 pub(super) fn yul_mload_literal_assignment(line: &str) -> Option<(String, usize)> {
     let (dst, expr) = yul_let_assignment(line)?;
     Some((dst, yul_mload_literal_expr(&expr)?))
 }
 
+/// Parse `mload(literal_ptr)`.
 pub(super) fn yul_mload_literal_expr(expr: &str) -> Option<usize> {
     let args = call_args(expr.trim(), "mload")?;
     if args.len() == 1 {
@@ -2511,6 +2939,7 @@ pub(super) fn yul_mload_literal_expr(expr: &str) -> Option<usize> {
     }
 }
 
+/// Parse `let dst := sub(r, value)`, the evaluator's negation form.
 pub(super) fn yul_sub_r_assignment(line: &str) -> Option<(String, String)> {
     let (dst, expr) = yul_let_assignment(line)?;
     let args = call_args(&expr, "sub")?;
@@ -2521,6 +2950,7 @@ pub(super) fn yul_sub_r_assignment(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// Return top-level comma-separated call arguments for `name(...)`.
 pub(super) fn call_args(expr: &str, name: &str) -> Option<Vec<String>> {
     let expr = expr.trim();
     let rest = expr.strip_prefix(name)?.trim_start();
@@ -2531,6 +2961,7 @@ pub(super) fn call_args(expr: &str, name: &str) -> Option<Vec<String>> {
     Some(split_top_level(&rest[..rest.len() - 1]))
 }
 
+/// Split a comma-separated argument list while respecting nested calls.
 pub(super) fn split_top_level(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut depth = 0usize;
