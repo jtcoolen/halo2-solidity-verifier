@@ -2108,12 +2108,14 @@ pub(super) fn quotient_program_usage(
                     }
                     Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
                         let run_len = read_u16(bytes, idx + 1) as usize;
-                        idx += 1 + QUOTIENT_VM_BYTE_U16_BYTES
+                        idx += 1
+                            + QUOTIENT_VM_BYTE_U16_BYTES
                             + run_len * (2 * QUOTIENT_VM_BYTE_U16_BYTES + 1);
                     }
                     Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
                         let run_len = read_u16(bytes, idx + 1) as usize;
-                        idx += 1 + QUOTIENT_VM_BYTE_U16_BYTES
+                        idx += 1
+                            + QUOTIENT_VM_BYTE_U16_BYTES
                             + run_len * (QUOTIENT_VM_BYTE_U16_BYTES + 1);
                     }
                     Q_OP_LIN7 => {
@@ -2125,9 +2127,7 @@ pub(super) fn quotient_program_usage(
                             + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
                     }
                     Q_OP_BILIN7_PAIRWISE => {
-                        idx += 1
-                            + 2 * QUOTIENT_VM_BYTE_U16_BYTES
-                            + QUOTIENT_VM_PAIRWISE_COEFFS;
+                        idx += 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_PAIRWISE_COEFFS;
                     }
                     _ => idx += quotient_op_len(bytes, idx),
                 }

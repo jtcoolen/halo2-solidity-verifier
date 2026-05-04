@@ -138,20 +138,21 @@ interpreter and macro encoding.
 Latest measured result:
 
 ```text
-Halo2Verifier.sol source bytes:           92,564
-Halo2VerifyingKey.sol source bytes:       74,007
-Halo2Verifier creation bytecode bytes:    11,678
-Halo2VerifyingKey creation bytecode bytes: 20,115
-Halo2Verifier deployed runtime bytes:     11,432
-Halo2VerifyingKey deployed runtime bytes: 19,712
-total deployed runtime bytes:             31,144
+Halo2Verifier.sol source bytes:            94,591
+Halo2VerifyingKey.sol source bytes:        60,263
+Halo2QuotientEvaluator.sol source bytes:  162,152
+Halo2Verifier deployed runtime bytes:      12,061
+Halo2VerifyingKey deployed runtime bytes:  14,016
+Halo2QuotientEvaluator runtime bytes:      23,221
+total deployed runtime bytes:              49,298
 
-compressed proof bytes:                    9,952
-EIP-2537 padded proof bytes:              12,672
-calldata bytes:                           13,188
+compressed proof bytes:                     5,056
+EIP-2537 padded proof bytes:                7,776
+calldata bytes:                             8,356
 
-quotient evaluation gas:               1,038,567
-total tx gas:                          2,494,591
+quotient numerator gas:                   412,748
+PCS final MSM gas:                        533,202
+total tx gas:                           1,399,196
 ```
 
 Compared to the first compact interpreter commit, the product-add and run macro
@@ -162,6 +163,11 @@ Moving the quotient payload into the pinned VK then reduced the verifier
 runtime from `25,598` bytes to `11,432` bytes. The VK grew from `6,752` bytes to
 `19,712` bytes, so both deployable contracts are now independently below the
 24KB EIP-170 limit.
+
+The latest default also enables limb-aware quotient VM opcodes. In the current
+IVC VK they compress `14` seven-limb linear forms and `7` seven-limb row
+products, saving about `13k` gas in the numerator checkpoint while keeping each
+runtime artifact below the EIP-170 limit.
 
 ### Validation Commands
 

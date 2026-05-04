@@ -1526,7 +1526,7 @@ VM CSE:                            on
 native permutation callback:       on
 native lookup callback:            on
 structured trash suffix:           on
-limb VM ops:                       off
+limb VM ops:                       on for byte encoding
 ```
 
 These settings are implementation choices. A reimplementation may pick a

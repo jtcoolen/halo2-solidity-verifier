@@ -611,22 +611,20 @@ The limb-aware opcodes `0x1c`, `0x1d`, and `0x1e` are also byte-oriented only.
 They are emitted only when the limb recognizer is enabled, and packed32
 lowering rejects programs containing them.
 
-The limb-aware opcodes are behind:
+The limb-aware opcodes are enabled by default in the pinned-VK compact path.
+Disable them for A/B comparison with:
 
 ```text
-HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=1
+HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=0
 ```
 
-They are opt-in until the IVC gas/size/trace gates are rebenchmarked. The
-default remains the gas-capped compact path. The generator also validates
-that the expanded VK quotient payload does not overlap the challenge/evaluation
-memory frame; if an experiment would overrun that reserved space, rendering
-fails closed instead of producing a verifier with corrupted transcript state.
-To inspect what the structural matcher found in the opt-in lowering path,
-run generation with both:
+The generator validates that the expanded VK quotient payload does not overlap
+the challenge/evaluation memory frame; if a setting would overrun that reserved
+space, rendering fails closed instead of producing a verifier with corrupted
+transcript state. To inspect what the structural matcher found, run generation
+with:
 
 ```text
-HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=1
 HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE=1
 ```
 
@@ -638,6 +636,23 @@ The profile reports counts for `LIN7`, `BILIN7_ROW`,
 Large recognized identities can be emitted as native Yul callbacks. The
 default gas-capped compact mode keeps four heavy gate identities native, plus
 the native permutation and lookup loops.
+
+Current gas-capped compact defaults:
+
+```text
+direct inline identities: 4
+native heavy gate callbacks: 4
+native permutation callback: on
+native lookup callback: on
+structured trash suffix: on
+VM CSE: on
+limb VM ops: on
+```
+
+On the two-leaf IVC Keccak bench with the outer non-fewer proof layout, enabling
+limb VM ops recognized `14` `LIN7` shapes and `7` `BILIN7_ROW` shapes. The
+batched numerator checkpoint moved from about `425,852` gas to `412,748` gas,
+while the quotient evaluator stayed below EIP-170 at `23,221` runtime bytes.
 
 Native callbacks preserve identity order because the VM stream contains an
 opcode at the exact identity position. The callback computes the evaluation

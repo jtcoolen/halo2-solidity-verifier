@@ -398,6 +398,7 @@ mod tests {
     fn compact_quotient_default_matches_gas_capped_setting() {
         assert_eq!(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES, 4);
         assert_eq!(DEFAULT_QUOTIENT_NATIVE_GATES, 4);
+        assert!(DEFAULT_QUOTIENT_LIMB_VM_OPS);
 
         let docs = include_str!("../../docs/QUOTIENT_NUMERATOR_EVALUATOR.md");
         assert!(
@@ -407,6 +408,10 @@ mod tests {
         assert!(
             docs.contains("structured trash suffix: on"),
             "quotient evaluator docs should record the gas-capped structured-tail default"
+        );
+        assert!(
+            docs.contains("limb VM ops: on"),
+            "quotient evaluator docs should record the limb-op default"
         );
         assert!(
             docs.contains("HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N"),

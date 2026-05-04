@@ -1514,16 +1514,13 @@ pub(super) fn computations(
         let final_msm_gas_cap = layout::precompile::g1msm_gas_cap(final_msm_len);
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall({final_msm_gas_cap}, 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, {G1_BYTES:#x})",
+            "    success := staticcall({final_msm_gas_cap}, 0x0c, {final_msm_scratch:#x}, {:#x}, FINAL_COM_MPTR, {G1_BYTES:#x})",
             final_msm_len
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
         ));
         lines.push("}".to_string());
-        lines.push(format!(
-            "mcopy(FINAL_COM_MPTR, {final_msm_scratch:#x}, {G1_BYTES:#x})"
-        ));
         lines.push("mstore(V_MPTR, v)".to_string());
 
         blocks.push(lines);

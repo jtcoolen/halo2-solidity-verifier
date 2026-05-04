@@ -39,6 +39,11 @@ pub(super) const QUOTIENT_STRUCTURED_TAIL_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_S
 pub(super) const QUOTIENT_NATIVE_PERMUTATION_ENV: &str =
     "HALO2_SOLIDITY_QUOTIENT_NATIVE_PERMUTATION";
 pub(super) const QUOTIENT_NATIVE_LOOKUP_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP";
+// Limb-aware VM superinstructions are part of the default byte-oriented
+// pinned-VK lowering: they structurally compress recurring 7-limb
+// foreign-field expressions while preserving the compact quotient interpreter.
+// Set HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=0 to compare the generic VM fallback.
+pub(super) const DEFAULT_QUOTIENT_LIMB_VM_OPS: bool = true;
 pub(super) const QUOTIENT_LIMB_VM_OPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS";
 pub(super) const QUOTIENT_SHAPE_PROFILE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE";
 
@@ -73,6 +78,9 @@ pub(super) struct CodegenOptions {
 impl CodegenOptions {
     /// Parse all supported environment variables, applying production defaults.
     pub(super) fn from_env() -> Self {
+        let quotient_encoding = parse_quotient_encoding();
+        let default_limb_vm_ops =
+            DEFAULT_QUOTIENT_LIMB_VM_OPS && quotient_encoding == QuotientProgramEncoding::Bytes;
         Self {
             hybrid_quotient_inline_identities: parse_usize_env(
                 HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV,
@@ -82,7 +90,7 @@ impl CodegenOptions {
                 QUOTIENT_NATIVE_GATES_ENV,
                 DEFAULT_QUOTIENT_NATIVE_GATES,
             ),
-            quotient_encoding: parse_quotient_encoding(),
+            quotient_encoding,
             quotient_inline_cse: parse_bool_env(QUOTIENT_CSE_ENV, false, "0/1", &["cse"]),
             quotient_vm_cse: parse_bool_env(QUOTIENT_VM_CSE_ENV, true, "0/1", &["cse"]),
             quotient_yul_helpers: parse_bool_env(
@@ -112,7 +120,7 @@ impl CodegenOptions {
             ),
             quotient_limb_vm_ops: parse_bool_env(
                 QUOTIENT_LIMB_VM_OPS_ENV,
-                false,
+                default_limb_vm_ops,
                 "0/1",
                 &["limb", "limbs"],
             ),
