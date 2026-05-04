@@ -10,7 +10,10 @@
 use crate::codegen::{
     artifact::{PayloadSectionKind, VkPayloadLayout},
     layout,
-    memory::{PcsMemoryRequirements, VerifierMemoryLayout, G1_BYTES, WORD_BYTES},
+    memory::{
+        PcsMemoryRequirements, VerifierMemoryLayout, VkConstructorMemoryLayout, G1_BYTES,
+        WORD_BYTES,
+    },
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     util::Ptr,
 };
@@ -122,7 +125,6 @@ pub(crate) struct AccumulatorTemplateConstants {
     pub(crate) limbs_per_word: usize,
     pub(crate) point_coords: usize,
     pub(crate) carried_scalars: usize,
-    pub(crate) pairing_batch_ptr: usize,
     pub(crate) pairing_batch_domain_tag_hex: &'static str,
     pub(crate) pairing_batch_rhs_offset: usize,
     pub(crate) pairing_batch_lhs_offset: usize,
@@ -237,7 +239,6 @@ impl Default for TemplateConstants {
                 limbs_per_word: layout::accumulator::LIMBS_PER_WORD,
                 point_coords: layout::accumulator::POINT_COORDS,
                 carried_scalars: layout::accumulator::CARRIED_SCALARS,
-                pairing_batch_ptr: layout::accumulator::PAIRING_BATCH_PTR,
                 pairing_batch_domain_tag_hex: layout::accumulator::PAIRING_BATCH_DOMAIN_TAG_HEX,
                 pairing_batch_rhs_offset: layout::accumulator::PAIRING_BATCH_RHS_OFFSET,
                 pairing_batch_lhs_offset: layout::accumulator::PAIRING_BATCH_LHS_OFFSET,
@@ -370,6 +371,14 @@ impl Halo2VerifyingKey {
                 self.len()
             ));
         }
+        let constructor_memory = VkConstructorMemoryLayout::new(self.len());
+        constructor_memory.validate()?;
+        if self.constructor_payload_mptr != constructor_memory.payload_mptr {
+            return Err(format!(
+                "VK constructor payload pointer mismatch: got {:#x}, expected {:#x}",
+                self.constructor_payload_mptr, constructor_memory.payload_mptr
+            ));
+        }
         Ok(())
     }
 
@@ -495,10 +504,6 @@ pub(crate) struct Halo2Verifier {
     pub(crate) vk_mptr: Ptr,
     pub(crate) challenge_mptr: Ptr,
     pub(crate) theta_mptr: Ptr,
-    pub(crate) constructor_smoke_scratch_mptr: usize,
-    pub(crate) transcript_mptr: usize,
-    pub(crate) final_pairing_scratch_mptr: usize,
-    pub(crate) return_mptr: usize,
     pub(crate) proof_cptr: Ptr,
     pub(crate) abi_selector_bytes: usize,
     pub(crate) abi_proof_head_offset: usize,
@@ -677,10 +682,12 @@ pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) fr_delta: String,
     pub(crate) memory: VerifierMemoryLayout,
     pub(crate) vk_mptr: Ptr,
+    pub(crate) vk_len: usize,
     pub(crate) challenge_mptr: Ptr,
+    pub(crate) num_user_challenges: usize,
     pub(crate) theta_mptr: Ptr,
-    pub(crate) return_mptr: usize,
     pub(crate) reversed_evals_mptr: Ptr,
+    pub(crate) num_evals: usize,
     pub(crate) selector_acc_mptr: usize,
     pub(crate) quotient_external: QuotientExternal,
     pub(crate) quotient_inline_computations: Vec<Vec<String>>,
@@ -857,6 +864,49 @@ impl Halo2Verifier {
 }
 
 impl Halo2QuotientEvaluator {
+    /// Validate the standalone evaluator's copied frame and output memory.
+    pub(crate) fn validate_layout(&self) -> Result<(), String> {
+        self.memory.validate()?;
+
+        let qext = &self.quotient_external;
+        qext.validate_contains("VK payload", self.vk_mptr.value().as_usize(), self.vk_len)?;
+        qext.validate_contains(
+            "user challenge block",
+            self.challenge_mptr.value().as_usize(),
+            self.num_user_challenges * WORD_BYTES,
+        )?;
+        let quotient_input_end = self.memory.instance_eval_mptr.value().as_usize() + WORD_BYTES;
+        qext.validate_contains(
+            "quotient challenge/common slots",
+            self.theta_mptr.value().as_usize(),
+            quotient_input_end.saturating_sub(self.theta_mptr.value().as_usize()),
+        )?;
+        qext.validate_contains(
+            "decoded proof evaluations",
+            self.reversed_evals_mptr.value().as_usize(),
+            self.num_evals * WORD_BYTES,
+        )?;
+
+        let expected_output_len = 2 * WORD_BYTES + self.simple_selector_cols.len() * WORD_BYTES;
+        if qext.output_len != expected_output_len {
+            return Err(format!(
+                "external quotient output length mismatch: got {:#x}, expected {expected_output_len:#x}",
+                qext.output_len
+            ));
+        }
+        if !qext.disjoint_range(self.memory.quotient_return_mptr, expected_output_len) {
+            return Err(format!(
+                "external quotient output overlaps copied frame: output {:#x}..{:#x}, frame {:#x}..{:#x}",
+                self.memory.quotient_return_mptr,
+                self.memory.quotient_return_mptr + expected_output_len,
+                qext.frame_base,
+                qext.frame_end()
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Render the standalone quotient evaluator contract.
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
@@ -896,8 +946,8 @@ mod tests {
     use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{
         memory::{
-            PcsMemoryRequirements, VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES,
-            WORD_BYTES,
+            PcsMemoryRequirements, VerifierMemoryLayout, VerifierMemoryLayoutConfig,
+            VkConstructorMemoryLayout, G1_BYTES, WORD_BYTES,
         },
         proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
         protocol::ProtocolPlan,
@@ -972,8 +1022,11 @@ mod tests {
                 )
             })
             .collect();
+        let constructor_memory = VkConstructorMemoryLayout::new(
+            constants.len() * WORD_BYTES + (fixed_comms.len() + permutation_comms.len()) * G1_BYTES,
+        );
         Halo2VerifyingKey {
-            constructor_payload_mptr: crate::codegen::layout::VK_CONSTRUCTOR_PAYLOAD_START,
+            constructor_payload_mptr: constructor_memory.payload_mptr,
             constants,
             fixed_comms,
             permutation_comms,
@@ -1050,10 +1103,6 @@ mod tests {
             vk_mptr: Ptr::memory(0x1000),
             challenge_mptr: Ptr::memory(0x1200),
             theta_mptr: Ptr::memory(0x1300),
-            constructor_smoke_scratch_mptr: crate::codegen::layout::LOW_MEMORY_SCRATCH_START,
-            transcript_mptr: crate::codegen::layout::TRANSCRIPT_BUFFER_START,
-            final_pairing_scratch_mptr: crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
-            return_mptr: crate::codegen::layout::VERIFIER_RETURN_BUFFER_START,
             proof_cptr: Ptr::calldata(proof_cptr),
             abi_selector_bytes: crate::codegen::layout::abi::SELECTOR_BYTES,
             abi_proof_head_offset: crate::codegen::layout::abi::VERIFY_PROOF_PROOF_HEAD_OFFSET,

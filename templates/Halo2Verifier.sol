@@ -65,8 +65,8 @@ contract Halo2Verifier {
     uint256 internal constant        PROOF_CPTR = {{ proof_cptr }};
     uint256 internal constant NUM_INSTANCE_CPTR = {{ num_instance_cptr|hex_padded(2) }};
     uint256 internal constant     INSTANCE_CPTR = {{ instance_cptr|hex_padded(2) }};
-    uint256 internal constant    TRANSCRIPT_MPTR = {{ transcript_mptr|hex() }};
-    uint256 internal constant        RETURN_MPTR = {{ return_mptr|hex() }};
+    uint256 internal constant    TRANSCRIPT_MPTR = {{ memory.transcript_mptr|hex() }};
+    uint256 internal constant        RETURN_MPTR = {{ memory.verifier_return_mptr|hex() }};
 
     // ----------------------------------------------------------------------
     // Verifying-key memory map. The VK header lives at VK_MPTR, followed
@@ -203,7 +203,7 @@ contract Halo2Verifier {
     /// @dev Uses identity inputs to catch absent EIP-2537 implementations, short return data, and incompatible pairing semantics at deployment.
     function require_eip2537_precompiles() private view {
         assembly ("memory-safe") {
-            let scratch := {{ constructor_smoke_scratch_mptr|hex() }}
+            let scratch := {{ memory.constructor_smoke_scratch_mptr|hex() }}
             for { let off := 0 } lt(off, {{ template_constants.eip2537.smoke_scratch_bytes|hex() }}) { off := add(off, {{ template_constants.word_bytes|hex() }}) } {
                 mstore(add(scratch, off), 0)
             }
@@ -377,7 +377,7 @@ contract Halo2Verifier {
             // when the VK payload becomes smaller.
             function scalar_inv(x) -> inv {
                 if iszero(x) { revert(0, 0) }
-                let p := sub(VK_MPTR, {{ template_constants.modexp.scratch_bytes|hex() }})
+                let p := {{ memory.scalar_inv_scratch_mptr|hex() }}
                 mstore(add(p, {{ template_constants.modexp.base_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})        // base len
                 mstore(add(p, {{ template_constants.modexp.exp_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})        // exp len
                 mstore(add(p, {{ template_constants.modexp.mod_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})        // mod len
@@ -796,7 +796,7 @@ contract Halo2Verifier {
                 // be a 4-step mstore chain for each G1 (~60 gas) and an
                 // 8-iter mstore loop for each G2 (~240 gas). Net saving
                 // here is ~500 gas per ec_pairing call.
-                let scratch := {{ final_pairing_scratch_mptr|hex() }}
+                let scratch := {{ memory.final_pairing_scratch_mptr|hex() }}
                 mcopy(scratch,              lhs_mptr,                 0x80)
                 mcopy(add(scratch, 0x80),   G2_BASE_MPTR,             0x100)
                 mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
@@ -1655,7 +1655,7 @@ contract Halo2Verifier {
                 }
 
                 {
-                    let batch_ptr := {{ template_constants.accumulator.pairing_batch_ptr|hex() }}
+                    let batch_ptr := {{ memory.accumulator_pairing_batch_mptr|hex() }}
 
                     // Domain || KZG rhs/lhs || accumulator rhs/lhs.
                     mstore(batch_ptr, {{ template_constants.accumulator.pairing_batch_domain_tag_hex }})

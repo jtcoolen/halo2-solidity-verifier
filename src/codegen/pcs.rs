@@ -1553,7 +1553,7 @@ pub(super) fn computations(
         lines.push(format!("mcopy(PAIRING_LHS_MPTR, PI_MPTR, {G1_BYTES:#x})"));
 
         // tmp = (-v) * G  =>  load G into planned scratch, scale by (r - v).
-        let scratch = crate::codegen::layout::PCS_PAIRING_SCRATCH_START;
+        let scratch = memory.pcs_pairing_scratch_mptr;
         let scratch_g1_b = scratch + G1_BYTES;
         let scratch_g1add_scalar = scratch + G1ADD_INPUT_BYTES;
         lines.push(format!("mcopy({scratch:#x}, G1_BASE_MPTR, {G1_BYTES:#x})"));

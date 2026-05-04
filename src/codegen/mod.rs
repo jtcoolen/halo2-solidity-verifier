@@ -1,7 +1,10 @@
 use crate::codegen::{
     artifact::{PackedProgramCodec, PayloadSectionKind, VkPayloadLayout},
     evaluator::Evaluator,
-    memory::{VerifierMemoryLayout, VerifierMemoryLayoutConfig, G1_BYTES, WORD_BYTES},
+    memory::{
+        VerifierMemoryLayout, VerifierMemoryLayoutConfig, VkConstructorMemoryLayout, G1_BYTES,
+        WORD_BYTES,
+    },
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,

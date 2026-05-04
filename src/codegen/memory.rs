@@ -26,10 +26,12 @@ use std::collections::BTreeMap;
 
 pub(crate) use crate::codegen::layout::{
     ACC_MSM_MIN_SCRATCH_BYTES, G1ADD_INPUT_BYTES, G1_BYTES, G1_MSM_PAIR_BYTES, G1_WORDS,
-    LOW_MEMORY_SCRATCH_START, MODEXP_FRAME_BYTES, MODEXP_SCRATCH_BYTES, PAIRING_PAIR_BYTES,
-    PAIRING_TWO_PAIR_BYTES, PCS_PAIRING_SCRATCH_START, PCS_STATIC_WORKING_WORDS,
+    LOW_MEMORY_SCRATCH_START, MODEXP_DECOMPRESSION_WORKING_WORDS, MODEXP_FRAME_BYTES,
+    MODEXP_SCRATCH_BYTES, PAIRING_PAIR_BYTES, PAIRING_STATIC_WORKING_WORDS, PAIRING_TWO_PAIR_BYTES,
+    PCS_PAIRING_SCRATCH_START, PCS_STATIC_WORKING_WORDS, QUOTIENT_RETURN_BUFFER_START,
     SOLIDITY_FREE_MEMORY_POINTER_SLOT, SOLIDITY_RESERVED_MEMORY_BYTES,
-    SOLIDITY_SCRATCH_SPACE_BYTES, SOLIDITY_ZERO_SLOT, TRANSCRIPT_BUFFER_START, WORD_BYTES,
+    SOLIDITY_SCRATCH_SPACE_BYTES, SOLIDITY_ZERO_SLOT, TRANSCRIPT_BUFFER_START,
+    VERIFIER_RETURN_BUFFER_START, VK_CONSTRUCTOR_PAYLOAD_START, WORD_BYTES,
 };
 /// Accumulator pairing-batch hash frame.
 ///
@@ -117,10 +119,14 @@ impl ThetaWindowLayout {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MemoryPhase {
+    /// Generated verifying-key constructor return payload.
+    VkConstructorPayload,
     /// Constructor-only precompile smoke tests.
     ConstructorSmoke,
     /// Streaming Fiat-Shamir buffer before generated VK memory is live.
     Transcript,
+    /// Conservative legacy low-memory decompression working set.
+    LegacyDecompressionScratch,
     /// Single scalar inversion scratch used by the modexp wrapper.
     ScalarInv,
     /// Batch inversion for Lagrange denominator terms.
@@ -143,6 +149,10 @@ pub(crate) enum MemoryPhase {
     AccumulatorPairingBatch,
     /// Final two-pair KZG pairing frame.
     FinalPairing,
+    /// Main verifier return word.
+    VerifierReturn,
+    /// Standalone quotient evaluator output frame.
+    QuotientReturn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -408,8 +418,23 @@ pub(crate) struct PcsMemoryRequirements {
 pub(crate) struct VerifierMemoryLayout {
     pub(crate) map: MemoryMap,
     pub(crate) theta_windows: ThetaWindowLayout,
+    /// Fixed low-memory scratch for constructor EIP-2537 smoke checks.
+    pub(crate) constructor_smoke_scratch_mptr: usize,
+    /// Base of the streaming transcript buffer.
+    pub(crate) transcript_mptr: usize,
+    /// Conservative low-memory working set retained for legacy proof
+    /// decompression bounds.
+    pub(crate) legacy_decompression_scratch_mptr: usize,
+    /// Low-memory scratch used by the PCS pairing-preparation helper.
+    pub(crate) pcs_pairing_scratch_mptr: usize,
+    /// Low-memory output word used by the main verifier.
+    pub(crate) verifier_return_mptr: usize,
+    /// Low-memory output frame used by the standalone quotient evaluator.
+    pub(crate) quotient_return_mptr: usize,
     /// Start of the copied or embedded verifying-key payload.
     pub(crate) vk_mptr: Ptr,
+    /// Scratch frame used by the scalar-inversion modexp wrapper.
+    pub(crate) scalar_inv_scratch_mptr: usize,
     /// Start of the variable-length user-challenge block after the VK payload.
     pub(crate) challenge_mptr: Ptr,
     /// Anchor for every historical fixed verifier slot below.
@@ -470,12 +495,59 @@ pub(crate) struct VerifierMemoryLayout {
     pub(crate) pcs_final_msm_scratch_mptr: usize,
     /// Public accumulator MSM buffer, historically floored at 0x7000.
     pub(crate) acc_msm_scratch: usize,
+    /// Low-memory transcript hash frame used to batch the accumulator pairing
+    /// equation with the KZG pairing equation.
+    pub(crate) accumulator_pairing_batch_mptr: usize,
+    /// Final KZG two-pairing precompile input frame.
+    pub(crate) final_pairing_scratch_mptr: usize,
     /// One-word buffer used only to materialize LOG data for trace builds.
     /// It is planned after every permanent and scratch region because
     /// `trace_u256` may be called between long-lived reads from the VK,
     /// decoded evals, and decompressed commitments.
     pub(crate) trace_u256_mptr: usize,
     pub(crate) pcs: PcsMemoryRequirements,
+}
+
+/// Memory map for the generated verifying-key constructor.
+///
+/// The VK contract is a separate deployment/runtime context from the verifier,
+/// so its constructor payload cannot be mixed into `VerifierMemoryLayout` without
+/// creating fake overlaps with verifier-runtime permanent regions. This small
+/// layout still keeps the fixed `0x80` payload pointer registered and validated
+/// by the same `MemoryMap` rules.
+#[derive(Clone, Debug)]
+pub(crate) struct VkConstructorMemoryLayout {
+    pub(crate) map: MemoryMap,
+    /// Constructor return-payload buffer.
+    pub(crate) payload_mptr: usize,
+}
+
+impl VkConstructorMemoryLayout {
+    /// Register the fixed constructor payload buffer for a VK runtime length.
+    pub(crate) fn new(payload_len: usize) -> Self {
+        let mut arena = MemoryArena::default();
+        let payload_mptr = arena.alloc_phase_scratch(
+            "vk_constructor_payload",
+            VK_CONSTRUCTOR_PAYLOAD_START,
+            payload_len,
+            MemoryPhase::VkConstructorPayload,
+        );
+        Self {
+            map: arena.into_map(),
+            payload_mptr,
+        }
+    }
+
+    /// Validate the constructor payload pointer and memory map.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.payload_mptr != VK_CONSTRUCTOR_PAYLOAD_START {
+            return Err(format!(
+                "VK constructor payload pointer drifted: got {:#x}, expected {VK_CONSTRUCTOR_PAYLOAD_START:#x}",
+                self.payload_mptr
+            ));
+        }
+        self.map.validate()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -519,34 +591,53 @@ impl VerifierMemoryLayout {
         let final_msm_len = config.pcs.final_msm.input_bytes;
         let acc_msm_len = config.acc_msm_terms * G1_MSM_PAIR_BYTES;
         let batch_invert_len = batch_invert_scratch_bytes(meta, config.num_instances);
+        let quotient_return_len = (2 + meta.num_simple_selectors) * WORD_BYTES;
 
         let mut arena = MemoryArena::default();
         let theta_windows = ThetaWindowLayout::compatibility();
 
         // Low-memory helpers are phase-scoped because the transcript buffer is
         // no longer live once algebra/precompile work begins.
-        arena.alloc_phase_scratch(
+        let constructor_smoke_scratch_mptr = arena.alloc_phase_scratch(
             "constructor_smoke_scratch",
             LOW_MEMORY_SCRATCH_START,
             PAIRING_PAIR_BYTES,
             MemoryPhase::ConstructorSmoke,
         );
-        arena.alloc_phase_scratch(
+        let transcript_mptr = arena.alloc_phase_scratch(
             "transcript_buffer",
             TRANSCRIPT_BUFFER_START,
             config.transcript_words * WORD_BYTES,
             MemoryPhase::Transcript,
         );
-        arena.alloc_phase_scratch(
-            "pcs_pairing_tmp",
+        let legacy_decompression_scratch_mptr = arena.alloc_phase_scratch(
+            "legacy_decompression_scratch",
+            LOW_MEMORY_SCRATCH_START,
+            MODEXP_DECOMPRESSION_WORKING_WORDS * WORD_BYTES,
+            MemoryPhase::LegacyDecompressionScratch,
+        );
+        let pcs_pairing_scratch_mptr = arena.alloc_phase_scratch(
+            "pcs_pairing_static_working",
             PCS_PAIRING_SCRATCH_START,
-            G1_BYTES + G1_MSM_PAIR_BYTES,
+            PCS_STATIC_WORKING_WORDS * WORD_BYTES,
             MemoryPhase::PcsPairing,
         );
-        arena.alloc_phase_scratch(
+        let verifier_return_mptr = arena.alloc_phase_scratch(
+            "verifier_return",
+            VERIFIER_RETURN_BUFFER_START,
+            WORD_BYTES,
+            MemoryPhase::VerifierReturn,
+        );
+        let quotient_return_mptr = arena.alloc_phase_scratch(
+            "quotient_return",
+            QUOTIENT_RETURN_BUFFER_START,
+            quotient_return_len,
+            MemoryPhase::QuotientReturn,
+        );
+        let final_pairing_scratch_mptr = arena.alloc_phase_scratch(
             "final_pairing_scratch",
             crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
-            PAIRING_TWO_PAIR_BYTES,
+            PAIRING_STATIC_WORKING_WORDS * WORD_BYTES,
             MemoryPhase::FinalPairing,
         );
 
@@ -560,7 +651,7 @@ impl VerifierMemoryLayout {
             vk.len(),
             MemoryLifetime::Permanent,
         );
-        arena.alloc_phase_scratch(
+        let scalar_inv_scratch_mptr = arena.alloc_phase_scratch(
             "scalar_inv_scratch",
             vk_start.saturating_sub(MODEXP_SCRATCH_BYTES),
             MODEXP_FRAME_BYTES,
@@ -721,9 +812,9 @@ impl VerifierMemoryLayout {
             let mut scratch = arena.scratch_allocator(acc_msm_scratch_base);
             scratch.alloc_phase_scratch("accumulator_msm", acc_msm_len, MemoryPhase::AccumulatorMsm)
         };
-        arena.alloc_phase_scratch(
+        let accumulator_pairing_batch_mptr = arena.alloc_phase_scratch(
             "accumulator_pairing_batch",
-            G1ADD_INPUT_BYTES,
+            crate::codegen::layout::accumulator::PAIRING_BATCH_PTR,
             ACCUMULATOR_PAIRING_BATCH_BYTES,
             MemoryPhase::AccumulatorPairingBatch,
         );
@@ -731,6 +822,14 @@ impl VerifierMemoryLayout {
         // one-word scratch is placed after every registered region rather than
         // borrowing any phase-specific base.
         let trace_u256_mptr = [
+            constructor_smoke_scratch_mptr + PAIRING_PAIR_BYTES,
+            transcript_mptr + config.transcript_words * WORD_BYTES,
+            legacy_decompression_scratch_mptr + MODEXP_DECOMPRESSION_WORKING_WORDS * WORD_BYTES,
+            pcs_pairing_scratch_mptr + PCS_STATIC_WORKING_WORDS * WORD_BYTES,
+            verifier_return_mptr + WORD_BYTES,
+            quotient_return_mptr + quotient_return_len,
+            final_pairing_scratch_mptr + PAIRING_STATIC_WORKING_WORDS * WORD_BYTES,
+            scalar_inv_scratch_mptr + MODEXP_FRAME_BYTES,
             vk_start + vk.len(),
             challenge_start + meta.challenge_indices.len() * WORD_BYTES,
             theta_start + theta_windows.rot_points_word * WORD_BYTES,
@@ -744,7 +843,7 @@ impl VerifierMemoryLayout {
             pcs_q_com_trace_scratch_mptr + q_com_trace_len,
             pcs_final_msm_scratch_mptr + final_msm_len,
             acc_msm_scratch + acc_msm_len,
-            G1ADD_INPUT_BYTES + ACCUMULATOR_PAIRING_BATCH_BYTES,
+            accumulator_pairing_batch_mptr + ACCUMULATOR_PAIRING_BATCH_BYTES,
         ]
         .into_iter()
         .max()
@@ -760,7 +859,14 @@ impl VerifierMemoryLayout {
         Self {
             map: arena.into_map(),
             theta_windows,
+            constructor_smoke_scratch_mptr,
+            transcript_mptr,
+            legacy_decompression_scratch_mptr,
+            pcs_pairing_scratch_mptr,
+            verifier_return_mptr,
+            quotient_return_mptr,
             vk_mptr,
+            scalar_inv_scratch_mptr,
             challenge_mptr,
             theta_mptr,
             beta_mptr: ptr_at_theta(ThetaSlot::Beta),
@@ -812,6 +918,8 @@ impl VerifierMemoryLayout {
             pcs_q_com_trace_scratch_mptr,
             pcs_final_msm_scratch_mptr,
             acc_msm_scratch,
+            accumulator_pairing_batch_mptr,
+            final_pairing_scratch_mptr,
             trace_u256_mptr,
             pcs: config.pcs,
         }
@@ -819,6 +927,68 @@ impl VerifierMemoryLayout {
 
     /// Validate fixed-window capacities and registered memory lifetimes.
     pub(crate) fn validate(&self) -> Result<(), String> {
+        let fixed_low_memory = [
+            (
+                "constructor_smoke_scratch_mptr",
+                self.constructor_smoke_scratch_mptr,
+                LOW_MEMORY_SCRATCH_START,
+            ),
+            (
+                "transcript_mptr",
+                self.transcript_mptr,
+                TRANSCRIPT_BUFFER_START,
+            ),
+            (
+                "legacy_decompression_scratch_mptr",
+                self.legacy_decompression_scratch_mptr,
+                LOW_MEMORY_SCRATCH_START,
+            ),
+            (
+                "pcs_pairing_scratch_mptr",
+                self.pcs_pairing_scratch_mptr,
+                PCS_PAIRING_SCRATCH_START,
+            ),
+            (
+                "verifier_return_mptr",
+                self.verifier_return_mptr,
+                VERIFIER_RETURN_BUFFER_START,
+            ),
+            (
+                "quotient_return_mptr",
+                self.quotient_return_mptr,
+                QUOTIENT_RETURN_BUFFER_START,
+            ),
+            (
+                "accumulator_pairing_batch_mptr",
+                self.accumulator_pairing_batch_mptr,
+                crate::codegen::layout::accumulator::PAIRING_BATCH_PTR,
+            ),
+            (
+                "final_pairing_scratch_mptr",
+                self.final_pairing_scratch_mptr,
+                crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
+            ),
+        ];
+        for (name, actual, expected) in fixed_low_memory {
+            if actual != expected {
+                return Err(format!(
+                    "fixed memory pointer {name} drifted: got {actual:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+
+        let expected_scalar_inv = self
+            .vk_mptr
+            .value()
+            .as_usize()
+            .saturating_sub(MODEXP_SCRATCH_BYTES);
+        if self.scalar_inv_scratch_mptr != expected_scalar_inv {
+            return Err(format!(
+                "scalar inversion scratch drifted: got {:#x}, expected {expected_scalar_inv:#x}",
+                self.scalar_inv_scratch_mptr
+            ));
+        }
+
         let windows = self.theta_windows;
         if self.pcs.rot_points_words > windows.rot_points_cap_words {
             return Err(format!(
@@ -998,10 +1168,27 @@ mod tests {
             .expect("scratch phases may reuse the same base");
     }
 
+    #[test]
+    fn vk_constructor_payload_is_planner_registered() {
+        let layout = VkConstructorMemoryLayout::new(0x660);
+        let region = layout
+            .map
+            .region("vk_constructor_payload")
+            .expect("VK constructor payload registered");
+
+        assert_eq!(layout.payload_mptr, VK_CONSTRUCTOR_PAYLOAD_START);
+        assert_eq!(region.start, VK_CONSTRUCTOR_PAYLOAD_START);
+        assert_eq!(region.len, 0x660);
+        layout.validate().expect("VK constructor layout is valid");
+    }
+
     fn synthetic_vk() -> Halo2VerifyingKey {
         let fixed: Vec<G1Words> = vec![(U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO)];
+        let constructor_memory = VkConstructorMemoryLayout::new(
+            crate::codegen::layout::VK_HEADER_WORDS * WORD_BYTES + fixed.len() * G1_BYTES,
+        );
         Halo2VerifyingKey {
-            constructor_payload_mptr: crate::codegen::layout::VK_CONSTRUCTOR_PAYLOAD_START,
+            constructor_payload_mptr: constructor_memory.payload_mptr,
             constants: (0..crate::codegen::layout::VK_HEADER_WORDS)
                 .map(|_| ("c", U256::ZERO))
                 .collect(),
@@ -1073,6 +1260,91 @@ mod tests {
             windows.reversed_evals_word,
             theta_window::REVERSED_EVALS_WORD
         );
+    }
+
+    #[test]
+    fn fixed_low_memory_regions_are_planner_registered() {
+        let meta = ConstraintSystemMeta {
+            num_simple_selectors: 3,
+            ..ConstraintSystemMeta::default()
+        };
+        let vk = synthetic_vk();
+        let layout = VerifierMemoryLayout::new(
+            &meta,
+            &vk,
+            Ptr::memory(0x1000),
+            VerifierMemoryLayoutConfig::default(),
+        );
+
+        let cases = [
+            (
+                "constructor_smoke_scratch",
+                layout.constructor_smoke_scratch_mptr,
+                LOW_MEMORY_SCRATCH_START,
+                PAIRING_PAIR_BYTES,
+            ),
+            (
+                "transcript_buffer",
+                layout.transcript_mptr,
+                TRANSCRIPT_BUFFER_START,
+                0,
+            ),
+            (
+                "legacy_decompression_scratch",
+                layout.legacy_decompression_scratch_mptr,
+                LOW_MEMORY_SCRATCH_START,
+                MODEXP_DECOMPRESSION_WORKING_WORDS * WORD_BYTES,
+            ),
+            (
+                "pcs_pairing_static_working",
+                layout.pcs_pairing_scratch_mptr,
+                PCS_PAIRING_SCRATCH_START,
+                PCS_STATIC_WORKING_WORDS * WORD_BYTES,
+            ),
+            (
+                "verifier_return",
+                layout.verifier_return_mptr,
+                VERIFIER_RETURN_BUFFER_START,
+                WORD_BYTES,
+            ),
+            (
+                "quotient_return",
+                layout.quotient_return_mptr,
+                QUOTIENT_RETURN_BUFFER_START,
+                (2 + meta.num_simple_selectors) * WORD_BYTES,
+            ),
+            (
+                "accumulator_pairing_batch",
+                layout.accumulator_pairing_batch_mptr,
+                crate::codegen::layout::accumulator::PAIRING_BATCH_PTR,
+                ACCUMULATOR_PAIRING_BATCH_BYTES,
+            ),
+            (
+                "final_pairing_scratch",
+                layout.final_pairing_scratch_mptr,
+                crate::codegen::layout::FINAL_PAIRING_SCRATCH_START,
+                PAIRING_STATIC_WORKING_WORDS * WORD_BYTES,
+            ),
+        ];
+
+        for (name, field, start, len) in cases {
+            let region = layout.map.region(name).expect("fixed region registered");
+            assert_eq!(field, start, "{name} field drifted");
+            assert_eq!(region.start, start, "{name} start drifted");
+            assert_eq!(region.len, len, "{name} len drifted");
+        }
+
+        let scalar_inv = layout
+            .map
+            .region("scalar_inv_scratch")
+            .expect("scalar inversion scratch registered");
+        assert_eq!(
+            layout.scalar_inv_scratch_mptr,
+            0x1000 - MODEXP_SCRATCH_BYTES
+        );
+        assert_eq!(scalar_inv.start, layout.scalar_inv_scratch_mptr);
+        assert_eq!(scalar_inv.len, MODEXP_FRAME_BYTES);
+        layout.validate().expect("fixed regions are phase-scoped");
     }
 
     #[test]

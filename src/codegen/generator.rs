@@ -710,18 +710,24 @@ impl<'a> SolidityGenerator<'a> {
         // Convert each commitment from G1Projective to G1Affine before
         // EIP-2537 packing.
         let to_affine = |g: &G1Projective| -> G1Affine { g.to_affine() };
-        let fixed_comms = chain![self.vk.fixed_commitments()]
+        let fixed_comms: Vec<_> = chain![self.vk.fixed_commitments()]
             .map(to_affine)
             .map(g1_to_u256s)
             .map(|[a, b, c, d]| (a, b, c, d))
             .collect();
-        let permutation_comms = chain![self.vk.permutation().commitments()]
+        let permutation_comms: Vec<_> = chain![self.vk.permutation().commitments()]
             .map(to_affine)
             .map(g1_to_u256s)
             .map(|[a, b, c, d]| (a, b, c, d))
             .collect();
+        let constructor_payload_len =
+            constants.len() * WORD_BYTES + (fixed_comms.len() + permutation_comms.len()) * G1_BYTES;
+        let constructor_memory = VkConstructorMemoryLayout::new(constructor_payload_len);
+        constructor_memory
+            .validate()
+            .unwrap_or_else(|err| panic!("invalid VK constructor memory layout: {err}"));
         Halo2VerifyingKey {
-            constructor_payload_mptr: layout::VK_CONSTRUCTOR_PAYLOAD_START,
+            constructor_payload_mptr: constructor_memory.payload_mptr,
             constants,
             fixed_comms,
             permutation_comms,
@@ -2723,7 +2729,7 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_external =
             Self::quotient_external_frame(vk_mptr, vk_len, &meta, &memory, sorted_simple.len());
 
-        Halo2QuotientEvaluator {
+        let quotient_evaluator = Halo2QuotientEvaluator {
             template_constants: Default::default(),
             trace: false,
             quotient_pow5_helper,
@@ -2734,10 +2740,12 @@ impl<'a> SolidityGenerator<'a> {
             fr_delta: fr_delta_literal(),
             memory,
             vk_mptr,
+            vk_len,
             challenge_mptr: data.challenge_mptr,
+            num_user_challenges: meta.num_user_challenges.iter().sum(),
             theta_mptr: data.theta_mptr,
-            return_mptr: layout::QUOTIENT_RETURN_BUFFER_START,
             reversed_evals_mptr: data.reversed_evals_mptr,
+            num_evals: meta.num_evals,
             selector_acc_mptr,
             quotient_external,
             quotient_inline_computations,
@@ -2749,7 +2757,11 @@ impl<'a> SolidityGenerator<'a> {
             quotient_program,
             simple_selector_cols: sorted_simple,
             quotient_identity_trace_base: layout::trace::QUOTIENT_IDENTITY_BASE,
-        }
+        };
+        quotient_evaluator
+            .validate_layout()
+            .unwrap_or_else(|err| panic!("invalid generated quotient evaluator layout: {err}"));
+        quotient_evaluator
     }
 
     /// Build the Askama model for the main Solidity verifier contract.
@@ -3146,10 +3158,6 @@ impl<'a> SolidityGenerator<'a> {
             vk_header: Default::default(),
             vk_mptr,
             num_neg_lagranges: meta.rotation_last.unsigned_abs() as usize,
-            constructor_smoke_scratch_mptr: layout::LOW_MEMORY_SCRATCH_START,
-            transcript_mptr: layout::TRANSCRIPT_BUFFER_START,
-            final_pairing_scratch_mptr: layout::FINAL_PAIRING_SCRATCH_START,
-            return_mptr: layout::VERIFIER_RETURN_BUFFER_START,
             user_phases,
             num_user_challenges,
             num_lookups: meta.num_lookups,
@@ -3386,6 +3394,9 @@ impl<'a> SolidityGenerator<'a> {
             layout::FINAL_PAIRING_SCRATCH_START + layout::PAIRING_STATIC_WORKING_WORDS * WORD_BYTES;
         let modexp_end = layout::LOW_MEMORY_SCRATCH_START
             + layout::MODEXP_DECOMPRESSION_WORKING_WORDS * WORD_BYTES;
+        let verifier_return_end = layout::VERIFIER_RETURN_BUFFER_START + WORD_BYTES;
+        let quotient_return_end =
+            layout::QUOTIENT_RETURN_BUFFER_START + (2 + meta.num_simple_selectors) * WORD_BYTES;
 
         itertools::max([
             // Transcript buffer (streaming Keccak256). The buffer must
@@ -3403,6 +3414,10 @@ impl<'a> SolidityGenerator<'a> {
             // bytes output = 9 words; we round up to 16 to leave room
             // for separate scratch areas).
             modexp_end,
+            // Low-memory return frames. The quotient evaluator's output grows
+            // with the number of simple selector buckets.
+            verifier_return_end,
+            quotient_return_end,
         ])
         .unwrap()
     }

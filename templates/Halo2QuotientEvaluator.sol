@@ -85,8 +85,8 @@ contract Halo2QuotientEvaluator {
     // Callee-local scratch for logless trace hooks. This evaluator is invoked
     // through STATICCALL, so trace hooks cannot emit LOG records; this word is
     // overwritten with QUOTIENT_MAGIC immediately before returning.
-    uint256 internal constant        TRACE_U256_MPTR = {{ return_mptr|hex() }};
-    uint256 internal constant    QUOTIENT_OUTPUT_MPTR = {{ return_mptr|hex() }};
+    uint256 internal constant        TRACE_U256_MPTR = {{ memory.quotient_return_mptr|hex() }};
+    uint256 internal constant    QUOTIENT_OUTPUT_MPTR = {{ memory.quotient_return_mptr|hex() }};
 
     // External-call frame metadata. The main verifier staticcalls this
     // contract with exactly QUOTIENT_FRAME_LEN bytes starting at
