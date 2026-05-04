@@ -3292,6 +3292,19 @@ impl<'a> SolidityGenerator<'a> {
             .unwrap_or((false, 0, 0, 0));
 
         let acc_msm_scratch = memory.acc_msm_scratch;
+        let g1msm_single_gas_cap = layout::precompile::g1msm_gas_cap(layout::G1_MSM_PAIR_BYTES);
+        let lin_trace_g1msm_gas_cap = layout::precompile::g1msm_gas_cap(
+            (meta.num_quotients + sorted_simple.len()) * layout::G1_MSM_PAIR_BYTES,
+        );
+        // The accumulator RHS MSM always includes the carried RHS point and may
+        // append generated fixed bases whose public scalars are nonzero. A max
+        // cap is safe because unused precompile gas is returned, and it avoids
+        // rendering the EIP-2537 discount-table switch into runtime bytecode.
+        let acc_rhs_g1msm_gas_cap = layout::precompile::g1msm_gas_cap(
+            (1 + acc_fixed_bases.len()) * layout::G1_MSM_PAIR_BYTES,
+        );
+        let final_pairing_gas_cap =
+            layout::precompile::pairing_gas_cap(layout::PAIRING_TWO_PAIR_BYTES);
 
         let verifier = Halo2Verifier {
             template_constants: Default::default(),
@@ -3301,12 +3314,18 @@ impl<'a> SolidityGenerator<'a> {
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,
+            g1msm_single_gas_cap,
+            lin_trace_g1msm_gas_cap,
+            acc_rhs_g1msm_gas_cap,
+            final_pairing_gas_cap,
             limb7_yul_coeffs: LIMB7_YUL_COEFFS,
             wide_limb7_yul_coeffs: WIDE_LIMB7_YUL_COEFFS,
             fr_delta: fr_delta_literal(),
             embedded_vk: (!separate).then_some(vk),
             expected_vk_codehash,
             vk_len,
+            num_instances: self.num_instances,
+            k: self.vk.get_domain().k() as usize,
             codegen_layout: VerifierCodegenLayout {
                 proof: proof_layout.clone(),
                 memory: memory.clone(),

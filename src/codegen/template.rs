@@ -493,12 +493,24 @@ pub(crate) struct Halo2Verifier {
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,
+    /// Generated gas cap for one-pair G1MSM calls.
+    pub(crate) g1msm_single_gas_cap: usize,
+    /// Generated gas cap for the trace-only linearization MSM.
+    pub(crate) lin_trace_g1msm_gas_cap: usize,
+    /// Generated max gas cap for the accumulator RHS MSM.
+    pub(crate) acc_rhs_g1msm_gas_cap: usize,
+    /// Generated gas cap for the final two-pair KZG pairing check.
+    pub(crate) final_pairing_gas_cap: usize,
     pub(crate) limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
     pub(crate) wide_limb7_yul_coeffs: [&'static str; layout::quotient_limb::LIN_COEFFS],
     pub(crate) fr_delta: String,
     pub(crate) embedded_vk: Option<Halo2VerifyingKey>,
     pub(crate) expected_vk_codehash: Option<U256>,
     pub(crate) vk_len: usize,
+    /// Generated public-instance count for this pinned VK/proof layout.
+    pub(crate) num_instances: usize,
+    /// Generated evaluation domain size exponent.
+    pub(crate) k: usize,
     pub(crate) proof_len: usize,
     pub(crate) codegen_layout: VerifierCodegenLayout,
     pub(crate) memory: VerifierMemoryLayout,
@@ -1140,12 +1152,26 @@ mod tests {
             quotient_pow5_helper: false,
             quotient_limb7_helper: false,
             quotient_wide_limb7_helper: false,
+            g1msm_single_gas_cap: crate::codegen::layout::precompile::g1msm_gas_cap(
+                crate::codegen::layout::G1_MSM_PAIR_BYTES,
+            ),
+            lin_trace_g1msm_gas_cap: crate::codegen::layout::precompile::g1msm_gas_cap(
+                crate::codegen::layout::G1_MSM_PAIR_BYTES,
+            ),
+            acc_rhs_g1msm_gas_cap: crate::codegen::layout::precompile::g1msm_gas_cap(
+                crate::codegen::layout::G1_MSM_PAIR_BYTES,
+            ),
+            final_pairing_gas_cap: crate::codegen::layout::precompile::pairing_gas_cap(
+                crate::codegen::layout::PAIRING_TWO_PAIR_BYTES,
+            ),
             limb7_yul_coeffs: crate::codegen::quotient::LIMB7_YUL_COEFFS,
             wide_limb7_yul_coeffs: crate::codegen::quotient::WIDE_LIMB7_YUL_COEFFS,
             fr_delta: crate::codegen::quotient::fr_delta_literal(),
             embedded_vk: None,
             expected_vk_codehash: Some(U256::from(1u64)),
             vk_len: 0,
+            num_instances: 1,
+            k: 8,
             proof_len,
             codegen_layout: super::VerifierCodegenLayout {
                 proof: proof_layout,

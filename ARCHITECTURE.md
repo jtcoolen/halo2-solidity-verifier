@@ -68,6 +68,14 @@ cannot redirect or mutate the program. This is a size split, not a trust-model
 change: the quotient program is still generated from the same circuit metadata,
 and a verifier deployment accepts exactly one VK runtime hash.
 
+This pinned-artifact model is the reason later code-size optimizations may
+specialize the quotient interpreter itself. The verifier is not intended to
+accept arbitrary VK runtimes at a single deployed address; it accepts one
+generated VK runtime hash. Therefore the rendered VM can omit opcode and memory
+token switch arms that the finalized pinned bytecode never uses. That is a
+runtime-size optimization over the generated artifact, not a change to the
+Rust verifier semantics.
+
 ### Opcode Strategy
 
 The base VM supports compact forms for:

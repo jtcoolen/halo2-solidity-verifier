@@ -34,14 +34,10 @@ pragma solidity ^0.8.24;
 ///   precompiles using identity inputs. Compile with Solidity >=0.8.24 and
 ///   deploy only on chains/forks that support MCOPY and EIP-2537.
 contract Halo2Verifier {
-    /// @notice Reverts when a pinned verifier dependency no longer matches its generated code hash.
-    /// @dev Covers the external verifying-key contract and, in split mode, the quotient evaluator.
-    error InvalidVerifierDependency();
-
     {%- match self.expected_vk_codehash %}
     {%- when Some with (expected_vk_codehash) %}
     /// @notice Verifying-key contract address authorized for this verifier.
-    /// @dev The runtime length and codehash are pinned by generated constants and checked at construction and verification time.
+    /// @dev The runtime length and codehash are pinned by generated constants and checked at construction time.
     address public immutable AUTHORIZED_VK;
     uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
     bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
@@ -341,24 +337,11 @@ contract Halo2Verifier {
         {%- match self.embedded_vk %}
         {%- when None %}
         address vk = AUTHORIZED_VK;
-        if (vk.code.length != EXPECTED_VK_LENGTH || vk.codehash != EXPECTED_VK_CODEHASH) {
-            revert InvalidVerifierDependency();
-        }
         {%- else %}
         {%- endmatch %}
         {%- match quotient_external %}
         {%- when Some with (_) %}
         address quotientEvaluator = AUTHORIZED_QUOTIENT;
-        {%- match self.expected_quotient_codehash %}
-        {%- when Some with (_) %}
-        if (
-            quotientEvaluator.code.length != EXPECTED_QUOTIENT_LENGTH
-                || quotientEvaluator.codehash != EXPECTED_QUOTIENT_CODEHASH
-        ) {
-            revert InvalidVerifierDependency();
-        }
-        {%- when None %}
-        {%- endmatch %}
         {%- when None %}
         {%- endmatch %}
         assembly ("memory-safe") {
@@ -554,154 +537,6 @@ contract Halo2Verifier {
                 mstore(second_mptr, inv_second)
             }
 
-            function g1add_gas_cap() -> cap {
-                cap := {{ template_constants.eip2537.g1add_gas_cap }}
-            }
-
-            function g1msm_gas_cap(input_len) -> cap {
-                let k := div(input_len, {{ template_constants.g1_msm_pair_bytes|hex() }})
-                let discount := 519
-                switch k
-                case 0 { discount := 0 }
-                case 1 { discount := 1000 }
-                case 2 { discount := 949 }
-                case 3 { discount := 848 }
-                case 4 { discount := 797 }
-                case 5 { discount := 764 }
-                case 6 { discount := 750 }
-                case 7 { discount := 738 }
-                case 8 { discount := 728 }
-                case 9 { discount := 719 }
-                case 10 { discount := 712 }
-                case 11 { discount := 705 }
-                case 12 { discount := 698 }
-                case 13 { discount := 692 }
-                case 14 { discount := 687 }
-                case 15 { discount := 682 }
-                case 16 { discount := 677 }
-                case 17 { discount := 673 }
-                case 18 { discount := 669 }
-                case 19 { discount := 665 }
-                case 20 { discount := 661 }
-                case 21 { discount := 658 }
-                case 22 { discount := 654 }
-                case 23 { discount := 651 }
-                case 24 { discount := 648 }
-                case 25 { discount := 645 }
-                case 26 { discount := 642 }
-                case 27 { discount := 640 }
-                case 28 { discount := 637 }
-                case 29 { discount := 635 }
-                case 30 { discount := 632 }
-                case 31 { discount := 630 }
-                case 32 { discount := 627 }
-                case 33 { discount := 625 }
-                case 34 { discount := 623 }
-                case 35 { discount := 621 }
-                case 36 { discount := 619 }
-                case 37 { discount := 617 }
-                case 38 { discount := 615 }
-                case 39 { discount := 613 }
-                case 40 { discount := 611 }
-                case 41 { discount := 609 }
-                case 42 { discount := 608 }
-                case 43 { discount := 606 }
-                case 44 { discount := 604 }
-                case 45 { discount := 603 }
-                case 46 { discount := 601 }
-                case 47 { discount := 599 }
-                case 48 { discount := 598 }
-                case 49 { discount := 596 }
-                case 50 { discount := 595 }
-                case 51 { discount := 593 }
-                case 52 { discount := 592 }
-                case 53 { discount := 591 }
-                case 54 { discount := 589 }
-                case 55 { discount := 588 }
-                case 56 { discount := 586 }
-                case 57 { discount := 585 }
-                case 58 { discount := 584 }
-                case 59 { discount := 582 }
-                case 60 { discount := 581 }
-                case 61 { discount := 580 }
-                case 62 { discount := 579 }
-                case 63 { discount := 577 }
-                case 64 { discount := 576 }
-                case 65 { discount := 575 }
-                case 66 { discount := 574 }
-                case 67 { discount := 573 }
-                case 68 { discount := 572 }
-                case 69 { discount := 570 }
-                case 70 { discount := 569 }
-                case 71 { discount := 568 }
-                case 72 { discount := 567 }
-                case 73 { discount := 566 }
-                case 74 { discount := 565 }
-                case 75 { discount := 564 }
-                case 76 { discount := 563 }
-                case 77 { discount := 562 }
-                case 78 { discount := 561 }
-                case 79 { discount := 560 }
-                case 80 { discount := 559 }
-                case 81 { discount := 558 }
-                case 82 { discount := 557 }
-                case 83 { discount := 556 }
-                case 84 { discount := 555 }
-                case 85 { discount := 554 }
-                case 86 { discount := 553 }
-                case 87 { discount := 552 }
-                case 88 { discount := 551 }
-                case 89 { discount := 550 }
-                case 90 { discount := 549 }
-                case 91 { discount := 548 }
-                case 92 { discount := 547 }
-                case 93 { discount := 547 }
-                case 94 { discount := 546 }
-                case 95 { discount := 545 }
-                case 96 { discount := 544 }
-                case 97 { discount := 543 }
-                case 98 { discount := 542 }
-                case 99 { discount := 541 }
-                case 100 { discount := 540 }
-                case 101 { discount := 540 }
-                case 102 { discount := 539 }
-                case 103 { discount := 538 }
-                case 104 { discount := 537 }
-                case 105 { discount := 536 }
-                case 106 { discount := 536 }
-                case 107 { discount := 535 }
-                case 108 { discount := 534 }
-                case 109 { discount := 533 }
-                case 110 { discount := 532 }
-                case 111 { discount := 532 }
-                case 112 { discount := 531 }
-                case 113 { discount := 530 }
-                case 114 { discount := 529 }
-                case 115 { discount := 528 }
-                case 116 { discount := 528 }
-                case 117 { discount := 527 }
-                case 118 { discount := 526 }
-                case 119 { discount := 525 }
-                case 120 { discount := 525 }
-                case 121 { discount := 524 }
-                case 122 { discount := 523 }
-                case 123 { discount := 522 }
-                case 124 { discount := 522 }
-                case 125 { discount := 521 }
-                case 126 { discount := 520 }
-                case 127 { discount := 520 }
-                case 128 { discount := 519 }
-                // EIP-2537 G1MSM gas: k * discount[k] * 12000 / 1000.
-                // The generated call sites pass input_len constants derived
-                // from the circuit/VK-specific MSM term counts.
-                cap := add({{ template_constants.eip2537.g1msm_base_gas }}, div(mul(mul(k, discount), {{ template_constants.eip2537.g1msm_scalar_multiplication_cost }}), {{ template_constants.eip2537.g1msm_discount_denominator }}))
-            }
-
-            function pairing_gas_cap(input_len) -> cap {
-                // Pairing inputs are 0x180 bytes per (G1, G2) pair.
-                cap := add({{ template_constants.eip2537.pairing_base_gas }}, mul(div(input_len, {{ template_constants.pairing_pair_bytes|hex() }}), {{ template_constants.eip2537.pairing_pair_gas }}))
-            }
-
             function ec_pairing(success, lhs_mptr, rhs_mptr) -> ret {
                 ret := success
                 if iszero(ret) { leave }
@@ -716,7 +551,7 @@ contract Halo2Verifier {
                 mcopy(add(scratch, 0x80),   G2_BASE_MPTR,             0x100)
                 mcopy(add(scratch, 0x180),  rhs_mptr,                 0x80)
                 mcopy(add(scratch, 0x200),  NEG_S_G2_BASE_MPTR,       0x100)
-                ret := staticcall(pairing_gas_cap({{ template_constants.pairing_two_pair_bytes|hex() }}), {{ template_constants.eip2537.pairing_address|hex() }}, scratch, {{ template_constants.pairing_two_pair_bytes|hex() }}, scratch, {{ template_constants.word_bytes|hex() }})
+                ret := staticcall({{ final_pairing_gas_cap }}, {{ template_constants.eip2537.pairing_address|hex() }}, scratch, {{ template_constants.pairing_two_pair_bytes|hex() }}, scratch, {{ template_constants.word_bytes|hex() }})
                 ret := and(ret, eq(returndatasize(), {{ template_constants.word_bytes|hex() }}))
                 ret := and(ret, mload(scratch))
                 if iszero(ret) { revert(0, 0) }
@@ -919,22 +754,14 @@ contract Halo2Verifier {
                 extcodecopy(vk, VK_MPTR, 0x00, {{ vk_len|hex() }})
                 {%- endmatch %}
 
-                // The code generator knows whether this verifier expects
-                // public accumulator limbs and how they are packed. Check
-                // the VK header agrees before decoding instance words under
-                // the wrong schema.
-                success := and(success, eq(mload(HAS_ACCUMULATOR_MPTR), {%- if self.expected_has_accumulator %} 1 {%- else %} 0 {%- endif %}))
-                success := and(success, eq(mload(ACC_OFFSET_MPTR), {{ self.expected_acc_offset }}))
-                success := and(success, eq(mload(NUM_ACC_LIMBS_MPTR), {{ self.expected_num_acc_limbs }}))
-                success := and(success, eq(mload(NUM_ACC_LIMB_BITS_MPTR), {{ self.expected_num_acc_limb_bits }}))
-
+                // This verifier is pinned to one generated VK, so schema
+                // values such as instance count and accumulator layout are
+                // rendered as constants instead of reread from the VK header.
                 success := and(success, eq({{ proof_len|hex() }}, calldataload(PROOF_LEN_CPTR)))
-
-                let num_instances := mload(NUM_INSTANCES_MPTR)
-                success := and(success, eq(num_instances, calldataload(NUM_INSTANCE_CPTR)))
+                success := and(success, eq({{ num_instances }}, calldataload(NUM_INSTANCE_CPTR)))
                 success := and(
                     success,
-                    eq(calldatasize(), add(INSTANCE_CPTR, mul(0x20, num_instances)))
+                    eq(calldatasize(), add(INSTANCE_CPTR, {{ (num_instances * 32)|hex() }}))
                 )
                 if iszero(success) { revert(0, 0) }
             }
@@ -971,13 +798,12 @@ contract Halo2Verifier {
             }
 
             {
-                let num_instances := mload(NUM_INSTANCES_MPTR)
                 // Native verifier absorbs a length scalar before instance
                 // values; Keccak Fq transcript input is canonical BE.
-                buf_len := common_word(buf_len, num_instances)
+                buf_len := common_word(buf_len, {{ num_instances }})
 
                 let instance_cptr := INSTANCE_CPTR
-                for { let instance_cptr_end := add(instance_cptr, mul(0x20, num_instances)) }
+                for { let instance_cptr_end := add(instance_cptr, {{ (num_instances * 32)|hex() }}) }
                     lt(instance_cptr, instance_cptr_end)
                     { instance_cptr := add(instance_cptr, 0x20) } {
                     let inst_be := calldataload(instance_cptr)
@@ -1260,7 +1086,7 @@ contract Halo2Verifier {
             // Lagrange & instance-evaluation block (pure Fr arithmetic).
             // ===============================================================
             {
-                let k := mload(K_MPTR)
+                let k := {{ k }}
                 let x := mload(X_MPTR)
                 let x_n := x
                 for { let idx := 0 } lt(idx, k) { idx := add(idx, 1) } {
@@ -1270,10 +1096,10 @@ contract Halo2Verifier {
                 let omega := mload(OMEGA_MPTR)
 
                 let mptr := X_N_MPTR
-                let mptr_end := add(mptr, mul(0x20, add(mload(NUM_INSTANCES_MPTR), {{ num_neg_lagranges }})))
-                if iszero(mload(NUM_INSTANCES_MPTR)) {
-                    mptr_end := add(mptr_end, 0x20)
-                }
+                let mptr_end := add(mptr, {{ ((num_instances + num_neg_lagranges) * 32)|hex() }})
+                {%- if num_instances == 0 %}
+                mptr_end := add(mptr_end, 0x20)
+                {%- endif %}
                 for { let pow_of_omega := mload(OMEGA_INV_TO_L_MPTR) }
                     lt(mptr, mptr_end)
                     { mptr := add(mptr, 0x20) } {
@@ -1304,7 +1130,7 @@ contract Halo2Verifier {
                 let instance_eval := 0
                 for {
                         let instance_cptr := INSTANCE_CPTR
-                        let instance_cptr_end := add(instance_cptr, mul(0x20, mload(NUM_INSTANCES_MPTR)))
+                        let instance_cptr_end := add(instance_cptr, {{ (num_instances * 32)|hex() }})
                     }
                     lt(instance_cptr, instance_cptr_end)
                     { instance_cptr := add(instance_cptr, 0x20)
@@ -1381,7 +1207,7 @@ contract Halo2Verifier {
             // ===============================================================
             {
                 let x := mload(X_MPTR)
-                let k := mload(K_MPTR)
+                let k := {{ k }}
                 let x_pow_2i := x
                 let x_pow_2i_minus1 := 1
                 for { let idx := 0 } lt(idx, k) { idx := add(idx, 1) } {
@@ -1420,7 +1246,7 @@ contract Halo2Verifier {
                 mstore(add(lin_pair, 0x80), mload(add(SELECTOR_ACC_MPTR, {{ (loop.index0 * 0x20)|hex() }})))
                 lin_pair := add(lin_pair, 0xa0)
                 {%- endfor %}
-                let lin_trace_ok := staticcall(g1msm_gas_cap({{ ((num_quotients + simple_selector_cols.len()) * template_constants.g1_msm_pair_bytes)|hex() }}), {{ template_constants.eip2537.g1msm_address|hex() }}, lin_scratch, {{ ((num_quotients + simple_selector_cols.len()) * template_constants.g1_msm_pair_bytes)|hex() }}, lin_scratch, {{ template_constants.g1_bytes|hex() }})
+                let lin_trace_ok := staticcall({{ lin_trace_g1msm_gas_cap }}, {{ template_constants.eip2537.g1msm_address|hex() }}, lin_scratch, {{ ((num_quotients + simple_selector_cols.len()) * template_constants.g1_msm_pair_bytes)|hex() }}, lin_scratch, {{ template_constants.g1_bytes|hex() }})
                 lin_trace_ok := and(lin_trace_ok, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                 if iszero(lin_trace_ok) {
                     mstore(0, 34)
@@ -1475,20 +1301,16 @@ contract Halo2Verifier {
             //
             // If either original equation is bad, this combined equation
             // holds for at most one alpha in Fr.
-            if mload(HAS_ACCUMULATOR_MPTR) {
-                let bits := mload(NUM_ACC_LIMB_BITS_MPTR)
-                let n := mload(NUM_ACC_LIMBS_MPTR)
+            {%- if self.expected_has_accumulator %}
+            {
+                let bits := {{ self.expected_num_acc_limb_bits }}
+                let n := {{ self.expected_num_acc_limbs }}
                 // The BLS12-381 self-emulation currently exposes Fp
                 // coordinates as 7 radix-2^56 limbs.
-                success := and(success, eq(bits, {{ template_constants.accumulator.limb_bits }}))
-                success := and(success, eq(n, {{ template_constants.accumulator.limbs }}))
-
                 let limb_base := shl(bits, 1)
                 let limbs_per_word := {{ template_constants.accumulator.limbs_per_word }}
                 let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
-                let acc_expected_words := add(add(mload(ACC_OFFSET_MPTR), add(mul({{ (template_constants.accumulator.point_coords * 2)|hex() }}, coord_words), {{ template_constants.accumulator.carried_scalars }})), {{ acc_fixed_bases.len() }})
-                success := and(success, eq(mload(NUM_INSTANCES_MPTR), acc_expected_words))
-                let acc_instance_ptr := add(INSTANCE_CPTR, mul(mload(ACC_OFFSET_MPTR), 0x20))
+                let acc_instance_ptr := add(INSTANCE_CPTR, {{ (self.expected_acc_offset * 32)|hex() }})
 
                 // LHS layout: point limbs (x,y), scalar. The collapsed
                 // accumulator has no fixed-base scalars on the LHS.
@@ -1507,7 +1329,7 @@ contract Halo2Verifier {
                     mcopy(acc_scratch, ACC_LHS_MPTR, 0x80)
                     mstore(add(acc_scratch, 0x80), lhs_scalar)
                     if success {
-                        success := staticcall(g1msm_gas_cap({{ template_constants.g1_msm_pair_bytes|hex() }}), {{ template_constants.eip2537.g1msm_address|hex() }}, acc_scratch, {{ template_constants.g1_msm_pair_bytes|hex() }}, ACC_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
+                        success := staticcall({{ g1msm_single_gas_cap }}, {{ template_constants.eip2537.g1msm_address|hex() }}, acc_scratch, {{ template_constants.g1_msm_pair_bytes|hex() }}, ACC_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                         success := and(success, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                     }
                 }
@@ -1559,7 +1381,7 @@ contract Halo2Verifier {
                 if acc_msm_len {
                     if success {
                         success := staticcall(
-                            g1msm_gas_cap(acc_msm_len),
+                            {{ acc_rhs_g1msm_gas_cap }},
                             {{ template_constants.eip2537.g1msm_address|hex() }},
                             acc_scratch,
                             acc_msm_len,
@@ -1586,12 +1408,12 @@ contract Halo2Verifier {
                     mcopy(batch_ptr, ACC_RHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                     mstore(add(batch_ptr, {{ template_constants.g1_bytes|hex() }}), acc_pair_alpha)
                     if success {
-                        success := staticcall(g1msm_gas_cap({{ template_constants.g1_msm_pair_bytes|hex() }}), {{ template_constants.eip2537.g1msm_address|hex() }}, batch_ptr, {{ template_constants.g1_msm_pair_bytes|hex() }}, batch_ptr, {{ template_constants.g1_bytes|hex() }})
+                        success := staticcall({{ g1msm_single_gas_cap }}, {{ template_constants.eip2537.g1msm_address|hex() }}, batch_ptr, {{ template_constants.g1_msm_pair_bytes|hex() }}, batch_ptr, {{ template_constants.g1_bytes|hex() }})
                         success := and(success, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                     }
                     mcopy(add(batch_ptr, {{ template_constants.g1_bytes|hex() }}), PAIRING_RHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                     if success {
-                        success := staticcall(g1add_gas_cap(), {{ template_constants.eip2537.g1add_address|hex() }}, batch_ptr, {{ template_constants.g1add_input_bytes|hex() }}, PAIRING_RHS_MPTR, {{ template_constants.g1_bytes|hex() }})
+                        success := staticcall({{ template_constants.eip2537.g1add_gas_cap }}, {{ template_constants.eip2537.g1add_address|hex() }}, batch_ptr, {{ template_constants.g1add_input_bytes|hex() }}, PAIRING_RHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                         success := and(success, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                     }
 
@@ -1599,19 +1421,20 @@ contract Halo2Verifier {
                     mcopy(batch_ptr, ACC_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                     mstore(add(batch_ptr, {{ template_constants.g1_bytes|hex() }}), acc_pair_alpha)
                     if success {
-                        success := staticcall(g1msm_gas_cap({{ template_constants.g1_msm_pair_bytes|hex() }}), {{ template_constants.eip2537.g1msm_address|hex() }}, batch_ptr, {{ template_constants.g1_msm_pair_bytes|hex() }}, batch_ptr, {{ template_constants.g1_bytes|hex() }})
+                        success := staticcall({{ g1msm_single_gas_cap }}, {{ template_constants.eip2537.g1msm_address|hex() }}, batch_ptr, {{ template_constants.g1_msm_pair_bytes|hex() }}, batch_ptr, {{ template_constants.g1_bytes|hex() }})
                         success := and(success, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                     }
                     mcopy(add(batch_ptr, {{ template_constants.g1_bytes|hex() }}), PAIRING_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                     if success {
-                        success := staticcall(g1add_gas_cap(), {{ template_constants.eip2537.g1add_address|hex() }}, batch_ptr, {{ template_constants.g1add_input_bytes|hex() }}, PAIRING_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
+                        success := staticcall({{ template_constants.eip2537.g1add_gas_cap }}, {{ template_constants.eip2537.g1add_address|hex() }}, batch_ptr, {{ template_constants.g1add_input_bytes|hex() }}, PAIRING_LHS_MPTR, {{ template_constants.g1_bytes|hex() }})
                         success := and(success, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                     }
                 }
             }
+            {%- endif %}
 
             {%- if self.gas_checkpoints %}
-            gas_checkpoint(15) // after public accumulator pairing batch prep (no-op when HAS_ACCUMULATOR_MPTR == 0)
+            gas_checkpoint(15) // after public accumulator pairing batch prep (omitted for no-accumulator VKs)
             {%- endif %}
 
             // The Yul `ec_pairing` helper checks
@@ -1636,8 +1459,8 @@ contract Halo2Verifier {
 
             {%- if self.trace %}
             trace_u256(1,  mload(VK_DIGEST_MPTR))
-            trace_u256(2,  mload(NUM_INSTANCES_MPTR))
-            trace_u256(3,  mload(K_MPTR))
+            trace_u256(2,  {{ num_instances }})
+            trace_u256(3,  {{ k }})
             trace_u256(4,  mload(N_INV_MPTR))
             trace_u256(5,  mload(OMEGA_MPTR))
             trace_u256(6,  mload(OMEGA_INV_MPTR))
@@ -1675,10 +1498,10 @@ contract Halo2Verifier {
             trace_u256(32, mload(V_MPTR))
             trace_point(33, FINAL_COM_MPTR)
             trace_u256(35, success)
-            if mload(HAS_ACCUMULATOR_MPTR) {
-                trace_point(29, ACC_LHS_MPTR)
-                trace_point(30, ACC_RHS_MPTR)
-            }
+            {%- if self.expected_has_accumulator %}
+            trace_point(29, ACC_LHS_MPTR)
+            trace_point(30, ACC_RHS_MPTR)
+            {%- endif %}
             {%- endif %}
 
             mstore(RETURN_MPTR, 1)

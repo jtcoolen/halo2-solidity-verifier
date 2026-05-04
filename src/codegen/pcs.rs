@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 
 use crate::codegen::{
-    layout::trace,
+    layout::{self, trace},
     memory::{
         FinalMsmShape, PcsMemoryRequirements, VerifierMemoryLayout, G1ADD_INPUT_BYTES, G1_BYTES,
         G1_MSM_PAIR_BYTES, PCS_STATIC_WORKING_WORDS, WORD_BYTES,
@@ -1099,8 +1099,9 @@ pub(super) fn computations(
                 "q_com trace MSM input term count changed during emission"
             );
             let msm_len = non_identity_terms * G1_MSM_PAIR_BYTES;
+            let msm_gas_cap = layout::precompile::g1msm_gas_cap(msm_len);
             lines.push(format!(
-                "let q_com_trace_ok_{set_idx} := staticcall(g1msm_gas_cap({msm_len:#x}), 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, {G1_BYTES:#x})"
+                "let q_com_trace_ok_{set_idx} := staticcall({msm_gas_cap}, 0x0c, {trace_scratch:#x}, {msm_len:#x}, {trace_scratch:#x}, {G1_BYTES:#x})"
             ));
             lines.push(format!(
                 "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1510,10 +1511,10 @@ pub(super) fn computations(
             "final MSM input term count changed during emission"
         );
 
+        let final_msm_gas_cap = layout::precompile::g1msm_gas_cap(final_msm_len);
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({:#x}), 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, {G1_BYTES:#x})",
-            final_msm_len,
+            "    success := staticcall({final_msm_gas_cap}, 0x0c, {final_msm_scratch:#x}, {:#x}, {final_msm_scratch:#x}, {G1_BYTES:#x})",
             final_msm_len
         ));
         lines.push(format!(
@@ -1562,7 +1563,8 @@ pub(super) fn computations(
         ));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {scratch:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
+            "    success := staticcall({}, 0x0c, {scratch:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})",
+            layout::precompile::g1msm_gas_cap(G1_MSM_PAIR_BYTES)
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1575,7 +1577,8 @@ pub(super) fn computations(
         ));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
+            "    success := staticcall({}, 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})",
+            layout::precompile::G1ADD_GAS_CAP
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1587,7 +1590,8 @@ pub(super) fn computations(
         lines.push(format!("mstore({scratch_g1add_scalar:#x}, mload(X3_MPTR))"));
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1msm_gas_cap({G1_MSM_PAIR_BYTES:#x}), 0x0c, {scratch_g1_b:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch_g1_b:#x}, {G1_BYTES:#x})"
+            "    success := staticcall({}, 0x0c, {scratch_g1_b:#x}, {G1_MSM_PAIR_BYTES:#x}, {scratch_g1_b:#x}, {G1_BYTES:#x})",
+            layout::precompile::g1msm_gas_cap(G1_MSM_PAIR_BYTES)
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"
@@ -1595,7 +1599,8 @@ pub(super) fn computations(
         lines.push("}".to_string());
         lines.push("if success {".to_string());
         lines.push(format!(
-            "    success := staticcall(g1add_gas_cap(), 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})"
+            "    success := staticcall({}, 0x0b, {scratch:#x}, {G1ADD_INPUT_BYTES:#x}, {scratch:#x}, {G1_BYTES:#x})",
+            layout::precompile::G1ADD_GAS_CAP
         ));
         lines.push(format!(
             "    success := and(success, eq(returndatasize(), {G1_BYTES:#x}))"

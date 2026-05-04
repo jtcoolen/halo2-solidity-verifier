@@ -107,6 +107,38 @@ pub(crate) mod precompile {
     /// EIP-2537 pairing gas formula: base + pair_count * pair_cost.
     pub(crate) const PAIRING_BASE_GAS: usize = 50_000;
     pub(crate) const PAIRING_PAIR_GAS: usize = 60_000;
+
+    /// EIP-2537 G1MSM discount table for k = 0..128.
+    ///
+    /// k=0 is not a real precompile input shape for verifier calls, but keeping
+    /// it in the table preserves the previous Yul helper's behavior.
+    pub(crate) const G1MSM_DISCOUNT_TABLE: [usize; 129] = [
+        0, 1000, 949, 848, 797, 764, 750, 738, 728, 719, 712, 705, 698, 692, 687, 682, 677, 673,
+        669, 665, 661, 658, 654, 651, 648, 645, 642, 640, 637, 635, 632, 630, 627, 625, 623, 621,
+        619, 617, 615, 613, 611, 609, 608, 606, 604, 603, 601, 599, 598, 596, 595, 593, 592, 591,
+        589, 588, 586, 585, 584, 582, 581, 580, 579, 577, 576, 575, 574, 573, 572, 570, 569, 568,
+        567, 566, 565, 564, 563, 562, 561, 560, 559, 558, 557, 556, 555, 554, 553, 552, 551, 550,
+        549, 548, 547, 547, 546, 545, 544, 543, 542, 541, 540, 540, 539, 538, 537, 536, 536, 535,
+        534, 533, 532, 532, 531, 530, 529, 528, 528, 527, 526, 525, 525, 524, 523, 522, 522, 521,
+        520, 520, 519,
+    ];
+
+    /// Return the bounded gas cap for a G1MSM input of `input_len` bytes.
+    ///
+    /// Pinned verifier codegen knows each static MSM input length, so rendering
+    /// this value as a literal avoids carrying the whole discount-table switch
+    /// in deployed Yul.
+    pub(crate) fn g1msm_gas_cap(input_len: usize) -> usize {
+        let k = input_len / super::G1_MSM_PAIR_BYTES;
+        let discount = G1MSM_DISCOUNT_TABLE.get(k).copied().unwrap_or(519);
+        G1MSM_BASE_GAS
+            + k * discount * G1MSM_SCALAR_MULTIPLICATION_COST / G1MSM_DISCOUNT_DENOMINATOR
+    }
+
+    /// Return the bounded gas cap for a pairing input of `input_len` bytes.
+    pub(crate) fn pairing_gas_cap(input_len: usize) -> usize {
+        PAIRING_BASE_GAS + (input_len / super::PAIRING_PAIR_BYTES) * PAIRING_PAIR_GAS
+    }
 }
 
 pub(crate) mod modexp_frame {

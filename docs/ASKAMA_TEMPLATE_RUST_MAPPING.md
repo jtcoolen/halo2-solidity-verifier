@@ -384,8 +384,8 @@ comparison against the instrumented Rust verifier.
 
 | Optimisation | Where | Benefit | Tradeoff / invariant |
 | --- | --- | --- | --- |
-| Separate VK payload contract | `Halo2VerifyingKey.sol`, `VkPayloadLayout` | Moves large constants and commitments out of verifier runtime | Verifier must pin runtime length and codehash; no runtime-mutability trust |
-| Split quotient evaluator | `Halo2QuotientEvaluator.sol` | Moves the largest scalar arithmetic body out of main verifier bytecode | Evaluator is correctness-critical and must be codehash pinned |
+| Separate VK payload contract | `Halo2VerifyingKey.sol`, `VkPayloadLayout` | Moves large constants and commitments out of verifier runtime | Constructor pins runtime length/codehash; per-proof codehash rechecks are omitted |
+| Split quotient evaluator | `Halo2QuotientEvaluator.sol` | Moves the largest scalar arithmetic body out of main verifier bytecode | Evaluator is correctness-critical and constructor-pinned |
 | Compact quotient VM | `quotient/mod.rs`, `QuotientNumeratorBlock.yul` | Reduces Solidity/Yul bytecode and improves compile stability | Higher runtime gas for interpreted identities |
 | Inline identity prefix | `quotient_program_plan` | Lowers gas for the first expensive identities | Increases verifier/evaluator runtime size |
 | Native permutation/lookup callbacks | `generator.rs`, `QuotientNumeratorBlock.yul` | Avoids interpreter overhead on structured product loops | Callback scratch must be reserved by the memory planner |
@@ -400,7 +400,7 @@ comparison against the instrumented Rust verifier.
 | Fewer point sets / dummy queries | `pcs.rs::compute_dummy_queries` | Can reduce KZG point-set work for selected profiles | Proof layout and transcript must include matching dummy evals |
 | Truncated PCS challenges | `truncated-challenges` feature | Mirrors Midfall KZG challenge truncation where enabled | Only the specified challenges/powers are truncated |
 | Accumulator pairing batch | `Halo2Verifier.sol` accumulator section | Combines public accumulator pairing with final KZG pairing | Batch randomizer is derived after all four G1 inputs are fixed |
-| EIP-2537 gas caps and return-size checks | `TemplateConstants`, helper wrappers | Catches missing or incompatible precompiles | Gas constants must match target fork assumptions |
+| EIP-2537 gas caps and return-size checks | `TemplateConstants`, `layout::precompile::*_gas_cap` | Catches missing or incompatible precompiles without a runtime gas-table helper | Gas constants must match target fork assumptions |
 | Gas checkpoints | `render_with_gas_checkpoints*` | Gives stable section-level gas deltas | Not a `view` verifier; profiling only |
 
 ## Trace Coverage

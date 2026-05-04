@@ -101,6 +101,42 @@ The generated verifier does not:
 - Provide a production audit guarantee. The repository README still marks the
   verifier as unaudited.
 
+### 1.3 Genericity Boundary
+
+There are two different notions of "generic" in this codebase:
+
+1. A reusable verifier binary that accepts arbitrary verifying keys at runtime.
+2. A generated verifier whose compact quotient VM can interpret a range of
+   generated quotient bytecode programs stored in the VK payload.
+
+The deployed artifact is not the first kind. Even in separate-VK mode, the
+verifier pins `Halo2VerifyingKey` by exact runtime length and codehash and then
+loads exactly those bytes with `extcodecopy`. The proof layout, query order,
+evaluation counts, memory layout, selector buckets, lookup chunking,
+permutation/trash shape, quotient frame length, and PCS point-set plan are all
+generated from one `VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>`.
+
+Before VM-case specialization, the quotient interpreter was closer to the
+second kind: it rendered every opcode case supported by the selected physical
+encoding. If a different pinned VK payload had contained a different valid
+quotient bytecode program using another supported opcode, the interpreter
+itself would probably not have been the blocker. The surrounding verifier still
+would have been VK/generated-shape-specific for the reasons above.
+
+After VM-case specialization, the interpreter is also VK-specialized: codegen
+scans the finalized quotient bytecode and renders only the opcode and memory
+token cases that can occur in that pinned program. This shrinks deployed
+runtime while preserving fail-closed behavior for malformed bytecode: any
+unrendered opcode, reserved opcode, invalid token, or invalid native callback
+index reaches `revert(0, 0)`.
+
+If a future deployment requirement is "one verifier binary for many VKs with
+the same high-level CS parameters", this optimization must become optional or
+be disabled for that profile. Such a generic profile would also need to revisit
+VK/evaluator codehash pinning, proof-layout constants, native callbacks, and
+any generated Yul that is derived from a single identity stream rather than
+from runtime VK data.
+
 ## 2. Terminology
 
 This repository follows `midnight_curves` naming, where `Fq` is used as the
@@ -153,11 +189,13 @@ that payload as runtime bytecode. The verifier:
 2. Stores the expected VK runtime `keccak256` codehash.
 3. Accepts the VK address in the constructor.
 4. Checks length and codehash in the constructor.
-5. Checks length and codehash again in `verifyProof`.
-6. Loads the VK payload using `extcodecopy(vk, VK_MPTR, 0, vk_len)`.
+5. Loads the VK payload using `extcodecopy(vk, VK_MPTR, 0, vk_len)`.
 
 The separate VK is a code-size split, not a new trust boundary. The generated
-verifier accepts exactly the pinned runtime bytes.
+verifier accepts exactly the pinned runtime bytes. Because the verifier already
+targets Cancun/Prague semantics (`MCOPY` plus EIP-2537), constructor pinning is
+treated as sufficient runtime immutability; `verifyProof` does not spend gas
+rechecking dependency codehashes on every proof.
 
 ### 3.3 Split Quotient Mode
 
@@ -1438,7 +1476,8 @@ Every EIP-2537 call checks:
 - Exact return-data size.
 - For pairing, returned word is 1.
 
-Gas caps are generated instead of forwarding all remaining gas:
+Gas caps are generated as literals instead of forwarding all remaining gas or
+carrying the EIP-2537 discount table in runtime bytecode:
 
 - G1ADD cap: `50000`.
 - G1MSM cap: `50000 + k * discount[k] * 12000 / 1000`, with the EIP-2537
@@ -1552,7 +1591,7 @@ A fresh implementation is compatible if it satisfies all of the following:
 - Constructs PCS intermediate sets, dummy queries, `q_eval_set`, `f_eval`,
   `final_com`, `v`, and pairing inputs as in section 12.
 - Pins every external correctness-critical artifact by runtime length and
-  codehash.
+  codehash at construction/deployment time.
 - Checks every scalar `< r`.
 - Rejects non-canonical padded G1 coordinates before transcript absorption.
 - Ensures every absorbed G1 is validated by an EIP-2537 path before success.
@@ -1586,7 +1625,7 @@ Minimum validation for a reimplementation:
   - non-canonical padded coordinate;
   - wrong proof length;
   - trailing calldata;
-  - wrong VK codehash;
-  - wrong quotient evaluator codehash.
+  - wrong VK codehash at construction;
+  - wrong quotient evaluator codehash at construction.
 
 Repository commands are documented in `README.md` and `TESTING.md`.

@@ -64,9 +64,9 @@ EXPECTED_QUOTIENT_LENGTH
 EXPECTED_QUOTIENT_CODEHASH
 ```
 
-The verifier checks those constants at construction and again before proof
-verification. The evaluator output also carries a generated magic word, and
-the verifier rejects outputs with the wrong size or wrong magic.
+The verifier checks those constants at construction. The evaluator output also
+carries a generated magic word, and the verifier rejects outputs with the wrong
+size or wrong magic.
 
 ## Frame ABI
 
@@ -509,6 +509,18 @@ The VM has opcodes for:
 
 The VM is the bytecode-size lever: moving identities into it usually shrinks
 deployed bytecode but costs more runtime gas.
+
+The bytecode is part of the generated, pinned VK payload, not a runtime input
+chosen by the prover. Recent gas-capped profiles also specialize the Yul
+interpreter to that finalized payload: codegen records which opcodes and memory
+tokens appear after bytecode compaction/repacking and omits unreachable switch
+arms from the rendered evaluator. This saves deployed runtime bytes and does
+not make the verifier less correct in the current pinned-artifact model, but it
+does mean the interpreter is no longer a universal implementation of every VM
+opcode for arbitrary future VK payloads.
+
+For the broader distinction between a VK-specialized artifact and a truly
+runtime-generic verifier, see `docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md`.
 
 ### VM Interpreter Case Reference
 

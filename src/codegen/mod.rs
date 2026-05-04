@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn eip2537_calls_use_bounded_gas_helpers() {
+    fn eip2537_calls_use_bounded_gas_literals() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
         let pcs_codegen = include_str!("pcs.rs");
 
@@ -560,11 +560,19 @@ mod tests {
             );
         }
 
-        assert!(verifier_template.contains("function g1add_gas_cap()"));
-        assert!(verifier_template.contains("function g1msm_gas_cap(input_len)"));
-        assert!(verifier_template.contains("function pairing_gas_cap(input_len)"));
-        assert!(pcs_codegen.contains("g1msm_gas_cap"));
-        assert!(pcs_codegen.contains("g1add_gas_cap"));
+        assert!(!verifier_template.contains("function g1add_gas_cap()"));
+        assert!(!verifier_template.contains("function g1msm_gas_cap(input_len)"));
+        assert!(!verifier_template.contains("function pairing_gas_cap(input_len)"));
+        assert!(
+            verifier_template.contains("{{ g1msm_single_gas_cap }}")
+                && verifier_template.contains("{{ final_pairing_gas_cap }}"),
+            "main verifier template should render generated gas-cap literals"
+        );
+        assert!(
+            pcs_codegen.contains("layout::precompile::g1msm_gas_cap")
+                && pcs_codegen.contains("layout::precompile::G1ADD_GAS_CAP"),
+            "PCS emitter should compute static EIP-2537 caps at codegen time"
+        );
     }
 
     #[test]
@@ -600,8 +608,8 @@ mod tests {
         );
         assert!(
             pcs_codegen.contains("if success {")
-                && pcs_codegen.contains("success := staticcall(g1msm_gas_cap")
-                && pcs_codegen.contains("success := staticcall(g1add_gas_cap"),
+                && pcs_codegen.contains("success := staticcall({final_msm_gas_cap}")
+                && pcs_codegen.contains("success := staticcall({}, 0x0b"),
             "PCS emitter should guard final MSM/add precompile calls with if success"
         );
     }
@@ -665,12 +673,12 @@ mod tests {
         let spec = include_str!("../../docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md");
 
         assert!(
-            verifier_template.contains("let acc_expected_words :="),
-            "accumulator verifier must compute the generated public-input schema width"
+            verifier_template.contains("eq({{ num_instances }}, calldataload(NUM_INSTANCE_CPTR))"),
+            "verifier must check calldata instance length against the generated public-input width"
         );
         assert!(
-            verifier_template.contains("eq(mload(NUM_INSTANCES_MPTR), acc_expected_words)"),
-            "accumulator verifier must reject extra or missing accumulator tail words"
+            verifier_template.contains("add(INSTANCE_CPTR, {{ (num_instances * 32)|hex() }})"),
+            "verifier must reject extra trailing calldata after the generated instance vector"
         );
         assert!(
             verifier_template.contains("RHS layout for this generated verifier is fully collapsed"),
@@ -697,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_vk_header_is_checked_against_codegen_metadata() {
+    fn accumulator_vk_header_is_specialized_at_codegen() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 
         for expected_check in [
@@ -707,13 +715,19 @@ mod tests {
             "eq(mload(NUM_ACC_LIMB_BITS_MPTR)",
         ] {
             assert!(
-                verifier_template.contains(expected_check),
-                "verifier must check VK accumulator metadata against generated codegen constants: {expected_check}"
+                !verifier_template.contains(expected_check),
+                "pinned verifier should not reread VK accumulator metadata at runtime: {expected_check}"
             );
         }
         assert!(
-            verifier_template.contains("the VK header agrees"),
-            "template should document why accumulator metadata is checked before instance decoding"
+            verifier_template.contains("schema\n                // values such as instance count and accumulator layout are\n                // rendered as constants"),
+            "template should document why VK schema values are generated constants"
+        );
+        assert!(
+            verifier_template.contains("{%- if self.expected_has_accumulator %}")
+                && verifier_template.contains("let bits := {{ self.expected_num_acc_limb_bits }}")
+                && verifier_template.contains("let n := {{ self.expected_num_acc_limbs }}"),
+            "accumulator decoding should be rendered only for generated accumulator VKs"
         );
     }
 
@@ -1144,12 +1158,8 @@ mod tests {
             "verifyProof NatSpec must document invalid-proof failure semantics"
         );
         assert!(
-            verifier_template.contains("error InvalidVerifierDependency();"),
-            "pinned dependency failures should use an explicit custom error"
-        );
-        assert!(
-            verifier_template.contains("revert InvalidVerifierDependency();"),
-            "pinned dependency preflight failures should revert, not return false"
+            !verifier_template.contains("InvalidVerifierDependency"),
+            "constructor pinning removes per-call dependency preflight code"
         );
         assert!(
             !verifier_template.contains("return false;"),
@@ -1379,8 +1389,8 @@ mod tests {
         }
 
         for required in [
-            "/// @notice Reverts when a pinned verifier dependency",
             "/// @notice Verifying-key contract address",
+            "checked at construction time",
             "/// @notice Quotient evaluator contract",
             "/// @param authorizedVk",
             "/// @param authorizedQuotient",
@@ -1895,8 +1905,7 @@ mod tests {
         bytes.extend_from_slice(&((0x120u32 << 16) | 0x140).to_be_bytes());
         push_packed_quotient_op(&mut bytes, Q_OP_FOLD_MAIN, 0);
 
-        let (ops, mem_tokens) =
-            quotient_program_usage(&bytes, QuotientProgramEncoding::Packed32);
+        let (ops, mem_tokens) = quotient_program_usage(&bytes, QuotientProgramEncoding::Packed32);
 
         assert!(ops.contains(&Q_OP_PUSH_MEM_TOKEN_OFFSET));
         assert!(ops.contains(&Q_OP_ADD_MUL_MEM_MEM_CONST_U8));
