@@ -987,11 +987,11 @@ The packed32 encoding is an alternate physical encoding where each base
 instruction is a four-byte word with the opcode in the high byte and a 24-bit
 operand. It must implement the same logical operations.
 
-The implementation notes and audit checklist for this VM live in
-`docs/QUOTIENT_NUMERATOR_EVALUATOR.md`. In particular, native callbacks may
-use scratch memory that is larger than the interpreter's operand stack. Memory
-planning must reserve the maximum of the VM stack depth and any enabled native
-callback scratch requirement.
+The full interpreter case reference, implementation notes, and audit checklist
+for this VM live in `docs/QUOTIENT_NUMERATOR_EVALUATOR.md`. In particular,
+native callbacks may use scratch memory that is larger than the interpreter's
+operand stack. Memory planning must reserve the maximum of the VM stack depth
+and any enabled native callback scratch requirement.
 
 ## 12. KZG Multi-Prepare PCS Check
 

@@ -510,6 +510,95 @@ The VM has opcodes for:
 The VM is the bytecode-size lever: moving identities into it usually shrinks
 deployed bytecode but costs more runtime gas.
 
+### VM Interpreter Case Reference
+
+The source of truth for opcode numbers is `src/codegen/quotient/mod.rs`; the
+runtime interpreter is the `switch q_op` block in
+`templates/QuotientNumeratorBlock.yul`. The bytecode is generated into the VK
+payload, not supplied by proof calldata.
+
+The interpreter is a small stack machine:
+
+- `q_top` caches the top stack value.
+- `q_has_top` says whether `q_top` is live.
+- `q_sp` points just past the spilled stack values in memory.
+- Push operations spill the old `q_top` to `mstore(q_sp, q_top)` and advance
+  `q_sp` when `q_has_top` is set.
+- Binary `ADD` and `MUL` pop one spilled value by decrementing `q_sp`, then
+  combine that value with `q_top`.
+- Accumulator-style opcodes mutate `q_top` without changing stack depth.
+- `FOLD_*` opcodes consume `q_top` and advance the y-batched identity stream.
+- Native callbacks require the generated stream to be at an identity boundary,
+  reset `q_top`/`q_sp`, and perform their own fold operations.
+
+There are two physical encodings:
+
+- `bytes`: one opcode byte followed by variable-width operands. Multi-byte
+  operands are big-endian.
+- `packed32`: each base instruction is one 4-byte word, with the opcode in the
+  high byte and a 24-bit primary operand. Two-pointer fused forms consume one
+  extra packed word.
+
+The logical cases are:
+
+| Opcode | Name | Byte operands | Packed32 form | Interpreter effect |
+|---|---|---|---|---|
+| `0x01` | `push_const` | `u16 const_idx` | primary operand is `const_idx` | Push `mload(q_const_mptr + 32 * const_idx)`. |
+| `0x02` | `push_mem_literal` | `u32 ptr` | primary operand is `ptr`, limited to 24 bits | Push `mload(ptr)`. |
+| `0x03` | `push_mem_token` | `u8 token` | primary operand is `token` | Resolve a symbolic memory token and push `mload(ptr_for_token(token))`. Unknown tokens revert. |
+| `0x04` | `push_mem_token_offset` | `u8 token, u32 offset` | primary operand is `(token << 16) \| offset`, so packed32 requires a `u16` offset | Resolve a token pointer, add the byte offset, and push `mload(ptr + offset)`. |
+| `0x05` | `push_mem_u16` | `u16 ptr` | primary operand is `ptr` | Short form of `push_mem_literal`: push `mload(ptr)`. |
+| `0x06` | `add` | none | primary operand is zero | Pop one spilled operand and set `q_top = popped + q_top mod r`. |
+| `0x07` | `mul` | none | primary operand is zero | Pop one spilled operand and set `q_top = popped * q_top mod r`. |
+| `0x08` | `neg` | none | primary operand is zero | Set `q_top = -q_top mod r`. |
+| `0x09` | `push_const_u8` | `u8 const_idx` | primary operand is `const_idx` | Short form of `push_const`. |
+| `0x0a` | `fold_main` | none | primary operand is zero | Trace `q_top`, clear the top slot, multiply `quotient_eval_numer` by `y`, advance selector scaling state, and add the evaluation into `quotient_eval_numer`. |
+| `0x0b` | `fold_selector` | `u16 selector_idx` | primary operand is `selector_idx` | Trace `q_top`, clear the top slot, advance the same global y position, and accumulate `q_top * q_sel_inv_scale` into `SELECTOR_ACC_MPTR[selector_idx]`. |
+| `0x0c` | `add_const_u8` | `u8 const_idx` | primary operand is `const_idx` | Set `q_top += const[const_idx]`. |
+| `0x0d` | `mul_const_u8` | `u8 const_idx` | primary operand is `const_idx` | Set `q_top *= const[const_idx]`. |
+| `0x0e` | `add_const` | `u16 const_idx` | primary operand is `const_idx` | Wider form of `add_const_u8`. |
+| `0x0f` | `mul_const` | `u16 const_idx` | primary operand is `const_idx` | Wider form of `mul_const_u8`. |
+| `0x10` | `add_mem_u16` | `u16 ptr` | primary operand is `ptr` | Set `q_top += mload(ptr)`. |
+| `0x11` | `mul_mem_u16` | `u16 ptr` | primary operand is `ptr` | Set `q_top *= mload(ptr)`. |
+| `0x12` | `add_mul_mem_mem_const_u8` | `u16 lhs, u16 rhs, u8 const_idx` | primary operand is `const_idx`, extra word is `(lhs << 16) \| rhs` | Set `q_top += mload(lhs) * mload(rhs) * const[const_idx]`. |
+| `0x13` | `add_mul_const_u8_mem_u16` | `u16 ptr, u8 const_idx` | primary operand is `(const_idx << 16) \| ptr` | Set `q_top += mload(ptr) * const[const_idx]`. |
+| `0x14` | `add_mul_mem_mem` | `u16 lhs, u16 rhs` | primary operand is zero, extra word is `(lhs << 16) \| rhs` | Set `q_top += mload(lhs) * mload(rhs)`. |
+| `0x15` | `run_add_mul_mem_mem_const_u8` | `u16 count`, then `count` copies of `u16 lhs, u16 rhs, u8 const_idx` | byte-only | Dynamic run form of repeated `0x12`; each item accumulates into `q_top`. |
+| `0x16` | `run_add_mul_const_u8_mem_u16` | `u16 count`, then `count` copies of `u16 ptr, u8 const_idx` | byte-only | Dynamic run form of repeated `0x13`; each item accumulates into `q_top`. |
+| `0x17` | `push_temp` | `u16 temp_idx` | primary operand is `temp_idx` | Push `mload(q_tmp_mptr + 32 * temp_idx)`. Present only when VM CSE temps exist. |
+| `0x18` | `store_temp` | `u16 temp_idx` | primary operand is `temp_idx` | Store `q_top` to `q_tmp_mptr + 32 * temp_idx`; `q_top` remains live. Present only when VM CSE temps exist. |
+| `0x19` | `native_permutation` | none | primary operand is zero | Reset the VM top/stack pointer and run the generated permutation callback at this identity position. The callback folds all permutation identities itself. |
+| `0x1a` | reserved | none | none | No interpreter case. The default branch reverts if this opcode appears. |
+| `0x1b` | `native_identity` | `u16 native_idx` | primary operand is `native_idx` | Reset the VM top/stack pointer and dispatch to one generated heavy-gate callback. Invalid callback indexes revert. |
+| `0x1c` | `lin7` | seven copies of `u8 const_idx, u16 ptr` | byte-only | Push `sum_i const[const_idx_i] * mload(ptr_i)`. Used for recognized 7-limb linear combinations. |
+| `0x1d` | `bilin7_row` | `u16 lhs`, then seven copies of `u8 const_idx, u16 rhs` | byte-only | Push `mload(lhs) * sum_i const[const_idx_i] * mload(rhs_i)`. |
+| `0x1e` | `bilin7_pairwise` | `u16 lhs_base, u16 rhs_base, 13 bytes const_idx[0..12]` | byte-only | Push `sum_{i=0..6,j=0..6} const[const_idx[i+j]] * mload(lhs_base + 32*i) * mload(rhs_base + 32*j)`. |
+| `0x1f` | `native_lookup` | none | primary operand is zero | Reset the VM top/stack pointer and run the generated LogUp lookup callback at this identity position. The callback folds boundary, helper, and accumulator identities itself. |
+
+The memory token switch used by `push_mem_token` and
+`push_mem_token_offset` currently recognizes:
+
+| Token | Pointer |
+|---|---|
+| `0x01` | `L_0_MPTR` |
+| `0x02` | `L_LAST_MPTR` |
+| `0x03` | `L_BLIND_MPTR` |
+| `0x04` | `BETA_MPTR` |
+| `0x05` | `GAMMA_MPTR` |
+| `0x06` | `X_MPTR` |
+| `0x07` | `THETA_MPTR` |
+| `0x08` | `TRASH_CHALLENGE_MPTR` |
+| `0x09` | `INSTANCE_EVAL_MPTR` |
+
+The dynamic run opcodes `0x15` and `0x16` are byte-oriented only. The
+bytecode builder compacts adjacent fused add-mul operations into those run
+forms only when `HALO2_SOLIDITY_QUOTIENT_ENCODING=bytes`. Packed32 generation
+uses the un-compacted fused cases instead.
+
+The limb-aware opcodes `0x1c`, `0x1d`, and `0x1e` are also byte-oriented only.
+They are emitted only when the limb recognizer is enabled, and packed32
+lowering rejects programs containing them.
+
 The limb-aware opcodes are behind:
 
 ```text
@@ -820,23 +909,22 @@ The gas-checkpoint bench reports the evaluator work under:
 batched identity numerator reconstruction
 ```
 
-For the gas-capped compact profile that is now the default, the latest recorded
-trace/gas-checkpoint run was:
+For the current gas-capped compact profile with native lookup enabled, the
+latest recorded IVC gas-checkpoint bench was:
 
 ```text
-release trace-equivalent total gas: 1,614,572
-gas-checkpoint tx gas:             1,594,941
-checkpointed section work:         1,432,403
-batched numerator section:           631,289
-verifier runtime:                    12,885 bytes
-VK runtime:                          13,568 bytes
-quotient evaluator runtime:          21,774 bytes
+gas-checkpoint tx gas:             1,499,730
+checkpointed section work:         1,336,950
+batched numerator section:           509,032
+verifier runtime:                    12,592 bytes
+VK runtime:                          13,024 bytes
+quotient evaluator runtime:          24,278 bytes
 ```
 
 Defaulting summary:
 
-- gas-checkpoint tx gas: `1,594,941`;
-- quotient runtime: `21,774` bytes.
+- gas-checkpoint tx gas: `1,499,730`;
+- quotient runtime: `24,278` bytes.
 
 The checkpoint build includes debug logs, so its total gas is not identical to
 the non-checkpoint trace-equivalence run. Use it for section deltas and
@@ -845,8 +933,8 @@ regression comparison, not as the production gas number.
 ### Why A Compile-Stable Profile Was Around 700k Gas
 
 A historical `~700k` batched-numerator measurement came from using the smaller
-compile-stable compact quotient VM profile instead of the older gas-capped
-compact profile.
+compile-stable compact quotient VM profile instead of the older pre-native
+lookup gas-capped compact profile.
 
 The old `~631k` run used:
 
@@ -854,7 +942,7 @@ The old `~631k` run used:
 direct inline identities: 4
 native gate callbacks:   4
 native permutation:      on
-native lookup:           on
+native lookup:           off
 structured trash suffix: on
 ```
 
@@ -864,7 +952,7 @@ The compile-stable profile used:
 direct inline identities: 0
 native gate callbacks:   4
 native permutation:      on
-native lookup:           on
+native lookup:           off
 structured trash suffix: off
 remaining identities:    q_program VM
 ```
@@ -892,17 +980,18 @@ changed the structured trash-tail default from `Trash` to `Off`.
 
 So the `~700k` number was not mainly a proof-shape or fewer-point-sets effect.
 It was the bytecode/compile-stability tradeoff. The gas-capped shape can be
-selected explicitly with:
+selected explicitly, now with native lookup enabled by default, with:
 
 ```sh
 HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=4 \
 HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash \
+HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP=1 \
 scripts/run_ivc_bench.sh --no-outer-fewer-point-sets --skip-srs-download
 ```
 
-This repository now defaults back to that gas-capped shape; the `0/off` profile
-remains useful as the smaller compile-stable fallback if a generated variant
-hits pinned-solc size or stack-pressure limits.
+This repository now defaults to the gas-capped shape plus the native lookup
+callback. The `0/off` profile remains useful as the smaller compile-stable
+fallback if a generated variant hits pinned-solc size or stack-pressure limits.
 
 ## Defaulting Policy
 
@@ -912,16 +1001,17 @@ The default is gas-capped compact mode:
 direct inline identities: 4
 native gate callbacks:   4
 native permutation:      on
+native lookup:           on
 structured trash suffix: on
 remaining identities:    q_program VM
 ```
 
-This default was selected to keep the IVC quotient-numerator gas near the
-previous `~631k` band while staying below the external quotient evaluator size
-budget:
+This default was selected to keep the IVC quotient-numerator gas at or below
+the previous `~631k` band while staying below the external quotient evaluator
+size budget:
 
-- quotient runtime is below `23,500` bytes;
-- every deployed runtime is below `24,576` bytes;
+- every deployed runtime, including the quotient evaluator, is below `24,576`
+  bytes;
 - Rust/Solidity trace equivalence passes byte-for-byte.
 
 `HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N`,

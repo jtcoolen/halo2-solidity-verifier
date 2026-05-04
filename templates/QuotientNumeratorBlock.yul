@@ -126,8 +126,162 @@
                 //   0x1e BILIN7_PAIRWISE      0x1f native lookup
                 //
                 // There are two physical encodings for the same logical VM:
-                // packed32 and byte-oriented. The generator chooses one; both
-                // branches implement the same opcodes.
+                // packed32 and byte-oriented. Packed32 implements the fixed
+                // base cases; byte-oriented mode also carries dynamic runs and
+                // optional limb-aware cases.
+                {#
+                Template-only switch/case reference.
+
+                This comment documents the interpreter source without being
+                emitted into generated Solidity. Runtime behavior lives in the
+                two switch blocks below; opcode numbers and operand layouts are
+                defined in src/codegen/quotient/mod.rs.
+
+                Shared stack model:
+                - q_top caches the top stack value.
+                - q_has_top records whether q_top is live.
+                - q_sp points just past spilled stack words.
+                - push-like cases spill the old q_top when q_has_top is set.
+                - ADD/MUL pop by moving q_sp back one word.
+                - accumulator cases mutate q_top in place.
+                - FOLD_* cases consume q_top and advance the y-batch state.
+                - native callbacks reset q_top/q_sp and perform their own
+                  fold calls inside generated callback code.
+
+                Case map:
+                0x01 push_const
+                  bytes:    u16 const_idx
+                  packed32: q_arg = const_idx
+                  effect:   push q_const_mptr[const_idx]
+
+                0x02 push_mem_literal
+                  bytes:    u32 ptr
+                  packed32: q_arg = ptr, limited to 24 bits
+                  effect:   push mload(ptr)
+
+                0x03 push_mem_token
+                  bytes:    u8 token
+                  packed32: q_arg = token
+                  effect:   resolve token to a generated pointer and push it
+
+                0x04 push_mem_token_offset
+                  bytes:    u8 token, u32 offset
+                  packed32: q_arg = (token << 16) | u16 offset
+                  effect:   resolve token, add byte offset, and push mload
+
+                0x05 push_mem_u16
+                  bytes:    u16 ptr
+                  packed32: q_arg = ptr
+                  effect:   compact pointer load
+
+                0x06 add
+                  effect: q_top = stack_pop() + q_top mod Fr
+
+                0x07 mul
+                  effect: q_top = stack_pop() * q_top mod Fr
+
+                0x08 neg
+                  effect: q_top = -q_top mod Fr
+
+                0x09 push_const_u8
+                  bytes:    u8 const_idx
+                  packed32: q_arg = const_idx
+                  effect:   short form of push_const
+
+                0x0a fold_main
+                  effect: trace q_top, advance q_eval_numer = q_eval_numer*y
+                          + q_top, and advance selector scaling if present
+
+                0x0b fold_selector
+                  bytes:    u16 selector_idx
+                  packed32: q_arg = selector_idx
+                  effect: trace q_top, advance the global y position, and add
+                          q_top * q_sel_inv_scale to selector bucket
+
+                0x0c add_const_u8
+                  effect: q_top += q_const_mptr[u8 const_idx]
+
+                0x0d mul_const_u8
+                  effect: q_top *= q_const_mptr[u8 const_idx]
+
+                0x0e add_const
+                  effect: q_top += q_const_mptr[u16 const_idx]
+
+                0x0f mul_const
+                  effect: q_top *= q_const_mptr[u16 const_idx]
+
+                0x10 add_mem_u16
+                  effect: q_top += mload(u16 ptr)
+
+                0x11 mul_mem_u16
+                  effect: q_top *= mload(u16 ptr)
+
+                0x12 add_mul_mem_mem_const_u8
+                  bytes:    u16 lhs, u16 rhs, u8 const_idx
+                  packed32: q_arg = const_idx, extra word = (lhs << 16) | rhs
+                  effect:   q_top += mload(lhs) * mload(rhs) * const
+
+                0x13 add_mul_const_u8_mem_u16
+                  bytes:    u16 ptr, u8 const_idx
+                  packed32: q_arg = (const_idx << 16) | ptr
+                  effect:   q_top += mload(ptr) * const
+
+                0x14 add_mul_mem_mem
+                  bytes:    u16 lhs, u16 rhs
+                  packed32: extra word = (lhs << 16) | rhs
+                  effect:   q_top += mload(lhs) * mload(rhs)
+
+                0x15 run_add_mul_mem_mem_const_u8
+                  bytes only: u16 count, then count * {u16 lhs, u16 rhs, u8 c}
+                  effect: repeated 0x12 in one dispatch
+
+                0x16 run_add_mul_const_u8_mem_u16
+                  bytes only: u16 count, then count * {u16 ptr, u8 c}
+                  effect: repeated 0x13 in one dispatch
+
+                0x17 push_temp
+                  effect: push q_tmp_mptr[temp_idx]; emitted only with CSE temps
+
+                0x18 store_temp
+                  effect: store q_top to q_tmp_mptr[temp_idx], leaving q_top live
+
+                0x19 native_permutation
+                  effect: evaluate and fold the generated permutation identity
+                          family at this VM stream position
+
+                0x1a reserved
+                  effect: no switch case; default branch reverts
+
+                0x1b native_identity
+                  effect: dispatch to one generated heavy-gate callback by index
+
+                0x1c lin7
+                  bytes only: seven {u8 const_idx, u16 ptr} pairs
+                  effect: push sum_i const_i * mload(ptr_i)
+
+                0x1d bilin7_row
+                  bytes only: u16 lhs, seven {u8 const_idx, u16 rhs} pairs
+                  effect: push mload(lhs) * sum_i const_i * mload(rhs_i)
+
+                0x1e bilin7_pairwise
+                  bytes only: u16 lhs_base, u16 rhs_base, 13 const indexes
+                  effect: push sum_{i,j} const_{i+j} * lhs_i * rhs_j
+
+                0x1f native_lookup
+                  effect: evaluate and fold LogUp boundary/helper/accumulator
+                          identities at this VM stream position
+
+                Memory token map used by 0x03/0x04:
+                0x01 L_0_MPTR
+                0x02 L_LAST_MPTR
+                0x03 L_BLIND_MPTR
+                0x04 BETA_MPTR
+                0x05 GAMMA_MPTR
+                0x06 X_MPTR
+                0x07 THETA_MPTR
+                0x08 TRASH_CHALLENGE_MPTR
+                0x09 INSTANCE_EVAL_MPTR
+                #}
                 {%- if program.packed32 %}
                 // Packed32 encoding: each base instruction is one 4-byte word
                 // with the opcode in the high byte and a 24-bit operand.
@@ -139,6 +293,7 @@
                     let q_arg := and(q_inst, {{ template_constants.quotient_vm.packed_arg_mask|hex() }})
 
                     switch q_op
+                    {# VM 0x01 PUSH_CONST (packed32): q_arg is a quotient constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.push_const|hex() }} {
                         let qconst := q_arg
                         if q_has_top {
@@ -148,6 +303,7 @@
                         q_top := mload(add(q_const_mptr, shl(5, qconst)))
                         q_has_top := 1
                     }
+                    {# VM 0x02 PUSH_MEM_LITERAL (packed32): q_arg is a 24-bit memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_literal|hex() }} {
                         let q_ptr := q_arg
                         if q_has_top {
@@ -157,9 +313,11 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x03 PUSH_MEM_TOKEN (packed32): q_arg selects a symbolic memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_token|hex() }} {
                         let q_token := q_arg
                         let q_ptr := 0
+                        {# Token cases decode generated symbolic memory addresses. #}
                         switch q_token
                         case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := L_0_MPTR }
                         case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := L_LAST_MPTR }
@@ -178,10 +336,12 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x04 PUSH_MEM_TOKEN_OFFSET (packed32): q_arg packs token and u16 byte offset. #}
                     case {{ template_constants.quotient_vm.op.push_mem_token_offset|hex() }} {
                         let q_token := shr(16, q_arg)
                         let q_off := and(q_arg, 0xffff)
                         let q_ptr := 0
+                        {# Token-offset cases reuse the same token table, then add q_off. #}
                         switch q_token
                         case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := add(L_0_MPTR, q_off) }
                         case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := add(L_LAST_MPTR, q_off) }
@@ -200,6 +360,7 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x05 PUSH_MEM_U16 (packed32): q_arg is a short memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_u16|hex() }} {
                         let q_ptr := q_arg
                         if q_has_top {
@@ -209,17 +370,21 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x06 ADD: pop one spilled stack word and add it to q_top. #}
                     case {{ template_constants.quotient_vm.op.add|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := addmod(mload(q_sp), q_top, r)
                     }
+                    {# VM 0x07 MUL: pop one spilled stack word and multiply it by q_top. #}
                     case {{ template_constants.quotient_vm.op.mul|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
+                    {# VM 0x08 NEG: replace q_top with its Fr negation. #}
                     case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
                     }
+                    {# VM 0x09 PUSH_CONST_U8 (packed32): q_arg is an 8-bit constant slot. #}
                     case {{ template_constants.quotient_vm.op.push_const_u8|hex() }} {
                         let qconst := q_arg
                         if q_has_top {
@@ -229,24 +394,31 @@
                         q_top := mload(add(q_const_mptr, shl(5, qconst)))
                         q_has_top := 1
                     }
+                    {# VM 0x0c ADD_CONST_U8: add a small constant-table slot into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_const_u8|hex() }} {
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
+                    {# VM 0x0d MUL_CONST_U8: multiply q_top by a small constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.mul_const_u8|hex() }} {
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
+                    {# VM 0x0e ADD_CONST: add a wider constant-table slot into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_const|hex() }} {
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
+                    {# VM 0x0f MUL_CONST: multiply q_top by a wider constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.mul_const|hex() }} {
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, q_arg))), r)
                     }
+                    {# VM 0x10 ADD_MEM_U16: add mload(q_arg) into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_mem_u16|hex() }} {
                         q_top := addmod(q_top, mload(q_arg), r)
                     }
+                    {# VM 0x11 MUL_MEM_U16: multiply q_top by mload(q_arg). #}
                     case {{ template_constants.quotient_vm.op.mul_mem_u16|hex() }} {
                         q_top := mulmod(q_top, mload(q_arg), r)
                     }
+                    {# VM 0x12 ADD_MUL_MEM_MEM_CONST_U8: fused q_top += lhs * rhs * const. #}
                     case {{ template_constants.quotient_vm.op.add_mul_mem_mem_const_u8|hex() }} {
                         let q_pair := shr(224, mload(q_pc))
                         q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
@@ -262,6 +434,7 @@
                             r
                         )
                     }
+                    {# VM 0x13 ADD_MUL_CONST_U8_MEM_U16: fused q_top += mem * const. #}
                     case {{ template_constants.quotient_vm.op.add_mul_const_u8_mem_u16|hex() }} {
                         let qconst := shr(16, q_arg)
                         let q_ptr := and(q_arg, 0xffff)
@@ -271,6 +444,7 @@
                             r
                         )
                     }
+                    {# VM 0x14 ADD_MUL_MEM_MEM: fused q_top += lhs * rhs. #}
                     case {{ template_constants.quotient_vm.op.add_mul_mem_mem|hex() }} {
                         let q_pair := shr(224, mload(q_pc))
                         q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
@@ -279,6 +453,7 @@
                         q_top := addmod(q_top, mulmod(mload(q_lhs), mload(q_rhs), r), r)
                     }
                     {%- if program.cse_temps > 0 %}
+                    {# VM 0x17 PUSH_TEMP: push a CSE temp from q_tmp_mptr. #}
                     case {{ template_constants.quotient_vm.op.push_temp|hex() }} {
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -287,6 +462,7 @@
                         q_top := mload(add(q_tmp_mptr, shl(5, q_arg)))
                         q_has_top := 1
                     }
+                    {# VM 0x18 STORE_TEMP: store q_top into a CSE temp without consuming it. #}
                     case {{ template_constants.quotient_vm.op.store_temp|hex() }} {
                         mstore(add(q_tmp_mptr, shl(5, q_arg)), q_top)
                     }
@@ -296,6 +472,7 @@
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
                     // avoiding a large interpreted product loop.
+                    {# VM 0x19 NATIVE_PERMUTATION: marker for the generated permutation callback. #}
                     case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
@@ -316,6 +493,7 @@
                     // accumulator identities at this VM position, preserving
                     // the Rust y-batch order while avoiding many interpreted
                     // product-loop opcodes.
+                    {# VM 0x1f NATIVE_LOOKUP: marker for the generated LogUp lookup callback. #}
                     case {{ template_constants.quotient_vm.op.native_lookup|hex() }} {
                         q_top := 0
                         q_has_top := 0
@@ -334,11 +512,13 @@
                     // opcode at the identity's original position, so the
                     // native Yul block keeps the same y-batching order as the
                     // compact interpreted identities.
+                    {# VM 0x1b NATIVE_IDENTITY: marker for generated heavy-gate callbacks. #}
                     case {{ template_constants.quotient_vm.op.native_identity|hex() }} {
                         let q_native_idx := q_arg
                         q_top := 0
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
+                        {# Native identity sub-cases are generated from selected heavy gate identities. #}
                         switch q_native_idx
                         {%- for code_block in quotient_native_identity_computations %}
                         case {{ loop.index0 }} {
@@ -350,6 +530,7 @@
                         default { revert(0, 0) }
                     }
                     {%- endif %}
+                    {# VM 0x0a FOLD_MAIN: consume q_top into the fully evaluated numerator fold. #}
                     case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
@@ -365,6 +546,7 @@
                         {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
+                    {# VM 0x0b FOLD_SELECTOR: consume q_top into one simple-selector bucket. #}
                     case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
                         let q_sel_idx := q_arg
                         let q_eval := q_top
@@ -383,6 +565,7 @@
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
                         mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
                     }
+                    {# Invalid generated bytecode should fail closed. 0x1a intentionally lands here. #}
                     default {
                         revert(0, 0)
                     }
@@ -396,6 +579,7 @@
                     q_pc := add(q_pc, 1)
 
                     switch q_op
+                    {# VM 0x01 PUSH_CONST (bytes): next two bytes are a constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.push_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         if q_has_top {
@@ -406,6 +590,7 @@
                         q_has_top := 1
                         q_pc := add(q_pc, 2)
                     }
+                    {# VM 0x02 PUSH_MEM_LITERAL (bytes): next four bytes are a memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_literal|hex() }} {
                         let q_ptr := shr(224, mload(q_pc))
                         q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
@@ -416,10 +601,12 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x03 PUSH_MEM_TOKEN (bytes): next byte selects a symbolic memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_token|hex() }} {
                         let q_token := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         let q_ptr := 0
+                        {# Token cases decode generated symbolic memory addresses. #}
                         switch q_token
                         case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := L_0_MPTR }
                         case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := L_LAST_MPTR }
@@ -438,11 +625,13 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x04 PUSH_MEM_TOKEN_OFFSET (bytes): token byte plus u32 byte offset. #}
                     case {{ template_constants.quotient_vm.op.push_mem_token_offset|hex() }} {
                         let q_token := byte(0, mload(q_pc))
                         let q_off := shr(224, mload(add(q_pc, 1)))
                         q_pc := add(q_pc, 5)
                         let q_ptr := 0
+                        {# Token-offset cases reuse the same token table, then add q_off. #}
                         switch q_token
                         case {{ template_constants.quotient_vm.mem.l0|hex() }} { q_ptr := add(L_0_MPTR, q_off) }
                         case {{ template_constants.quotient_vm.mem.l_last|hex() }} { q_ptr := add(L_LAST_MPTR, q_off) }
@@ -461,6 +650,7 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x05 PUSH_MEM_U16 (bytes): next two bytes are a short memory pointer. #}
                     case {{ template_constants.quotient_vm.op.push_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -471,17 +661,21 @@
                         q_top := mload(q_ptr)
                         q_has_top := 1
                     }
+                    {# VM 0x06 ADD: pop one spilled stack word and add it to q_top. #}
                     case {{ template_constants.quotient_vm.op.add|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := addmod(mload(q_sp), q_top, r)
                     }
+                    {# VM 0x07 MUL: pop one spilled stack word and multiply it by q_top. #}
                     case {{ template_constants.quotient_vm.op.mul|hex() }} {
                         q_sp := sub(q_sp, 0x20)
                         q_top := mulmod(mload(q_sp), q_top, r)
                     }
+                    {# VM 0x08 NEG: replace q_top with its Fr negation. #}
                     case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
                     }
+                    {# VM 0x09 PUSH_CONST_U8 (bytes): next byte is a constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.push_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         if q_has_top {
@@ -492,36 +686,43 @@
                         q_has_top := 1
                         q_pc := add(q_pc, 1)
                     }
+                    {# VM 0x0c ADD_CONST_U8: add a small constant-table slot into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
+                    {# VM 0x0d MUL_CONST_U8: multiply q_top by a small constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.mul_const_u8|hex() }} {
                         let qconst := byte(0, mload(q_pc))
                         q_pc := add(q_pc, 1)
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
+                    {# VM 0x0e ADD_CONST: add a wider constant-table slot into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := addmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
+                    {# VM 0x0f MUL_CONST: multiply q_top by a wider constant-table slot. #}
                     case {{ template_constants.quotient_vm.op.mul_const|hex() }} {
                         let qconst := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := mulmod(q_top, mload(add(q_const_mptr, shl(5, qconst))), r)
                     }
+                    {# VM 0x10 ADD_MEM_U16: add a short memory load into q_top. #}
                     case {{ template_constants.quotient_vm.op.add_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := addmod(q_top, mload(q_ptr), r)
                     }
+                    {# VM 0x11 MUL_MEM_U16: multiply q_top by a short memory load. #}
                     case {{ template_constants.quotient_vm.op.mul_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := mulmod(q_top, mload(q_ptr), r)
                     }
+                    {# VM 0x12 ADD_MUL_MEM_MEM_CONST_U8: fused q_top += lhs * rhs * const. #}
                     case {{ template_constants.quotient_vm.op.add_mul_mem_mem_const_u8|hex() }} {
                         let q_lhs := shr(240, mload(q_pc))
                         let q_rhs := shr(240, mload(add(q_pc, 2)))
@@ -537,6 +738,7 @@
                             r
                         )
                     }
+                    {# VM 0x13 ADD_MUL_CONST_U8_MEM_U16: fused q_top += mem * const. #}
                     case {{ template_constants.quotient_vm.op.add_mul_const_u8_mem_u16|hex() }} {
                         let q_ptr := shr(240, mload(q_pc))
                         let qconst := byte(0, mload(add(q_pc, 2)))
@@ -547,6 +749,7 @@
                             r
                         )
                     }
+                    {# VM 0x14 ADD_MUL_MEM_MEM: fused q_top += lhs * rhs. #}
                     case {{ template_constants.quotient_vm.op.add_mul_mem_mem|hex() }} {
                         let q_lhs := shr(240, mload(q_pc))
                         let q_rhs := shr(240, mload(add(q_pc, 2)))
@@ -554,6 +757,7 @@
                         q_top := addmod(q_top, mulmod(mload(q_lhs), mload(q_rhs), r), r)
                     }
                     {%- if program.cse_temps > 0 %}
+                    {# VM 0x17 PUSH_TEMP: push a CSE temp from q_tmp_mptr. #}
                     case {{ template_constants.quotient_vm.op.push_temp|hex() }} {
                         let q_tmp_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -564,12 +768,14 @@
                         q_top := mload(add(q_tmp_mptr, shl(5, q_tmp_idx)))
                         q_has_top := 1
                     }
+                    {# VM 0x18 STORE_TEMP: store q_top into a CSE temp without consuming it. #}
                     case {{ template_constants.quotient_vm.op.store_temp|hex() }} {
                         let q_tmp_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         mstore(add(q_tmp_mptr, shl(5, q_tmp_idx)), q_top)
                     }
                     {%- endif %}
+                    {# VM 0x15 RUN_ADD_MUL_MEM_MEM_CONST_U8: byte-only loop over fused 0x12 payloads. #}
                     case {{ template_constants.quotient_vm.op.run_add_mul_mem_mem_const_u8|hex() }} {
                         let q_count := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -590,6 +796,7 @@
                             )
                         }
                     }
+                    {# VM 0x16 RUN_ADD_MUL_CONST_U8_MEM_U16: byte-only loop over fused 0x13 payloads. #}
                     case {{ template_constants.quotient_vm.op.run_add_mul_const_u8_mem_u16|hex() }} {
                         let q_count := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -621,6 +828,7 @@
                     // 2^LOG2_BASE. The verifier does not switch fields; it
                     // evaluates the lowered identity over BLS12-381 Fr, using
                     // Fr coefficients equal to base^i mod m or base^(i+j) mod m.
+                    {# VM 0x1c LIN7: byte-only 7-term foreign-field linear form. #}
                     case {{ template_constants.quotient_vm.op.lin7|hex() }} {
                         // LIN7: sum_i coeff[i] * value[i] over Fr.
                         // Typical Rust origin: foreign/gates/norm.rs
@@ -644,6 +852,7 @@
                         q_top := q_acc
                         q_has_top := 1
                     }
+                    {# VM 0x1d BILIN7_ROW: byte-only lhs times a 7-term weighted row. #}
                     case {{ template_constants.quotient_vm.op.bilin7_row|hex() }} {
                         // BILIN7_ROW: lhs * sum_i coeff[i] * rhs[i].
                         // Typical Rust origin: one row/slice of
@@ -674,6 +883,7 @@
                         q_top := q_acc
                         q_has_top := 1
                     }
+                    {# VM 0x1e BILIN7_PAIRWISE: byte-only 7-by-7 weighted convolution. #}
                     case {{ template_constants.quotient_vm.op.bilin7_pairwise|hex() }} {
                         // BILIN7_PAIRWISE:
                         //   sum_{i=0..6,j=0..6} coeff[i+j] * lhs[i] * rhs[j].
@@ -715,6 +925,7 @@
                     // permutation identities from permutation.rs at this exact
                     // VM position, preserving the Rust identity order while
                     // avoiding a large interpreted product loop.
+                    {# VM 0x19 NATIVE_PERMUTATION: marker for the generated permutation callback. #}
                     case {{ template_constants.quotient_vm.op.native_permutation|hex() }} {
                         q_top := 0
                         q_has_top := 0
@@ -735,6 +946,7 @@
                     // accumulator identities at this VM position, preserving
                     // the Rust y-batch order while avoiding many interpreted
                     // product-loop opcodes.
+                    {# VM 0x1f NATIVE_LOOKUP: marker for the generated LogUp lookup callback. #}
                     case {{ template_constants.quotient_vm.op.native_lookup|hex() }} {
                         q_top := 0
                         q_has_top := 0
@@ -754,12 +966,14 @@
                     // non-native identity arithmetic remains in
                     // the compact q_program VM above, preserving the Rust
                     // `partially_evaluate_identities` order.
+                    {# VM 0x1b NATIVE_IDENTITY: marker for generated heavy-gate callbacks. #}
                     case {{ template_constants.quotient_vm.op.native_identity|hex() }} {
                         let q_native_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
                         q_top := 0
                         q_has_top := 0
                         q_sp := {{ program.stack_mptr|hex() }}
+                        {# Native identity sub-cases are generated from selected heavy gate identities. #}
                         switch q_native_idx
                         {%- for code_block in quotient_native_identity_computations %}
                         case {{ loop.index0 }} {
@@ -771,6 +985,7 @@
                         default { revert(0, 0) }
                     }
                     {%- endif %}
+                    {# VM 0x0a FOLD_MAIN: consume q_top into the fully evaluated numerator fold. #}
                     case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
@@ -786,6 +1001,7 @@
                         {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
+                    {# VM 0x0b FOLD_SELECTOR: consume q_top into one simple-selector bucket. #}
                     case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
                         let q_sel_idx := shr(240, mload(q_pc))
                         q_pc := add(q_pc, 2)
@@ -805,6 +1021,7 @@
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
                         mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
                     }
+                    {# Invalid generated bytecode should fail closed. 0x1a intentionally lands here. #}
                     default {
                         revert(0, 0)
                     }
