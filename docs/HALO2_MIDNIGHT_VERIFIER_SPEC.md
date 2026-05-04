@@ -1469,15 +1469,15 @@ HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=0|1
 HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE=0|1
 ```
 
-Compile-stable defaults:
+Current quotient lowering defaults:
 
 ```text
-direct inline quotient identities: 0
+direct inline quotient identities: 4
 native heavy gate callbacks:       4
 quotient program encoding:         bytes
 VM CSE:                            on
 native permutation callback:       on
-structured trash suffix:           off
+structured trash suffix:           on
 limb VM ops:                       off
 ```
 

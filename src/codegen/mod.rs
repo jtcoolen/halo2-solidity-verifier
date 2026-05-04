@@ -381,18 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn compact_quotient_default_matches_compile_stable_setting() {
-        assert_eq!(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES, 0);
+    fn compact_quotient_default_matches_gas_capped_setting() {
+        assert_eq!(DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES, 4);
         assert_eq!(DEFAULT_QUOTIENT_NATIVE_GATES, 4);
 
         let docs = include_str!("../../docs/QUOTIENT_NUMERATOR_EVALUATOR.md");
         assert!(
-            docs.contains("direct inline identities: 0"),
-            "quotient evaluator docs should record the compile-stable compact default"
+            docs.contains("direct inline identities: 4"),
+            "quotient evaluator docs should record the gas-capped compact default"
         );
         assert!(
-            docs.contains("structured trash suffix: off"),
-            "quotient evaluator docs should record the compile-stable structured-tail default"
+            docs.contains("structured trash suffix: on"),
+            "quotient evaluator docs should record the gas-capped structured-tail default"
         );
         assert!(
             docs.contains("HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N"),

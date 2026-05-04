@@ -371,9 +371,9 @@ compressed - (1 - q(x)) * trash_eval
 
 The Rust `required_degree` comment notes that the degree is at least two
 because of the `(1 - q) * trash` product. Solidity emits the same formula in
-the structured trash suffix when
-`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash` is enabled; the compile-stable
-default leaves trash identities in the VM.
+the structured trash suffix by default. Set
+`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off` to leave trash identities in the
+VM for the smaller compile-stable fallback.
 
 ## Y-Batching Algebra
 
@@ -517,7 +517,7 @@ HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=1
 ```
 
 They are opt-in until the IVC gas/size/trace gates are rebenchmarked. The
-default remains the compile-stable compact path. The generator also validates
+default remains the gas-capped compact path. The generator also validates
 that the expanded VK quotient payload does not overlap the challenge/evaluation
 memory frame; if an experiment would overrun that reserved space, rendering
 fails closed instead of producing a verifier with corrupted transcript state.
@@ -535,8 +535,8 @@ The profile reports counts for `LIN7`, `BILIN7_ROW`,
 ### Native Callbacks
 
 Large recognized identities can be emitted as native Yul callbacks. The
-default compile-stable compact mode keeps four heavy gate identities native,
-plus the native permutation loop.
+default gas-capped compact mode keeps four heavy gate identities native, plus
+the native permutation loop.
 
 Native callbacks preserve identity order because the VM stream contains an
 opcode at the exact identity position. The callback computes the evaluation
@@ -544,11 +544,11 @@ and then returns to the shared fold logic.
 
 ### Structured Trash Suffix
 
-The compile-stable default keeps trash identities interpreted by the VM. The
-structured suffix remains available via
-`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash`; this is a measured gas/size
-trade for local experiments because trash is regular enough to avoid too much
-bytecode while saving VM dispatch overhead.
+The default emits trash identities as a structured Yul suffix. This is a
+measured gas/size trade because trash is regular enough to avoid too much
+bytecode while saving VM dispatch overhead. Set
+`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off` to keep trash in the VM for the
+smaller compile-stable fallback.
 
 ## Limb Helpers
 
@@ -770,9 +770,9 @@ Invalid proof handling is therefore success-or-revert for this path.
 
 ## Trace And Checkpoint Coverage
 
-The full IVC trace-equivalence test compares native Rust verifier trace points
-against generated Solidity trace logs. The critical quotient-facing trace
-points include:
+The IVC trace-equivalence test compares native Rust verifier trace points
+against generated Solidity trace logs for the main verifier path. The critical
+quotient-facing trace points include:
 
 - `x`;
 - `x^n`;
@@ -784,36 +784,75 @@ points include:
 - `linearization_expected_eval`;
 - linearization scalars.
 
+The proof evaluation stream is also traced by the main verifier, including the
+prover-supplied `q_evals` that are read after `x3`. Those values are compared
+against the instrumented Rust verifier like the other proof scalar reads.
+
+There is one important external-evaluator boundary. In the IVC bench the
+quotient numerator is reconstructed in `Halo2QuotientEvaluator` via
+`STATICCALL`. Because EVM logs are forbidden under `STATICCALL`, the evaluator's
+internal quotient identity trace hooks are deliberately logless. The IVC trace
+test therefore excludes the per-identity quotient-evaluation trace id range:
+
+```text
+30_000..40_000
+```
+
+For that external path, trace equivalence still checks the reconstructed scalar
+returned to the main verifier:
+
+- trace id `23`: `linearization_expected_eval = -nu_y(x)`;
+- trace id `36`: reconstructed numerator `nu_y(x)`;
+- trace ids `60_000..61_000`: selector accumulator folds.
+
+Monolithic and non-IVC trace tests do not cross the external `STATICCALL`
+boundary, so they require the `30_000..40_000` quotient identity-evaluation
+range and compare those internal batched evaluations directly.
+
 The gas-checkpoint bench reports the evaluator work under:
 
 ```text
 batched identity numerator reconstruction
 ```
 
-For the current compile-stable compact default, the latest trace/gas-checkpoint
-CI-shaped run recorded:
+For the gas-capped compact profile that is now the default, the latest recorded
+trace/gas-checkpoint run was:
 
 ```text
-trace + gas-checkpoint tx gas:     2,841,943
-checkpointed section work:         2,569,456
-batched numerator section:           726,361
-verifier runtime:                    21,774 bytes
-VK runtime:                          15,104 bytes
-quotient evaluator runtime:          18,385 bytes
+release trace-equivalent total gas: 1,614,572
+gas-checkpoint tx gas:             1,594,941
+checkpointed section work:         1,432,403
+batched numerator section:           631,289
+verifier runtime:                    12,885 bytes
+VK runtime:                          13,568 bytes
+quotient evaluator runtime:          21,774 bytes
 ```
 
 Defaulting summary:
 
-- trace/gas-checkpoint tx gas: `2,841,943`;
-- quotient runtime: `18,385` bytes.
+- gas-checkpoint tx gas: `1,594,941`;
+- quotient runtime: `21,774` bytes.
 
-The trace/gas-checkpoint build includes debug logs, so its total gas is not
-identical to the non-checkpoint production render. Use it for section deltas
-and regression comparison, not as the production gas number.
+The checkpoint build includes debug logs, so its total gas is not identical to
+the non-checkpoint trace-equivalence run. Use it for section deltas and
+regression comparison, not as the production gas number.
 
-## Defaulting Policy
+### Why A Compile-Stable Profile Was Around 700k Gas
 
-The default is compile-stable compact mode:
+A historical `~700k` batched-numerator measurement came from using the smaller
+compile-stable compact quotient VM profile instead of the older gas-capped
+compact profile.
+
+The old `~631k` run used:
+
+```text
+direct inline identities: 4
+native gate callbacks:   4
+native permutation:      on
+structured trash suffix: on
+```
+
+The compile-stable profile used:
 
 ```text
 direct inline identities: 0
@@ -823,21 +862,75 @@ structured trash suffix: off
 remaining identities:    q_program VM
 ```
 
-This default was selected because every verifier variant must compile under the
-pinned CI compiler (`solc 0.8.30+commit.73712a01 --via-ir`):
+That change moved more numerator arithmetic through the interpreted
+`q_program` VM. The VM saves bytecode, but every interpreted identity pays
+dispatch, stack/memory traffic, and fold-state loads/stores. The measured trade
+was:
 
+```text
+batched numerator section: 631,289 -> 726,361 gas
+quotient evaluator runtime: 21,774 -> 18,385 bytes
+```
+
+The non-trace IVC docs recorded the same band:
+
+```text
+batched identity numerator reconstruction: 705,271 gas
+quotient runtime: 18,318 bytes
+```
+
+The change was introduced by `c9b1567 Make verifier variants compile in CI`,
+which changed `DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES` from `4` to `0` and
+changed the structured trash-tail default from `Trash` to `Off`.
+
+So the `~700k` number was not mainly a proof-shape or fewer-point-sets effect.
+It was the bytecode/compile-stability tradeoff. The gas-capped shape can be
+selected explicitly with:
+
+```sh
+HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=4 \
+HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash \
+scripts/run_ivc_bench.sh --no-outer-fewer-point-sets --skip-srs-download
+```
+
+This repository now defaults back to that gas-capped shape; the `0/off` profile
+remains useful as the smaller compile-stable fallback if a generated variant
+hits pinned-solc size or stack-pressure limits.
+
+## Defaulting Policy
+
+The default is gas-capped compact mode:
+
+```text
+direct inline identities: 4
+native gate callbacks:   4
+native permutation:      on
+structured trash suffix: on
+remaining identities:    q_program VM
+```
+
+This default was selected to keep the IVC quotient-numerator gas near the
+previous `~631k` band while staying below the external quotient evaluator size
+budget:
+
+- quotient runtime is below `23,500` bytes;
 - every deployed runtime is below `24,576` bytes;
-- embedded, separate-VK, trace, gas-checkpoint, and external-quotient variants
-  compile;
-- outer fewer-point-sets on/off variants compile;
 - Rust/Solidity trace equivalence passes byte-for-byte.
 
 `HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N`,
 `HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N`, and
-`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash` remain experimental tuning
-hooks. Non-default values must pass the full trace-equivalence test, the
-variant compile matrix, and the detailed bench before being treated as safe.
-For example, `N=3` produced much smaller bytecode in one trial but failed trace
+`HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off|trash` remain tuning hooks. If a
+variant hits pinned-solc compile pressure, the smaller compile-stable fallback
+is:
+
+```text
+HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=0
+HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off
+```
+
+Non-default values must pass the full trace-equivalence test, the variant
+compile matrix, and the detailed bench before being treated as safe. For
+example, `N=3` produced much smaller bytecode in one trial but failed trace
 equivalence, so it is not a valid default.
 
 ## Commands

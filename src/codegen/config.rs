@@ -1,11 +1,11 @@
 use super::{QuotientProgramEncoding, QuotientStructuredTailMode};
 
-// Keep the default monolithic verifier on the most compile-stable compact VM
-// path. Direct native quotient snippets are still available for local gas
-// experiments via HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N, but the
-// default must survive solc's via-IR stack allocator across embedded/separate
-// verifier variants.
-pub(super) const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 0;
+// Keep a small direct prefix as the default gas-capped compact VM path:
+// it avoids running the entire numerator through the interpreter while staying
+// below the external quotient evaluator size budget. Set
+// HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=0 for the smaller
+// compile-stable fallback.
+pub(super) const DEFAULT_HYBRID_QUOTIENT_INLINE_IDENTITIES: usize = 4;
 pub(super) const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 
@@ -13,17 +13,17 @@ pub(super) const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
 // callbacks. After the direct prefix, the heaviest N remaining gate identities
 // are emitted as VM opcodes that call generated Yul blocks; everything else
 // stays in the compact interpreter. The default keeps the heaviest callbacks
-// native while leaving the direct prefix and structured tail off for solc
-// compile stability. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
+// native. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
 pub(super) const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 4;
 pub(super) const QUOTIENT_NATIVE_GATES_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES";
 pub(super) const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 // The compact quotient VM path is the default size-oriented emitter: it stores
 // identity arithmetic as data in the VK and interprets it from one small Yul
-// loop. Keep the structured tail off by default so the monolithic verifier
-// compiles under pinned solc; set HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=trash,
-// HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1, or HALO2_SOLIDITY_QUOTIENT_CSE=1
-// for local gas/size experiments.
+// loop. Emit the final trash suffix as structured Yul by default to save
+// dispatch gas. Set HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off for the smaller
+// compile-stable fallback, HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1 for the
+// larger fully structured experiment, or HALO2_SOLIDITY_QUOTIENT_CSE=1 for
+// fully inline CSE gas measurement.
 pub(super) const QUOTIENT_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_CSE";
 pub(super) const QUOTIENT_VM_CSE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_VM_CSE";
 pub(super) const QUOTIENT_YUL_HELPERS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS";
@@ -132,7 +132,7 @@ fn parse_quotient_encoding() -> QuotientProgramEncoding {
 
 fn parse_structured_tail() -> QuotientStructuredTailMode {
     let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_TAIL_ENV) else {
-        return QuotientStructuredTailMode::Off;
+        return QuotientStructuredTailMode::Trash;
     };
 
     match value.trim().to_ascii_lowercase().as_str() {

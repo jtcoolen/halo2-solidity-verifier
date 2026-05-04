@@ -157,6 +157,10 @@ scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
 Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
 `scripts/run_ivc_bench.sh --trace`. Custom Midfall overrides must expose the
 `midnight-proofs/solidity-verifier-trace` feature for that leg.
+For the external IVC quotient evaluator, this compares the proof scalar reads
+including `q_evals` and the reconstructed quotient numerator, while internal
+quotient identity trace ids `30_000..40_000` are only available in monolithic
+trace tests because the split evaluator runs under `STATICCALL`.
 
 Compile-check the IVC bench without running the full proof:
 
@@ -223,7 +227,7 @@ This inventory is the output shape of
 - `codegen::tests::accumulator_schema_is_checked_against_instance_count`
 - `codegen::tests::accumulator_vk_header_is_checked_against_codegen_metadata`
 - `codegen::tests::batch_invert_handles_empty_and_singleton_ranges`
-- `codegen::tests::compact_quotient_default_matches_compile_stable_setting`
+- `codegen::tests::compact_quotient_default_matches_gas_capped_setting`
 - `codegen::tests::differential_trace_hooks_cover_expected_categories`
 - `codegen::tests::eip2537_calls_use_bounded_gas_helpers`
 - `codegen::tests::expression_lowering_matches_quotient_vm_eval`
