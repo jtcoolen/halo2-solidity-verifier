@@ -5,7 +5,7 @@
 
 use crate::codegen::{
     layout::{BLS_FP_BYTES, EIP2537_FP_PAD_BYTES},
-    memory::{VerifierMemoryLayout, G1_BYTES, G1_WORDS, WORD_BYTES},
+    memory::{VerifierMemoryLayout, G1_WORDS, WORD_BYTES},
     proof_layout::ProofCalldataLayout,
     protocol::{EvalRead, PermutationZEval, ProtocolPlan},
     template::Halo2VerifyingKey,
@@ -154,7 +154,13 @@ impl ConstraintSystemMeta {
     pub(crate) fn validate_against_protocol(&self) -> Result<(), String> {
         self.protocol.validate()?;
         let planned_g1s = self.protocol.num_commitments();
-        let scheduled_g1s = self.num_advices().iter().sum::<usize>();
+        let scheduled_g1s = self.num_user_advices.iter().sum::<usize>()
+            + self.num_lookups
+            + self.num_permutation_zs
+            + self.lookup_chunks.iter().sum::<usize>()
+            + self.num_lookups
+            + self.num_trashcans
+            + self.num_quotients;
         if planned_g1s != scheduled_g1s {
             return Err(format!(
                 "proof G1 read schedule mismatch: protocol={planned_g1s} metadata={scheduled_g1s}"
@@ -170,86 +176,6 @@ impl ConstraintSystemMeta {
         Ok(())
     }
 
-    /// Returns the number of advice / advice-like commitments emitted in
-    /// each phase of the proof byte stream. This matches the
-    /// `for current_phase in vk.cs.phases() { ... }` loop in
-    /// `midnight_proofs::plonk::verifier::parse_trace`, *plus* dedicated
-    /// "phases" for:
-    ///   - lookup multiplicities (one per lookup, after theta)
-    ///   - permutation product commitments (after beta/gamma)
-    ///   - lookup helpers + accumulators (after permutation products)
-    ///   - trashcan commitments (after trash_challenge)
-    ///   - quotient limbs (after y)
-    ///
-    /// We surface the per-phase counts so the Yul template can emit the
-    /// matching EIP-2537-padded G1 read loops.
-    pub(crate) fn num_advices(&self) -> Vec<usize> {
-        let mut out = self.num_user_advices.clone();
-        // theta is squeezed *between* the user phases and the lookup
-        // multiplicity phase, so the multiplicity phase is its own block.
-        if self.num_lookups != 0 {
-            out.push(self.num_lookups); // multiplicities
-        }
-        // permutation product commitments
-        if self.num_permutation_zs != 0 {
-            out.push(self.num_permutation_zs);
-        }
-        // lookup helpers + accumulators
-        let lookup_h_plus_acc: usize = self.lookup_chunks.iter().sum::<usize>() + self.num_lookups;
-        if lookup_h_plus_acc != 0 {
-            out.push(lookup_h_plus_acc);
-        }
-        // trashcans
-        if self.num_trashcans != 0 {
-            out.push(self.num_trashcans);
-        }
-        // quotient limbs
-        out.push(self.num_quotients);
-        out
-    }
-
-    pub(crate) fn num_challenges(&self) -> Vec<usize> {
-        // midnight-proofs squeezes the challenges in this order:
-        //   user-phase challenges (any number per user phase)
-        //   theta
-        //   beta, gamma
-        //   trash_challenge
-        //   y
-        //   x
-        //
-        // To keep the Yul template structure (alternating "read advices /
-        // squeeze challenges"), we splice these into the per-phase
-        // schedule. The exact splicing scheme is finalised in Step 6
-        // (Yul rewrite); this metadata only records the *counts* and
-        // their squeeze ordering.
-        let mut counts = self.num_user_challenges.clone();
-
-        if self.num_lookups != 0 {
-            // Last user phase: append theta (squeezed before reading
-            // multiplicities).
-            *counts.last_mut().unwrap() += 1; // theta
-            counts.push(2); // beta, gamma after multiplicities
-                            // After permutation_products + lookup_helpers, before trashcans.
-            if self.num_trashcans != 0 {
-                counts.push(1); // trash_challenge
-            }
-            counts.push(1); // y
-            counts.push(1); // x
-        } else {
-            // No lookups: theta+beta+gamma collapse to a single squeeze
-            // block (they are still squeezed individually but with no
-            // intervening reads).
-            *counts.last_mut().unwrap() += 3; // theta, beta, gamma
-            if self.num_trashcans != 0 {
-                counts.push(1); // trash_challenge
-            }
-            counts.push(1); // y
-            counts.push(1); // x
-        }
-
-        counts
-    }
-
     pub(crate) fn num_permutations(&self) -> usize {
         self.permutation_columns.len()
     }
@@ -259,28 +185,6 @@ impl ConstraintSystemMeta {
             .expect("constraint-system metadata must match protocol plan before proof sizing");
         ProofCalldataLayout::from_protocol(&self.protocol, 0, self.num_evals, self.num_point_sets)
             .proof_len
-    }
-
-    pub(crate) fn batch_open_proof_len(&self) -> usize {
-        // Trailing G1 points are: f_com (1) + pi (1) = 2.
-        // Plus the per-set q_evals (handled separately as scalars).
-        self.batch_open_g1_count() * G1_BYTES
-    }
-
-    /// G1 commitments emitted *after* the evaluation block in the proof
-    /// stream by `KZGCommitmentScheme::multi_open` (midnight-proofs):
-    ///   `f_com` (the proof of the polynomial-commitment-degree
-    ///   reduction) and `pi` (the final KZG opening). 2 G1 in total.
-    pub(crate) fn batch_open_g1_count(&self) -> usize {
-        2
-    }
-
-    /// Extra Fq scalars in the multi-open block: one `q_eval` per
-    /// distinct point set (read at `x_3`). Computed from the simulated
-    /// `construct_intermediate_sets` run; populated by the caller after
-    /// `ConstraintSystemMeta` is constructed.
-    pub(crate) fn batch_open_extra_evals(&self) -> usize {
-        self.num_point_sets
     }
 
     /// Setter used by `SolidityGenerator` after running the codegen-side

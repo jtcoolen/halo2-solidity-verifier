@@ -35,18 +35,20 @@ impl QueryKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitmentRead {
-    Advice { column: usize },
-    LookupMultiplicity { lookup: usize },
-    PermutationProduct { set: usize },
-    LookupHelper { lookup: usize, chunk: usize },
-    LookupAccumulator { lookup: usize },
-    Trash { index: usize },
-    Quotient { limb: usize },
+    // The commitment stream only needs kinds for sizing and transcript order.
+    // Column/query identity lives in the eval and PCS plans below.
+    Advice,
+    LookupMultiplicity,
+    PermutationProduct,
+    LookupHelper,
+    LookupAccumulator,
+    Trash,
+    Quotient,
 }
 
 impl CommitmentRead {
     pub(crate) fn is_quotient(self) -> bool {
-        matches!(self, Self::Quotient { .. })
+        matches!(self, Self::Quotient)
     }
 }
 
@@ -325,41 +327,36 @@ impl ProtocolPlan {
         // Hash the prover's advice commitments into the transcript by phase,
         // squeezing the phase challenge before the next phase's commitments
         // are read (`parse_trace`).
-        proof.commitments.extend(
-            advice_indices
-                .iter()
-                .copied()
-                .map(|column| CommitmentRead::Advice { column }),
-        );
+        proof
+            .commitments
+            .extend((0..advice_indices.len()).map(|_| CommitmentRead::Advice));
         // Lookup commitments follow the Rust verifier order: one LogUp
         // multiplicity commitment per lookup, then each chunk helper and
         // accumulator commitment after permutation products are bound.
         proof
             .commitments
-            .extend((0..num_lookups).map(|lookup| CommitmentRead::LookupMultiplicity { lookup }));
+            .extend((0..num_lookups).map(|_| CommitmentRead::LookupMultiplicity));
         // The verifier samples beta/gamma before hashing each permutation
         // product commitment; this plan keeps only the proof cursor order,
         // while the Solidity template owns the transcript squeezes.
         proof
             .commitments
-            .extend((0..num_permutation_zs).map(|set| CommitmentRead::PermutationProduct { set }));
-        for (lookup, &chunks) in lookup_chunks.iter().enumerate() {
-            proof.commitments.extend(
-                (0..chunks).map(move |chunk| CommitmentRead::LookupHelper { lookup, chunk }),
-            );
+            .extend((0..num_permutation_zs).map(|_| CommitmentRead::PermutationProduct));
+        for &chunks in &lookup_chunks {
             proof
                 .commitments
-                .push(CommitmentRead::LookupAccumulator { lookup });
+                .extend((0..chunks).map(|_| CommitmentRead::LookupHelper));
+            proof.commitments.push(CommitmentRead::LookupAccumulator);
         }
         proof
             .commitments
-            .extend((0..num_trashcans).map(|index| CommitmentRead::Trash { index }));
+            .extend((0..num_trashcans).map(|_| CommitmentRead::Trash));
         // Read commitment(s) to the quotient polynomial h(X)=nu(X)/(X^n-1).
         // Multi-limb quotient commitments are kept unless the circuit only
         // needs a single h limb.
         proof
             .commitments
-            .extend((0..num_quotients).map(|limb| CommitmentRead::Quotient { limb }));
+            .extend((0..num_quotients).map(|_| CommitmentRead::Quotient));
 
         // Committed-instance columns are opened by PCS and read as proof
         // evals. Non-committed instance columns are Lagrange-interpolated

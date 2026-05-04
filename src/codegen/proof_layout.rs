@@ -243,36 +243,34 @@ mod tests {
     ) -> ProtocolPlan {
         let num_lookups = lookup_chunks.len();
         let mut proof = ProofReadPlan::default();
-        for column in 0..user_advices.iter().sum::<usize>() {
-            proof.commitments.push(CommitmentRead::Advice { column });
-        }
         proof
             .commitments
-            .extend((0..num_lookups).map(|lookup| CommitmentRead::LookupMultiplicity { lookup }));
+            .extend((0..user_advices.iter().sum::<usize>()).map(|_| CommitmentRead::Advice));
         proof
             .commitments
-            .extend((0..permutation_zs).map(|set| CommitmentRead::PermutationProduct { set }));
-        for (lookup, chunks) in lookup_chunks.iter().copied().enumerate() {
-            proof.commitments.extend(
-                (0..chunks).map(move |chunk| CommitmentRead::LookupHelper { lookup, chunk }),
-            );
+            .extend((0..num_lookups).map(|_| CommitmentRead::LookupMultiplicity));
+        proof
+            .commitments
+            .extend((0..permutation_zs).map(|_| CommitmentRead::PermutationProduct));
+        for chunks in lookup_chunks.iter().copied() {
             proof
                 .commitments
-                .push(CommitmentRead::LookupAccumulator { lookup });
+                .extend((0..chunks).map(|_| CommitmentRead::LookupHelper));
+            proof.commitments.push(CommitmentRead::LookupAccumulator);
         }
         proof
             .commitments
-            .extend((0..trashcans).map(|index| CommitmentRead::Trash { index }));
+            .extend((0..trashcans).map(|_| CommitmentRead::Trash));
         proof
             .commitments
-            .extend((0..quotients).map(|limb| CommitmentRead::Quotient { limb }));
+            .extend((0..quotients).map(|_| CommitmentRead::Quotient));
 
         ProtocolPlan {
             num_user_advices: user_advices,
             advice_indices: (0..proof
                 .commitments
                 .iter()
-                .filter(|read| matches!(read, CommitmentRead::Advice { .. }))
+                .filter(|read| matches!(read, CommitmentRead::Advice))
                 .count())
                 .collect(),
             lookup_chunks,
