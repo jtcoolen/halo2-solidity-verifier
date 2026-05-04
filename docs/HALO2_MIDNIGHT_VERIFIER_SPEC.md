@@ -19,7 +19,9 @@ The normative target is the current generator in:
 - `templates/QuotientNumeratorBlock.yul`
 
 Existing focused notes remain useful, especially `docs/MEMORY_LAYOUT.md` and
-`docs/QUOTIENT_NUMERATOR_EVALUATOR.md`. This document consolidates the full
+`docs/QUOTIENT_NUMERATOR_EVALUATOR.md`. For a template-by-template map from
+Askama Solidity/Yul sections to the Midfall Rust verifier, see
+`docs/ASKAMA_TEMPLATE_RUST_MAPPING.md`. This document consolidates the full
 verifier contract, proof format, transcript, algebra, KZG opening check, and
 split-artifact architecture.
 
@@ -37,6 +39,8 @@ this generator:
 - Identity and linearization comments from `plonk/mod.rs` and
   `plonk/linearization/verifier.rs` map to `templates/QuotientNumeratorBlock.yul`
   and `docs/QUOTIENT_NUMERATOR_EVALUATOR.md`.
+- Askama template structure, generated Solidity/Yul sections, and optimization
+  tradeoffs are mapped in `docs/ASKAMA_TEMPLATE_RUST_MAPPING.md`.
 - KZG multi-open, dummy-query, point-set sorting, MSM, and pairing comments from
   `poly/kzg/{mod.rs,msm.rs,utils.rs}` map to `src/codegen/pcs.rs`.
 - LogUp, permutation, and trash comments map to the quotient evaluator docs and
