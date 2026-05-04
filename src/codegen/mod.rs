@@ -8,7 +8,8 @@ use crate::codegen::{
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
-        QuotientProgram, UserPhase, VerifierCodegenLayout,
+        QuotientProgram, QuotientVmMemUsage, QuotientVmOpcodeUsage, UserPhase,
+        VerifierCodegenLayout,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
@@ -1854,6 +1855,53 @@ mod tests {
             eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
             expected
         );
+    }
+
+    #[test]
+    fn quotient_program_usage_tracks_byte_ops_and_tokens() {
+        let bytes = vec![
+            Q_OP_PUSH_MEM_TOKEN,
+            Q_MEM_THETA,
+            Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16,
+            0x00,
+            0x02,
+            0x00,
+            0x20,
+            0x03,
+            0x00,
+            0x40,
+            0x04,
+            Q_OP_FOLD_MAIN,
+        ];
+
+        let (ops, mem_tokens) = quotient_program_usage(&bytes, QuotientProgramEncoding::Bytes);
+
+        assert!(ops.contains(&Q_OP_PUSH_MEM_TOKEN));
+        assert!(ops.contains(&Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16));
+        assert!(ops.contains(&Q_OP_FOLD_MAIN));
+        assert!(!ops.contains(&Q_OP_ADD_MUL_CONST_U8_MEM_U16));
+        assert_eq!(mem_tokens, vec![Q_MEM_THETA]);
+    }
+
+    #[test]
+    fn quotient_program_usage_tracks_packed_extra_words_and_token_offsets() {
+        let mut bytes = Vec::new();
+        push_packed_quotient_op(
+            &mut bytes,
+            Q_OP_PUSH_MEM_TOKEN_OFFSET,
+            ((Q_MEM_X as u32) << 16) | 0x40,
+        );
+        push_packed_quotient_op(&mut bytes, Q_OP_ADD_MUL_MEM_MEM_CONST_U8, 7);
+        bytes.extend_from_slice(&((0x120u32 << 16) | 0x140).to_be_bytes());
+        push_packed_quotient_op(&mut bytes, Q_OP_FOLD_MAIN, 0);
+
+        let (ops, mem_tokens) =
+            quotient_program_usage(&bytes, QuotientProgramEncoding::Packed32);
+
+        assert!(ops.contains(&Q_OP_PUSH_MEM_TOKEN_OFFSET));
+        assert!(ops.contains(&Q_OP_ADD_MUL_MEM_MEM_CONST_U8));
+        assert!(ops.contains(&Q_OP_FOLD_MAIN));
+        assert_eq!(mem_tokens, vec![Q_MEM_X]);
     }
 
     #[test]

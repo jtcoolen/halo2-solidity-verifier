@@ -97,6 +97,13 @@ pub(super) struct QuotientProgramBuild {
     ///
     /// Persistent VM state slots are laid out immediately after these temps.
     pub(super) cse_temps: usize,
+    /// Opcode bytes actually present in the finalized physical program.
+    ///
+    /// The template uses this to render only the interpreter cases reachable
+    /// by this VK-specialized quotient program.
+    pub(super) used_ops: Vec<u8>,
+    /// Memory-token operands actually present in the finalized physical program.
+    pub(super) used_mem_tokens: Vec<u8>,
 }
 
 /// One Halo2 quotient identity in both legacy-Yul and VM-ready forms.
@@ -1251,6 +1258,7 @@ impl QuotientProgramBuilder {
             QuotientProgramEncoding::Bytes => compact_quotient_runs(&self.bytes),
             QuotientProgramEncoding::Packed32 => pack_quotient_u32_program(&self.bytes),
         };
+        let (used_ops, used_mem_tokens) = quotient_program_usage(&bytes, encoding);
         let profile = self.profile;
         if quotient_shape_profile_enabled() {
             eprintln!(
@@ -1270,6 +1278,8 @@ impl QuotientProgramBuilder {
             max_stack: self.max_stack,
             packed32: encoding == QuotientProgramEncoding::Packed32,
             cse_temps,
+            used_ops,
+            used_mem_tokens,
         }
     }
 
@@ -2066,6 +2076,96 @@ pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
         idx += quotient_op_len(bytes, idx);
     }
     false
+}
+
+/// Return opcode and memory-token usage for a finalized quotient program.
+///
+/// This is a code-size optimization for the VK-specialized interpreter. The
+/// generated evaluator only needs switch arms for opcodes that can actually
+/// occur in its embedded program; malformed external frames still hit the
+/// default revert branch.
+pub(super) fn quotient_program_usage(
+    bytes: &[u8],
+    encoding: QuotientProgramEncoding,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut ops = Vec::new();
+    let mut mem_tokens = Vec::new();
+
+    match encoding {
+        QuotientProgramEncoding::Bytes => {
+            let mut idx = 0usize;
+            while idx < bytes.len() {
+                let op = bytes[idx];
+                push_unique_u8(&mut ops, op);
+                match op {
+                    Q_OP_PUSH_MEM_TOKEN => {
+                        push_unique_u8(&mut mem_tokens, bytes[idx + 1]);
+                        idx += 2;
+                    }
+                    Q_OP_PUSH_MEM_TOKEN_OFFSET => {
+                        push_unique_u8(&mut mem_tokens, bytes[idx + 1]);
+                        idx += 1 + 1 + QUOTIENT_VM_BYTE_U32_BYTES;
+                    }
+                    Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+                        let run_len = read_u16(bytes, idx + 1) as usize;
+                        idx += 1 + QUOTIENT_VM_BYTE_U16_BYTES
+                            + run_len * (2 * QUOTIENT_VM_BYTE_U16_BYTES + 1);
+                    }
+                    Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+                        let run_len = read_u16(bytes, idx + 1) as usize;
+                        idx += 1 + QUOTIENT_VM_BYTE_U16_BYTES
+                            + run_len * (QUOTIENT_VM_BYTE_U16_BYTES + 1);
+                    }
+                    Q_OP_LIN7 => {
+                        idx += 1 + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
+                    }
+                    Q_OP_BILIN7_ROW => {
+                        idx += 1
+                            + QUOTIENT_VM_BYTE_U16_BYTES
+                            + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
+                    }
+                    Q_OP_BILIN7_PAIRWISE => {
+                        idx += 1
+                            + 2 * QUOTIENT_VM_BYTE_U16_BYTES
+                            + QUOTIENT_VM_PAIRWISE_COEFFS;
+                    }
+                    _ => idx += quotient_op_len(bytes, idx),
+                }
+            }
+        }
+        QuotientProgramEncoding::Packed32 => {
+            let mut idx = 0usize;
+            while idx < bytes.len() {
+                let word = read_u32(bytes, idx);
+                let op = (word >> QUOTIENT_VM_PACKED_ARG_BITS) as u8;
+                let arg = word & QUOTIENT_VM_PACKED_ARG_MASK;
+                push_unique_u8(&mut ops, op);
+                match op {
+                    Q_OP_PUSH_MEM_TOKEN => {
+                        push_unique_u8(&mut mem_tokens, arg as u8);
+                        idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+                    }
+                    Q_OP_PUSH_MEM_TOKEN_OFFSET => {
+                        push_unique_u8(&mut mem_tokens, (arg >> 16) as u8);
+                        idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+                    }
+                    Q_OP_ADD_MUL_MEM_MEM_CONST_U8 | Q_OP_ADD_MUL_MEM_MEM => {
+                        idx += 2 * QUOTIENT_VM_PACKED_INSTRUCTION_BYTES;
+                    }
+                    _ => idx += QUOTIENT_VM_PACKED_INSTRUCTION_BYTES,
+                }
+            }
+        }
+    }
+
+    (ops, mem_tokens)
+}
+
+fn push_unique_u8(values: &mut Vec<u8>, value: u8) {
+    if !values.contains(&value) {
+        values.push(value);
+        values.sort_unstable();
+    }
 }
 
 /// Append one packed32 instruction word.

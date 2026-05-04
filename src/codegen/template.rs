@@ -718,6 +718,10 @@ pub(crate) struct QuotientProgram {
     pub(crate) packed32: bool,
     /// Number of VM CSE temp words.
     pub(crate) cse_temps: usize,
+    /// Opcode switch arms required by this generated program.
+    pub(crate) op_usage: QuotientVmOpcodeUsage,
+    /// Memory-token switch arms required by this generated program.
+    pub(crate) mem_usage: QuotientVmMemUsage,
     /// Memory pointer to the first constant word.
     pub(crate) const_mptr: usize,
     /// Memory pointer to VM temp/state area.
@@ -736,6 +740,53 @@ pub(crate) struct QuotientProgram {
     pub(crate) stack_mptr: usize,
     /// Memory pointer to the first encoded program word.
     pub(crate) program_mptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QuotientVmOpcodeUsage {
+    pub(crate) push_const: bool,
+    pub(crate) push_mem_literal: bool,
+    pub(crate) push_mem_token: bool,
+    pub(crate) push_mem_token_offset: bool,
+    pub(crate) push_mem_u16: bool,
+    pub(crate) add: bool,
+    pub(crate) mul: bool,
+    pub(crate) neg: bool,
+    pub(crate) push_const_u8: bool,
+    pub(crate) fold_main: bool,
+    pub(crate) fold_selector: bool,
+    pub(crate) add_const_u8: bool,
+    pub(crate) mul_const_u8: bool,
+    pub(crate) add_const: bool,
+    pub(crate) mul_const: bool,
+    pub(crate) add_mem_u16: bool,
+    pub(crate) mul_mem_u16: bool,
+    pub(crate) add_mul_mem_mem_const_u8: bool,
+    pub(crate) add_mul_const_u8_mem_u16: bool,
+    pub(crate) add_mul_mem_mem: bool,
+    pub(crate) run_add_mul_mem_mem_const_u8: bool,
+    pub(crate) run_add_mul_const_u8_mem_u16: bool,
+    pub(crate) push_temp: bool,
+    pub(crate) store_temp: bool,
+    pub(crate) native_permutation: bool,
+    pub(crate) native_lookup: bool,
+    pub(crate) native_identity: bool,
+    pub(crate) lin7: bool,
+    pub(crate) bilin7_row: bool,
+    pub(crate) bilin7_pairwise: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QuotientVmMemUsage {
+    pub(crate) l0: bool,
+    pub(crate) l_last: bool,
+    pub(crate) l_blind: bool,
+    pub(crate) beta: bool,
+    pub(crate) gamma: bool,
+    pub(crate) x: bool,
+    pub(crate) theta: bool,
+    pub(crate) trash_challenge: bool,
+    pub(crate) instance_eval: bool,
 }
 
 impl Halo2VerifyingKey {
