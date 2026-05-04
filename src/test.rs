@@ -344,6 +344,55 @@ impl Circuit<F> for ShapeFuzzCircuit {
 }
 
 #[test]
+fn lookup_shape_verifier_compiles_with_native_lookup_callback() {
+    if !shape_fuzz_inputs_available_for_evm() {
+        return;
+    }
+    if env::var("HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP")
+        .ok()
+        .is_some_and(|value| value == "0")
+    {
+        eprintln!("skipping native lookup compile test: native lookup disabled by environment");
+        return;
+    }
+
+    let case = ShapeFuzzCase {
+        name: "native lookup compile",
+        k: 5,
+        seed: 303,
+        spec: ShapeFuzzSpec {
+            second_phase: true,
+            lookup: true,
+            fixed_scale: true,
+            tag: 3,
+            ..ShapeFuzzSpec::default()
+        },
+    };
+    let circuit = ShapeFuzzCircuit::new(case.spec, case.seed);
+    let mut setup_rng = ChaCha8Rng::seed_from_u64(case.seed ^ 0x5eed_5eed);
+    let params = PoseidonParams::unsafe_setup(case.k, &mut setup_rng);
+    let vk = keygen_vk_with_k::<F, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, case.k)
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` vk generation failed: {err:?}", case.name));
+
+    let generator = SolidityGenerator::new(&params, &vk, 1, 1);
+    let (verifier_solidity, vk_solidity) = generator
+        .render_separately()
+        .unwrap_or_else(|err| panic!("shape fuzz `{}` render failed: {err:?}", case.name));
+
+    assert!(
+        verifier_solidity.contains("case 0x1f"),
+        "lookup verifier should include the native lookup VM callback"
+    );
+    assert!(
+        verifier_solidity.contains("q_lookup_f"),
+        "lookup verifier should include the structured lookup callback body"
+    );
+
+    assert!(!compile_solidity(verifier_solidity).is_empty());
+    assert!(!compile_solidity(vk_solidity).is_empty());
+}
+
+#[test]
 fn supported_shape_circuit_fuzz_e2e() {
     if !shape_fuzz_inputs_available_for_evm() {
         return;

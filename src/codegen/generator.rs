@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn quotient_stack_words_cover_native_permutation_scratch() {
+    fn quotient_stack_words_cover_native_callback_scratch() {
         let build = QuotientProgramBuild {
             bytes: Vec::new(),
             consts: Vec::new(),
@@ -937,12 +937,12 @@ impl<'a> SolidityGenerator<'a> {
     /// Return stack/scratch words needed by interpreted VM and native callbacks.
     fn quotient_stack_words_for_build(
         build: &QuotientProgramBuild,
-        native_permutation_scratch_words: usize,
+        native_callback_scratch_words: usize,
     ) -> usize {
         // `build.max_stack` only describes the interpreted operand stack. Some
         // native callbacks share `quotient_stack_mptr` as a scratch base, so
         // the registered memory region must cover both possible users.
-        build.max_stack.max(native_permutation_scratch_words)
+        build.max_stack.max(native_callback_scratch_words)
     }
 
     /// Choose inline, VM, and native-callback representation for identities.
@@ -955,8 +955,8 @@ impl<'a> SolidityGenerator<'a> {
         // each identity:
         //   * a small gate prefix can stay inline,
         //   * ordinary identities become compact VM bytecode,
-        //   * recognized expensive gates/permutation products become native
-        //     callback markers in the same stream.
+        //   * recognized expensive gates plus regular permutation/lookup
+        //     families become native callback markers in the same stream.
         let parts = self.quotient_identity_parts(meta, data);
         let inline_count = hybrid_quotient_inline_count(&parts.gates);
         let inline_identities = parts.gates[..inline_count].to_vec();
@@ -964,6 +964,7 @@ impl<'a> SolidityGenerator<'a> {
         let native_gate_indices = Self::native_gate_indices(remaining_gates);
         let native_permutation =
             quotient_native_permutation_enabled() && meta.num_permutation_zs > 0;
+        let native_lookup = quotient_native_lookup_enabled() && meta.num_lookups > 0;
         let structured_trash_tail = quotient_structured_tail_mode()
             == QuotientStructuredTailMode::Trash
             && meta.num_trashcans > 0;
@@ -973,7 +974,8 @@ impl<'a> SolidityGenerator<'a> {
                 + parts.permutation.len()
                 + parts.lookup.len()
                 + parts.trash.len()
-                + usize::from(native_permutation),
+                + usize::from(native_permutation)
+                + usize::from(native_lookup),
         );
         let mut native_identities = Vec::with_capacity(native_gate_indices.len());
         for (gate_idx, identity) in remaining_gates.iter().enumerate() {
@@ -997,13 +999,17 @@ impl<'a> SolidityGenerator<'a> {
                     .map(QuotientProgramItem::Identity),
             );
         }
-        items.extend(
-            parts
-                .lookup
-                .iter()
-                .cloned()
-                .map(QuotientProgramItem::Identity),
-        );
+        if native_lookup {
+            items.push(QuotientProgramItem::NativeLookup);
+        } else {
+            items.extend(
+                parts
+                    .lookup
+                    .iter()
+                    .cloned()
+                    .map(QuotientProgramItem::Identity),
+            );
+        }
         if !structured_trash_tail {
             items.extend(
                 parts
@@ -1020,6 +1026,7 @@ impl<'a> SolidityGenerator<'a> {
             native_identities,
             sorted_simple: parts.sorted_simple,
             has_native_permutation: native_permutation,
+            has_native_lookup: native_lookup,
         }
     }
 
@@ -1897,6 +1904,45 @@ impl<'a> SolidityGenerator<'a> {
         (2 * num_cols) + (2 * num_sets) + num_sets.saturating_sub(1) + 1
     }
 
+    /// Maximum parallel input width across LogUp lookup chunks.
+    fn structured_lookup_max_parallel(&self, meta: &ConstraintSystemMeta) -> usize {
+        if meta.num_lookups == 0 {
+            return 0;
+        }
+
+        let mut max_parallel = 1usize;
+        for lookup in self.vk.cs().lookups() {
+            let chunked = lookup.chunk_by_degree(self.vk.cs().degree());
+            for input_chunk in chunked.input_expression_chunks() {
+                max_parallel = max_parallel.max(input_chunk.len());
+            }
+        }
+        max_parallel
+    }
+
+    /// Scratch table width used by the native lookup callback.
+    fn structured_lookup_scratch_words(&self, meta: &ConstraintSystemMeta) -> usize {
+        // Native lookup stages f+beta values plus prefix and suffix products.
+        self.structured_lookup_max_parallel(meta) * 3
+    }
+
+    /// Largest scratch table needed by any enabled native VM callback.
+    fn native_callback_scratch_words(
+        &self,
+        meta: &ConstraintSystemMeta,
+        plan: &QuotientProgramPlan,
+    ) -> usize {
+        let permutation_words = plan
+            .has_native_permutation
+            .then(|| Self::structured_permutation_scratch_words(meta))
+            .unwrap_or(0);
+        let lookup_words = plan
+            .has_native_lookup
+            .then(|| self.structured_lookup_scratch_words(meta))
+            .unwrap_or(0);
+        permutation_words.max(lookup_words)
+    }
+
     /// Emit a native structured loop for the full permutation identity block.
     ///
     /// The formula follows the upstream permutation verifier/evaluator:
@@ -2164,6 +2210,26 @@ impl<'a> SolidityGenerator<'a> {
 
                 if k == 0 {
                     block.push("let q_lookup_eval := 0".to_string());
+                    Self::push_structured_main_fold(
+                        &mut block,
+                        "q_lookup_eval",
+                        sorted_simple,
+                        state_slots,
+                        trace,
+                    );
+                    block.push("}".to_string());
+                    continue;
+                }
+
+                if k == 1 {
+                    evaluator.reset_locals();
+                    let (mut compressed_lines, compressed_var) = evaluator
+                        .compress_expressions_with_challenge_var(&input_chunk[0], "q_lookup_theta");
+                    block.append(&mut compressed_lines);
+                    block.push(format!(
+                        "let q_lookup_eval := addmod(mulmod({}, addmod({compressed_var}, q_lookup_beta, r), r), sub(r, 1), r)",
+                        h_eval
+                    ));
                     Self::push_structured_main_fold(
                         &mut block,
                         "q_lookup_eval",
@@ -2577,13 +2643,11 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
-        let native_permutation_scratch_words = quotient_plan
-            .has_native_permutation
-            .then(|| Self::structured_permutation_scratch_words(&meta))
-            .unwrap_or(0);
+        let native_callback_scratch_words =
+            self.native_callback_scratch_words(&meta, &quotient_plan);
         let quotient_stack_words = Self::quotient_stack_words_for_build(
             &quotient_program_build,
-            native_permutation_scratch_words,
+            native_callback_scratch_words,
         );
         let memory = self.memory_layout_for(
             &meta,
@@ -2643,6 +2707,7 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_eval_numer_computations = Vec::new();
         let mut quotient_post_vm_computations = Vec::new();
         let mut quotient_native_permutation_computation = Vec::new();
+        let mut quotient_native_lookup_computation = Vec::new();
         let mut quotient_native_identity_computations = Vec::new();
         let quotient_native_trash_computation = Vec::new();
 
@@ -2676,6 +2741,19 @@ impl<'a> SolidityGenerator<'a> {
                 quotient_native_permutation_computation = block;
             }
         }
+        if quotient_plan.has_native_lookup {
+            if let Some(block) = self.structured_lookup_loop_block(
+                &meta,
+                &data,
+                &evaluator,
+                &sorted_simple,
+                quotient_stack_mptr,
+                Some(quotient_state_slots),
+                false,
+            ) {
+                quotient_native_lookup_computation = block;
+            }
+        }
         for identity in &quotient_plan.native_identities {
             quotient_native_identity_computations.push(Self::direct_quotient_block(
                 &identity.lines,
@@ -2706,6 +2784,7 @@ impl<'a> SolidityGenerator<'a> {
             .iter()
             .chain(quotient_post_vm_computations.iter())
             .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(std::iter::once(&quotient_native_lookup_computation))
             .chain(quotient_native_identity_computations.iter())
             .chain(std::iter::once(&quotient_native_trash_computation))
             .flat_map(|block| block.iter())
@@ -2714,6 +2793,7 @@ impl<'a> SolidityGenerator<'a> {
             .iter()
             .chain(quotient_post_vm_computations.iter())
             .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(std::iter::once(&quotient_native_lookup_computation))
             .chain(quotient_native_identity_computations.iter())
             .chain(std::iter::once(&quotient_native_trash_computation))
             .flat_map(|block| block.iter())
@@ -2722,6 +2802,7 @@ impl<'a> SolidityGenerator<'a> {
             .iter()
             .chain(quotient_post_vm_computations.iter())
             .chain(std::iter::once(&quotient_native_permutation_computation))
+            .chain(std::iter::once(&quotient_native_lookup_computation))
             .chain(quotient_native_identity_computations.iter())
             .chain(std::iter::once(&quotient_native_trash_computation))
             .flat_map(|block| block.iter())
@@ -2753,6 +2834,7 @@ impl<'a> SolidityGenerator<'a> {
             quotient_eval_numer_computations,
             quotient_post_vm_computations,
             quotient_native_permutation_computation,
+            quotient_native_lookup_computation,
             quotient_native_identity_computations,
             quotient_native_trash_computation,
             quotient_program,
@@ -2825,11 +2907,9 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_stack_words = quotient_program_build
             .as_ref()
             .map(|build| {
-                let native_permutation_scratch_words = quotient_plan
-                    .has_native_permutation
-                    .then(|| Self::structured_permutation_scratch_words(&meta))
-                    .unwrap_or(0);
-                Self::quotient_stack_words_for_build(build, native_permutation_scratch_words)
+                let native_callback_scratch_words =
+                    self.native_callback_scratch_words(&meta, &quotient_plan);
+                Self::quotient_stack_words_for_build(build, native_callback_scratch_words)
             })
             .unwrap_or(0);
         let memory = self.memory_layout_for(
@@ -2920,6 +3000,7 @@ impl<'a> SolidityGenerator<'a> {
         let mut quotient_eval_numer_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_post_vm_computations: Vec<Vec<String>> = Vec::new();
         let mut quotient_native_permutation_computation: Vec<String> = Vec::new();
+        let mut quotient_native_lookup_computation: Vec<String> = Vec::new();
         let mut quotient_native_identity_computations: Vec<Vec<String>> = Vec::new();
         let quotient_native_trash_computation: Vec<String> = Vec::new();
 
@@ -2976,6 +3057,20 @@ impl<'a> SolidityGenerator<'a> {
                 }
             }
 
+            if quotient_plan.has_native_lookup {
+                if let Some(block) = self.structured_lookup_loop_block(
+                    &meta,
+                    &data,
+                    &evaluator,
+                    &sorted_simple,
+                    quotient_stack_mptr,
+                    quotient_state_slots,
+                    trace,
+                ) {
+                    quotient_native_lookup_computation = block;
+                }
+            }
+
             for identity in &quotient_plan.native_identities {
                 quotient_native_identity_computations.push(Self::direct_quotient_block(
                     &identity.lines,
@@ -3010,6 +3105,7 @@ impl<'a> SolidityGenerator<'a> {
                 .chain(quotient_inline_computations.iter())
                 .chain(quotient_post_vm_computations.iter())
                 .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(std::iter::once(&quotient_native_lookup_computation))
                 .chain(quotient_native_identity_computations.iter())
                 .chain(std::iter::once(&quotient_native_trash_computation))
                 .flat_map(|block| block.iter())
@@ -3020,6 +3116,7 @@ impl<'a> SolidityGenerator<'a> {
                 .chain(quotient_inline_computations.iter())
                 .chain(quotient_post_vm_computations.iter())
                 .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(std::iter::once(&quotient_native_lookup_computation))
                 .chain(quotient_native_identity_computations.iter())
                 .chain(std::iter::once(&quotient_native_trash_computation))
                 .flat_map(|block| block.iter())
@@ -3030,6 +3127,7 @@ impl<'a> SolidityGenerator<'a> {
                 .chain(quotient_inline_computations.iter())
                 .chain(quotient_post_vm_computations.iter())
                 .chain(std::iter::once(&quotient_native_permutation_computation))
+                .chain(std::iter::once(&quotient_native_lookup_computation))
                 .chain(quotient_native_identity_computations.iter())
                 .chain(std::iter::once(&quotient_native_trash_computation))
                 .flat_map(|block| block.iter())
@@ -3193,6 +3291,7 @@ impl<'a> SolidityGenerator<'a> {
             quotient_eval_numer_computations,
             quotient_post_vm_computations,
             quotient_native_permutation_computation,
+            quotient_native_lookup_computation,
             quotient_native_identity_computations,
             quotient_native_trash_computation,
             quotient_program: if external_quotient {
@@ -3241,6 +3340,7 @@ impl<'a> SolidityGenerator<'a> {
                         Some(Self::quotient_identity_expr(identity))
                     }
                     QuotientProgramItem::NativePermutation
+                    | QuotientProgramItem::NativeLookup
                     | QuotientProgramItem::NativeIdentity(_) => None,
                 })
                 .collect::<Vec<_>>();
@@ -3254,6 +3354,7 @@ impl<'a> SolidityGenerator<'a> {
                     builder.identity_expr(&expr, identity.target, cse.as_mut());
                 }
                 QuotientProgramItem::NativePermutation => builder.native_permutation(),
+                QuotientProgramItem::NativeLookup => builder.native_lookup(),
                 QuotientProgramItem::NativeIdentity(native_idx) => {
                     builder.native_identity(*native_idx);
                 }

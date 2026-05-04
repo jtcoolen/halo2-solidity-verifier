@@ -123,7 +123,7 @@
                 //   0x17/0x18 load/store CSE temp
                 //   0x19 native permutation    0x1b native heavy identity
                 //   0x1c LIN7                 0x1d BILIN7_ROW
-                //   0x1e BILIN7_PAIRWISE
+                //   0x1e BILIN7_PAIRWISE      0x1f native lookup
                 //
                 // There are two physical encodings for the same logical VM:
                 // packed32 and byte-oriented. The generator chooses one; both
@@ -306,6 +306,25 @@
                         // whenever this opcode can appear.
                         q_sp := {{ program.stack_mptr|hex() }}
                         {%- for line in quotient_native_permutation_computation %}
+                        {{ line }}
+                        {%- endfor %}
+                    }
+                    {%- endif %}
+                    {%- if quotient_native_lookup_computation.len() > 0 %}
+                    // Native lookup callback. This whole-family opcode
+                    // evaluates the LogUp boundary, helper-chunk, and
+                    // accumulator identities at this VM position, preserving
+                    // the Rust y-batch order while avoiding many interpreted
+                    // product-loop opcodes.
+                    case {{ template_constants.quotient_vm.op.native_lookup|hex() }} {
+                        q_top := 0
+                        q_has_top := 0
+                        // The generated loop below uses program.stack_mptr as
+                        // f+beta/prefix/suffix scratch rather than as a
+                        // conventional VM stack. The Rust memory planner must
+                        // reserve structured_lookup_scratch_words(meta).
+                        q_sp := {{ program.stack_mptr|hex() }}
+                        {%- for line in quotient_native_lookup_computation %}
                         {{ line }}
                         {%- endfor %}
                     }
@@ -710,10 +729,29 @@
                         {%- endfor %}
                     }
                     {%- endif %}
+                    {%- if quotient_native_lookup_computation.len() > 0 %}
+                    // Native lookup callback. This whole-family opcode
+                    // evaluates the LogUp boundary, helper-chunk, and
+                    // accumulator identities at this VM position, preserving
+                    // the Rust y-batch order while avoiding many interpreted
+                    // product-loop opcodes.
+                    case {{ template_constants.quotient_vm.op.native_lookup|hex() }} {
+                        q_top := 0
+                        q_has_top := 0
+                        // The generated loop below uses program.stack_mptr as
+                        // f+beta/prefix/suffix scratch rather than as a
+                        // conventional VM stack. The Rust memory planner must
+                        // reserve structured_lookup_scratch_words(meta).
+                        q_sp := {{ program.stack_mptr|hex() }}
+                        {%- for line in quotient_native_lookup_computation %}
+                        {{ line }}
+                        {%- endfor %}
+                    }
+                    {%- endif %}
                     {%- if quotient_native_identity_computations.len() > 0 %}
                     // Native callbacks are generated only for the heaviest
-                    // recognized Midfall gate identities. All other gate,
-                    // lookup, and non-native identity arithmetic remains in
+                    // recognized Midfall gate identities. All other gate and
+                    // non-native identity arithmetic remains in
                     // the compact q_program VM above, preserving the Rust
                     // `partially_evaluate_identities` order.
                     case {{ template_constants.quotient_vm.op.native_identity|hex() }} {

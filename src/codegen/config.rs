@@ -38,6 +38,7 @@ pub(super) const QUOTIENT_STRUCTURED_LOOPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_
 pub(super) const QUOTIENT_STRUCTURED_TAIL_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL";
 pub(super) const QUOTIENT_NATIVE_PERMUTATION_ENV: &str =
     "HALO2_SOLIDITY_QUOTIENT_NATIVE_PERMUTATION";
+pub(super) const QUOTIENT_NATIVE_LOOKUP_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP";
 pub(super) const QUOTIENT_LIMB_VM_OPS_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS";
 pub(super) const QUOTIENT_SHAPE_PROFILE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE";
 
@@ -61,6 +62,8 @@ pub(super) struct CodegenOptions {
     pub(super) quotient_structured_tail: QuotientStructuredTailMode,
     /// Whether permutation identities can be replaced by a native VM callback.
     pub(super) quotient_native_permutation: bool,
+    /// Whether lookup identities can be replaced by a native VM callback.
+    pub(super) quotient_native_lookup: bool,
     /// Whether byte-oriented VM emission may use limb-specialized opcodes.
     pub(super) quotient_limb_vm_ops: bool,
     /// Whether limb recognizer counters are printed to stderr.
@@ -97,6 +100,12 @@ impl CodegenOptions {
             quotient_structured_tail: parse_structured_tail(),
             quotient_native_permutation: parse_bool_env(
                 QUOTIENT_NATIVE_PERMUTATION_ENV,
+                true,
+                "0/1",
+                &["native"],
+            ),
+            quotient_native_lookup: parse_bool_env(
+                QUOTIENT_NATIVE_LOOKUP_ENV,
                 true,
                 "0/1",
                 &["native"],

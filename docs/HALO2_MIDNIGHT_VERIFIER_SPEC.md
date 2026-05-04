@@ -974,6 +974,9 @@ big-endian.
         const[const_idx[i+j]]
         * mload(lhs_base + 32*i)
         * mload(rhs_base + 32*j)
+
+0x1f:
+    native lookup callback
 ```
 
 The packed32 encoding is an alternate physical encoding where each base
@@ -1465,6 +1468,7 @@ HALO2_SOLIDITY_QUOTIENT_YUL_HELPERS=0|1
 HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=0|1
 HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off|trash
 HALO2_SOLIDITY_QUOTIENT_NATIVE_PERMUTATION=0|1
+HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP=0|1
 HALO2_SOLIDITY_QUOTIENT_LIMB_VM_OPS=0|1
 HALO2_SOLIDITY_QUOTIENT_SHAPE_PROFILE=0|1
 ```
@@ -1477,6 +1481,7 @@ native heavy gate callbacks:       4
 quotient program encoding:         bytes
 VM CSE:                            on
 native permutation callback:       on
+native lookup callback:            on
 structured trash suffix:           on
 limb VM ops:                       off
 ```

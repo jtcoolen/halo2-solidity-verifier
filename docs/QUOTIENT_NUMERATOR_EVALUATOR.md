@@ -536,11 +536,16 @@ The profile reports counts for `LIN7`, `BILIN7_ROW`,
 
 Large recognized identities can be emitted as native Yul callbacks. The
 default gas-capped compact mode keeps four heavy gate identities native, plus
-the native permutation loop.
+the native permutation and lookup loops.
 
 Native callbacks preserve identity order because the VM stream contains an
 opcode at the exact identity position. The callback computes the evaluation
 and then returns to the shared fold logic.
+
+The lookup callback is a whole-family superinstruction for the LogUp block. It
+replaces the interpreted boundary, helper-chunk, and accumulator identities
+with a generated structured loop that shares `f + beta`, prefix-product, and
+suffix-product scratch tables.
 
 ### Structured Trash Suffix
 
@@ -849,6 +854,7 @@ The old `~631k` run used:
 direct inline identities: 4
 native gate callbacks:   4
 native permutation:      on
+native lookup:           on
 structured trash suffix: on
 ```
 
@@ -858,6 +864,7 @@ The compile-stable profile used:
 direct inline identities: 0
 native gate callbacks:   4
 native permutation:      on
+native lookup:           on
 structured trash suffix: off
 remaining identities:    q_program VM
 ```
@@ -918,7 +925,8 @@ budget:
 - Rust/Solidity trace equivalence passes byte-for-byte.
 
 `HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES=N`,
-`HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N`, and
+`HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N`,
+`HALO2_SOLIDITY_QUOTIENT_NATIVE_LOOKUP=0|1`, and
 `HALO2_SOLIDITY_QUOTIENT_STRUCTURED_TAIL=off|trash` remain tuning hooks. If a
 variant hits pinned-solc compile pressure, the smaller compile-stable fallback
 is:

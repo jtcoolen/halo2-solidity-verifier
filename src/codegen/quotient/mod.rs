@@ -38,10 +38,13 @@
 //! The VM is intentionally small rather than general-purpose. It has only Fr
 //! arithmetic, memory loads from generated verifier addresses, a deduplicated
 //! VK-resident constant table, optional common-subexpression temporaries, and a
-//! few fused opcodes for shapes that dominate Midfall quotient identities. The
-//! limb-aware opcodes are justified as structural compression of foreign-field
-//! limb expressions; they do not change the source of truth and they still
-//! evaluate the resulting PLONK identity over BLS12-381 Fr.
+//! few fused opcodes for shapes that dominate Midfall quotient identities.
+//! Whole-family native markers, such as permutation and lookup callbacks, are
+//! domain-shaped superinstructions: they preserve identity order while moving
+//! regular product-loop arithmetic out of the interpreter. The limb-aware
+//! opcodes are justified as structural compression of foreign-field limb
+//! expressions; they do not change the source of truth and they still evaluate
+//! the resulting PLONK identity over BLS12-381 Fr.
 
 use super::*;
 
@@ -237,6 +240,8 @@ pub(super) enum QuotientProgramItem {
     Identity(QuotientIdentity),
     /// Generated callback for the whole permutation identity block.
     NativePermutation,
+    /// Generated callback for the whole lookup identity block.
+    NativeLookup,
     /// Generated callback for a selected heavy gate identity.
     NativeIdentity(usize),
 }
@@ -259,6 +264,8 @@ pub(super) struct QuotientProgramPlan {
     pub(super) sorted_simple: Vec<usize>,
     /// Whether the stream contains a native permutation callback marker.
     pub(super) has_native_permutation: bool,
+    /// Whether the stream contains a native lookup callback marker.
+    pub(super) has_native_lookup: bool,
 }
 
 pub(super) const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
@@ -350,6 +357,7 @@ pub(super) const Q_OP_NATIVE_IDENTITY: u8 = 0x1b;
 pub(super) const Q_OP_LIN7: u8 = 0x1c;
 pub(super) const Q_OP_BILIN7_ROW: u8 = 0x1d;
 pub(super) const Q_OP_BILIN7_PAIRWISE: u8 = 0x1e;
+pub(super) const Q_OP_NATIVE_LOOKUP: u8 = 0x1f;
 
 // Memory tokens compress generated Yul symbols whose concrete addresses depend
 // on the memory planner. Literal pointers are used for most proof/VK evals;
@@ -603,6 +611,13 @@ pub(super) const QUOTIENT_OPCODE_TABLE: &[QuotientOpcodeSpec] = &[
     QuotientOpcodeSpec {
         name: "native_permutation",
         opcode: Q_OP_NATIVE_PERMUTATION,
+        byte_len: 1,
+        encoding: QuotientOpcodeEncoding::None,
+        packed32: true,
+    },
+    QuotientOpcodeSpec {
+        name: "native_lookup",
+        opcode: Q_OP_NATIVE_LOOKUP,
         byte_len: 1,
         encoding: QuotientOpcodeEncoding::None,
         packed32: true,
@@ -1182,6 +1197,19 @@ impl QuotientProgramBuilder {
         // the y-batched identity stream. The generated Yul block performs its
         // own scratch writes and fold calls at this exact program position.
         self.bytes.push(Q_OP_NATIVE_PERMUTATION);
+    }
+
+    /// Emit the native lookup marker.
+    ///
+    /// The generated Yul callback evaluates every LogUp lookup identity
+    /// (boundary, helper chunks, accumulator) and folds each one in the same
+    /// order as the interpreted identity stream.
+    pub(super) fn native_lookup(&mut self) {
+        assert_eq!(self.stack_depth, 0, "native lookup expects empty VM stack");
+        // Like native permutation, this is a domain-shaped superinstruction:
+        // the opcode marks one family in the y-batched stream while the
+        // generated callback performs all per-identity arithmetic and folds.
+        self.bytes.push(Q_OP_NATIVE_LOOKUP);
     }
 
     /// Emit a native heavy-identity marker addressed by `native_idx`.
@@ -1986,7 +2014,12 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
                 push_packed_quotient_op(&mut out, op, bytes[idx + 1] as u32);
                 idx += 2;
             }
-            Q_OP_ADD | Q_OP_MUL | Q_OP_NEG | Q_OP_FOLD_MAIN | Q_OP_NATIVE_PERMUTATION => {
+            Q_OP_ADD
+            | Q_OP_MUL
+            | Q_OP_NEG
+            | Q_OP_FOLD_MAIN
+            | Q_OP_NATIVE_PERMUTATION
+            | Q_OP_NATIVE_LOOKUP => {
                 push_packed_quotient_op(&mut out, op, 0);
                 idx += 1;
             }
@@ -2109,6 +2142,11 @@ pub(super) fn quotient_structured_tail_mode() -> QuotientStructuredTailMode {
 /// Whether the permutation identity block may be a native VM callback.
 pub(super) fn quotient_native_permutation_enabled() -> bool {
     config::CodegenOptions::from_env().quotient_native_permutation
+}
+
+/// Whether lookup identities should be emitted as one native VM callback.
+pub(super) fn quotient_native_lookup_enabled() -> bool {
+    config::CodegenOptions::from_env().quotient_native_lookup
 }
 
 /// Whether byte-oriented VM lowering may emit limb-specialized opcodes.
