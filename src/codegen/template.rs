@@ -674,6 +674,7 @@ impl QuotientExternal {
 pub(crate) struct Halo2QuotientEvaluator {
     pub(crate) template_constants: TemplateConstants,
     pub(crate) trace: bool,
+    pub(crate) quotient_yul_helpers: bool,
     pub(crate) quotient_pow5_helper: bool,
     pub(crate) quotient_limb7_helper: bool,
     pub(crate) quotient_wide_limb7_helper: bool,

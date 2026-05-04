@@ -2732,6 +2732,7 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_evaluator = Halo2QuotientEvaluator {
             template_constants: Default::default(),
             trace: false,
+            quotient_yul_helpers: false,
             quotient_pow5_helper,
             quotient_limb7_helper,
             quotient_wide_limb7_helper,

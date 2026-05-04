@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn field_negations_used_by_traces_are_canonical() {
-        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient_helpers = include_str!("../../templates/QuotientHelpers.yul");
         let quotient_template = include_str!("../../templates/QuotientNumeratorBlock.yul");
         let evaluator_source = include_str!("evaluator.rs");
         let pcs_source = include_str!("pcs.rs");
@@ -1031,7 +1031,7 @@ mod tests {
         for (name, source, needle) in [
             (
                 "q_neg helper",
-                verifier_template,
+                quotient_helpers,
                 "z := addmod(0, sub(FR_MODULUS, a), FR_MODULUS)",
             ),
             (
@@ -1068,6 +1068,46 @@ mod tests {
             assert!(
                 source.contains(needle),
                 "{name} should canonicalize zero negations with addmod"
+            );
+        }
+    }
+
+    #[test]
+    fn quotient_helper_definitions_live_in_shared_partial() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let quotient_evaluator_template =
+            include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let quotient_helpers = include_str!("../../templates/QuotientHelpers.yul");
+
+        assert!(
+            verifier_template.contains(
+                "{%- when None %}\n            {%- include \"QuotientHelpers.yul\" %}\n            {%- include \"QuotientNumeratorBlock.yul\" %}"
+            ),
+            "monolithic verifier quotient path should include helpers beside the numerator block"
+        );
+        assert!(
+            quotient_evaluator_template.contains(
+                "{%- include \"QuotientHelpers.yul\" %}\n            {%- include \"QuotientNumeratorBlock.yul\" %}"
+            ),
+            "external evaluator should include helpers beside the numerator block"
+        );
+        for helper in [
+            "function q_pow5(",
+            "function q_limb7(",
+            "function q_limb7_wide(",
+            "function q_add(",
+        ] {
+            assert!(
+                quotient_helpers.contains(helper),
+                "quotient helper partial should define {helper}"
+            );
+            assert!(
+                !verifier_template.contains(helper),
+                "main verifier template should not carry duplicate quotient helper body {helper}"
+            );
+            assert!(
+                !quotient_evaluator_template.contains(helper),
+                "external evaluator template should not carry duplicate quotient helper body {helper}"
             );
         }
     }
@@ -1147,12 +1187,14 @@ mod tests {
     fn templates_do_not_write_solidity_reserved_memory_slots() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
         let quotient_template = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let quotient_helpers = include_str!("../../templates/QuotientHelpers.yul");
         let vk_template = include_str!("../../templates/Halo2VerifyingKey.sol");
         let pcs_source = include_str!("pcs.rs");
 
         for (name, source) in [
             ("Halo2Verifier.sol", verifier_template),
             ("Halo2QuotientEvaluator.sol", quotient_template),
+            ("QuotientHelpers.yul", quotient_helpers),
             ("Halo2VerifyingKey.sol", vk_template),
         ] {
             for needle in [
@@ -1362,6 +1404,7 @@ mod tests {
     fn midfall_comment_ports_reference_rust_sources() {
         let verifier = include_str!("../../templates/Halo2Verifier.sol");
         let quotient = include_str!("../../templates/Halo2QuotientEvaluator.sol");
+        let quotient_helpers = include_str!("../../templates/QuotientHelpers.yul");
         let numerator = include_str!("../../templates/QuotientNumeratorBlock.yul");
         let transcript = include_str!("../transcript.rs");
         let generator = include_str!("generator.rs");
@@ -1386,7 +1429,9 @@ mod tests {
             "selectors do not appear as normal proof eval scalars",
         ] {
             assert!(
-                quotient.contains(required) || numerator.contains(required),
+                quotient.contains(required)
+                    || quotient_helpers.contains(required)
+                    || numerator.contains(required),
                 "quotient docs should carry adapted upstream comments: {required}"
             );
         }

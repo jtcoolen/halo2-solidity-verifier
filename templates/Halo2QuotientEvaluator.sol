@@ -113,82 +113,6 @@ contract Halo2QuotientEvaluator {
             // verifier path.
             calldatacopy(QUOTIENT_FRAME_BASE, 0, QUOTIENT_FRAME_LEN)
 
-            {%- if self.quotient_pow5_helper %}
-            // Reusable x^5 helper for recurring Midfall custom-gate terms.
-            //
-            // Rust source shape:
-            //   circuits/src/hash/poseidon/poseidon_chip.rs::sbox
-            //   full_round_gate / partial_round_gate
-            //   circuits/src/hash/poseidon/round_skips.rs::RoundId
-            //
-            // The Rust verifier only sees this as an Expression tree from
-            // `vk.cs.gates`; the generator emits q_pow5 after recognizing five
-            // equal multiplicative factors. It is a codegen shortcut for the
-            // Poseidon S-box x^5, not a separate verifier rule.
-            function q_pow5(x) -> z {
-                let q_r := FR_MODULUS
-                let x2 := mulmod(x, x, q_r)
-                z := mulmod(x, mulmod(x2, x2, q_r), q_r)
-            }
-            {%- endif %}
-
-            {%- if self.quotient_limb7_helper %}
-            // Compact evaluator for a recurring 7-limb linear combination.
-            //
-            // Rust source shape:
-            //   proofs/src/plonk/mod.rs::partially_evaluate_identities
-            //   proofs/src/plonk/verifier.rs evaluation-read path
-            //   circuits/src/field/foreign/params.rs::base_powers
-            //   foreign/gates/norm.rs::Foreign-field normalization
-            //   foreign/gates/mul.rs::Foreign-field multiplication
-            //
-            // This is the Fr evaluation of sum_i base_powers[i] * limb_i for
-            // the generated 7-limb foreign-field basis. The circuit is
-            // emulating arithmetic modulo a different modulus `m` using limbs
-            // in base 2^LOG2_BASE, but the Solidity verifier only evaluates
-            // the resulting PLONK identity over BLS12-381 Fr. The constants
-            // are Fr encodings of base^i mod m from the VK/codegen path,
-            // never proof-selected values.
-            function q_limb7(x0, x1, x2, x3, x4, x5, x6) -> z {
-                let q_r := FR_MODULUS
-                {%- for coeff in limb7_yul_coeffs %}
-                {%- if loop.first %}
-                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
-                {%- else %}
-                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
-                {%- endif %}
-                {%- endfor %}
-            }
-            {%- endif %}
-
-            {%- if self.quotient_wide_limb7_helper %}
-            // Wide variant for the pairwise-product side of foreign-field
-            // multiplication.
-            //
-            // Rust source shape:
-            //   proofs/src/plonk/mod.rs::partially_evaluate_identities
-            //   foreign/gates/mul.rs::Foreign-field multiplication
-            //   ecc/foreign/gates/{on_curve,slope,tangent,lambda_squared}.rs
-            //   xys = pair_wise_prod(xs, ys)
-            //   sum_exprs(double_base_powers, xys)
-            //
-            // The native multiplication callbacks group repeated 7-term slices
-            // of the double-base product-convolution basis into q_limb7_wide.
-            // double_base_powers contains base^(i+j) mod the emulated modulus
-            // `m`; each coefficient is then embedded into Fr so the verifier
-            // can evaluate the same gate polynomial with addmod/mulmod.
-            function q_limb7_wide(x0, x1, x2, x3, x4, x5, x6) -> z {
-                let q_r := FR_MODULUS
-                {%- for coeff in wide_limb7_yul_coeffs %}
-                {%- if loop.first %}
-                z := addmod(x0, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
-                {%- else %}
-                z := addmod(z, mulmod({{ coeff }}, x{{ loop.index }}, q_r), q_r)
-                {%- endif %}
-                {%- endfor %}
-            }
-            {%- endif %}
-
             let r := FR_MODULUS
 
             // The shared quotient numerator block emits trace hooks in both
@@ -219,6 +143,7 @@ contract Halo2QuotientEvaluator {
             // SELECTOR_ACC_MPTR buckets for later multiplication by fixed
             // selector commitments, while fully evaluated identities contribute
             // to the negated expected scalar.
+            {%- include "QuotientHelpers.yul" %}
             {%- include "QuotientNumeratorBlock.yul" %}
 
             // Return the compact output frame. Halo2Verifier checks the magic,
