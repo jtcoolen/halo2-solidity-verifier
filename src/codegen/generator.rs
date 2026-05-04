@@ -103,10 +103,15 @@ impl<'a> SolidityGenerator<'a> {
         self
     }
 
+    /// Validate the currently supported committed/non-committed instance split.
     fn validate_instance_column_shape(
         total_instance_columns: usize,
         num_committed_instances: usize,
     ) -> Result<(), GeneratorError> {
+        // The Rust verifier accepts committed and normal instance arguments
+        // separately, with committed instance columns first. The current
+        // Solidity calldata ABI supports exactly one of each so every instance
+        // query can be classified without an extra column-routing table.
         let supported_committed = Self::SUPPORTED_COMMITTED_INSTANCE_COLUMNS;
         let supported_non_committed = Self::SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS;
         let non_committed = total_instance_columns
@@ -190,6 +195,7 @@ struct QuotientStateSlots {
 }
 
 impl QuotientStateSlots {
+    /// Place persistent VM state immediately after optional CSE temp words.
     fn new(tmp_mptr: usize, cse_temps: usize) -> Self {
         // Layout at `quotient_tmp_mptr`:
         //   [0 .. cse_temps)        VM STORE_TEMP/PUSH_TEMP scratch
@@ -580,6 +586,7 @@ impl<'a> SolidityGenerator<'a> {
         Ok((verifier_output, vk_output))
     }
 
+    /// Generate the VK payload before compact quotient constants/program data.
     fn generate_base_vk(&self) -> Halo2VerifyingKey {
         let constants: Vec<(&'static str, U256)>;
         {
@@ -725,6 +732,12 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Generate the final VK payload, including compact quotient VM data.
+    ///
+    /// The quotient program depends on memory addresses, and memory addresses
+    /// depend on the final VK length. This method reserves zero-filled quotient
+    /// sections first, rebuilds against the final layout, and then fills the
+    /// sections. Assertions catch any non-convergent program size change.
     fn generate_vk(&self) -> Halo2VerifyingKey {
         let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let mut vk = self.generate_base_vk();
@@ -809,6 +822,7 @@ impl<'a> SolidityGenerator<'a> {
         vk
     }
 
+    /// Build metadata, data handles, and memory layout for a candidate VK base.
     fn meta_data_for_vk(
         &self,
         vk: &Halo2VerifyingKey,
@@ -860,6 +874,11 @@ impl<'a> SolidityGenerator<'a> {
         (meta, data, memory)
     }
 
+    /// Find a VK memory base that is stable after proof-shape planning.
+    ///
+    /// Transcript/PCS low-memory requirements can grow when dummy query planning
+    /// discovers extra eval scalars. Iterate until the chosen `VK_MPTR` matches
+    /// the requirements computed from the resulting metadata.
     fn meta_data_for_stable_static_layout(
         &self,
         vk: &Halo2VerifyingKey,
@@ -879,6 +898,7 @@ impl<'a> SolidityGenerator<'a> {
         panic!("static verifier memory layout did not converge after proof-shape planning");
     }
 
+    /// Build a verifier memory layout after filling derived config fields.
     fn memory_layout_for(
         &self,
         meta: &ConstraintSystemMeta,
@@ -892,6 +912,7 @@ impl<'a> SolidityGenerator<'a> {
         VerifierMemoryLayout::new(meta, vk, vk_mptr, config)
     }
 
+    /// Build the compact quotient VM artifact for a metadata/data snapshot.
     fn compact_quotient_program_for(
         &self,
         meta: &ConstraintSystemMeta,
@@ -907,6 +928,7 @@ impl<'a> SolidityGenerator<'a> {
         (quotient_program_build, sorted_simple)
     }
 
+    /// Return stack/scratch words needed by interpreted VM and native callbacks.
     fn quotient_stack_words_for_build(
         build: &QuotientProgramBuild,
         native_permutation_scratch_words: usize,
@@ -917,6 +939,7 @@ impl<'a> SolidityGenerator<'a> {
         build.max_stack.max(native_permutation_scratch_words)
     }
 
+    /// Choose inline, VM, and native-callback representation for identities.
     fn quotient_program_plan(
         &self,
         meta: &ConstraintSystemMeta,
@@ -994,6 +1017,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Pick the heaviest remaining gate identities for native callbacks.
     fn native_gate_indices(gates: &[QuotientIdentity]) -> HashSet<usize> {
         let count = quotient_native_gate_count(gates);
         if count == 0 {
@@ -1011,6 +1035,7 @@ impl<'a> SolidityGenerator<'a> {
         costs.into_iter().take(count).map(|(_, idx)| idx).collect()
     }
 
+    /// Compute the copied-memory frame required by the external evaluator.
     fn quotient_external_frame(
         vk_mptr: Ptr,
         vk_len: usize,
@@ -1028,6 +1053,7 @@ impl<'a> SolidityGenerator<'a> {
         )
     }
 
+    /// Compute an external quotient frame from already-known range bounds.
     pub(super) fn quotient_external_frame_from_bounds(
         frame_base: usize,
         vk_len: usize,
@@ -1046,6 +1072,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Estimate compact-VM byte cost of one identity for native selection.
     fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
         let mut builder = QuotientProgramBuilder::default();
         let expr = Self::quotient_identity_expr(identity);
@@ -1053,6 +1080,13 @@ impl<'a> SolidityGenerator<'a> {
         builder.bytes.len()
     }
 
+    /// Split the quotient identity stream into gate/permutation/lookup/trash parts.
+    ///
+    /// Upstream reference: `plonk::partially_evaluate_identities` returns gate
+    /// identities first, then permutation, lookup, and trash identities, with
+    /// simple-selector gates tagged by their fixed-column index. This method
+    /// preserves that order and converts selector columns into local bucket
+    /// indices used by the generated linearization MSM.
     fn quotient_identity_parts(
         &self,
         meta: &ConstraintSystemMeta,
@@ -1165,6 +1199,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Return the typed quotient expression, parsing legacy Yul if necessary.
     fn quotient_identity_expr(identity: &QuotientIdentity) -> QuotientExpr {
         if let Some(expr) = &identity.expr {
             return expr.clone();
@@ -1172,6 +1207,7 @@ impl<'a> SolidityGenerator<'a> {
         Self::quotient_identity_yul_expr(identity)
     }
 
+    /// Parse an evaluator-emitted Yul identity into the quotient AST.
     fn quotient_identity_yul_expr(identity: &QuotientIdentity) -> QuotientExpr {
         let mut parser = QuotientProgramBuilder::default();
         for line in &identity.lines {
@@ -1180,6 +1216,7 @@ impl<'a> SolidityGenerator<'a> {
         parser.parse_expr(&identity.var)
     }
 
+    /// Lower a Halo2 expression into the quotient AST using generated data.
     fn quotient_expr_from_plonk_expr(
         meta: &ConstraintSystemMeta,
         data: &Data,
@@ -1188,6 +1225,12 @@ impl<'a> SolidityGenerator<'a> {
         quotient_expr_from_expression(&DataQuotientExpressionEnv { meta, data }, expression)
     }
 
+    /// Emit direct quotient computations with memory-backed CSE.
+    ///
+    /// This path is a measurement/debug representation of the same identity
+    /// stream. It keeps the Rust linearization invariant from
+    /// `compute_linearization_commitment`: selector identities go to selector
+    /// buckets, fully evaluated identities go to the numerator scalar.
     fn inline_cse_quotient_computations(
         identities: &[QuotientIdentity],
         sorted_simple: &[usize],
@@ -1254,6 +1297,7 @@ impl<'a> SolidityGenerator<'a> {
         computations
     }
 
+    /// Emit one direct/native quotient identity block and its y-fold side effects.
     fn direct_quotient_block(
         lines: &[String],
         var: &str,
@@ -1304,6 +1348,7 @@ impl<'a> SolidityGenerator<'a> {
         block
     }
 
+    /// Append trace emission for a quotient identity value.
     fn push_quotient_trace(
         block: &mut Vec<String>,
         state_slots: Option<QuotientStateSlots>,
@@ -1325,6 +1370,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Add an identity value into the current numerator accumulator.
     fn push_quotient_eval_numer_add(
         block: &mut Vec<String>,
         state_slots: Option<QuotientStateSlots>,
@@ -1343,6 +1389,10 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Advance the global y-fold state by `count` identity positions.
+    ///
+    /// Selector buckets store inverse-scaled values during a forward scan; the
+    /// final selector scale restores the reverse-fold powers used upstream.
     fn push_structured_fold_advance(
         block: &mut Vec<String>,
         count: usize,
@@ -1388,6 +1438,11 @@ impl<'a> SolidityGenerator<'a> {
         block.push("}".to_string());
     }
 
+    /// Compact runs of adjacent `mstore(dst+i, mload(src+i*stride))` lines.
+    ///
+    /// Native callbacks often stage contiguous eval tables. This helper emits a
+    /// small copy loop when the staged source and destination offsets form a
+    /// regular run, otherwise it leaves the original store shape intact.
     fn push_mstore_mload_literal_runs(
         block: &mut Vec<String>,
         dst: &str,
@@ -1472,10 +1527,16 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Return whether two Yul operands match a pair in either order.
     fn yul_pair_matches(lhs: &str, rhs: &str, a: &str, b: &str) -> bool {
         (lhs == a && rhs == b) || (lhs == b && rhs == a)
     }
 
+    /// Recognize `a_i + f_i - next_i` selector-gate identities.
+    ///
+    /// Consecutive recognized identities become a structured loop in
+    /// `selector_linear_next_loop_block`, reducing the direct/native gate prefix
+    /// without changing the identity order.
     fn parse_selector_linear_next_identity(
         lines: &[String],
         final_var: &str,
@@ -1515,6 +1576,7 @@ impl<'a> SolidityGenerator<'a> {
         Some((a_addr, f_addr, next_addr))
     }
 
+    /// Emit a loop for a run of adjacent selector linear-next identities.
     pub(super) fn selector_linear_next_loop_block(
         run: &[(Vec<String>, String)],
     ) -> Option<(usize, Vec<String>)> {
@@ -1564,6 +1626,7 @@ impl<'a> SolidityGenerator<'a> {
         Some((count, block))
     }
 
+    /// Emit one identity inside a selector run accumulator.
     fn push_selector_run_identity(
         block: &mut Vec<String>,
         lines: &[String],
@@ -1582,6 +1645,7 @@ impl<'a> SolidityGenerator<'a> {
         ));
     }
 
+    /// Emit a grouped selector run and write its inverse-scaled selector bucket.
     fn selector_run_quotient_block(
         run: &[(Vec<String>, String)],
         selector_idx: usize,
@@ -1625,6 +1689,7 @@ impl<'a> SolidityGenerator<'a> {
         block
     }
 
+    /// Flush pending selector identities into either direct or grouped form.
     fn flush_structured_selector_run(
         computations: &mut Vec<Vec<String>>,
         pending_selector: &mut Option<usize>,
@@ -1660,6 +1725,11 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Replace recognized seven-limb linear chains with helper calls.
+    ///
+    /// This operates on legacy/direct Yul text, not on the compact VM AST. The
+    /// VM has its own structural limb opcodes; this helper keeps native Yul
+    /// callbacks compact for the same foreign-field shapes.
     pub(super) fn specialize_limb7_chains(lines: &[String]) -> Vec<String> {
         let mut out = Vec::with_capacity(lines.len());
         let mut const_vars = HashMap::new();
@@ -1691,6 +1761,7 @@ impl<'a> SolidityGenerator<'a> {
         out
     }
 
+    /// Try to recognize one helper-compatible seven-limb add/mul chain.
     fn try_limb7_chain(
         lines: &[String],
         const_vars: &HashMap<String, String>,
@@ -1753,6 +1824,7 @@ impl<'a> SolidityGenerator<'a> {
         Some((idx, keep, local_consts))
     }
 
+    /// Parse one `mulmod(coeff, limb, r)` line in a limb7 chain.
     fn parse_limb7_mul_assignment(
         line: &str,
         expected_coeff: &str,
@@ -1768,6 +1840,7 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Return whether a literal or constant variable equals `expected_coeff`.
     fn yul_coeff_matches(
         value: &str,
         expected_coeff: &str,
@@ -1776,6 +1849,7 @@ impl<'a> SolidityGenerator<'a> {
         yul_const_value(value, const_vars).as_deref() == Some(expected_coeff)
     }
 
+    /// Record `let name := const` bindings for later limb-chain matching.
     fn record_yul_const_assignment(line: &str, const_vars: &mut HashMap<String, String>) {
         let Some((dst, rhs)) = yul_let_assignment(line) else {
             return;
@@ -1786,6 +1860,7 @@ impl<'a> SolidityGenerator<'a> {
         const_vars.insert(dst, value);
     }
 
+    /// Trace, advance, and accumulate one main quotient identity value.
     fn push_structured_main_fold(
         block: &mut Vec<String>,
         value: impl AsRef<str>,
@@ -1798,6 +1873,7 @@ impl<'a> SolidityGenerator<'a> {
         Self::push_quotient_eval_numer_add(block, state_slots, value.as_ref());
     }
 
+    /// Scratch table width used by the native permutation callback.
     fn structured_permutation_scratch_words(meta: &ConstraintSystemMeta) -> usize {
         if meta.num_permutation_zs == 0 {
             return 0;
@@ -1815,6 +1891,11 @@ impl<'a> SolidityGenerator<'a> {
         (2 * num_cols) + (2 * num_sets) + num_sets.saturating_sub(1) + 1
     }
 
+    /// Emit a native structured loop for the full permutation identity block.
+    ///
+    /// The formula follows the upstream permutation verifier/evaluator:
+    /// first-set boundary, last-set booleanity, set-to-set continuity, and
+    /// active-row product equality for each chunk.
     fn structured_permutation_loop_block(
         meta: &ConstraintSystemMeta,
         data: &Data,
@@ -2001,6 +2082,11 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Emit a native structured loop for all LogUp lookup identities.
+    ///
+    /// This adapts the upstream LogUp helper and accumulator constraints while
+    /// staging parallel lookup products in scratch to avoid repeated generated
+    /// straight-line Yul.
     fn structured_lookup_loop_block(
         &self,
         meta: &ConstraintSystemMeta,
@@ -2223,6 +2309,10 @@ impl<'a> SolidityGenerator<'a> {
         Some(block)
     }
 
+    /// Emit a native structured loop for the trash identity suffix.
+    ///
+    /// Trash constraints compress their expressions with `trash_challenge` and
+    /// subtract `(1 - selector) * trash_eval`, matching the Rust trash verifier.
     fn structured_trash_loop_block(
         &self,
         meta: &ConstraintSystemMeta,
@@ -2276,6 +2366,10 @@ impl<'a> SolidityGenerator<'a> {
         Some(block)
     }
 
+    /// Emit the fully structured quotient path used for experiments.
+    ///
+    /// Gates are still emitted directly, but permutation, lookup, and trash
+    /// identities can be grouped into loops while preserving the global y-fold.
     fn structured_loop_quotient_computations(
         &self,
         meta: &ConstraintSystemMeta,
@@ -2457,6 +2551,7 @@ impl<'a> SolidityGenerator<'a> {
         computations
     }
 
+    /// Build the Askama model for the standalone quotient evaluator contract.
     fn generate_quotient_evaluator(&self) -> Halo2QuotientEvaluator {
         let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
 
@@ -2657,6 +2752,12 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
+    /// Build the Askama model for the main Solidity verifier contract.
+    ///
+    /// This is the central assembly point: it fixes proof calldata, VK bytes,
+    /// memory layout, quotient representation, PCS computations, accumulator
+    /// metadata, trace settings, and optional external quotient pinning before
+    /// handing immutable data to the template.
     fn generate_verifier(
         &self,
         separate: bool,
@@ -3113,6 +3214,7 @@ impl<'a> SolidityGenerator<'a> {
         verifier
     }
 
+    /// Lower a logical quotient item stream into compact VM bytecode.
     fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         // Lower the logical plan into bytecode in one pass. CSE planning looks
@@ -3258,6 +3360,7 @@ impl<'a> SolidityGenerator<'a> {
         self.repacked_proof_layout_plan().scalar_layout()
     }
 
+    /// Return the compressed/repacked proof layout used by the off-chain shim.
     fn repacked_proof_layout_plan(&self) -> RepackedProofLayoutPlan {
         let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
         let vk = self.generate_vk();
@@ -3272,6 +3375,7 @@ impl<'a> SolidityGenerator<'a> {
         RepackedProofLayoutPlan::from_proof_layout(&proof_layout)
     }
 
+    /// Low-memory working-set size that must stay below `VK_MPTR`.
     fn static_working_memory_size_for_meta(&self, meta: &ConstraintSystemMeta) -> usize {
         let pcs_computation = pcs::static_working_memory_size();
         let transcript_words =
@@ -3304,6 +3408,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     #[cfg(test)]
+    /// Test helper exposing the transcript buffer word bound.
     pub(super) fn transcript_buffer_words_bound(
         meta: &ConstraintSystemMeta,
         num_instances: usize,
@@ -3311,6 +3416,7 @@ impl<'a> SolidityGenerator<'a> {
         Self::transcript_buffer_layout_for_meta(meta, num_instances).words
     }
 
+    /// Compute the transcript buffer layout for a metadata snapshot.
     pub(super) fn transcript_buffer_layout_for_meta(
         meta: &ConstraintSystemMeta,
         num_instances: usize,

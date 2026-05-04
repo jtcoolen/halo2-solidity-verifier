@@ -19,20 +19,25 @@ use crate::codegen::layout::trace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct QueryKey {
+    /// Column index within its column kind.
     pub(crate) column: usize,
+    /// Halo2 rotation relative to the current row.
     pub(crate) rotation: i32,
 }
 
 impl QueryKey {
+    /// Construct a query key from a column index and rotation.
     pub(crate) fn new(column: usize, rotation: i32) -> Self {
         Self { column, rotation }
     }
 
+    /// Return the historical tuple representation used by `ConstraintSystemMeta`.
     pub(crate) fn tuple(self) -> (usize, i32) {
         (self.column, self.rotation)
     }
 }
 
+/// Kinds of G1 commitments read from proof calldata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitmentRead {
     // The commitment stream only needs kinds for sizing and transcript order.
@@ -47,31 +52,47 @@ pub(crate) enum CommitmentRead {
 }
 
 impl CommitmentRead {
+    /// Return whether this read is one of the quotient limb commitments.
     pub(crate) fn is_quotient(self) -> bool {
         matches!(self, Self::Quotient)
     }
 }
 
+/// Which evaluation of a permutation product commitment is being read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PermutationZEval {
+    /// Evaluation at `x`.
     Cur,
+    /// Evaluation at `omega * x`.
     Next,
+    /// Evaluation at the last usable rotation.
     Last,
 }
 
+/// Scalar evaluations read from the proof's main eval block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EvalRead {
+    /// PCS-opened committed instance column.
     CommittedInstance(QueryKey),
+    /// Advice polynomial query.
     Advice(QueryKey),
+    /// Non-simple fixed polynomial query.
     Fixed(QueryKey),
+    /// Common permutation sigma polynomial query.
     PermutationCommon { column: Column<Any> },
+    /// Permutation product query.
     PermutationZ { set: usize, kind: PermutationZEval },
+    /// LogUp multiplicity polynomial query.
     LookupMultiplicity { lookup: usize },
+    /// LogUp helper polynomial query.
     LookupHelper { lookup: usize, chunk: usize },
+    /// LogUp accumulator polynomial query.
     LookupAccumulator { lookup: usize, rotation: i32 },
+    /// Trashcan accumulator query.
     Trash { index: usize },
 }
 
+/// Source of one KZG multi-open query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PcsQuerySource {
     Advice(QueryKey),
@@ -87,6 +108,10 @@ pub(crate) enum PcsQuerySource {
 }
 
 impl PcsQuerySource {
+    /// Return the rotation point used by this query.
+    ///
+    /// `rotation_last` is circuit-dependent and is needed only for the
+    /// permutation product's last-row opening.
     pub(crate) fn rotation(self, rotation_last: i32) -> i32 {
         match self {
             Self::Advice(q) | Self::CommittedInstance(q) | Self::Fixed(q) => q.rotation,
@@ -105,29 +130,43 @@ impl PcsQuerySource {
     }
 }
 
+/// Common polynomial values generated locally by the verifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum CommonPoly {
+    /// Rotation point `omega^rotation * x`.
     Rotation(i32),
+    /// First-row Lagrange basis evaluation.
     L0,
+    /// Last-row Lagrange basis evaluation.
     LLast,
+    /// Blinding-row Lagrange basis evaluation.
     LBlind,
 }
 
+/// Ordered proof-read plan for commitments and scalar evaluations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProofReadPlan {
+    /// G1 commitment reads in transcript order.
     pub(crate) commitments: Vec<CommitmentRead>,
+    /// Scalar evaluation reads in proof order.
     pub(crate) evals: Vec<EvalRead>,
 }
 
+/// Counts of quotient identities by source family.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct QuotientIdentityPlan {
+    /// Gate polynomial identities.
     pub(crate) gates: usize,
+    /// Permutation identities.
     pub(crate) permutation: usize,
+    /// Lookup identities.
     pub(crate) lookup: usize,
+    /// Trashcan identities.
     pub(crate) trash: usize,
 }
 
 impl QuotientIdentityPlan {
+    /// Total identity count in the global `y` fold.
     pub(crate) fn total(&self) -> usize {
         self.gates + self.permutation + self.lookup + self.trash
     }
@@ -138,13 +177,18 @@ pub(crate) const TRACE_PCS_QUERY_BASE: u64 = trace::PCS_QUERY_BASE;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UsedQueries {
+    /// Fixed queries referenced by an expression.
     pub(crate) fixed: BTreeSet<QueryKey>,
+    /// Advice queries referenced by an expression.
     pub(crate) advice: BTreeSet<QueryKey>,
+    /// Instance queries referenced by an expression.
     pub(crate) instance: BTreeSet<QueryKey>,
+    /// Challenge indices referenced by an expression.
     pub(crate) challenges: BTreeSet<usize>,
 }
 
 impl UsedQueries {
+    /// Merge two expression-use summaries.
     fn merge(mut self, other: Self) -> Self {
         self.fixed.extend(other.fixed);
         self.advice.extend(other.advice);
@@ -193,6 +237,7 @@ pub(crate) fn used_query(expression: &Expression<Fq>) -> UsedQueries {
     )
 }
 
+/// Return which locally-computed Lagrange polynomials are needed.
 pub(crate) fn used_lagrange(
     uses_permutation: bool,
     uses_lookup: bool,
@@ -210,33 +255,60 @@ pub(crate) fn used_lagrange(
     out
 }
 
+/// Complete protocol-shape plan consumed by proof layout, memory layout, and emitters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProtocolPlan {
+    /// Number of fixed columns in the constraint system.
     pub(crate) num_fixeds: usize,
+    /// Columns participating in the permutation argument.
     pub(crate) permutation_columns: Vec<Column<Any>>,
+    /// Maximum columns per permutation product chunk.
     pub(crate) permutation_chunk_len: usize,
+    /// Helper chunks per lookup argument.
     pub(crate) lookup_chunks: Vec<usize>,
+    /// Number of lookup arguments.
     pub(crate) num_lookups: usize,
+    /// Number of trashcan arguments.
     pub(crate) num_trashcans: usize,
+    /// Number of permutation product commitments.
     pub(crate) num_permutation_zs: usize,
+    /// Number of quotient limb commitments.
     pub(crate) num_quotients: usize,
+    /// Advice queries in upstream verifier order.
     pub(crate) advice_queries: Vec<QueryKey>,
+    /// Fixed queries in upstream verifier order.
     pub(crate) fixed_queries: Vec<QueryKey>,
+    /// Instance queries in upstream verifier order.
     pub(crate) instance_queries: Vec<QueryKey>,
+    /// Number of simple selector columns.
     pub(crate) num_simple_selectors: usize,
+    /// Fixed-column indices that are simple selectors.
     pub(crate) simple_selector_cols: BTreeSet<usize>,
+    /// Number of instance columns opened through PCS.
     pub(crate) num_committed_instances: usize,
+    /// Number of distinct rotation points needed by PCS/common polys.
     pub(crate) num_rotations: usize,
+    /// Advice commitment counts by user phase.
     pub(crate) num_user_advices: Vec<usize>,
+    /// Challenge counts by user phase.
     pub(crate) num_user_challenges: Vec<usize>,
+    /// Advice-column remapping from CS order into phase-order commitment order.
     pub(crate) advice_indices: Vec<usize>,
+    /// Challenge-index remapping from CS order into phase-order memory slots.
     pub(crate) challenge_indices: Vec<usize>,
+    /// Last negative row rotation used by blinding/last-row checks.
     pub(crate) rotation_last: i32,
+    /// Commitment/evaluation proof-read schedule.
     pub(crate) proof: ProofReadPlan,
+    /// PCS query schedule, ending with the synthetic linearization query.
     pub(crate) pcs_queries: Vec<PcsQuerySource>,
+    /// Trace topic ids for quotient identities.
     pub(crate) quotient_trace_ids: Vec<u64>,
+    /// Trace topic ids for PCS queries.
     pub(crate) pcs_query_trace_ids: Vec<u64>,
+    /// Common polynomial values the generated verifier must materialize.
     pub(crate) common_polys: BTreeSet<CommonPoly>,
+    /// Quotient identity counts by family.
     pub(crate) quotient: QuotientIdentityPlan,
 }
 
@@ -297,6 +369,9 @@ impl ProtocolPlan {
 
         let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
         let remapping = |phase: Vec<u8>| {
+            // Midnight stores advice/challenge columns in declaration order but
+            // verifies them phase by phase. `nums` gives per-phase counts and
+            // `index` maps original column indices into that phase-packed order.
             let nums = phase.iter().fold(vec![0usize; num_phase], |mut nums, p| {
                 nums[*p as usize] += 1;
                 nums
@@ -564,14 +639,17 @@ impl ProtocolPlan {
         plan
     }
 
+    /// Number of scalar evaluations in the proof's main eval block.
     pub(crate) fn num_main_evals(&self) -> usize {
         self.proof.evals.len()
     }
 
+    /// Number of proof commitment reads, including quotient limbs.
     pub(crate) fn num_commitments(&self) -> usize {
         self.proof.commitments.len()
     }
 
+    /// Number of proof commitment reads before quotient limbs.
     pub(crate) fn num_non_quotient_commitments(&self) -> usize {
         self.proof
             .commitments
@@ -607,6 +685,10 @@ impl ProtocolPlan {
         groups
     }
 
+    /// Check cross-field invariants of the protocol plan.
+    ///
+    /// This catches stale assumptions when upstream `midnight-proofs` changes
+    /// proof-read order, selector handling, or PCS query coverage.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.num_simple_selectors != self.simple_selector_cols.len() {
             return Err(format!(

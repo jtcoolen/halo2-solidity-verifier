@@ -103,8 +103,11 @@ pub struct AccumulatorEncoding {
 }
 
 impl AccumulatorEncoding {
+    /// Supported limb count for one BLS12-381 base-field coordinate.
     pub const SUPPORTED_NUM_LIMBS: usize = layout::accumulator::LIMBS;
+    /// Supported bits per accumulator limb.
     pub const SUPPORTED_NUM_LIMB_BITS: usize = layout::accumulator::LIMB_BITS;
+    /// Public-input words required by the fully collapsed accumulator form.
     pub const FULLY_COLLAPSED_PUBLIC_INPUT_WORDS: usize = 10;
 
     /// Return a new `AccumulatorEncoding`.
@@ -116,11 +119,13 @@ impl AccumulatorEncoding {
         }
     }
 
+    /// Number of public-input words needed for one base-field coordinate.
     fn coordinate_words(self) -> usize {
         let limbs_per_instance = (254 / self.num_limb_bits).max(1);
         self.num_limbs.div_ceil(limbs_per_instance)
     }
 
+    /// Number of public-input words for two G1 coordinates plus two scalars.
     fn point_and_scalar_words(self) -> usize {
         4 * self.coordinate_words() + 2
     }
@@ -132,6 +137,7 @@ impl AccumulatorEncoding {
         Ok(self.point_and_scalar_words())
     }
 
+    /// Validate this encoding against the generated verifier's supported schema.
     fn validate_for_num_instances(self, num_instances: usize) -> Result<(), GeneratorError> {
         if self.num_limbs != Self::SUPPORTED_NUM_LIMBS
             || self.num_limb_bits != Self::SUPPORTED_NUM_LIMB_BITS
@@ -159,6 +165,7 @@ impl AccumulatorEncoding {
         Ok(())
     }
 
+    /// Number of optional fixed-base accumulator scalars after the fixed payload.
     fn fixed_scalar_count(self, num_instances: usize) -> Result<usize, GeneratorError> {
         self.validate_for_num_instances(num_instances)?;
         Ok(num_instances - (self.offset + self.point_and_scalar_words()))
@@ -197,6 +204,7 @@ pub enum GeneratorError {
 }
 
 impl fmt::Display for GeneratorError {
+    /// Format typed generator errors as caller-facing diagnostics.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoAdviceColumns => {
@@ -307,7 +315,9 @@ impl ProofEvaluationCounts {
         self.lookup_multiplicity + self.lookup_helper + self.lookup_accumulator
     }
 }
-/// callers don't have to import `evm`.
+/// Encode verifier calldata for an EIP-2537-padded proof and public instances.
+///
+/// This is a small API bridge so callers do not need to import `evm` directly.
 pub fn encode_calldata_bls_padded(
     _generator: &SolidityGenerator<'_>,
     proof: &[u8],

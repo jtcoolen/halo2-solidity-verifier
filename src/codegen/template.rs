@@ -1,3 +1,10 @@
+//! Askama data models for the generated Solidity/Yul templates.
+//!
+//! The structs in this module are deliberately plain: they carry already-planned
+//! calldata, memory, VK, quotient, and PCS facts into the templates. Keeping the
+//! planning logic outside Askama makes generated Solidity easier to audit and
+//! lets Rust tests validate layouts before rendering.
+
 #![allow(dead_code)]
 
 use crate::codegen::{
@@ -49,20 +56,33 @@ pub(crate) type G1Words = (U256, U256, U256, U256);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TemplateConstants {
+    /// EVM word byte width.
     pub(crate) word_bytes: usize,
+    /// Scalar byte width.
     pub(crate) fr_bytes: usize,
+    /// EIP-2537 padded G1 byte width.
     pub(crate) g1_bytes: usize,
+    /// EIP-2537 padded G2 byte width.
     pub(crate) g2_bytes: usize,
+    /// G1MSM input tuple byte width.
     pub(crate) g1_msm_pair_bytes: usize,
+    /// G1ADD input byte width.
     pub(crate) g1add_input_bytes: usize,
+    /// Pairing input byte width for one pair.
     pub(crate) pairing_pair_bytes: usize,
+    /// Pairing input byte width for two pairs.
     pub(crate) pairing_two_pair_bytes: usize,
+    /// EIP-2537 precompile constants.
     pub(crate) eip2537: Eip2537TemplateConstants,
+    /// EIP-198 modexp constants.
     pub(crate) modexp: ModexpTemplateConstants,
+    /// Public accumulator layout constants.
     pub(crate) accumulator: AccumulatorTemplateConstants,
+    /// Compact quotient VM constants.
     pub(crate) quotient_vm: QuotientVmTemplateConstants,
 }
 
+/// EIP-2537 precompile addresses and gas formulas rendered into templates.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Eip2537TemplateConstants {
     pub(crate) g1add_address: usize,
@@ -79,6 +99,7 @@ pub(crate) struct Eip2537TemplateConstants {
     pub(crate) smoke_scratch_bytes: usize,
 }
 
+/// EIP-198 modexp frame constants rendered into templates.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModexpTemplateConstants {
     pub(crate) address: usize,
@@ -93,6 +114,7 @@ pub(crate) struct ModexpTemplateConstants {
     pub(crate) mod_offset: usize,
 }
 
+/// Public accumulator ABI and pairing-batch constants.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AccumulatorTemplateConstants {
     pub(crate) limb_bits: usize,
@@ -109,6 +131,7 @@ pub(crate) struct AccumulatorTemplateConstants {
     pub(crate) pairing_batch_hash_bytes: usize,
 }
 
+/// Compact quotient VM opcode constants rendered into Solidity/Yul.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuotientVmOpcodeTemplateConstants {
     pub(crate) push_const: u8,
@@ -142,6 +165,7 @@ pub(crate) struct QuotientVmOpcodeTemplateConstants {
     pub(crate) bilin7_pairwise: u8,
 }
 
+/// Compact quotient VM memory-token constants rendered into Solidity/Yul.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuotientVmMemTokenTemplateConstants {
     pub(crate) l0: u8,
@@ -155,6 +179,7 @@ pub(crate) struct QuotientVmMemTokenTemplateConstants {
     pub(crate) instance_eval: u8,
 }
 
+/// Compact quotient VM table-level constants rendered into templates.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuotientVmTemplateConstants {
     pub(crate) op: QuotientVmOpcodeTemplateConstants,
@@ -166,6 +191,7 @@ pub(crate) struct QuotientVmTemplateConstants {
 }
 
 impl Default for TemplateConstants {
+    /// Build template constants from the Rust-side layout and VM specs.
     fn default() -> Self {
         use crate::codegen::quotient as q;
 
@@ -274,17 +300,26 @@ impl Default for TemplateConstants {
 #[derive(Template)]
 #[template(path = "Halo2VerifyingKey.sol")]
 pub(crate) struct Halo2VerifyingKey {
+    /// Constructor memory base used while returning VK bytes.
     pub(crate) constructor_payload_mptr: usize,
+    /// Header constants followed by optional quotient constants/program words.
     pub(crate) constants: Vec<(&'static str, U256)>,
+    /// EIP-2537-padded fixed commitments.
     pub(crate) fixed_comms: Vec<G1Words>,
+    /// EIP-2537-padded permutation commitments.
     pub(crate) permutation_comms: Vec<G1Words>,
+    /// Word offset of quotient constants, when present.
     pub(crate) quotient_const_offset_words: Option<usize>,
+    /// Number of quotient constant words.
     pub(crate) quotient_const_words: usize,
+    /// Word offset of quotient program words, when present.
     pub(crate) quotient_program_offset_words: Option<usize>,
+    /// Number of quotient program words.
     pub(crate) quotient_program_words: usize,
 }
 
 impl Halo2VerifyingKey {
+    /// Reconstruct and validate the typed VK payload layout.
     pub(crate) fn payload_layout(&self) -> Result<VkPayloadLayout, String> {
         let quotient_words = self.quotient_const_words + self.quotient_program_words;
         let header_words = self
@@ -325,6 +360,7 @@ impl Halo2VerifyingKey {
         Ok(layout)
     }
 
+    /// Validate that typed layout length equals rendered byte length.
     pub(crate) fn validate_payload_layout(&self) -> Result<(), String> {
         let layout = self.payload_layout()?;
         if layout.total_bytes() != self.len() {
@@ -337,12 +373,14 @@ impl Halo2VerifyingKey {
         Ok(())
     }
 
+    /// Rendered VK payload length in bytes.
     pub(crate) fn len(&self) -> usize {
         // 32 bytes per scalar constant + 128 bytes per G1 point (EIP-2537 padded).
         (self.constants.len() * WORD_BYTES)
             + (self.fixed_comms.len() + self.permutation_comms.len()) * G1_BYTES
     }
 
+    /// Rendered VK payload bytes in the exact contract return order.
     pub(crate) fn bytes(&self) -> Vec<u8> {
         self.constants
             .iter()
@@ -377,13 +415,19 @@ pub(crate) struct UserPhase {
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerifierCodegenLayout {
+    /// Planned proof calldata layout.
     pub(crate) proof: ProofCalldataLayout,
+    /// Planned verifier memory layout.
     pub(crate) memory: VerifierMemoryLayout,
+    /// VK header slot mapping rendered for template readability.
     pub(crate) vk_header: VkHeaderTemplateSlots,
+    /// Transcript buffer bound.
     pub(crate) transcript: TranscriptBufferLayout,
+    /// External quotient frame, if the verifier delegates quotient eval.
     pub(crate) quotient_external: Option<QuotientExternal>,
 }
 
+/// Word offsets for VK header fields rendered as template constants.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VkHeaderTemplateSlots {
     pub(crate) vk_digest: usize,
@@ -403,6 +447,7 @@ pub(crate) struct VkHeaderTemplateSlots {
 }
 
 impl Default for VkHeaderTemplateSlots {
+    /// Build slot offsets from the typed VK header schema.
     fn default() -> Self {
         use crate::codegen::layout::{VkHeaderLayout, VkHeaderSlot as Slot};
 
@@ -576,27 +621,35 @@ pub(crate) struct Halo2Verifier {
 
 #[derive(Clone, Debug)]
 pub(crate) struct QuotientExternal {
+    /// Base of the copied frame supplied to the external evaluator.
     pub(crate) frame_base: usize,
+    /// Length of the copied frame in bytes.
     pub(crate) frame_len: usize,
+    /// Expected return payload length in bytes.
     pub(crate) output_len: usize,
+    /// Magic version tag checked between verifier and evaluator.
     pub(crate) magic: u64,
 }
 
 impl QuotientExternal {
+    /// End byte of the copied frame, exclusive.
     fn frame_end(&self) -> usize {
         self.frame_base + self.frame_len
     }
 
+    /// Return whether a range is fully contained by the external frame.
     fn contains_range(&self, start: usize, len: usize) -> bool {
         let end = start.saturating_add(len);
         start >= self.frame_base && end <= self.frame_end()
     }
 
+    /// Return whether a range is disjoint from the copied external frame.
     fn disjoint_range(&self, start: usize, len: usize) -> bool {
         let end = start.saturating_add(len);
         end <= self.frame_base || start >= self.frame_end()
     }
 
+    /// Validate that a named range is fully copied into the external frame.
     fn validate_contains(&self, name: &str, start: usize, len: usize) -> Result<(), String> {
         if self.contains_range(start, len) {
             Ok(())
@@ -643,23 +696,38 @@ pub(crate) struct Halo2QuotientEvaluator {
 
 #[derive(Clone, Debug)]
 pub(crate) struct QuotientProgram {
+    /// Fr constant table carried by the VK payload.
     pub(crate) consts: Vec<U256>,
+    /// Encoded program chunks as VK words.
     pub(crate) chunks: Vec<U256>,
+    /// Program length in bytes before word padding.
     pub(crate) len: usize,
+    /// Whether `chunks` contain packed32 instructions.
     pub(crate) packed32: bool,
+    /// Number of VM CSE temp words.
     pub(crate) cse_temps: usize,
+    /// Memory pointer to the first constant word.
     pub(crate) const_mptr: usize,
+    /// Memory pointer to VM temp/state area.
     pub(crate) tmp_mptr: usize,
+    /// Persistent quotient numerator accumulator word.
     pub(crate) eval_numer_mptr: usize,
+    /// Persistent trace-id word.
     pub(crate) trace_id_mptr: usize,
+    /// Persistent selector forward-scale word.
     pub(crate) sel_scale_mptr: usize,
+    /// Persistent selector inverse-scale word.
     pub(crate) sel_inv_scale_mptr: usize,
+    /// Persistent `y^-1` word.
     pub(crate) y_inv_mptr: usize,
+    /// Operand stack / callback scratch base.
     pub(crate) stack_mptr: usize,
+    /// Memory pointer to the first encoded program word.
     pub(crate) program_mptr: usize,
 }
 
 impl Halo2VerifyingKey {
+    /// Render the verifying-key contract.
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
             Error::Fmt(err) => err,
@@ -669,6 +737,7 @@ impl Halo2VerifyingKey {
 }
 
 impl Halo2Verifier {
+    /// Validate template inputs against the typed proof and memory layouts.
     pub(crate) fn validate_layout(&self) -> Result<(), String> {
         self.memory.validate()?;
 
@@ -778,6 +847,7 @@ impl Halo2Verifier {
         Ok(())
     }
 
+    /// Render the verifier contract.
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
             Error::Fmt(err) => err,
@@ -787,6 +857,7 @@ impl Halo2Verifier {
 }
 
 impl Halo2QuotientEvaluator {
+    /// Render the standalone quotient evaluator contract.
     pub(crate) fn render(&self, writer: &mut impl fmt::Write) -> Result<(), fmt::Error> {
         self.render_into(writer).map_err(|err| match err {
             Error::Fmt(err) => err,
@@ -798,6 +869,7 @@ impl Halo2QuotientEvaluator {
 mod filters {
     use std::fmt::LowerHex;
 
+    /// Askama filter that renders a lower-hex value as an even-width Yul literal.
     pub fn hex(value: impl LowerHex) -> ::askama::Result<String> {
         let value = format!("{value:x}");
         Ok(if value.len() % 2 == 1 {
@@ -807,6 +879,7 @@ mod filters {
         })
     }
 
+    /// Askama filter that renders a lower-hex value padded to `pad` nibbles.
     pub fn hex_padded(value: impl LowerHex, pad: usize) -> ::askama::Result<String> {
         let string = format!("0x{value:0pad$x}");
         if string == "0x0" {

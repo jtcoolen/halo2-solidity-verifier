@@ -11,13 +11,18 @@ use crate::codegen::{
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProofSection {
+    /// Start byte offset in verifier calldata.
     pub(crate) start: usize,
+    /// Number of homogeneous items in this section.
     pub(crate) item_count: usize,
+    /// Byte length of one item.
     pub(crate) item_bytes: usize,
+    /// Total byte length of the section.
     pub(crate) byte_len: usize,
 }
 
 impl ProofSection {
+    /// Construct a homogeneous section and derive its byte length.
     fn new(start: usize, item_count: usize, item_bytes: usize) -> Self {
         Self {
             start,
@@ -27,41 +32,68 @@ impl ProofSection {
         }
     }
 
+    /// End byte offset, exclusive.
     pub(crate) fn end(self) -> usize {
         self.start + self.byte_len
     }
 }
 
+/// Calldata layout for one lookup argument's commitment reads.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProofLookupCommitmentsLayout {
+    /// Lookup argument index.
     pub(crate) lookup: usize,
+    /// Chunk helper commitments for this lookup.
     pub(crate) helpers: ProofSection,
+    /// LogUp accumulator commitment for this lookup.
     pub(crate) accumulator: ProofSection,
 }
 
+/// Complete calldata section map for the generated verifier proof argument.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProofCalldataLayout {
+    /// Byte offset of the first proof payload byte.
     pub(crate) proof_cptr: usize,
+    /// Advice commitments grouped by user phase.
     pub(crate) advice_phases: Vec<ProofSection>,
+    /// Lookup multiplicity commitments.
     pub(crate) lookup_multiplicities: ProofSection,
+    /// Permutation product commitments.
     pub(crate) permutation_products: ProofSection,
+    /// Per-lookup helper and accumulator commitments.
     pub(crate) lookups: Vec<ProofLookupCommitmentsLayout>,
+    /// Trashcan commitments.
     pub(crate) trash: ProofSection,
+    /// Quotient limb commitments.
     pub(crate) quotient_limbs: ProofSection,
+    /// Main scalar evaluation block.
     pub(crate) evals: ProofSection,
+    /// KZG `f_com` commitment.
     pub(crate) f_com: ProofSection,
+    /// KZG point-set evaluation scalars.
     pub(crate) q_evals: ProofSection,
+    /// KZG proof commitment `pi`.
     pub(crate) pi: ProofSection,
+    /// Start of quotient commitment section.
     pub(crate) quotient_comm_cptr: usize,
+    /// Start of the main evaluation scalar section.
     pub(crate) eval_cptr: usize,
     /// Start of the trailing KZG multi-open G1 block (`f_com`).
     pub(crate) w_cptr: usize,
+    /// Start of quotient point-set evaluation scalars.
     pub(crate) q_eval_cptr: usize,
+    /// End byte offset of the proof payload.
     pub(crate) proof_end: usize,
+    /// Total proof payload byte length.
     pub(crate) proof_len: usize,
 }
 
 impl ProofCalldataLayout {
+    /// Build the calldata layout by replaying the protocol proof-read order.
+    ///
+    /// `num_evals` and `num_point_sets` include feature-dependent dummy evals
+    /// and PCS point-set planning results, so this function stays independent
+    /// of those later codegen passes.
     pub(crate) fn from_protocol(
         protocol: &ProtocolPlan,
         proof_cptr: usize,
@@ -133,6 +165,7 @@ impl ProofCalldataLayout {
         }
     }
 
+    /// Number of proof G1 commitments before quotient limbs.
     pub(crate) fn non_quotient_g1_count(&self) -> usize {
         self.advice_phases
             .iter()
@@ -148,14 +181,17 @@ impl ProofCalldataLayout {
             + self.trash.item_count
     }
 
+    /// Number of proof G1 commitments that participate in transcript reads.
     pub(crate) fn commitment_g1_count(&self) -> usize {
         self.non_quotient_g1_count() + self.quotient_limbs.item_count
     }
 
+    /// Total number of G1 points in the Solidity-facing proof payload.
     pub(crate) fn total_g1_count(&self) -> usize {
         self.commitment_g1_count() + self.f_com.item_count + self.pi.item_count
     }
 
+    /// Commitment group sizes in the exact read/repack order.
     pub(crate) fn commitment_read_groups(&self) -> Vec<usize> {
         let mut groups = Vec::new();
         groups.extend(
@@ -182,15 +218,21 @@ impl ProofCalldataLayout {
     }
 }
 
+/// Conservative bound for the streaming transcript buffer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TranscriptBufferLayout {
+    /// Max bytes before the first challenge squeeze.
     pub(crate) initial_run_bytes: usize,
+    /// Max bytes for the evaluation scalar absorb run.
     pub(crate) eval_run_bytes: usize,
+    /// Max bytes for the full commitment/scalar absorb run.
     pub(crate) total_run_bytes: usize,
+    /// Required EVM words above `TRANSCRIPT_BUFFER_START`.
     pub(crate) words: usize,
 }
 
 impl TranscriptBufferLayout {
+    /// Derive transcript-buffer bounds from proof calldata shape and instances.
     pub(crate) fn from_proof_layout(proof: &ProofCalldataLayout, num_instances: usize) -> Self {
         let word_absorb = layout::transcript::WORD_ABSORB_BYTES;
         let g1_absorb = layout::transcript::G1_ABSORB_BYTES;

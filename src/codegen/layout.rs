@@ -188,45 +188,71 @@ pub(crate) mod abi {
     pub(crate) const VERIFY_PROOF_PROOF_HEAD_OFFSET: usize = VERIFY_PROOF_HEAD_BYTES;
 }
 
+/// Number of scalar words before embedded SRS base points in the VK header.
 const VK_HEADER_SCALAR_WORDS: usize = 11;
+/// Header word where the padded G1 generator starts.
 const VK_HEADER_G1_BASE_WORD: usize = VK_HEADER_SCALAR_WORDS;
+/// Header word where the padded G2 generator starts.
 const VK_HEADER_G2_BASE_WORD: usize = VK_HEADER_G1_BASE_WORD + G1_WORDS;
+/// Header word where the padded `-sG2` point starts.
 const VK_HEADER_NEG_S_G2_BASE_WORD: usize = VK_HEADER_G2_BASE_WORD + G2_WORDS;
 
+/// Stable word slots in the generated verifying-key header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum VkHeaderSlot {
+    /// Fiat-Shamir VK digest absorbed before proof data.
     VkDigest = 0,
+    /// Expected public instance count.
     NumInstances = 1,
+    /// Evaluation-domain exponent.
     K = 2,
+    /// Multiplicative inverse of domain size.
     NInv = 3,
+    /// Domain generator.
     Omega = 4,
+    /// Inverse domain generator.
     OmegaInv = 5,
+    /// `omega_inv^last_rotation_abs` for negative-row Lagrange terms.
     OmegaInvToL = 6,
+    /// Boolean flag for optional public accumulator batching.
     HasAccumulator = 7,
+    /// Public-input offset of accumulator encoding.
     AccOffset = 8,
+    /// Limbs per BLS base-field coordinate in accumulator encoding.
     NumAccLimbs = 9,
+    /// Bits per accumulator limb.
     NumAccLimbBits = 10,
+    /// Padded G1 generator.
     G1Base = VK_HEADER_G1_BASE_WORD,
+    /// Padded G2 generator.
     G2Base = VK_HEADER_G2_BASE_WORD,
+    /// Padded negated SRS `sG2` point.
     NegSG2Base = VK_HEADER_NEG_S_G2_BASE_WORD,
 }
 
 impl VkHeaderSlot {
+    /// Return the word offset of this header slot.
     pub(crate) const fn word(self) -> usize {
         self as usize
     }
 }
 
+/// Total number of EVM words in the VK header.
 pub(crate) const VK_HEADER_WORDS: usize = VK_HEADER_NEG_S_G2_BASE_WORD + G2_WORDS;
 
+/// Schema descriptor for one VK header field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VkHeaderFieldSpec {
+    /// First slot occupied by the field.
     pub(crate) slot: VkHeaderSlot,
+    /// Stable source/debug name.
     pub(crate) name: &'static str,
+    /// Field width in EVM words.
     pub(crate) width_words: usize,
 }
 
+/// Ordered VK header schema.
 pub(crate) const VK_HEADER_FIELDS: [VkHeaderFieldSpec; 14] = [
     VkHeaderFieldSpec {
         slot: VkHeaderSlot::VkDigest,
@@ -300,17 +326,21 @@ pub(crate) const VK_HEADER_FIELDS: [VkHeaderFieldSpec; 14] = [
     },
 ];
 
+/// Accessor namespace for the stable VK header schema.
 pub(crate) struct VkHeaderLayout;
 
 impl VkHeaderLayout {
+    /// Return the total header width in EVM words.
     pub(crate) const fn header_words() -> usize {
         VK_HEADER_WORDS
     }
 
+    /// Return every header field descriptor in render order.
     pub(crate) fn fields() -> &'static [VkHeaderFieldSpec] {
         &VK_HEADER_FIELDS
     }
 
+    /// Return the descriptor for a single slot.
     pub(crate) fn field(slot: VkHeaderSlot) -> VkHeaderFieldSpec {
         let fields = Self::fields();
         let mut idx = 0;
@@ -323,23 +353,27 @@ impl VkHeaderLayout {
         panic!("unknown VK header slot")
     }
 
+    /// Create an empty checked header builder.
     pub(crate) fn builder() -> VkHeaderBuilder {
         VkHeaderBuilder::new()
     }
 }
 
+/// Checked writer for the VK header constant vector.
 #[derive(Clone, Debug)]
 pub(crate) struct VkHeaderBuilder {
     words: Vec<Option<(&'static str, U256)>>,
 }
 
 impl VkHeaderBuilder {
+    /// Create a builder with every header word initially unset.
     pub(crate) fn new() -> Self {
         Self {
             words: vec![None; VkHeaderLayout::header_words()],
         }
     }
 
+    /// Insert a field at its schema-defined slot, checking width and overlap.
     pub(crate) fn insert(
         &mut self,
         slot: VkHeaderSlot,
@@ -383,6 +417,7 @@ impl VkHeaderBuilder {
         Ok(())
     }
 
+    /// Insert a one-word scalar header field.
     pub(crate) fn scalar(
         &mut self,
         slot: VkHeaderSlot,
@@ -392,6 +427,7 @@ impl VkHeaderBuilder {
         self.insert(slot, 1, &[(name, value)])
     }
 
+    /// Insert a padded G1 header field.
     pub(crate) fn g1(
         &mut self,
         slot: VkHeaderSlot,
@@ -405,6 +441,7 @@ impl VkHeaderBuilder {
         self.insert(slot, G1_WORDS, &words)
     }
 
+    /// Insert a padded G2 header field.
     pub(crate) fn g2(
         &mut self,
         slot: VkHeaderSlot,
@@ -418,6 +455,7 @@ impl VkHeaderBuilder {
         self.insert(slot, G2_WORDS, &words)
     }
 
+    /// Return the completed header or report the first missing word.
     pub(crate) fn finish(self) -> Result<Vec<(&'static str, U256)>, String> {
         self.words
             .into_iter()
@@ -429,39 +467,68 @@ impl VkHeaderBuilder {
     }
 }
 
+/// Historical word slots rooted at `THETA_MPTR`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum ThetaSlot {
+    /// Lookup compression challenge.
     Theta = 0,
+    /// Permutation/lookup beta challenge.
     Beta = 1,
+    /// Permutation/lookup gamma challenge.
     Gamma = 2,
+    /// Trash argument compression challenge.
     TrashChallenge = 3,
+    /// Quotient identity batch challenge.
     Y = 4,
+    /// Evaluation point.
     X = 5,
+    /// PCS challenge x1.
     X1 = 6,
+    /// PCS challenge x2.
     X2 = 7,
+    /// PCS challenge x3.
     X3 = 8,
+    /// PCS challenge x4.
     X4 = 9,
+    /// KZG `f_com` G1 slot.
     FCom = 10,
+    /// KZG proof commitment `pi` G1 slot.
     Pi = 14,
+    /// Public accumulator left-hand G1 slot.
     AccLhs = 18,
+    /// Public accumulator right-hand G1 slot.
     AccRhs = 22,
+    /// `x^n` scalar slot.
     XN = 26,
+    /// `(x^n - 1)^-1` scalar slot.
     XNMinus1Inv = 27,
+    /// Last-row Lagrange scalar slot.
     LLast = 28,
+    /// Blinding-row Lagrange scalar slot.
     LBlind = 29,
+    /// First-row Lagrange scalar slot.
     L0 = 30,
+    /// Locally interpolated public-instance evaluation.
     InstanceEval = 31,
+    /// Negated quotient numerator evaluation.
     QuotientEval = 32,
+    /// Quotient linearization scratch G1-sized slot.
     Quotient = 33,
+    /// PCS `f_eval` scalar slot.
     FEval = 38,
+    /// PCS `v` scalar slot.
     V = 39,
+    /// Final linearized commitment G1 slot.
     FinalCom = 40,
+    /// Final pairing LHS G1 slot.
     PairingLhs = 44,
+    /// Final pairing RHS G1 slot.
     PairingRhs = 48,
 }
 
 impl ThetaSlot {
+    /// Return this slot's word offset relative to `THETA_MPTR`.
     pub(crate) const fn word(self) -> usize {
         self as usize
     }

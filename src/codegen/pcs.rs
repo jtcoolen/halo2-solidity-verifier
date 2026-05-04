@@ -65,12 +65,16 @@ use crate::codegen::{
 /// when the Yul is emitted.
 #[derive(Clone, Debug)]
 pub(crate) struct Query {
+    /// Rotation exponent for the opening point `omega^rotation * x`.
     pub rotation: i32,
+    /// Commitment being opened.
     pub comm: EcPoint,
+    /// Claimed evaluation scalar.
     pub eval: Word,
 }
 
 impl Query {
+    /// Construct one query from a commitment, rotation, and eval word.
     fn new(comm: EcPoint, rotation: i32, eval: Word) -> Self {
         Self {
             rotation,
@@ -96,6 +100,7 @@ pub(crate) fn queries(meta: &ConstraintSystemMeta, data: &Data) -> Vec<Query> {
         .collect()
 }
 
+/// Resolve a typed protocol query source to concrete commitment/eval handles.
 fn query_from_plan(source: PcsQuerySource, meta: &ConstraintSystemMeta, data: &Data) -> Query {
     match source {
         PcsQuerySource::Advice(q) => Query::new(
@@ -283,9 +288,12 @@ pub(crate) struct CommitmentEntry {
     pub evals: Vec<Word>,
 }
 
+/// Codegen-time result of the KZG intermediate-set construction.
 #[derive(Clone, Debug)]
 pub(crate) struct IntermediateSets {
+    /// Unique commitments with eval vectors aligned to their point set.
     pub commitments: Vec<CommitmentEntry>,
+    /// Distinct rotation sets, sorted by verifier order.
     pub point_sets: Vec<Vec<i32>>,
 }
 
@@ -417,6 +425,7 @@ fn sort_sets(input: IntermediateSets) -> IntermediateSets {
     }
 }
 
+/// Build sorted intermediate sets, applying dummy queries when configured.
 pub(crate) fn intermediate_sets(meta: &ConstraintSystemMeta, data: &Data) -> IntermediateSets {
     let raw = queries(meta, data);
     let queries = if data.dummy_eval_words.is_empty() {
@@ -429,10 +438,12 @@ pub(crate) fn intermediate_sets(meta: &ConstraintSystemMeta, data: &Data) -> Int
     sort_sets(construct_intermediate_sets_impl(&queries))
 }
 
+/// Return the number of distinct KZG point sets after dummy-query planning.
 pub(super) fn num_point_sets(meta: &ConstraintSystemMeta, data: &Data) -> usize {
     intermediate_sets(meta, data).point_sets.len()
 }
 
+/// Group commitment entries by their sorted point-set index.
 fn commitments_by_set(sets: &IntermediateSets, n_sets: usize) -> Vec<Vec<&CommitmentEntry>> {
     let mut by_set: Vec<Vec<&CommitmentEntry>> = vec![Vec::new(); n_sets];
     for c in &sets.commitments {
@@ -441,6 +452,7 @@ fn commitments_by_set(sets: &IntermediateSets, n_sets: usize) -> Vec<Vec<&Commit
     by_set
 }
 
+/// Number of MSM terms represented by the synthetic linearization commitment.
 fn linearization_term_count(meta: &ConstraintSystemMeta) -> usize {
     // `linearization/verifier.rs::compute_linearization_commitment` builds an
     // MSM for
@@ -451,6 +463,7 @@ fn linearization_term_count(meta: &ConstraintSystemMeta) -> usize {
     meta.num_quotients + meta.simple_selector_cols.len()
 }
 
+/// Number of non-identity q_com MSM terms needed for one point set.
 fn q_com_terms_for_set(
     meta: &ConstraintSystemMeta,
     data: &Data,
@@ -474,6 +487,7 @@ fn q_com_terms_for_set(
         .sum()
 }
 
+/// Maximum trace-only q_com MSM size across all point sets.
 fn q_com_trace_terms(
     meta: &ConstraintSystemMeta,
     data: &Data,
@@ -486,6 +500,7 @@ fn q_com_trace_terms(
         .unwrap_or(0)
 }
 
+/// Shape of the fused final PCS MSM after expanding linearization terms.
 fn final_msm_shape(
     meta: &ConstraintSystemMeta,
     data: &Data,
@@ -513,12 +528,16 @@ fn final_msm_shape(
 
 pub(super) const Q_EVAL_ROLL_THRESHOLD: usize = 4;
 
+/// Emission strategy for a point set's q_eval fold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QEvalStrategy {
+    /// Use a loop over memory-backed eval source addresses.
     Rolled,
+    /// Emit straight-line arithmetic.
     Unrolled,
 }
 
+/// Pick the q_eval emission strategy for commitments in one point set.
 fn q_eval_strategy(commitments: &[&CommitmentEntry]) -> QEvalStrategy {
     let Some(first) = commitments.first() else {
         return QEvalStrategy::Unrolled;
@@ -543,6 +562,7 @@ fn q_eval_strategy(commitments: &[&CommitmentEntry]) -> QEvalStrategy {
     }
 }
 
+/// Compute all PCS scratch-window and MSM size requirements.
 pub(super) fn memory_requirements(
     meta: &ConstraintSystemMeta,
     data: &Data,
@@ -630,6 +650,10 @@ pub(super) fn computations(
         return Vec::new();
     }
 
+    // The emitted blocks below adapt the Rust `multi_prepare` flow:
+    // construct/sort point sets, fold q_eval vectors, interpolate at x3,
+    // build the final commitment with x4 powers, then prepare the final KZG
+    // pairing inputs `(pi, final_com - vG + x3*pi)`.
     // Per-set commitment list. Reused by the q_eval fold block and the
     // fused final commitment MSM.
     let by_set = commitments_by_set(&sets, n_sets);
@@ -1593,6 +1617,7 @@ pub(super) fn computations(
 // Tiny formatting helpers.
 // ---------------------------------------------------------------------------
 
+/// Render `base` or `add(base, offset)` for generated Yul pointers.
 fn add_offset(base: &str, offset: usize) -> String {
     if offset == 0 {
         base.to_string()
@@ -1602,6 +1627,7 @@ fn add_offset(base: &str, offset: usize) -> String {
 }
 
 #[allow(dead_code)]
+/// Return the byte offset of a rotation inside a sorted rotation list.
 fn rot_offset(rotations: &[i32], rot: i32) -> usize {
     rotations
         .iter()
@@ -1738,13 +1764,17 @@ mod tests {
                 // c3's evals are aligned with the set's sorted point list;
                 // use the protocol-level pairs (rotation -> eval) for a
                 // location-independent check.
-                let pairs: Vec<(i32, Word)> = pts.iter().copied().zip(c.evals.iter().copied()).collect();
+                let pairs: Vec<(i32, Word)> =
+                    pts.iter().copied().zip(c.evals.iter().copied()).collect();
                 assert!(pairs.contains(&(0, ev(0x270))));
                 assert!(pairs.contains(&(1, ev(0x290))));
                 assert!(pairs.contains(&(-1, ev(0x2b0))));
             }
         }
-        assert!(found_c0 && found_c3, "expected c0 and c3 entries in commitments");
+        assert!(
+            found_c0 && found_c3,
+            "expected c0 and c3 entries in commitments"
+        );
     }
 
     #[test]

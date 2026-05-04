@@ -12,34 +12,50 @@ use crate::codegen::layout::{G1_WORDS, WORD_BYTES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PayloadSectionKind {
+    /// Fixed VK header words consumed by both embedded and external VK paths.
     Header,
+    /// Deduplicated Fr constants used by the compact quotient VM.
     QuotientConstants,
+    /// Packed compact-VM bytecode words.
     QuotientProgram,
+    /// EIP-2537-padded fixed polynomial commitments.
     FixedCommitments,
+    /// EIP-2537-padded permutation commitment bases.
     PermutationCommitments,
 }
 
+/// One contiguous word-aligned section inside the generated VK payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PayloadSection {
+    /// Logical section kind.
     pub(crate) kind: PayloadSectionKind,
+    /// Start word relative to the beginning of the VK payload.
     pub(crate) word_offset: usize,
+    /// Length in EVM words.
     pub(crate) word_len: usize,
 }
 
 impl PayloadSection {
+    /// End word offset, exclusive.
     pub(crate) fn word_end(self) -> usize {
         self.word_offset + self.word_len
     }
 
+    /// Start byte offset relative to the beginning of the VK payload.
     pub(crate) fn byte_offset(self) -> usize {
         self.word_offset * WORD_BYTES
     }
 
+    /// Length in bytes.
     pub(crate) fn byte_len(self) -> usize {
         self.word_len * WORD_BYTES
     }
 }
 
+/// Monotonic section map for the generated VK byte payload.
+///
+/// The layout is append-only by construction so template emission, runtime
+/// `extcodecopy`, and tests all agree on the same section boundaries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VkPayloadLayout {
     sections: Vec<PayloadSection>,
@@ -47,10 +63,15 @@ pub(crate) struct VkPayloadLayout {
 }
 
 impl VkPayloadLayout {
+    /// Start an empty layout with the cursor at word zero.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
+    /// Build the complete static VK payload section map.
+    ///
+    /// Commitment counts are converted into EIP-2537 G1 word widths here so
+    /// callers do not repeat that arithmetic at the emission sites.
     pub(crate) fn for_vk(
         header_words: usize,
         quotient_const_words: usize,
@@ -71,6 +92,10 @@ impl VkPayloadLayout {
         Ok(layout)
     }
 
+    /// Reserve a generic word section at the current cursor.
+    ///
+    /// Each logical kind may appear at most once; duplicate sections would make
+    /// generated offsets ambiguous and are rejected immediately.
     pub(crate) fn reserve(
         &mut self,
         kind: PayloadSectionKind,
@@ -90,6 +115,7 @@ impl VkPayloadLayout {
         Ok(section)
     }
 
+    /// Reserve a section containing `commitments` EIP-2537-padded G1 points.
     pub(crate) fn reserve_g1(
         &mut self,
         kind: PayloadSectionKind,
@@ -98,6 +124,7 @@ impl VkPayloadLayout {
         self.reserve(kind, commitments * G1_WORDS)
     }
 
+    /// Return the section for `kind`, if it has been reserved.
     pub(crate) fn section(&self, kind: PayloadSectionKind) -> Option<PayloadSection> {
         self.sections
             .iter()
@@ -105,6 +132,7 @@ impl VkPayloadLayout {
             .find(|section| section.kind == kind)
     }
 
+    /// Return the section for `kind` or an explanatory layout error.
     pub(crate) fn require_section(
         &self,
         kind: PayloadSectionKind,
@@ -113,30 +141,37 @@ impl VkPayloadLayout {
             .ok_or_else(|| format!("missing VK payload section: {kind:?}"))
     }
 
+    /// Start word of a required section.
     pub(crate) fn word_offset(&self, kind: PayloadSectionKind) -> Result<usize, String> {
         Ok(self.require_section(kind)?.word_offset)
     }
 
+    /// Word length of a required section.
     pub(crate) fn word_len(&self, kind: PayloadSectionKind) -> Result<usize, String> {
         Ok(self.require_section(kind)?.word_len)
     }
 
+    /// Start byte offset of a required section.
     pub(crate) fn byte_offset(&self, kind: PayloadSectionKind) -> Result<usize, String> {
         Ok(self.require_section(kind)?.byte_offset())
     }
 
+    /// Byte length of a required section.
     pub(crate) fn byte_len(&self, kind: PayloadSectionKind) -> Result<usize, String> {
         Ok(self.require_section(kind)?.byte_len())
     }
 
+    /// Total payload length in words.
     pub(crate) fn total_words(&self) -> usize {
         self.cursor_words
     }
 
+    /// Total payload length in bytes.
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_words() * WORD_BYTES
     }
 
+    /// Check that sections are contiguous and the cursor matches their end.
     pub(crate) fn validate(&self) -> Result<(), String> {
         let mut cursor = 0usize;
         for section in &self.sections {
@@ -158,13 +193,16 @@ impl VkPayloadLayout {
     }
 }
 
+/// Codec for storing byte-oriented quotient programs in VK constant words.
 pub(crate) struct PackedProgramCodec;
 
 impl PackedProgramCodec {
+    /// Number of EVM words required to hold `byte_len` bytes.
     pub(crate) fn word_len_for_bytes(byte_len: usize) -> usize {
         byte_len.div_ceil(WORD_BYTES)
     }
 
+    /// Pack bytes into big-endian `U256` words, zero-padding the final word.
     pub(crate) fn encode_words(bytes: &[u8]) -> Vec<U256> {
         let mut padded = bytes.to_vec();
         padded.resize(Self::word_len_for_bytes(bytes.len()) * WORD_BYTES, 0);
@@ -174,6 +212,7 @@ impl PackedProgramCodec {
             .collect::<Vec<_>>()
     }
 
+    /// Decode packed words and verify that all unused padding bytes are zero.
     pub(crate) fn decode_words(words: &[U256], byte_len: usize) -> Result<Vec<u8>, String> {
         let capacity = words.len() * WORD_BYTES;
         if byte_len > capacity {

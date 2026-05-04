@@ -1,6 +1,13 @@
-// Some Yul-emission helpers in this module are shared by production codegen
-// and tests. Keep them available without `cfg(test)` gates so the emitter can
-// reuse a single metadata model.
+//! Shared metadata, pointer, formatting, and BLS encoding helpers for codegen.
+//!
+//! This module is intentionally close to the generated Yul model. `Ptr`,
+//! `Word`, and `EcPoint` render directly as calldata/memory loads, while
+//! `ConstraintSystemMeta` and `Data` bind the typed protocol plan to concrete
+//! verifier memory addresses.
+//!
+//! Some Yul-emission helpers in this module are shared by production codegen
+//! and tests. Keep them available without `cfg(test)` gates so the emitter can
+//! reuse a single metadata model.
 #![allow(dead_code)]
 
 use crate::codegen::{
@@ -61,17 +68,29 @@ type LookupEvalSlots = (Option<Word>, Vec<Option<Word>>, Option<Word>, Option<Wo
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConstraintSystemMeta {
+    /// Typed source plan for proof reads and PCS queries.
     pub(crate) protocol: ProtocolPlan,
+    /// Number of fixed columns.
     pub(crate) num_fixeds: usize,
+    /// Columns participating in the permutation argument.
     pub(crate) permutation_columns: Vec<Column<Any>>,
+    /// Maximum columns per permutation product chunk.
     pub(crate) permutation_chunk_len: usize,
+    /// Number of lookup arguments.
     pub(crate) num_lookups: usize,
+    /// Helper chunks per lookup.
     pub(crate) lookup_chunks: Vec<usize>,
+    /// Number of trashcan arguments.
     pub(crate) num_trashcans: usize,
+    /// Number of permutation product commitments.
     pub(crate) num_permutation_zs: usize,
+    /// Number of quotient limb commitments.
     pub(crate) num_quotients: usize,
+    /// Advice query tuples `(column, rotation)`.
     pub(crate) advice_queries: Vec<(usize, i32)>,
+    /// Fixed query tuples `(column, rotation)`.
     pub(crate) fixed_queries: Vec<(usize, i32)>,
+    /// Instance query tuples `(column, rotation)`.
     pub(crate) instance_queries: Vec<(usize, i32)>,
     pub(crate) num_simple_selectors: usize,
     /// Set of fixed-column indices that are *simple selectors* (i.e.
@@ -102,10 +121,15 @@ pub(crate) struct ConstraintSystemMeta {
     /// `SolidityGenerator::generate_verifier` once it has constructed the
     /// `Data` and run `pcs::queries`.
     pub(crate) num_point_sets: usize,
+    /// Advice commitment counts by user phase.
     pub(crate) num_user_advices: Vec<usize>,
+    /// Challenge counts by user phase.
     pub(crate) num_user_challenges: Vec<usize>,
+    /// Advice remapping into phase-packed verifier order.
     pub(crate) advice_indices: Vec<usize>,
+    /// Challenge remapping into phase-packed memory order.
     pub(crate) challenge_indices: Vec<usize>,
+    /// Last negative rotation used for row-boundary constraints.
     pub(crate) rotation_last: i32,
 }
 
@@ -151,6 +175,7 @@ impl ConstraintSystemMeta {
         }
     }
 
+    /// Check legacy scalar fields against the typed protocol plan.
     pub(crate) fn validate_against_protocol(&self) -> Result<(), String> {
         self.protocol.validate()?;
         let planned_g1s = self.protocol.num_commitments();
@@ -176,10 +201,12 @@ impl ConstraintSystemMeta {
         Ok(())
     }
 
+    /// Number of columns participating in permutation checks.
     pub(crate) fn num_permutations(&self) -> usize {
         self.permutation_columns.len()
     }
 
+    /// Solidity-facing proof payload length for this metadata snapshot.
     pub(crate) fn proof_len(&self) -> usize {
         self.validate_against_protocol()
             .expect("constraint-system metadata must match protocol plan before proof sizing");
@@ -219,14 +246,21 @@ impl ConstraintSystemMeta {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Data {
+    /// Memory pointer to user challenge slots.
     pub(crate) challenge_mptr: Ptr,
+    /// Memory pointer to the fixed theta-rooted state window.
     pub(crate) theta_mptr: Ptr,
 
+    /// Calldata pointer to quotient limb commitments.
     pub(crate) quotient_comm_cptr: Ptr,
+    /// Calldata pointer to KZG `f_com`.
     pub(crate) w_cptr: Ptr,
 
+    /// Fixed commitments in VK memory.
     pub(crate) fixed_comms: Vec<EcPoint>,
+    /// Permutation commitments keyed by `Column<Any>`.
     pub(crate) permutation_comms: HashMap<Column<Any>, EcPoint>,
+    /// Advice commitments in phase-packed memory order.
     pub(crate) advice_comms: Vec<EcPoint>,
     /// Per committed-instance column: the EcPoint of the committed
     /// instance commitment. Currently always points to `G1_IDENTITY_MPTR`
@@ -239,8 +273,10 @@ pub(crate) struct Data {
     pub(crate) lookup_z_comms: Vec<EcPoint>,
     pub(crate) trashcan_comms: Vec<EcPoint>,
 
+    /// User challenge words.
     pub(crate) challenges: Vec<Word>,
 
+    /// Locally-computed non-committed instance evaluation.
     pub(crate) instance_eval: Word,
     /// Per-(committed-instance-column, rotation): the calldata word for
     /// that committed instance evaluation. Empty when
@@ -287,6 +323,11 @@ pub(crate) struct Data {
 }
 
 impl Data {
+    /// Bind protocol metadata to concrete proof calldata and verifier memory.
+    ///
+    /// The resulting value is the lookup table every emitter uses: it maps
+    /// proof commitments, evaluations, challenges, and computed helper values
+    /// to typed `Word`/`EcPoint` handles that render as Yul loads.
     pub(crate) fn new(
         meta: &ConstraintSystemMeta,
         vk: &Halo2VerifyingKey,
@@ -601,11 +642,14 @@ impl Data {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Location {
+    /// A value loaded from calldata.
     Calldata,
+    /// A value loaded from EVM memory.
     Memory,
 }
 
 impl Location {
+    /// Yul load opcode for this location.
     fn opcode(&self) -> &'static str {
         match self {
             Location::Calldata => "calldataload",
@@ -628,10 +672,12 @@ pub(crate) enum Value {
 }
 
 impl Value {
+    /// Return true when this value is a concrete byte offset.
     pub(crate) fn is_integer(&self) -> bool {
         matches!(self, Value::Integer(_))
     }
 
+    /// Return the concrete offset, panicking for symbolic identifiers.
     pub(crate) fn as_usize(&self) -> usize {
         match self {
             Value::Integer(int) => *int as usize,
@@ -641,23 +687,27 @@ impl Value {
 }
 
 impl Default for Value {
+    /// Default to the zero byte offset.
     fn default() -> Self {
         Self::Integer(0)
     }
 }
 
 impl From<&'static str> for Value {
+    /// Convert a Yul identifier into a symbolic pointer value.
     fn from(ident: &'static str) -> Self {
         Value::Identifier(ident, 0)
     }
 }
 
 impl From<usize> for Value {
+    /// Convert a concrete byte offset into a pointer value.
     fn from(int: usize) -> Self {
         Value::Integer(int as isize)
     }
 }
 
+/// Format an integer byte offset as a stable even-width Yul hex literal.
 fn fmt_hex(off: isize) -> String {
     let hex = format!("{:x}", off as usize);
     if hex.len() % 2 == 1 {
@@ -668,6 +718,7 @@ fn fmt_hex(off: isize) -> String {
 }
 
 impl Display for Value {
+    /// Render the value as a Yul pointer expression.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(int) if *int >= 0 => write!(f, "{}", fmt_hex(*int)),
@@ -685,6 +736,7 @@ impl Display for Value {
 
 impl Add<usize> for Value {
     type Output = Value;
+    /// Advance by `rhs` EVM words.
     fn add(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int + (rhs as isize) * WORD_BYTES as isize),
@@ -697,6 +749,7 @@ impl Add<usize> for Value {
 
 impl Sub<usize> for Value {
     type Output = Value;
+    /// Move backward by `rhs` EVM words.
     fn sub(self, rhs: usize) -> Self::Output {
         match self {
             Value::Integer(int) => Value::Integer(int - (rhs as isize) * WORD_BYTES as isize),
@@ -714,6 +767,7 @@ pub(crate) struct Ptr {
 }
 
 impl Ptr {
+    /// Construct a pointer at a location with a concrete or symbolic value.
     pub(crate) fn new(loc: Location, value: impl Into<Value>) -> Self {
         Self {
             loc,
@@ -721,24 +775,29 @@ impl Ptr {
         }
     }
 
+    /// Construct a memory pointer.
     pub(crate) fn memory(value: impl Into<Value>) -> Self {
         Self::new(Location::Memory, value.into())
     }
 
+    /// Construct a calldata pointer.
     pub(crate) fn calldata(value: impl Into<Value>) -> Self {
         Self::new(Location::Calldata, value.into())
     }
 
+    /// Return whether this pointer targets calldata or memory.
     pub(crate) fn loc(&self) -> Location {
         self.loc
     }
 
+    /// Return the underlying byte-offset expression.
     pub(crate) fn value(&self) -> Value {
         self.value
     }
 }
 
 impl Display for Ptr {
+    /// Render the pointer's byte-offset expression.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.value)
     }
@@ -746,6 +805,7 @@ impl Display for Ptr {
 
 impl Add<usize> for Ptr {
     type Output = Ptr;
+    /// Advance by `rhs` EVM words while preserving location.
     fn add(mut self, rhs: usize) -> Self::Output {
         self.value = self.value + rhs;
         self
@@ -754,6 +814,7 @@ impl Add<usize> for Ptr {
 
 impl Sub<usize> for Ptr {
     type Output = Ptr;
+    /// Move backward by `rhs` EVM words while preserving location.
     fn sub(mut self, rhs: usize) -> Self::Output {
         self.value = self.value - rhs;
         self
@@ -764,21 +825,25 @@ impl Sub<usize> for Ptr {
 pub(crate) struct Word(Ptr);
 
 impl Word {
+    /// Infinite iterator of consecutive word handles starting at `word`.
     pub(crate) fn range(word: impl Into<Word>) -> impl Iterator<Item = Word> {
         let ptr = word.into().ptr();
         (0..).map(move |idx| ptr + idx).map_into()
     }
 
+    /// Return the pointer backing this word.
     pub(crate) fn ptr(&self) -> Ptr {
         self.0
     }
 
+    /// Return whether the word is loaded from calldata or memory.
     pub(crate) fn loc(&self) -> Location {
         self.0.loc()
     }
 }
 
 impl Display for Word {
+    /// Render as the appropriate Yul load expression.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         // For Calldata-located Words (proof evals/q_evals), the Solidity
         // proof shim stores scalars as canonical BE words, so calldataload
@@ -791,58 +856,71 @@ impl Display for Word {
 }
 
 impl From<Ptr> for Word {
+    /// Treat a pointer as the start of one word.
     fn from(ptr: Ptr) -> Self {
         Self(ptr)
     }
 }
 
+/// EIP-2537-padded G1 point handle in calldata or memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EcPoint {
     base: Ptr,
 }
 
 impl EcPoint {
+    /// Construct a point handle at its first word.
     pub(crate) fn new(base: impl Into<Ptr>) -> Self {
         Self { base: base.into() }
     }
 
+    /// Infinite iterator of consecutive padded G1 points.
     pub(crate) fn range(base: impl Into<EcPoint>) -> impl Iterator<Item = EcPoint> {
         let base = base.into().base;
         (0..).map(move |idx| EcPoint::new(base + 4 * idx))
     }
 
+    /// Return whether the point is loaded from calldata or memory.
     pub(crate) fn loc(&self) -> Location {
         self.base.loc()
     }
 
+    /// Return the pointer to the first word.
     pub(crate) fn ptr(&self) -> Ptr {
         self.base
     }
 
+    /// High word of the x coordinate.
     pub(crate) fn x_hi(&self) -> Word {
         Word::from(self.base)
     }
+    /// Low word of the x coordinate.
     pub(crate) fn x_lo(&self) -> Word {
         Word::from(self.base + 1)
     }
+    /// High word of the y coordinate.
     pub(crate) fn y_hi(&self) -> Word {
         Word::from(self.base + 2)
     }
+    /// Low word of the y coordinate.
     pub(crate) fn y_lo(&self) -> Word {
         Word::from(self.base + 3)
     }
 
+    /// All four EIP-2537 words in order.
     pub(crate) fn words(&self) -> [Word; 4] {
         [self.x_hi(), self.x_lo(), self.y_hi(), self.y_lo()]
     }
 }
 
 impl From<Ptr> for EcPoint {
+    /// Treat a pointer as the first word of a padded G1 point.
     fn from(ptr: Ptr) -> Self {
         Self::new(ptr)
     }
 }
 
+/// Emit four `mstore` statements that copy one padded G1 point.
 pub(crate) fn copy_g1_point(dst_base: Ptr, src: &EcPoint) -> [String; 4] {
     let [x_hi, x_lo, y_hi, y_lo] = src.words();
     [
@@ -853,6 +931,7 @@ pub(crate) fn copy_g1_point(dst_base: Ptr, src: &EcPoint) -> [String; 4] {
     ]
 }
 
+/// Indent generated Yul lines by `N` four-space levels.
 pub(crate) fn indent<const N: usize>(
     lines: impl IntoIterator<Item = impl Into<String>>,
 ) -> Vec<String> {
@@ -862,6 +941,10 @@ pub(crate) fn indent<const N: usize>(
         .collect()
 }
 
+/// Render a Yul block around generated lines.
+///
+/// `PACKED` renders single-line blocks as `{ stmt }`, which keeps compact
+/// `for` clauses readable.
 pub(crate) fn code_block<const N: usize, const PACKED: bool>(
     lines: impl IntoIterator<Item = impl Into<String>>,
 ) -> Vec<String> {
@@ -879,6 +962,7 @@ pub(crate) fn code_block<const N: usize, const PACKED: bool>(
     }
 }
 
+/// Build a formatted Yul `for` loop from initialization, condition, step, and body.
 pub(crate) fn for_loop(
     initialization: impl IntoIterator<Item = impl Into<String>>,
     condition: impl Into<String>,
@@ -895,6 +979,7 @@ pub(crate) fn for_loop(
     .collect()
 }
 
+/// Group adjacent words that walk backward by one word in the same location.
 pub(crate) fn group_backward_adjacent_words<'a>(
     words: impl IntoIterator<Item = &'a Word>,
 ) -> Vec<(Location, Vec<&'a Word>)> {
@@ -916,6 +1001,7 @@ pub(crate) fn group_backward_adjacent_words<'a>(
     })
 }
 
+/// Group adjacent G1 points that walk backward by one point in the same location.
 pub(crate) fn group_backward_adjacent_ec_points<'a>(
     ec_point: impl IntoIterator<Item = &'a EcPoint>,
 ) -> Vec<(Location, Vec<&'a EcPoint>)> {
@@ -944,6 +1030,7 @@ pub(crate) fn group_backward_adjacent_ec_points<'a>(
 // matches the padded precompile calldata expected by the generated verifier.
 // ----------------------------------------------------------------------------
 
+/// Split a 48-byte big-endian Fp coordinate into EIP-2537 hi/lo words.
 fn fp48_be_to_hi_lo(be: &[u8]) -> (U256, U256) {
     debug_assert_eq!(be.len(), BLS_FP_BYTES);
     let mut hi_bytes = [0u8; 32];
@@ -1008,6 +1095,7 @@ pub(crate) fn g2_to_u256s(ec_point: impl Borrow<G2Affine>) -> [U256; 8] {
     [x0_hi, x0_lo, x1_hi, x1_lo, y0_hi, y0_lo, y1_hi, y1_lo]
 }
 
+/// Convert a 32-byte little-endian prime-field representation into `U256`.
 pub(crate) fn fe_to_u256<F>(fe: impl Borrow<F>) -> U256
 where
     F: PrimeField,
@@ -1021,6 +1109,7 @@ where
     U256::from_le_bytes(le)
 }
 
+/// Convert an integer-like value into one 32-byte big-endian EVM word.
 pub(crate) fn to_u256_be_bytes<T>(value: T) -> [u8; 32]
 where
     U256: UintTryFrom<T>,

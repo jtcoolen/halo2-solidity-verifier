@@ -136,6 +136,7 @@ pub(crate) struct RepackedProofLayoutPlan {
 }
 
 impl RepackedProofLayoutPlan {
+    /// Build a proof repacking plan from the typed Solidity calldata layout.
     pub(crate) fn from_proof_layout(
         layout: &crate::codegen::proof_layout::ProofCalldataLayout,
     ) -> Self {
@@ -146,10 +147,12 @@ impl RepackedProofLayoutPlan {
         }
     }
 
+    /// Number of compressed G1 points before the scalar eval block.
     pub(crate) fn prefix_g1_count(&self) -> usize {
         self.g1_groups.iter().sum()
     }
 
+    /// Native compressed proof byte length expected by the repacker.
     pub(crate) fn compressed_len(&self) -> usize {
         self.prefix_g1_count() * crate::codegen::layout::G1_COMPRESSED_BYTES
             + self.num_evals * crate::codegen::layout::WORD_BYTES
@@ -158,6 +161,7 @@ impl RepackedProofLayoutPlan {
             + crate::codegen::layout::G1_COMPRESSED_BYTES
     }
 
+    /// Solidity-facing EIP-2537-padded proof byte length after repacking.
     pub(crate) fn repacked_len(&self) -> usize {
         self.prefix_g1_count() * crate::codegen::layout::G1_BYTES
             + self.num_evals * crate::codegen::layout::WORD_BYTES
@@ -168,6 +172,7 @@ impl RepackedProofLayoutPlan {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    /// Return scalar offsets within the repacked proof for tests.
     pub(crate) fn scalar_layout(&self) -> RepackedProofScalarLayout {
         let eval_offset = self.prefix_g1_count() * crate::codegen::layout::G1_BYTES;
         let q_eval_offset = eval_offset
@@ -200,6 +205,7 @@ pub(super) struct QuotientIdentityParts {
 }
 
 impl QuotientIdentityParts {
+    /// Return every identity in global y-batch order.
     pub(super) fn all_identities(&self) -> Vec<QuotientIdentity> {
         self.gates
             .iter()
@@ -684,6 +690,7 @@ pub(super) const QUOTIENT_VM_SPEC: QuotientVmSpec = QuotientVmSpec {
     limb_pairwise_coeffs: QUOTIENT_VM_PAIRWISE_COEFFS,
 };
 
+/// Return the VM opcode spec for a stable opcode byte.
 pub(super) fn quotient_opcode_spec(opcode: u8) -> Option<&'static QuotientOpcodeSpec> {
     QUOTIENT_VM_SPEC
         .opcodes
@@ -931,6 +938,7 @@ pub(super) struct QuotientInlineCseEmitter<'a> {
 }
 
 impl<'a> QuotientInlineCseEmitter<'a> {
+    /// Create a direct-Yul CSE emitter.
     pub(super) fn new(plan: &'a QuotientInlineCsePlan, cse_mptr: usize, helpers: bool) -> Self {
         Self {
             plan,
@@ -942,10 +950,12 @@ impl<'a> QuotientInlineCseEmitter<'a> {
         }
     }
 
+    /// Emit an identity expression and return the Yul variable holding it.
     pub(super) fn emit_identity(&mut self, expr: &QuotientExpr, out: &mut Vec<String>) -> String {
         self.emit_expr(expr, out, None)
     }
 
+    /// Emit a quotient expression, recursively materializing CSE temps as needed.
     pub(super) fn emit_expr(
         &mut self,
         expr: &QuotientExpr,
@@ -1014,6 +1024,7 @@ impl<'a> QuotientInlineCseEmitter<'a> {
         }
     }
 
+    /// Ensure a selected CSE expression has been stored to its temp slot.
     fn ensure_cse(&mut self, key: &str, out: &mut Vec<String>) {
         if self.emitted.contains(key) {
             return;
@@ -1038,15 +1049,18 @@ impl<'a> QuotientInlineCseEmitter<'a> {
         self.emitted.insert(key.to_string());
     }
 
+    /// Render an `mload` from a CSE temp slot.
     fn cse_load(&self, key: &str) -> String {
         format!("mload({})", self.cse_ptr(key))
     }
 
+    /// Render the pointer for a CSE temp slot.
     fn cse_ptr(&self, key: &str) -> String {
         let slot = self.plan.slots[key] as usize;
         format!("{:#x}", self.cse_mptr + slot * layout::WORD_BYTES)
     }
 
+    /// Allocate the next direct-Yul temporary name.
     fn fresh_var(&mut self) -> String {
         let var = format!("q_cse_var_{}", self.next_var);
         self.next_var += 1;
@@ -1135,6 +1149,7 @@ impl QuotientProgramBuilder {
         assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
     }
 
+    /// Emit the fold opcode for the completed top-of-stack identity value.
     fn fold_identity(&mut self, target: QuotientTarget) {
         // Mirrors the Rust `compute_linearization_commitment` y-batch:
         // every emitted identity is first absorbed into the same running
@@ -1869,6 +1884,7 @@ impl QuotientProgramBuilder {
     }
 }
 
+/// Compact long adjacent fused-op runs in byte-oriented VM encoding.
 pub(super) fn compact_quotient_runs(bytes: &[u8]) -> Vec<u8> {
     // Run compaction is only a byte-encoding optimization. It preserves the
     // logical operation stream by replacing long adjacent fused add-mul ops
@@ -2260,10 +2276,15 @@ pub(super) fn quotient_mem_token_from_name(name: &str) -> Option<u8> {
 /// The VM lowerer is independent of the concrete verifier memory layout; this
 /// trait supplies the memory-backed expression for each kind of query.
 pub(super) trait QuotientExpressionEnv {
+    /// Lower a selector leaf.
     fn selector(&self, selector: Selector) -> QuotientExpr;
+    /// Lower a fixed-column query leaf.
     fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    /// Lower an advice-column query leaf.
     fn advice(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    /// Lower an instance-column query leaf.
     fn instance(&self, column_index: usize, rotation: i32) -> QuotientExpr;
+    /// Lower a challenge leaf.
     fn challenge(&self, index: usize) -> QuotientExpr;
 }
 
@@ -2300,10 +2321,12 @@ pub(super) struct DataQuotientExpressionEnv<'a> {
 }
 
 impl QuotientExpressionEnv for DataQuotientExpressionEnv<'_> {
+    /// Reject virtual selectors after selector-to-fixed conversion.
     fn selector(&self, _selector: Selector) -> QuotientExpr {
         panic!("virtual selectors must be removed before quotient lowering")
     }
 
+    /// Lower a fixed query, synthesizing simple selectors as constant one.
     fn fixed(&self, column_index: usize, rotation: i32) -> QuotientExpr {
         if self.meta.simple_selector_cols.contains(&column_index) {
             QuotientExpr::Const(U256::from(1u64))
@@ -2318,6 +2341,7 @@ impl QuotientExpressionEnv for DataQuotientExpressionEnv<'_> {
         }
     }
 
+    /// Lower an advice query to a memory-backed eval word.
     fn advice(&self, column_index: usize, rotation: i32) -> QuotientExpr {
         word_to_quotient_expr(
             *self
@@ -2328,6 +2352,7 @@ impl QuotientExpressionEnv for DataQuotientExpressionEnv<'_> {
         )
     }
 
+    /// Lower an instance query from proof evals or local instance evaluation.
     fn instance(&self, column_index: usize, rotation: i32) -> QuotientExpr {
         if column_index < self.meta.num_committed_instances {
             word_to_quotient_expr(
@@ -2342,11 +2367,13 @@ impl QuotientExpressionEnv for DataQuotientExpressionEnv<'_> {
         }
     }
 
+    /// Lower a user challenge to its memory-backed word.
     fn challenge(&self, index: usize) -> QuotientExpr {
         word_to_quotient_expr(self.data.challenges[index])
     }
 }
 
+/// Convert a memory-backed `Word` into a quotient memory load expression.
 pub(super) fn word_to_quotient_expr(word: Word) -> QuotientExpr {
     assert_eq!(
         word.loc(),
@@ -2437,6 +2464,7 @@ pub(super) fn collect_product_leaves(expr: &QuotientExpr, leaves: &mut Vec<Quoti
     }
 }
 
+/// Recognize any supported seven-limb foreign-field quotient shape.
 pub(super) fn quotient_limb_shape(expr: &QuotientExpr) -> Option<QuotientLimbShape> {
     // Recover foreign-field limb algebra from the generic `QuotientExpr`
     // tree. This deliberately does not look at gate names: the Rust verifier

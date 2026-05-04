@@ -43,15 +43,22 @@ use crate::codegen::util::{fe_to_u256, ConstraintSystemMeta, Data, Location, Val
 
 #[derive(Debug)]
 pub(crate) struct Evaluator<'a> {
+    /// Source constraint system whose identities are emitted.
     cs: &'a ConstraintSystem<Fq>,
+    /// Codegen metadata for query order and selector handling.
     meta: &'a ConstraintSystemMeta,
+    /// Concrete memory/calldata handles for all queried values.
     data: &'a Data,
+    /// Whether five repeated factors should be lowered through `q_pow5`.
     use_pow5_helper: bool,
+    /// Local variable counter for the current emitted identity.
     var_counter: RefCell<usize>,
+    /// Per-identity expression text to variable-name cache.
     var_cache: RefCell<HashMap<String, String>>,
 }
 
 impl<'a> Evaluator<'a> {
+    /// Create an evaluator bound to a constraint system, metadata, and data map.
     pub(crate) fn new(
         cs: &'a ConstraintSystem<Fq>,
         meta: &'a ConstraintSystemMeta,
@@ -67,19 +74,26 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Enable or disable the optional `q_pow5` Yul helper peephole.
     pub(crate) fn with_pow5_helper(mut self, enabled: bool) -> Self {
         self.use_pow5_helper = enabled;
         self
     }
 
+    /// Clear local variable and expression caches.
     pub(crate) fn reset_locals(&self) {
         self.reset();
     }
 
+    /// Emit Yul for a single Halo2 expression without changing caller state.
     pub(crate) fn evaluate_expression(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         self.evaluate(expression)
     }
 
+    /// Compress expressions with a caller-provided challenge variable.
+    ///
+    /// This is used by structured lookup/trash paths that hoist theta or the
+    /// trash challenge once and then reuse the variable across loop bodies.
     pub(crate) fn compress_expressions_with_challenge_var(
         &self,
         expressions: &[Expression<Fq>],
@@ -88,6 +102,12 @@ impl<'a> Evaluator<'a> {
         self.compress_expressions(expressions, challenge_var)
     }
 
+    /// Emit a shared-prefix optimization for parallel lookup inputs.
+    ///
+    /// When every parallel input has the same prefix and its final limb is laid
+    /// out in adjacent memory words, the generated Yul evaluates the prefix
+    /// once and loops over the tails. This mirrors LogUp's θ-compression while
+    /// avoiding repeated arithmetic in wide range-check lookups.
     pub(crate) fn lookup_shared_prefix_f_plus_beta(
         &self,
         input_chunk: &[Vec<Expression<Fq>>],
@@ -201,6 +221,12 @@ impl<'a> Evaluator<'a> {
     // permutation cosets).
     // ----------------------------------------------------------------
 
+    /// Emit permutation numerator identities.
+    ///
+    /// Upstream reference: `plonk/evaluation.rs` describes the same four
+    /// constraints over `l_0`, `l_last`, `l_blind`, and the permutation product
+    /// chunks. The generator emits them one identity at a time so the quotient
+    /// y-batch order matches `partially_evaluate_identities`.
     pub(crate) fn permutation_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_permutation_zs == 0 {
             return Vec::new();
@@ -373,6 +399,12 @@ impl<'a> Evaluator<'a> {
     //       all multiplied by active_rows = 1 - (l_last + l_blind)
     // ----------------------------------------------------------------
 
+    /// Emit LogUp lookup numerator identities.
+    ///
+    /// The helper identity checks `h * prod(f_j + beta) = sum prod_{k!=j}` and
+    /// the accumulator identity checks
+    /// `(Z_next - Z - selector * sum(h)) * (table + beta) + m = 0`, with the
+    /// active-row gate applied as in the Rust verifier.
     pub(crate) fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_lookups == 0 {
             return Vec::new();
@@ -406,10 +438,8 @@ impl<'a> Evaluator<'a> {
             // `(Vec<String>, String)` entries.
             let selector_expr = chunked.selector_expression();
 
-            for (input_chunk, h_eval) in chunked
-                .input_expression_chunks()
-                .iter()
-                .zip(h_evals.iter())
+            for (input_chunk, h_eval) in
+                chunked.input_expression_chunks().iter().zip(h_evals.iter())
             {
                 self.reset();
                 let mut lines = Vec::new();
@@ -586,6 +616,10 @@ impl<'a> Evaluator<'a> {
     // squeezing and storing it before the quotient eval block.
     // ----------------------------------------------------------------
 
+    /// Emit trash argument numerator identities.
+    ///
+    /// Trash uses a dedicated Fiat-Shamir challenge, not theta, to compress its
+    /// constraint expressions before subtracting the inactive-row trash value.
     pub(crate) fn trashcan_computations(&self) -> Vec<(Vec<String>, String)> {
         if self.meta.num_trashcans == 0 {
             return Vec::new();
@@ -684,6 +718,7 @@ impl<'a> Evaluator<'a> {
         (lines, final_var)
     }
 
+    /// Fold expressions as `acc = acc * challenge + expr`.
     fn compress_expressions(
         &self,
         expressions: &[Expression<Fq>],
@@ -709,6 +744,10 @@ impl<'a> Evaluator<'a> {
         (lines, final_var)
     }
 
+    /// Return the concrete memory pointer for a simple query expression.
+    ///
+    /// This is used only by loop optimizers that require adjacent memory-backed
+    /// evals; non-query expressions or symbolic pointers return `None`.
     fn expression_memory_ptr(&self, expression: &Expression<Fq>) -> Option<usize> {
         let word = match expression {
             Expression::Advice(query) => self
@@ -750,6 +789,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Recognize `a * a * a * a * a` when the Yul pow5 helper is enabled.
     fn pow5_base_expr<'b>(&self, expression: &'b Expression<Fq>) -> Option<&'b Expression<Fq>> {
         if !self.use_pow5_helper {
             return None;
@@ -796,20 +836,24 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Allocate the next local Yul variable name.
     fn fresh_var(&self) -> String {
         self.next_var()
     }
 
+    /// Reset local-variable numbering and expression cache.
     fn reset(&self) {
         *self.var_counter.borrow_mut() = Default::default();
         *self.var_cache.borrow_mut() = Default::default();
     }
 
+    /// Emit one expression from a clean local state.
     fn evaluate_and_reset(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         self.reset();
         self.evaluate(expression)
     }
 
+    /// Emit an expression, first trying additive-term fusion.
     fn evaluate(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         if let Some(result) = self.evaluate_sum_with_coeff_and_const(expression) {
             return result;
@@ -818,6 +862,10 @@ impl<'a> Evaluator<'a> {
         self.evaluate_basic(expression)
     }
 
+    /// Try to flatten a sum into constants and scaled terms before emission.
+    ///
+    /// This avoids nested `addmod` trees and lets product/constant terms use
+    /// fewer temporary variables in generated Yul.
     fn evaluate_sum_with_coeff_and_const(
         &self,
         expression: &Expression<Fq>,
@@ -865,6 +913,7 @@ impl<'a> Evaluator<'a> {
         })
     }
 
+    /// Recursively collect additive terms with their accumulated coefficient.
     fn collect_sum_terms<'b>(
         expression: &'b Expression<Fq>,
         coeff: Fq,
@@ -889,6 +938,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Emit one term multiplied by a known Fr coefficient.
     fn evaluate_scaled_term(
         &self,
         expression: &Expression<Fq>,
@@ -942,6 +992,7 @@ impl<'a> Evaluator<'a> {
         (lines, out_var)
     }
 
+    /// Emit an expression through the native `Expression::evaluate` visitor.
     fn evaluate_basic(&self, expression: &Expression<Fq>) -> (Vec<String>, String) {
         if let Some(base) = self.pow5_base_expr(expression) {
             let (mut lines, base_var) = self.evaluate_basic(base);
@@ -1026,6 +1077,7 @@ impl<'a> Evaluator<'a> {
         )
     }
 
+    /// Resolve an instance query either from proof evals or local interpolation.
     fn instance_eval_at(&self, column_index: usize, rotation: i32) -> String {
         if column_index < self.meta.num_committed_instances {
             self.data
@@ -1041,6 +1093,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Bind a Yul expression to a local variable, reusing cached variables.
     fn init_var(&self, value: impl ToString, var: Option<String>) -> (Vec<String>, String) {
         let value = value.to_string();
         if self.var_cache.borrow().contains_key(&value) {
@@ -1054,6 +1107,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Return the next `varN` local name.
     fn next_var(&self) -> String {
         let count = *self.var_counter.borrow();
         *self.var_counter.borrow_mut() += 1;
@@ -1061,6 +1115,7 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+/// Render a `U256` as the shortest stable hexadecimal Yul literal.
 fn u256_string(value: U256) -> String {
     if value.bit_len() < 64 {
         format!("0x{:x}", value.as_limbs()[0])
@@ -1069,6 +1124,7 @@ fn u256_string(value: U256) -> String {
     }
 }
 
+/// Stable variable name for a column evaluation and rotation.
 fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> String {
     match rotation.cmp(&0) {
         Ordering::Less => format!("{prefix}_{column_index}_prev_{}", rotation.abs()),
@@ -1077,6 +1133,7 @@ fn column_eval_var(prefix: &'static str, column_index: usize, rotation: i32) -> 
     }
 }
 
+/// Flatten a product tree into leaf expressions.
 fn collect_product_factors<'a>(
     expression: &'a Expression<Fq>,
     factors: &mut Vec<&'a Expression<Fq>>,

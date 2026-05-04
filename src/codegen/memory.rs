@@ -77,6 +77,10 @@ pub(crate) struct ThetaWindowLayout {
 }
 
 impl ThetaWindowLayout {
+    /// Return the historical theta-rooted window layout.
+    ///
+    /// Debug assertions tie the derived offsets back to `layout::theta_window`
+    /// so future edits cannot drift silently.
     pub(crate) fn compatibility() -> Self {
         let rot_points_word = ThetaSlot::PairingRhs.word() + G1_WORDS;
         let x1_powers_word = rot_points_word + theta_window::ROT_POINTS_CAP_WORDS;
@@ -152,6 +156,7 @@ pub(crate) enum MemoryLifetime {
 }
 
 impl MemoryLifetime {
+    /// Return whether two lifetimes can be live at the same time.
     fn intersects(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Permanent, _) | (_, Self::Permanent) => true,
@@ -173,6 +178,7 @@ pub(crate) struct MemoryRegion {
 }
 
 impl MemoryRegion {
+    /// Create a named region at an absolute byte range with a lifetime.
     pub(crate) fn new(
         name: &'static str,
         start: usize,
@@ -187,10 +193,12 @@ impl MemoryRegion {
         }
     }
 
+    /// End byte offset, exclusive.
     fn end(&self) -> usize {
         self.start + self.len
     }
 
+    /// Return whether two non-empty byte ranges overlap.
     fn overlaps(&self, other: &Self) -> bool {
         self.len != 0 && other.len != 0 && self.start < other.end() && other.start < self.end()
     }
@@ -202,15 +210,18 @@ pub(crate) struct MemoryMap {
 }
 
 impl MemoryMap {
+    /// Register a region for later validation.
     pub(crate) fn push(&mut self, region: MemoryRegion) {
         self.regions.push(region);
     }
 
+    /// Find a region by name for tests.
     #[cfg(test)]
     pub(crate) fn region(&self, name: &str) -> Option<&MemoryRegion> {
         self.regions.iter().find(|region| region.name == name)
     }
 
+    /// Validate alignment, Solidity reserved-memory rules, and live overlap.
     pub(crate) fn validate(&self) -> Result<(), String> {
         // All generated Yul uses word-granular `mload`, `mstore`, and
         // precompile input lengths. Byte-granular ranges would be a bug, not a
@@ -328,11 +339,13 @@ impl MemoryArena {
         }
     }
 
+    /// Consume the arena and return its registered map.
     pub(crate) fn into_map(self) -> MemoryMap {
         self.map
     }
 }
 
+/// Phase-aware scratch allocator that reuses a base across disjoint phases.
 pub(crate) struct ScratchAllocator<'arena> {
     arena: &'arena mut MemoryArena,
     base: usize,
@@ -363,6 +376,7 @@ pub(crate) struct FinalMsmShape {
 }
 
 impl FinalMsmShape {
+    /// Build a shape from a number of `(G1, scalar)` pairs.
     pub(crate) fn from_terms(terms: usize) -> Self {
         Self {
             terms,
@@ -485,6 +499,11 @@ pub(crate) struct VerifierMemoryLayoutConfig {
 }
 
 impl VerifierMemoryLayout {
+    /// Plan the generated verifier's complete memory map.
+    ///
+    /// The function preserves historical permanent addresses first, then
+    /// registers scratch regions with explicit phases so intentional aliasing
+    /// is validated instead of accidental.
     pub(crate) fn new(
         meta: &ConstraintSystemMeta,
         vk: &Halo2VerifyingKey,
@@ -568,6 +587,9 @@ impl VerifierMemoryLayout {
 
         let total_advices: usize = meta.num_user_advices.iter().sum();
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
+        // Commitment memory mirrors the proof read schedule but is stored by
+        // category. PCS and quotient code take typed bases for each category so
+        // these offsets are the single source of truth for all later mloads.
         let non_quotient_g1s = total_advices
             + meta.num_lookups
             + meta.num_permutation_zs
@@ -705,6 +727,9 @@ impl VerifierMemoryLayout {
             ACCUMULATOR_PAIRING_BATCH_BYTES,
             MemoryPhase::AccumulatorPairingBatch,
         );
+        // Trace logging can occur between otherwise long-lived reads, so its
+        // one-word scratch is placed after every registered region rather than
+        // borrowing any phase-specific base.
         let trace_u256_mptr = [
             vk_start + vk.len(),
             challenge_start + meta.challenge_indices.len() * WORD_BYTES,
@@ -792,6 +817,7 @@ impl VerifierMemoryLayout {
         }
     }
 
+    /// Validate fixed-window capacities and registered memory lifetimes.
     pub(crate) fn validate(&self) -> Result<(), String> {
         let windows = self.theta_windows;
         if self.pcs.rot_points_words > windows.rot_points_cap_words {
@@ -825,6 +851,7 @@ impl VerifierMemoryLayout {
     }
 }
 
+/// Number of proof commitment G1 points materialized in verifier memory.
 pub(crate) fn commitment_g1_count(meta: &ConstraintSystemMeta) -> usize {
     meta.num_user_advices.iter().sum::<usize>()
         + meta.num_lookups
@@ -835,6 +862,7 @@ pub(crate) fn commitment_g1_count(meta: &ConstraintSystemMeta) -> usize {
         + meta.num_quotients
 }
 
+/// Scratch size required by the batched scalar-inversion helper.
 fn batch_invert_scratch_bytes(meta: &ConstraintSystemMeta, num_instances: usize) -> usize {
     // The template calls:
     //   batch_invert(X_N_MPTR, mptr_end + WORD_BYTES, scratch, r)

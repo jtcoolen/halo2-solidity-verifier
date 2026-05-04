@@ -1,3 +1,10 @@
+//! Environment-driven knobs for experimental code-generation paths.
+//!
+//! These options are intentionally read at generation time instead of becoming
+//! public API surface. Most of them select equivalent representations of the
+//! quotient numerator path so gas, bytecode size, and compiler behavior can be
+//! compared without changing call sites.
+
 use super::{QuotientProgramEncoding, QuotientStructuredTailMode};
 
 // Keep a small direct prefix as the default gas-capped compact VM path:
@@ -36,20 +43,32 @@ pub(super) const QUOTIENT_SHAPE_PROFILE_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_SHA
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CodegenOptions {
+    /// Number of gate identities kept as direct Yul before the compact VM.
     pub(super) hybrid_quotient_inline_identities: usize,
+    /// Number of remaining heavy gate identities emitted as native callbacks.
     pub(super) quotient_native_gates: usize,
+    /// Physical encoding used for the compact quotient VM program.
     pub(super) quotient_encoding: QuotientProgramEncoding,
+    /// Whether the direct quotient path stores repeated expressions in memory.
     pub(super) quotient_inline_cse: bool,
+    /// Whether the compact VM may use persistent temp slots.
     pub(super) quotient_vm_cse: bool,
+    /// Whether direct Yul quotient emission can call local helper functions.
     pub(super) quotient_yul_helpers: bool,
+    /// Whether full gate/permutation/lookup/trash structured-loop mode is used.
     pub(super) quotient_structured_loops: bool,
+    /// Which suffix identities, if any, should bypass the VM as structured Yul.
     pub(super) quotient_structured_tail: QuotientStructuredTailMode,
+    /// Whether permutation identities can be replaced by a native VM callback.
     pub(super) quotient_native_permutation: bool,
+    /// Whether byte-oriented VM emission may use limb-specialized opcodes.
     pub(super) quotient_limb_vm_ops: bool,
+    /// Whether limb recognizer counters are printed to stderr.
     pub(super) quotient_shape_profile: bool,
 }
 
 impl CodegenOptions {
+    /// Parse all supported environment variables, applying production defaults.
     pub(super) fn from_env() -> Self {
         Self {
             hybrid_quotient_inline_identities: parse_usize_env(
@@ -98,6 +117,7 @@ impl CodegenOptions {
     }
 }
 
+/// Parse an unsigned integer environment variable or return `default`.
 fn parse_usize_env(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -105,6 +125,10 @@ fn parse_usize_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Parse a boolean/toggle environment variable with optional named aliases.
+///
+/// The `expected` string is used only for a panic message so bad tuning values
+/// fail loudly during code generation instead of silently selecting a default.
 fn parse_bool_env(name: &str, default: bool, expected: &str, true_aliases: &[&str]) -> bool {
     let Ok(value) = std::env::var(name) else {
         return default;
@@ -118,6 +142,7 @@ fn parse_bool_env(name: &str, default: bool, expected: &str, true_aliases: &[&st
     }
 }
 
+/// Parse the compact quotient VM physical encoding.
 fn parse_quotient_encoding() -> QuotientProgramEncoding {
     let Ok(value) = std::env::var(QUOTIENT_ENCODING_ENV) else {
         return QuotientProgramEncoding::Bytes;
@@ -130,6 +155,7 @@ fn parse_quotient_encoding() -> QuotientProgramEncoding {
     }
 }
 
+/// Parse the structured suffix mode for quotient identity emission.
 fn parse_structured_tail() -> QuotientStructuredTailMode {
     let Ok(value) = std::env::var(QUOTIENT_STRUCTURED_TAIL_ENV) else {
         return QuotientStructuredTailMode::Trash;
