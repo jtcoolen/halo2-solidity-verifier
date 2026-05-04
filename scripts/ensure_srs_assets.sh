@@ -44,5 +44,6 @@ ensure_asset() {
 ensure_asset "bls_filecoin_2p19" "https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19"
 ensure_asset "midnight-srs-2p19" "https://srs.midnight.network/midnight-srs-2p19"
 ensure_asset "midnight-srs-2p20" "https://srs.midnight.network/midnight-srs-2p20"
+ensure_asset "midnight-srs-2p22" "https://srs.midnight.network/midnight-srs-2p22"
 
 echo "[srs] SRS_DIR=$SRS_DIR"

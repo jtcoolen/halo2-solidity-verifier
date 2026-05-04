@@ -22,8 +22,12 @@ The ignored proving benches need local SRS files. `scripts/run_ivc_bench.sh`
 downloads the IVC bench assets into `.srs/` by default, or you can point
 `SRS_DIR` at an existing SRS directory. The IVC Solidity tree bench needs
 Midnight `midnight-srs-2p19` for the leaf IVC proofs and
-`midnight-srs-2p20` for the final decider proof; the optional native Midfall
-comparison path also needs a Filecoin SRS.
+`midnight-srs-2p20` for the final decider proof. The default outer single-H
+decider proof also needs `midnight-srs-2p22` for the extended monomial basis;
+`--skip-srs-download` intentionally fails if that file is absent. Run the
+bench once without `--skip-srs-download`, or download
+`https://srs.midnight.network/midnight-srs-2p22` into `SRS_DIR`. The optional
+native Midfall comparison path also needs a Filecoin SRS.
 
 ```bash
 rustc --version    # should report 1.90.0
@@ -147,6 +151,26 @@ Full bench:
 ```bash
 scripts/run_ivc_bench.sh
 ```
+
+The default full bench is a two-phase single-H run. The first cargo invocation
+builds multi-limb recursive leaf proofs into
+`target/ivc-keccak-solidity-dump/ivc-leaf-bundle.bin`; the second invocation
+loads that bundle and emits the final Keccak decider proof with one quotient
+commitment. This preserves the in-circuit verifier layout while changing only
+the Solidity-facing outer proof.
+
+Run the legacy multi-limb outer decider proof shape:
+
+```bash
+scripts/run_ivc_bench.sh --no-outer-single-h-commitment
+```
+
+Expected single-H deltas for the current IVC decider are small but visible:
+the final PCS MSM shrinks from `78` to `75` terms. In the current profiled
+command this moves PCS block 5 from `533,202` to `515,290` gas and total
+transaction gas from `1,399,268` to `1,374,697`. The quotient numerator
+checkpoint does not change, because single-H changes only the quotient
+commitment side.
 
 Run the same bench with fewer point sets kept for the recursive verifier, but
 disabled for the outer Solidity-facing decider proof:

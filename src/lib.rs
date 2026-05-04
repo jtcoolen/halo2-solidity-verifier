@@ -47,6 +47,13 @@ pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool = cfg!(feature = "solidity-gas-
 /// extra dummy eval scalars.
 pub const OUTER_FEWER_POINT_SETS_ENABLED: bool = cfg!(feature = "outer-fewer-point-sets");
 
+/// Whether the generated Solidity verifier expects the outer proof to use
+/// Midnight's single-H quotient commitment layout.
+///
+/// This is intentionally outer-only. Recursive proofs checked inside the IVC
+/// decider circuit remain on the multi-limb layout from `midnight-circuits`.
+pub const OUTER_SINGLE_H_COMMITMENT_ENABLED: bool = cfg!(feature = "outer-single-h-commitment");
+
 #[cfg(feature = "evm")]
 pub use evm::test::{
     compile_solidity, compile_solidity_with_runs, pinned_solc_available, revm, solc_version,

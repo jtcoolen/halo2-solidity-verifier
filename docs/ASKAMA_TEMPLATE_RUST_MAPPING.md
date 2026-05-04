@@ -80,7 +80,7 @@ with Midfall transcript and KZG details rendered directly into Yul.
 | `beta`, `gamma`, permutation products | Squeezes permutation challenges and reads permutation product commitments | `parse_trace`: `beta`, `gamma`, `Argument::read_product_commitments` | `permutation/verifier.rs` mapping |
 | Lookup helper/accumulator commitments | Reads each LogUp helper commitment and accumulator commitment | `CommittedMultiplicities::read_commitment` | `proof_layout.rs::ProofLookupCommitmentsLayout` |
 | `trash_challenge`, trash commitments | Squeezes trash challenge unconditionally, then reads trash commitments when present | `parse_trace`: trash challenge and `trash::Argument::read_committed` | `trash/verifier.rs` mapping |
-| `y`, quotient limb commitments | Squeezes identity-batching challenge and reads quotient limb commitments | `verify_algebraic_constraints`: `read_n(transcript, nb_quotient_coms)` before `x` | `proof_layout.rs`, `memory.rs` |
+| `y`, quotient commitment(s) | Squeezes identity-batching challenge and reads quotient commitment(s) | `verify_algebraic_constraints`: `read_n(transcript, nb_quotient_coms)` before `x` | `proof_layout.rs`, `memory.rs` |
 | `x` and evaluation scalars | Squeezes opening challenge, range-checks proof evals, stores them in `REVERSED_EVALS_MPTR`, and absorbs them | `verify_algebraic_constraints`: committed-instance evals, advice evals, fixed evals, permutation/common evals, lookup evals, trash evals | `Protocol` eval order, `proof_layout.rs`, `evaluator.rs` |
 | `x1`, `x2`, `f_com`, `x3`, `q_evals`, `x4`, `pi` | Completes Midfall KZG transcript for multi-opening proof | KZG `multi_prepare` in `../midfall/proofs/src/poly/kzg` | `pcs.rs`, `proof_layout.rs` |
 | Lagrange and instance evaluation | Computes `x^n`, `(x^n-1)^-1`, `l_last`, `l_blind`, `l_0`, and the public instance evaluation | `verify_algebraic_constraints`: `domain.l_i_range` and `compute_inner_product` | `templates/Halo2Verifier.sol`, `memory.rs` |
@@ -147,7 +147,7 @@ This contract maps to the scalar side of:
 
 It does not read proof calldata, sample challenges, evaluate `h(x)`, or check
 commitments. The main verifier has already done transcript parsing and later
-binds the returned scalar to the quotient limb commitments through KZG.
+binds the returned scalar to the quotient commitment(s) through KZG.
 
 Because the main verifier calls the evaluator with `STATICCALL`, evaluator-local
 trace hooks are logless in split mode. The main verifier still traces proof

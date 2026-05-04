@@ -10,14 +10,17 @@ RUN_SOLIDITY_BENCH=1
 SKIP_SRS_DOWNLOAD=0
 RUN_TRACE=0
 IN_CIRCUIT_FEWER_POINT_SETS=1
-OUTER_FEWER_POINT_SETS=1
+OUTER_FEWER_POINT_SETS=0
+OUTER_SINGLE_H_COMMITMENT=0
 
 SRS_DIR="${SRS_DIR:-"$ROOT_DIR/.srs"}"
 MIDFALL_DIR="${MIDFALL_DIR:-"$ROOT_DIR/../midfall"}"
+IVC_LEAF_BUNDLE="${IVC_LEAF_BUNDLE:-"$ROOT_DIR/target/ivc-keccak-solidity-dump/ivc-leaf-bundle.bin"}"
 
 FILECOIN_SRS_URL="https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19"
 MIDNIGHT_SRS_2P19_URL="https://srs.midnight.network/midnight-srs-2p19"
 MIDNIGHT_SRS_2P20_URL="https://srs.midnight.network/midnight-srs-2p20"
+MIDNIGHT_SRS_2P22_URL="https://srs.midnight.network/midnight-srs-2p22"
 PINNED_SOLC_VERSION="0.8.30+commit.73712a01"
 
 usage() {
@@ -37,6 +40,12 @@ Options:
                        Disable fewer-point-sets for the final Solidity-facing
                        decider proof while keeping the recursive in-circuit
                        verifier on the fewer-point-sets layout.
+  --no-outer-single-h-commitment
+                       Disable the default single-H quotient commitment layout
+                       for the final Solidity-facing decider proof.
+  --leaf-bundle PATH   Path for the generated/reused multi-limb IVC leaf
+                       bundle. Defaults to target/ivc-keccak-solidity-dump/
+                       ivc-leaf-bundle.bin.
   --trace              Enable native Rust/Solidity trace equivalence.
                        Requires midnight-proofs/solidity-verifier-trace.
   --native-midfall     Also run Midfall's native Poseidon-chain final IVC test from
@@ -48,10 +57,12 @@ Options:
 
 Default behavior:
   1. Ensure SRS_DIR has Midnight's midnight-srs-2p19 and midnight-srs-2p20.
+     The default outer single-H path also needs midnight-srs-2p22.
      The optional --native-midfall path also needs a Filecoin SRS.
   2. Compile the gated Solidity verifier bench.
-  3. Run tests/ivc_keccak_solidity.rs::ivc_final_keccak_solidity_e2e with
-     evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints.
+  3. In the default outer single-H path, generate the multi-limb IVC leaf
+     bundle without outer-single-h-commitment, then run the final decider
+     Solidity bench with outer-single-h-commitment.
 
 Examples:
   scripts/run_ivc_bench.sh --check-only
@@ -103,6 +114,14 @@ while (($#)); do
     --no-outer-fewer-point-sets)
       OUTER_FEWER_POINT_SETS=0
       ;;
+    --no-outer-single-h-commitment)
+      OUTER_SINGLE_H_COMMITMENT=0
+      ;;
+    --leaf-bundle)
+      [[ $# -ge 2 ]] || die "--leaf-bundle requires a value"
+      IVC_LEAF_BUNDLE="$2"
+      shift
+      ;;
     --trace)
       RUN_TRACE=1
       ;;
@@ -131,6 +150,7 @@ done
 
 SRS_DIR="$(abs_path "$SRS_DIR")"
 MIDFALL_DIR="$(abs_path "$MIDFALL_DIR")"
+IVC_LEAF_BUNDLE="$(abs_path "$IVC_LEAF_BUNDLE")"
 
 download_if_missing() {
   local path="$1"
@@ -157,6 +177,9 @@ ensure_srs_assets() {
 
   download_if_missing "$SRS_DIR/midnight-srs-2p19" "$MIDNIGHT_SRS_2P19_URL"
   download_if_missing "$SRS_DIR/midnight-srs-2p20" "$MIDNIGHT_SRS_2P20_URL"
+  if [[ "$OUTER_SINGLE_H_COMMITMENT" -eq 1 ]]; then
+    download_if_missing "$SRS_DIR/midnight-srs-2p22" "$MIDNIGHT_SRS_2P22_URL"
+  fi
 }
 
 ensure_filecoin_srs_asset() {
@@ -170,12 +193,16 @@ ensure_filecoin_srs_asset() {
 }
 
 cargo_features() {
+  local include_outer_single_h="${1:-$OUTER_SINGLE_H_COMMITMENT}"
   local features="evm,truncated-challenges"
   if [[ "$IN_CIRCUIT_FEWER_POINT_SETS" -eq 1 ]]; then
     features="$features,in-circuit-fewer-point-sets"
   fi
   if [[ "$OUTER_FEWER_POINT_SETS" -eq 1 ]]; then
     features="$features,outer-fewer-point-sets"
+  fi
+  if [[ "$include_outer_single_h" -eq 1 ]]; then
+    features="$features,outer-single-h-commitment"
   fi
   if [[ "$GAS_CHECKPOINTS" -eq 1 ]]; then
     features="$features,solidity-gas-checkpoints"
@@ -211,10 +238,40 @@ run_native_midfall() {
 
 run_solidity_bench() {
   local features
-  features="$(cargo_features)"
+  local leaf_features
+  features="$(cargo_features "$OUTER_SINGLE_H_COMMITMENT")"
+  leaf_features="$(cargo_features 0)"
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
     require_pinned_solc
+  fi
+
+  if [[ "$OUTER_SINGLE_H_COMMITMENT" -eq 1 ]]; then
+    echo "[ivc-bench] compiling multi-limb IVC leaf-bundle generator"
+    echo "+ SRS_DIR=$SRS_DIR cargo test --release --features $leaf_features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e --no-run"
+    (
+      cd "$ROOT_DIR"
+      SRS_DIR="$SRS_DIR" cargo test --release \
+        --features "$leaf_features" \
+        --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+        --no-run
+    )
+
+    if [[ "$CHECK_ONLY" -eq 0 ]]; then
+      mkdir -p "$(dirname "$IVC_LEAF_BUNDLE")"
+      echo "[ivc-bench] generating multi-limb IVC leaf bundle"
+      echo "+ HALO2_SOLIDITY_RUN_IVC_BENCH=1 HALO2_SOLIDITY_WRITE_IVC_LEAF_BUNDLE=1 HALO2_SOLIDITY_IVC_LEAF_BUNDLE=$IVC_LEAF_BUNDLE SRS_DIR=$SRS_DIR cargo test --release --features $leaf_features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --nocapture"
+      (
+        cd "$ROOT_DIR"
+        HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
+          HALO2_SOLIDITY_WRITE_IVC_LEAF_BUNDLE=1 \
+          HALO2_SOLIDITY_IVC_LEAF_BUNDLE="$IVC_LEAF_BUNDLE" \
+          SRS_DIR="$SRS_DIR" cargo test --release \
+            --features "$leaf_features" \
+            --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
+            -- --nocapture
+      )
+    fi
   fi
 
   echo "[ivc-bench] compiling IVC Keccak Solidity verifier bench (Poseidon-chain leaves)"
@@ -229,10 +286,12 @@ run_solidity_bench() {
 
   if [[ "$CHECK_ONLY" -eq 0 ]]; then
     echo "[ivc-bench] running IVC Keccak Solidity verifier bench (Poseidon-chain leaves)"
-    echo "+ HALO2_SOLIDITY_RUN_IVC_BENCH=1 SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --nocapture"
+    echo "+ HALO2_SOLIDITY_RUN_IVC_BENCH=1 HALO2_SOLIDITY_IVC_LEAF_BUNDLE=$IVC_LEAF_BUNDLE SRS_DIR=$SRS_DIR cargo test --release --features $features --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e -- --nocapture"
     (
       cd "$ROOT_DIR"
-      HALO2_SOLIDITY_RUN_IVC_BENCH=1 SRS_DIR="$SRS_DIR" cargo test --release \
+      HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
+        HALO2_SOLIDITY_IVC_LEAF_BUNDLE="$IVC_LEAF_BUNDLE" \
+        SRS_DIR="$SRS_DIR" cargo test --release \
         --features "$features" \
         --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
         -- --nocapture
@@ -253,6 +312,12 @@ require_cmd cargo
 ensure_srs_assets
 
 echo "[ivc-bench] SRS_DIR=$SRS_DIR"
+if [[ "$OUTER_SINGLE_H_COMMITMENT" -eq 1 ]]; then
+  echo "[ivc-bench] outer single-H commitment: enabled"
+  echo "[ivc-bench] IVC_LEAF_BUNDLE=$IVC_LEAF_BUNDLE"
+else
+  echo "[ivc-bench] outer single-H commitment: disabled"
+fi
 
 if [[ "$RUN_NATIVE_MIDFALL" -eq 1 ]]; then
   run_native_midfall

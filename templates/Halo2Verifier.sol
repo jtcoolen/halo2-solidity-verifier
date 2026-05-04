@@ -966,8 +966,8 @@ contract Halo2Verifier {
             // ---- y ----
             buf_len := squeeze_to(buf_len, Y_MPTR)
 
-            // ---- quotient limbs ----
-            // Each uncompressed limb is calldatacopied directly to
+            // ---- quotient commitment(s) ----
+            // Each uncompressed quotient commitment is calldatacopied directly to
             // QUOTIENT_LIMB_COMMS_MPTR_BASE; the Horner fold below reads
             // them back from memory. common_uncompressed_g1 absorbs the
             // 128-byte calldata form into the transcript verbatim.
@@ -1197,7 +1197,7 @@ contract Halo2Verifier {
             // + Σ_j sel_acc_j * S_j_com,
             // where x_split = x^(n-1). Instead of materializing that point
             // with a standalone G1MSM here, PCS block 5 expands the
-            // linearized commitment into its quotient-limb and selector
+            // linearized commitment into its quotient and selector
             // pairs inside the already-fused final MSM.
             //
             // QUOTIENT_MPTR is no longer a G1 point in this path. Its first

@@ -349,7 +349,8 @@ The Solidity proof byte stream is:
    - lookup helper commitments, one per lookup chunk;
    - lookup accumulator commitment.
 5. Trash commitments, one per trash argument.
-6. Quotient limb commitments, `degree - 1` G1 points.
+6. Quotient commitment(s): one G1 point with `outer-single-h-commitment`,
+   otherwise `degree - 1` G1 points.
 7. Main evaluation scalars.
 8. `f_com` G1.
 9. `q_eval` scalars, one per PCS point set.
@@ -402,7 +403,8 @@ non_quotient_g1s =
   + num_lookups                         // lookup accumulator commitments
   + num_trashcans
 
-num_quotients  = cs.degree() - 1
+num_quotients  = 1 when outer-single-h-commitment is enabled,
+                 otherwise cs.degree() - 1
 batch_g1s      = 2                      // f_com, pi
 num_point_sets = PCS intermediate point-set count
 ```
@@ -417,6 +419,40 @@ proof_len =
 ```
 
 The verifier checks the proof bytes length exactly.
+
+### 5.5 Outer Single-H Decider Layout
+
+The `outer-single-h-commitment` feature mirrors Midfall's
+`midnight-proofs/single-h-commitment` for the final Solidity-facing proof only.
+It does not enable `single-h-commitment` in `midnight-circuits`,
+`midnight-zk-stdlib`, or `midnight-aggregation`, so recursive proofs verified
+inside the decider circuit remain on the multi-limb quotient layout.
+
+Operationally, the IVC bench runs in two phases:
+
+1. compile without `outer-single-h-commitment` and write a multi-limb leaf
+   bundle containing the two leaf states, proof bytes, and final collapsed
+   accumulator;
+2. compile with `outer-single-h-commitment`, load that bundle, and prove the
+   final Keccak decider proof with one quotient commitment.
+
+The single-H proof requires an extended monomial SRS for the decider quotient
+polynomial. For the current decider, `DECIDER_K = 20` and `cs_degree = 5`, so:
+
+```text
+extended_k = 20 + ceil_log2(5 - 1) = 22
+```
+
+The default bench therefore needs `midnight-srs-2p19`, `midnight-srs-2p20`, and
+`midnight-srs-2p22`. Passing `--skip-srs-download` fails closed if `2p22` is
+not already present.
+
+For the current VK, single-H changes the final PCS linearization contribution
+from `4` quotient commitment terms to `1`. The fused final MSM therefore drops
+from `78` to `75` terms. The EIP-2537 G1MSM gas table makes this a marginal
+runtime change. In the current profiled IVC command, PCS block 5 drops by
+`17,912` gas and total transaction gas drops by `24,571`; the quotient
+numerator reconstruction does not change.
 
 ## 6. Verifying Key Payload
 
@@ -517,7 +553,7 @@ The verifier must execute this schedule exactly:
 13. Squeeze `trash_challenge`. This is unconditional.
 14. Absorb trash commitments, if any.
 15. Squeeze `y`.
-16. Absorb quotient limb commitments.
+16. Absorb quotient commitment(s).
 17. Squeeze `x`.
 18. Absorb all main evaluation scalars, including dummy evals if present.
 19. Squeeze `x1`.
@@ -567,7 +603,8 @@ num_permutation_zs      = ceil(len(permutation_columns) / permutation_chunk_len)
 lookup_chunks[i]        = cs.lookups()[i].chunk_by_degree(cs.degree()).num_chunks()
 num_lookups             = len(lookup_chunks)
 num_trashcans           = len(cs.trashcans())
-num_quotients           = cs.degree() - 1
+num_quotients           = 1 when outer-single-h-commitment is enabled,
+                          otherwise cs.degree() - 1
 num_simple_selectors    = cs.num_simple_selectors()
 simple_selector_cols    = fixed columns where cs.has_simple_selector_col(idx)
 rotation_last           = -(cs.blinding_factors() + 1)
@@ -589,7 +626,7 @@ for each lookup:
     lookup helper commitments
     lookup accumulator commitment
 trash commitments
-quotient limb commitments
+quotient commitment(s)
 ```
 
 Every absorbed proof commitment must later be consumed by PCS or another
@@ -857,9 +894,12 @@ where:
 
 ```text
 x_split = x^(n - 1)
-Q_i     = quotient limb commitment i
+Q_i     = quotient commitment i
 S_j     = simple selector fixed commitment j
 ```
+
+In the outer single-H layout the sum has one `Q_0` term, so the quotient-side
+scalar is exactly `1 - x^n`.
 
 The scalar side is `-nu_y(x)`. The verifier does not compute or trust
 `h(x) = nu_y(x) / (x^n - 1)`.
@@ -1184,12 +1224,15 @@ The implementation fuses this into one G1MSM. If a commitment is the
 linearization commitment, it expands it into:
 
 ```text
-for each quotient limb Q_j:
+for each quotient commitment Q_j:
     scalar = x4_pow[s] * x1_powers[i] * (1 - x^n) * x_split^j
 
 for each simple selector S_j:
     scalar = x4_pow[s] * x1_powers[i] * selector_bucket[j]
 ```
+
+With `outer-single-h-commitment`, there is only `Q_0`, so the quotient scalar
+does not carry an extra `x_split^j` ladder beyond `j = 0`.
 
 Identity commitments are skipped in the MSM input but still contribute to
 `q_eval_set`.
@@ -1453,7 +1496,7 @@ permutation Z
 lookup helpers
 lookup accumulator Z
 trash commitments
-quotient limbs
+quotient commitment(s)
 ```
 
 See `docs/MEMORY_LAYOUT.md` for the detailed scratch lifetime table and update
@@ -1495,6 +1538,7 @@ solidity-gas-checkpoints
 truncated-challenges
 in-circuit-fewer-point-sets
 outer-fewer-point-sets
+outer-single-h-commitment
 fewer-point-sets
 rust-verifier-trace
 ```
@@ -1587,7 +1631,8 @@ A fresh implementation is compatible if it satisfies all of the following:
 - Evaluates gate, permutation, lookup, and trash identities in Rust order.
 - Folds main and simple-selector identities with the y powers in section 10.
 - Uses `-nu_y(x)` as the linearization expected eval.
-- Expands quotient limbs with `(1 - x^n) * x_split^i`.
+- Expands quotient commitment(s) with `(1 - x^n) * x_split^i`; in the
+  outer single-H layout this has only the `i = 0` term.
 - Constructs PCS intermediate sets, dummy queries, `q_eval_set`, `f_eval`,
   `final_com`, `v`, and pairing inputs as in section 12.
 - Pins every external correctness-critical artifact by runtime length and

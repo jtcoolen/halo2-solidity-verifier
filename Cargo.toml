@@ -99,6 +99,11 @@ truncated-challenges = [
 in-circuit-fewer-point-sets = ["midnight-aggregation/fewer-point-sets"]
 # Enables fewer-point-sets for the final Solidity-facing proof layout.
 outer-fewer-point-sets = ["midnight-proofs/fewer-point-sets"]
+# Enables the Midnight single-H quotient commitment layout for the final
+# Solidity-facing proof only. Do not forward this to midnight-circuits,
+# midnight-zk-stdlib, or midnight-aggregation: recursive proofs verified
+# inside the decider circuit stay on their existing multi-limb layout.
+outer-single-h-commitment = ["midnight-proofs/single-h-commitment"]
 # Backwards-compatible aggregate feature: old commands that pass
 # `fewer-point-sets` retain the previous "everything on" behavior.
 fewer-point-sets = ["in-circuit-fewer-point-sets", "outer-fewer-point-sets"]

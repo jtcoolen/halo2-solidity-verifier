@@ -10,8 +10,9 @@
 //!      the result over the fixed IVC VK bases.
 //!   4. Prove that decider circuit under Keccak-256, render
 //!      `Halo2Verifier.sol` + `Halo2VerifyingKey.sol` against the decider
-//!      VK with `truncated-challenges` and the fewer-point-set proof layout
-//!      enabled.
+//!      VK with `truncated-challenges`; the bench runner can keep the outer
+//!      proof on a one-commitment single-H quotient layout while preserving
+//!      the multi-limb recursive leaf proofs verified inside the circuit.
 //!   5. Compile the Solidity, deploy on Prague-spec revm (EIP-2537
 //!      precompiles routed through blst), repack the proof off-chain
 //!      via `SolidityGenerator::repack_compressed_proof`, encode
@@ -19,9 +20,9 @@
 //!   6. Assert success and dump gas.
 //!
 //! Required features: `evm`, `truncated-challenges`. The bench runner enables
-//! `in-circuit-fewer-point-sets` and `outer-fewer-point-sets` by default;
-//! omit only `outer-fewer-point-sets` to benchmark the non-fewer final proof
-//! layout while the recursive verifier remains on fewer point sets.
+//! `in-circuit-fewer-point-sets` and the outer single-H decider proof layout
+//! by default; disable `outer-single-h-commitment` to benchmark the legacy
+//! multi-limb final proof layout.
 //! Midnight crates are pulled from the immutable Midfall revision pinned in
 //! `Cargo.toml`; `SRS_DIR` still needs to point at local SRS assets.
 //! Run:
@@ -30,7 +31,7 @@
 //! HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
 //!   SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-single-h-commitment \
 //!     --test ivc_keccak_solidity \
 //!     -- --nocapture
 //! ```
@@ -41,7 +42,7 @@
 //! HALO2_SOLIDITY_RUN_IVC_BENCH=1 \
 //!   SRS_DIR=/path/to/midfall/zk_stdlib/examples/assets \
 //!   cargo test --release \
-//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-fewer-point-sets,solidity-gas-checkpoints \
+//!     --features evm,truncated-challenges,in-circuit-fewer-point-sets,outer-single-h-commitment,solidity-gas-checkpoints \
 //!     --test ivc_keccak_solidity ivc_final_keccak_solidity_e2e \
 //!     -- --nocapture
 //! ```
@@ -51,10 +52,16 @@
 
 #![cfg(all(feature = "evm", feature = "truncated-challenges",))]
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+#[cfg(feature = "outer-single-h-commitment")]
+use std::{fs::File, io::BufReader};
 
-use ff::Field;
-use group::Group;
+use ff::{Field, PrimeField};
+use group::{Group, GroupEncoding};
 use midnight_aggregation::ivc::{self, IvcCircuit, IvcContext, IvcIO, IvcState, IvcTransition};
 use midnight_circuits::{
     hash::poseidon::{PoseidonChip, PoseidonState},
@@ -66,11 +73,16 @@ use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::{self, ConstraintSystem, Error},
     poly::{
-        kzg::{params::ParamsVerifierKZG, scoped_fewer_point_sets, KZGCommitmentScheme},
+        kzg::{
+            params::{ParamsKZG, ParamsVerifierKZG},
+            scoped_fewer_point_sets, KZGCommitmentScheme,
+        },
         EvaluationDomain,
     },
     transcript::{CircuitTranscript, Transcript},
 };
+#[cfg(feature = "outer-single-h-commitment")]
+use midnight_proofs::{poly::commitment::Params as _, utils::SerdeFormat};
 use midnight_zk_stdlib::{
     cs_degree,
     utils::plonk_api::{load_srs, SrsSource},
@@ -90,6 +102,10 @@ type C = <S as SelfEmulation>::C;
 type E = <S as SelfEmulation>::Engine;
 
 const RUN_IVC_BENCH_ENV: &str = "HALO2_SOLIDITY_RUN_IVC_BENCH";
+const WRITE_IVC_LEAF_BUNDLE_ENV: &str = "HALO2_SOLIDITY_WRITE_IVC_LEAF_BUNDLE";
+const IVC_LEAF_BUNDLE_PATH_ENV: &str = "HALO2_SOLIDITY_IVC_LEAF_BUNDLE";
+const IVC_LEAF_BUNDLE_MAGIC: &[u8] = b"IVC_LEAF_BUNDLE_V1";
+const G1_COMPRESSED_BYTES: usize = 48;
 
 // ---------------------------------------------------------------------------
 // IVC Poseidon hash-chain transition (mirror of
@@ -379,6 +395,131 @@ struct TreeDeciderWitness {
 }
 
 #[derive(Clone, Debug)]
+struct IvcLeafBundle {
+    leaves: [TreeLeafWitness; TREE_LEAVES],
+    final_acc: Accumulator<S>,
+}
+
+fn push_scalar_le(out: &mut Vec<u8>, scalar: &F) {
+    out.extend_from_slice(scalar.to_repr().as_ref());
+}
+
+fn read_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize, label: &str) -> &'a [u8] {
+    let end = cursor
+        .checked_add(len)
+        .unwrap_or_else(|| panic!("leaf bundle cursor overflow while reading {label}"));
+    assert!(
+        end <= bytes.len(),
+        "leaf bundle ended while reading {label}: need {end} bytes, have {}",
+        bytes.len()
+    );
+    let out = &bytes[*cursor..end];
+    *cursor = end;
+    out
+}
+
+fn read_scalar_le(bytes: &[u8], cursor: &mut usize, label: &str) -> F {
+    let mut repr = <F as PrimeField>::Repr::default();
+    repr.as_mut()
+        .copy_from_slice(read_exact(bytes, cursor, 32, label));
+    Option::from(F::from_repr(repr))
+        .unwrap_or_else(|| panic!("leaf bundle contains non-canonical scalar for {label}"))
+}
+
+fn push_g1_compressed(out: &mut Vec<u8>, point: &C) {
+    out.extend_from_slice(point.to_bytes().as_ref());
+}
+
+fn read_g1_compressed(bytes: &[u8], cursor: &mut usize, label: &str) -> C {
+    let mut repr = <C as GroupEncoding>::Repr::default();
+    repr.as_mut()
+        .copy_from_slice(read_exact(bytes, cursor, G1_COMPRESSED_BYTES, label));
+    Option::from(C::from_bytes(&repr))
+        .unwrap_or_else(|| panic!("leaf bundle contains malformed compressed G1 for {label}"))
+}
+
+fn write_ivc_leaf_bundle(path: &Path, bundle: &IvcLeafBundle) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(IVC_LEAF_BUNDLE_MAGIC);
+    bytes.extend_from_slice(&(TREE_LEAVES as u32).to_le_bytes());
+    for leaf in &bundle.leaves {
+        push_scalar_le(&mut bytes, &leaf.state.cnt);
+        push_scalar_le(&mut bytes, &leaf.state.val);
+        let proof_len: u32 = leaf
+            .proof
+            .len()
+            .try_into()
+            .expect("leaf proof length fits u32");
+        bytes.extend_from_slice(&proof_len.to_le_bytes());
+        bytes.extend_from_slice(&leaf.proof);
+    }
+
+    let no_fixed_bases = BTreeMap::new();
+    let (lhs, rhs) = bundle.final_acc.fully_collapse(&no_fixed_bases);
+    push_g1_compressed(&mut bytes, &lhs);
+    push_g1_compressed(&mut bytes, &rhs);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create leaf bundle parent directory");
+    }
+    std::fs::write(path, bytes).expect("write IVC leaf bundle");
+}
+
+fn read_ivc_leaf_bundle(path: &Path) -> IvcLeafBundle {
+    let bytes = std::fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read IVC leaf bundle {}: {err}; run scripts/run_ivc_bench.sh so the multi-limb leaf phase is generated first",
+            path.display()
+        )
+    });
+    let mut cursor = 0usize;
+    assert_eq!(
+        read_exact(&bytes, &mut cursor, IVC_LEAF_BUNDLE_MAGIC.len(), "magic"),
+        IVC_LEAF_BUNDLE_MAGIC,
+        "invalid IVC leaf bundle magic"
+    );
+    let mut count_bytes = [0u8; 4];
+    count_bytes.copy_from_slice(read_exact(&bytes, &mut cursor, 4, "leaf count"));
+    let leaf_count = u32::from_le_bytes(count_bytes) as usize;
+    assert_eq!(
+        leaf_count, TREE_LEAVES,
+        "IVC leaf bundle has {leaf_count} leaves, expected {TREE_LEAVES}"
+    );
+
+    let mut leaves = Vec::with_capacity(TREE_LEAVES);
+    for idx in 0..TREE_LEAVES {
+        let cnt = read_scalar_le(&bytes, &mut cursor, "leaf cnt");
+        let val = read_scalar_le(&bytes, &mut cursor, "leaf val");
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(read_exact(&bytes, &mut cursor, 4, "leaf proof length"));
+        let proof_len = u32::from_le_bytes(len_bytes) as usize;
+        let proof = read_exact(&bytes, &mut cursor, proof_len, "leaf proof").to_vec();
+        leaves.push(TreeLeafWitness {
+            state: State { cnt, val },
+            proof,
+        });
+        println!("[ivc-keccak-solidity] loaded leaf {idx} from bundle: proof = {proof_len} bytes");
+    }
+
+    let lhs = read_g1_compressed(&bytes, &mut cursor, "final accumulator lhs");
+    let rhs = read_g1_compressed(&bytes, &mut cursor, "final accumulator rhs");
+    assert_eq!(
+        cursor,
+        bytes.len(),
+        "IVC leaf bundle has {} trailing byte(s)",
+        bytes.len() - cursor
+    );
+
+    IvcLeafBundle {
+        leaves: leaves.try_into().expect("exactly two leaves"),
+        final_acc: Accumulator::new(
+            Msm::from_terms(&[lhs], &[F::ONE]),
+            Msm::from_terms(&[rhs], &[F::ONE]),
+        ),
+    }
+}
+
+#[derive(Clone, Debug)]
 struct IvcTreeDeciderCircuit {
     ctx: TreeDeciderContext,
 }
@@ -537,11 +678,11 @@ fn srs_dir() -> String {
     std::env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".to_string())
 }
 
-fn has_required_srs_assets() -> bool {
+fn has_required_srs_assets(required_ks: &[u32]) -> bool {
     let srs_dir = srs_dir();
     let mut ok = true;
 
-    for k in [19, 20] {
+    for &k in required_ks {
         let path = format!("{srs_dir}/midnight-srs-2p{k}");
         if !std::path::Path::new(&path).is_file() {
             println!(
@@ -553,6 +694,77 @@ fn has_required_srs_assets() -> bool {
     }
 
     ok
+}
+
+fn ivc_leaf_bundle_path() -> PathBuf {
+    std::env::var(IVC_LEAF_BUNDLE_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("ivc-keccak-solidity-dump")
+                .join("ivc-leaf-bundle.bin")
+        })
+}
+
+fn ceil_log2_usize(n: usize) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        usize::BITS - (n - 1).leading_zeros()
+    }
+}
+
+fn outer_single_h_extended_srs_k(decider_k: u32, cs_degree: usize) -> u32 {
+    decider_k + ceil_log2_usize(cs_degree.saturating_sub(1).max(1))
+}
+
+fn required_srs_ks(ivc_k: u32, decider_k: u32, decider_degree: usize) -> Vec<u32> {
+    let mut required = vec![ivc_k, decider_k];
+    if halo2_solidity_verifier::OUTER_SINGLE_H_COMMITMENT_ENABLED {
+        required.push(outer_single_h_extended_srs_k(decider_k, decider_degree));
+    }
+    required.sort_unstable();
+    required.dedup();
+    required
+}
+
+#[cfg(feature = "outer-single-h-commitment")]
+fn read_midnight_srs(k: u32) -> ParamsKZG<E> {
+    let srs_path = PathBuf::from(srs_dir()).join(format!("midnight-srs-2p{k}"));
+    let file = File::open(&srs_path)
+        .unwrap_or_else(|err| panic!("failed to open Midnight SRS {}: {err}", srs_path.display()));
+    ParamsKZG::<E>::read_custom(&mut BufReader::new(file), SerdeFormat::RawBytesUnchecked)
+        .unwrap_or_else(|err| panic!("failed to read Midnight SRS {}: {err}", srs_path.display()))
+}
+
+fn load_decider_srs(decider_k: u32, cs_degree: usize) -> ParamsKZG<E> {
+    if halo2_solidity_verifier::OUTER_SINGLE_H_COMMITMENT_ENABLED {
+        #[cfg(feature = "outer-single-h-commitment")]
+        {
+            let extended_k = outer_single_h_extended_srs_k(decider_k, cs_degree);
+            let base = read_midnight_srs(decider_k);
+            let extended = read_midnight_srs(extended_k);
+            let combined = base.with_extended_monomial(extended);
+            let required_monomials = ((1usize << decider_k) - 1)
+                .checked_mul(cs_degree.saturating_sub(1))
+                .expect("single-H quotient SRS requirement fits usize");
+            assert!(
+                combined.g_monomial_size() >= required_monomials,
+                "single-H decider SRS has {} monomial elements, need at least {required_monomials}",
+                combined.g_monomial_size()
+            );
+            println!(
+                "[ivc-keccak-solidity] outer single-H SRS: base k={decider_k}, extended monomial k={extended_k}, monomial elements = {}",
+                combined.g_monomial_size()
+            );
+            combined
+        }
+        #[cfg(not(feature = "outer-single-h-commitment"))]
+        unreachable!("outer single-H flag can only be true when the feature is enabled")
+    } else {
+        load_srs(SrsSource::Midnight, decider_k, cs_degree)
+    }
 }
 
 fn proof_evaluation_count_summary(counts: &ProofEvaluationCounts) -> String {
@@ -592,35 +804,12 @@ fn print_proof_evaluation_counts(counts: &ProofEvaluationCounts) {
     }
 }
 
-#[test]
-fn ivc_final_keccak_solidity_e2e() {
-    const IVC_K: u32 = 19;
-    const DECIDER_K: u32 = 20;
-    const SOLC_OPTIMIZE_RUNS: u32 = 1;
-    const EIP170_MAX_RUNTIME_SIZE: usize = 0x6000;
-
-    if !env_flag_enabled(RUN_IVC_BENCH_ENV) {
-        println!("[ivc-keccak-solidity] set {RUN_IVC_BENCH_ENV}=1 to run the full bench");
-        return;
-    }
-
-    // Bail out cleanly when the pinned solc isn't available.
-    if !pinned_solc_available() {
-        println!("[ivc-keccak-solidity] pinned solc not available; skipping");
-        return;
-    }
-    if !has_required_srs_assets() {
-        println!("[ivc-keccak-solidity] required SRS assets missing; skipping");
-        return;
-    }
-
-    // ----------------------------------------------------------
-    // Two independent one-step Poseidon-chain IVC leaves
-    // (Midnight SRS at k = 19).
-    // ----------------------------------------------------------
-    let ivc_srs = load_srs(SrsSource::Midnight, IVC_K, IvcCircuit::<Chain>::cs_degree());
+fn setup_and_prove_ivc_leaves(
+    ivc_srs: &ParamsKZG<E>,
+    ivc_k: u32,
+) -> ([TreeLeafWitness; TREE_LEAVES], ivc::IvcVerifier) {
     let start = Instant::now();
-    let (leaf_prover, verifier) = ivc::setup::<Chain>(ivc_srs.clone(), IVC_K, ());
+    let (leaf_prover, verifier) = ivc::setup::<Chain>(ivc_srs.clone(), ivc_k, ());
     println!(
         "[ivc-keccak-solidity] IVC setup completed in {:.2?}",
         start.elapsed()
@@ -646,8 +835,105 @@ fn ivc_final_keccak_solidity_e2e() {
         });
     }
 
-    let leaf_witnesses: [TreeLeafWitness; TREE_LEAVES] =
-        leaf_witnesses.try_into().expect("exactly two tree leaves");
+    (
+        leaf_witnesses.try_into().expect("exactly two tree leaves"),
+        verifier,
+    )
+}
+
+fn write_leaf_bundle_mode(ivc_k: u32, path: &Path) {
+    assert!(
+        !halo2_solidity_verifier::OUTER_SINGLE_H_COMMITMENT_ENABLED,
+        "IVC leaf bundles must be generated without outer-single-h-commitment so leaf proofs stay multi-limb"
+    );
+    if !has_required_srs_assets(&[ivc_k]) {
+        println!("[ivc-keccak-solidity] required leaf SRS assets missing; skipping");
+        return;
+    }
+
+    let ivc_srs = load_srs(SrsSource::Midnight, ivc_k, IvcCircuit::<Chain>::cs_degree());
+    let (leaf_witnesses, verifier) = setup_and_prove_ivc_leaves(&ivc_srs, ivc_k);
+    let (ivc_cs, ivc_domain) = ivc_constraint_system(IvcCircuit::<Chain>::arch(), ivc_k);
+    let decider_ctx = TreeDeciderContext {
+        ivc_cs,
+        ivc_domain,
+        ivc_vk: verifier.vk().clone(),
+        ivc_params_verifier: ivc_srs.verifier_params(),
+    };
+    let final_acc = decider_ctx.final_acc(&leaf_witnesses);
+    let no_fixed_bases = BTreeMap::new();
+    assert!(
+        final_acc.check(&ivc_srs.verifier_params(), &no_fixed_bases),
+        "multi-limb leaf bundle accumulator must satisfy the pairing invariant"
+    );
+
+    write_ivc_leaf_bundle(
+        path,
+        &IvcLeafBundle {
+            leaves: leaf_witnesses,
+            final_acc,
+        },
+    );
+    println!(
+        "[ivc-keccak-solidity] wrote multi-limb IVC leaf bundle to {}",
+        path.display()
+    );
+}
+
+#[test]
+fn ivc_final_keccak_solidity_e2e() {
+    const IVC_K: u32 = 19;
+    const DECIDER_K: u32 = 20;
+    const SOLC_OPTIMIZE_RUNS: u32 = 1;
+    const EIP170_MAX_RUNTIME_SIZE: usize = 0x6000;
+
+    if !env_flag_enabled(RUN_IVC_BENCH_ENV) {
+        println!("[ivc-keccak-solidity] set {RUN_IVC_BENCH_ENV}=1 to run the full bench");
+        return;
+    }
+
+    let leaf_bundle_path = ivc_leaf_bundle_path();
+    if env_flag_enabled(WRITE_IVC_LEAF_BUNDLE_ENV) {
+        write_leaf_bundle_mode(IVC_K, &leaf_bundle_path);
+        return;
+    }
+
+    let decider_degree = cs_degree(IvcTreeDeciderCircuit::arch());
+
+    // Bail out cleanly when the pinned solc isn't available.
+    if !pinned_solc_available() {
+        println!("[ivc-keccak-solidity] pinned solc not available; skipping");
+        return;
+    }
+    let required_srs = required_srs_ks(IVC_K, DECIDER_K, decider_degree);
+    if !has_required_srs_assets(&required_srs) {
+        println!("[ivc-keccak-solidity] required SRS assets missing; skipping");
+        return;
+    }
+
+    // ----------------------------------------------------------
+    // Two independent one-step Poseidon-chain IVC leaves
+    // (Midnight SRS at k = 19).
+    // ----------------------------------------------------------
+    let ivc_srs = load_srs(SrsSource::Midnight, IVC_K, IvcCircuit::<Chain>::cs_degree());
+    let outer_single_h = halo2_solidity_verifier::OUTER_SINGLE_H_COMMITMENT_ENABLED;
+    let (leaf_witnesses, verifier, bundled_final_acc) = if outer_single_h {
+        let start = Instant::now();
+        let (_leaf_prover, verifier) = ivc::setup::<Chain>(ivc_srs.clone(), IVC_K, ());
+        println!(
+            "[ivc-keccak-solidity] IVC setup completed in {:.2?}",
+            start.elapsed()
+        );
+        let bundle = read_ivc_leaf_bundle(&leaf_bundle_path);
+        println!(
+            "[ivc-keccak-solidity] using multi-limb leaf bundle from {}",
+            leaf_bundle_path.display()
+        );
+        (bundle.leaves, verifier, Some(bundle.final_acc))
+    } else {
+        let (leaf_witnesses, verifier) = setup_and_prove_ivc_leaves(&ivc_srs, IVC_K);
+        (leaf_witnesses, verifier, None)
+    };
 
     // ----------------------------------------------------------
     // Final tree decider proof under Keccak.
@@ -660,9 +946,10 @@ fn ivc_final_keccak_solidity_e2e() {
         ivc_params_verifier: ivc_srs.verifier_params(),
     };
     let decider_relation = IvcTreeDeciderCircuit::new(decider_ctx.clone());
+    let final_acc = bundled_final_acc.unwrap_or_else(|| decider_ctx.final_acc(&leaf_witnesses));
     let decider_instance = TreeDeciderInstance {
         leaf_states: std::array::from_fn(|i| leaf_witnesses[i].state),
-        final_acc: decider_ctx.final_acc(&leaf_witnesses),
+        final_acc,
     };
     let no_fixed_bases = BTreeMap::new();
     assert!(
@@ -676,11 +963,7 @@ fn ivc_final_keccak_solidity_e2e() {
         leaves: leaf_witnesses,
     };
 
-    let decider_srs = load_srs(
-        SrsSource::Midnight,
-        DECIDER_K,
-        cs_degree(IvcTreeDeciderCircuit::arch()),
-    );
+    let decider_srs = load_decider_srs(DECIDER_K, decider_degree);
     let start = Instant::now();
     let decider_vk = midnight_zk_stdlib::setup_vk(&decider_srs, &decider_relation);
     let decider_pk = midnight_zk_stdlib::setup_pk(&decider_relation, &decider_vk);
@@ -690,6 +973,15 @@ fn ivc_final_keccak_solidity_e2e() {
     );
 
     let outer_fewer_point_sets = halo2_solidity_verifier::OUTER_FEWER_POINT_SETS_ENABLED;
+    if outer_single_h {
+        println!(
+            "[ivc-keccak-solidity] outer proof single-H commitment: enabled (one quotient commitment expected)"
+        );
+    } else {
+        println!(
+            "[ivc-keccak-solidity] outer proof single-H commitment: disabled (multi-limb quotient commitments)"
+        );
+    }
     if outer_fewer_point_sets {
         println!(
             "[ivc-keccak-solidity] outer proof fewer-point-sets: enabled (dummy query evals expected)"

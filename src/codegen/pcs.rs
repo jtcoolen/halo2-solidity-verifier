@@ -22,10 +22,10 @@
 //! Notes:
 //!
 //!   * The query list includes the linearized commitment built from the
-//!     quotient-limb commitments and any simple-selector commitments. Its
+//!     quotient commitment(s) and any simple-selector commitments. Its
 //!     expected opening scalar is not `h(x)`; the verifier reconstructs
 //!     the batched identity numerator `nu_y(x)` and stores `-nu_y(x)`.
-//!     The commitment side already carries the `(1 - x^n)` quotient-limb
+//!     The commitment side already carries the `(1 - x^n)` quotient
 //!     factor.
 //!
 //!   * For point-set inversion we emit one `modexp` precompile call per
@@ -458,6 +458,8 @@ fn linearization_term_count(meta: &ConstraintSystemMeta) -> usize {
     // MSM for
     //   S_0*id_0(x) + y*S_1*id_1(x) + ... -
     //   (h_0 + x^(n-1)h_1 + ...)*(x^n - 1)
+    // In the outer single-H layout this quotient slice has exactly one term,
+    // so the scalar is just `(1 - x^n)`.
     // Fully evaluated identities are not included on the commitment side;
     // they are accumulated, negated, and used as the expected eval scalar.
     meta.num_quotients + meta.simple_selector_cols.len()

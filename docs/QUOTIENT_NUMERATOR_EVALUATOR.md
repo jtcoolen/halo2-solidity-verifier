@@ -121,7 +121,7 @@ then name the local memory slot or generated block that ports it.
 
 The Rust verifier flow around the quotient numerator is:
 
-1. read quotient limb commitments from the transcript;
+1. read quotient commitment(s) from the transcript;
 2. sample the evaluation challenge `x`;
 3. compute `splitting_factor = x^(n - 1)` and `x^n`;
 4. read or compute all evaluations used by identities;
@@ -471,15 +471,48 @@ where each `S_j` is either:
 
 In implementation terms:
 
-- quotient limb commitments are added with powers of `splitting_factor`;
+- quotient commitments are added with powers of `splitting_factor`; in the
+  outer single-H layout there is one such term, with scalar `1 - x^n`;
 - simple selector buckets become fixed commitment scalars;
 - `None` identities are subtracted into `expected_eval`.
 
 Solidity splits this across two contracts:
 
 - `Halo2QuotientEvaluator` returns `expected_eval` and selector buckets;
-- `Halo2Verifier` expands quotient limbs and selector commitments into the
-  fused PCS final MSM.
+- `Halo2Verifier` expands quotient commitment(s) and selector commitments into
+  the fused PCS final MSM.
+
+## Outer Single-H Effect
+
+Midfall's `single-h-commitment` feature changes how the prover commits to the
+quotient polynomial `h(X)`. Instead of committing to `cs.degree() - 1` degree
+bounded limbs, the prover commits once to the full `h(X)`. This repository
+exposes that as `outer-single-h-commitment` and forwards it only to
+`midnight-proofs`, so only the final Solidity-facing decider proof changes.
+The recursive leaf proofs verified inside the decider circuit keep their
+multi-limb proof layout.
+
+This is a commitment-side change, not a numerator-side change. The evaluator
+still reconstructs the same ordered identity stream, consumes the same
+evaluation scalars, computes the same selector buckets, and returns the same
+`linearization_expected_eval = -nu_y(x)`. Trace-compatible builds still keep
+the same linearization scalar trace shape, including `x_split = x^(n - 1)` and
+`1 - x^n`.
+
+The visible verifier changes are downstream of the evaluator:
+
+- transcript/proof layout reads one quotient commitment instead of
+  `cs.degree() - 1`;
+- PCS block 5 receives fewer quotient commitment terms in the fused final MSM;
+- for the current degree-5 IVC decider this shrinks that MSM from `78` to `75`
+  terms;
+- the batched identity numerator reconstruction checkpoint is expected to stay
+  essentially unchanged.
+
+In the current profiled IVC command, that shows up as `533,202 -> 515,290` gas
+in PCS block 5 and `1,399,268 -> 1,374,697` total transaction gas. The
+numerator checkpoint remains about `412k` gas in both profiles because it is
+still evaluating the same identities.
 
 ## Generated Evaluator Structure
 

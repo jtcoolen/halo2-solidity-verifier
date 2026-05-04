@@ -148,13 +148,46 @@ scripts/run_ivc_bench.sh
 ```
 
 This prints the detailed checkpoint table, deployed runtime sizes, total
-transaction gas, and real checkpointed section work.
+transaction gas, and real checkpointed section work. The default path uses the
+outer single-H quotient commitment layout for the Solidity-facing decider
+proof, so `SRS_DIR` must contain `midnight-srs-2p19`, `midnight-srs-2p20`,
+and `midnight-srs-2p22`. If `--skip-srs-download` is passed and `2p22` is
+missing, the script fails before compiling; run without `--skip-srs-download`
+once, or fetch it with:
+
+```bash
+curl -fL --retry 3 --retry-delay 2 \
+  -o .srs/midnight-srs-2p22 \
+  https://srs.midnight.network/midnight-srs-2p22
+```
+
+Single-H is outer-only in this repo: the recursive leaf proofs verified inside
+the decider circuit stay on Midfall's multi-limb quotient layout, while the
+final Solidity-facing decider proof uses one quotient commitment. The bench
+therefore performs a two-phase run: first it generates a multi-limb leaf bundle
+without `outer-single-h-commitment`, then it proves and verifies the final
+decider proof with `outer-single-h-commitment`.
+
+The gas effect is intentionally modest. For the current IVC decider shape,
+single-H removes three quotient commitment terms from the fused PCS final MSM:
+`78 -> 75` terms. In the current profiled command this saves `17,912` gas in
+PCS block 5 and `24,571` total transaction gas versus
+`--no-outer-single-h-commitment`. The batched identity numerator
+reconstruction is unchanged. The larger structural effect is proof layout size:
+three fewer G1 commitments means `144` fewer compressed proof bytes and `384`
+fewer EIP-2537-padded proof bytes.
 
 To keep the recursive verifier on fewer point sets but benchmark the outer
 decider proof without dummy PCS evals:
 
 ```bash
 scripts/run_ivc_bench.sh --no-outer-fewer-point-sets
+```
+
+To run the legacy multi-limb outer proof shape:
+
+```bash
+scripts/run_ivc_bench.sh --no-outer-single-h-commitment
 ```
 
 Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:

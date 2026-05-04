@@ -344,7 +344,11 @@ impl ProtocolPlan {
             .collect();
         let num_lookups = lookup_chunks.len();
         let num_trashcans = cs.trashcans().len();
-        let num_quotients = cs_degree.saturating_sub(1);
+        let num_quotients = if crate::OUTER_SINGLE_H_COMMITMENT_ENABLED {
+            1
+        } else {
+            cs_degree.saturating_sub(1)
+        };
 
         let advice_queries = cs
             .advice_queries()
@@ -427,8 +431,8 @@ impl ProtocolPlan {
             .commitments
             .extend((0..num_trashcans).map(|_| CommitmentRead::Trash));
         // Read commitment(s) to the quotient polynomial h(X)=nu(X)/(X^n-1).
-        // Multi-limb quotient commitments are kept unless the circuit only
-        // needs a single h limb.
+        // The outer single-H feature mirrors midnight-proofs' one-commitment
+        // transcript shape; otherwise h is split into degree-bound limbs.
         proof
             .commitments
             .extend((0..num_quotients).map(|_| CommitmentRead::Quotient));
@@ -1059,6 +1063,36 @@ mod tests {
             3 * plan.num_permutation_zs - 1
         );
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn quotient_commitment_count_matches_outer_single_h_feature() {
+        let mut cs = ConstraintSystem::default();
+        let a0 = cs.advice_column();
+        let a1 = cs.advice_column();
+        let a2 = cs.advice_column();
+        cs.create_gate("degree three", |meta| {
+            let a0 = meta.query_advice(a0, Rotation::cur());
+            let a1 = meta.query_advice(a1, Rotation::cur());
+            let a2 = meta.query_advice(a2, Rotation::cur());
+            Constraints::without_selector(vec![("degree three", a0 * a1 * a2)])
+        });
+
+        let plan = ProtocolPlan::from_constraint_system(&cs, 0);
+        let expected = if crate::OUTER_SINGLE_H_COMMITMENT_ENABLED {
+            1
+        } else {
+            cs.degree() - 1
+        };
+        assert_eq!(plan.num_quotients, expected);
+        assert_eq!(
+            plan.proof
+                .commitments
+                .iter()
+                .filter(|read| read.is_quotient())
+                .count(),
+            expected
+        );
     }
 
     #[test]
