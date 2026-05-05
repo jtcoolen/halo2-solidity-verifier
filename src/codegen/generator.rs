@@ -1288,7 +1288,7 @@ impl<'a> SolidityGenerator<'a> {
 
     /// Estimate compact-VM byte cost of one identity for native selection.
     fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
-        let mut builder = QuotientProgramBuilder::default();
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         let expr = Self::quotient_identity_expr(identity);
         builder.identity_expr(&expr, identity.target, None);
         builder.bytes.len()
