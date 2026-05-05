@@ -57,6 +57,19 @@ pub(crate) struct Evaluator<'a> {
     var_cache: RefCell<HashMap<String, String>>,
 }
 
+/// Yul computation plus source metadata for one gate polynomial.
+#[derive(Clone, Debug)]
+pub(crate) struct GateComputation {
+    pub(crate) lines: Vec<String>,
+    pub(crate) var: String,
+    pub(crate) simple_selector_index: Option<usize>,
+    pub(crate) gate_index: usize,
+    pub(crate) gate_name: String,
+    pub(crate) constraint_index: usize,
+    pub(crate) constraint_name: String,
+    pub(crate) polynomial_index: usize,
+}
+
 impl<'a> Evaluator<'a> {
     /// Create an evaluator bound to a constraint system, metadata, and data map.
     pub(crate) fn new(
@@ -181,11 +194,12 @@ impl<'a> Evaluator<'a> {
     /// `directly_convert_selectors_to_fixed`, a simple selector's
     /// `index()` equals the fixed column index of its replacement
     /// (selector indices were shifted by `nr_fixed_columns`).
-    pub(crate) fn gate_computations_tagged(&self) -> Vec<(Vec<String>, String, Option<usize>)> {
+    pub(crate) fn gate_computations_tagged(&self) -> Vec<GateComputation> {
         self.cs
             .gates()
             .iter()
-            .flat_map(|gate| {
+            .enumerate()
+            .flat_map(|(gate_index, gate)| {
                 let simple_idx = gate
                     .queried_selectors()
                     .iter()
@@ -193,9 +207,19 @@ impl<'a> Evaluator<'a> {
                     .map(|s| s.index());
                 gate.polynomials()
                     .iter()
-                    .map(|poly| {
+                    .enumerate()
+                    .map(move |(polynomial_index, poly)| {
                         let (lines, var) = self.evaluate_and_reset(poly);
-                        (lines, var, simple_idx)
+                        GateComputation {
+                            lines,
+                            var,
+                            simple_selector_index: simple_idx,
+                            gate_index,
+                            gate_name: gate.name().to_string(),
+                            constraint_index: polynomial_index,
+                            constraint_name: gate.constraint_name(polynomial_index).to_string(),
+                            polynomial_index,
+                        }
                     })
                     .collect::<Vec<_>>()
             })

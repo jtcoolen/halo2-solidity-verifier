@@ -79,7 +79,7 @@ use midnight_proofs::{
         },
         EvaluationDomain,
     },
-    transcript::{CircuitTranscript, Transcript},
+    transcript::{CircuitTranscript, Hashable, Transcript},
 };
 #[cfg(feature = "outer-single-h-commitment")]
 use midnight_proofs::{poly::commitment::Params as _, utils::SerdeFormat};
@@ -89,11 +89,12 @@ use midnight_zk_stdlib::{
     MidnightVK, Relation, ZkStdLib, ZkStdLibArch,
 };
 use rand::rngs::OsRng;
+use sha3::Digest;
 
 use halo2_solidity_verifier::{
     compile_solidity_with_runs, encode_calldata_bls_padded, pinned_solc_available, solc_version,
-    AccumulatorEncoding, CallOutcome, Evm, ProofEvaluationCounts, SolidityGenerator,
-    PINNED_SOLC_VERSION,
+    AccumulatorEncoding, CallOutcome, Evm, ProofEvaluationCounts, QuotientIdentitySource,
+    SolidityGenerator, PINNED_SOLC_VERSION,
 };
 
 type S = BlstrsEmulation;
@@ -427,7 +428,7 @@ fn read_scalar_le(bytes: &[u8], cursor: &mut usize, label: &str) -> F {
 }
 
 fn push_g1_compressed(out: &mut Vec<u8>, point: &C) {
-    out.extend_from_slice(point.to_bytes().as_ref());
+    out.extend_from_slice(<C as GroupEncoding>::to_bytes(point).as_ref());
 }
 
 fn read_g1_compressed(bytes: &[u8], cursor: &mut usize, label: &str) -> C {
@@ -804,6 +805,243 @@ fn print_proof_evaluation_counts(counts: &ProofEvaluationCounts) {
     }
 }
 
+fn assert_ivc_aggregation_quotient_manifest(generator: &SolidityGenerator<'_>) {
+    let manifest = generator.quotient_identity_manifest();
+    let normal_gate_names = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.source {
+            QuotientIdentitySource::Gate { gate_name, .. } => Some(gate_name.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let trash_names = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.source {
+            QuotientIdentitySource::Trash { trash_name, .. } => Some(trash_name.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let configured_names = normal_gate_names
+        .iter()
+        .chain(trash_names.iter())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for expected in [
+        "arith_gate",
+        "12_minus_34",
+        "parallel_add_gate",
+        "Foreign-field multiplication",
+        "Foreign-field normalization",
+        "Foreign-field EC is_on_curve",
+        "Foreign-field EC lambda slope",
+        "Foreign-field EC assert_tangent",
+        "Foreign-field EC assert_lambda_squared",
+        "full_round_gate",
+        "partial_round_gate",
+    ] {
+        assert!(
+            configured_names.contains(expected),
+            "IVC aggregation manifest should include configured gate {expected}; got normal={normal_gate_names:?}, trash={trash_names:?}"
+        );
+    }
+    assert_eq!(configured_names.len(), 11);
+    assert!(
+        !normal_gate_names.contains("partial_round_gate"),
+        "partial_round_gate should be represented by trash, not normal gate identities"
+    );
+    assert!(
+        trash_names
+            .iter()
+            .any(|name| name.contains("partial_round_gate")),
+        "IVC aggregation trash manifest should name partial_round_gate; got {trash_names:?}"
+    );
+
+    let lookup_argument_count = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.source {
+            QuotientIdentitySource::Lookup { lookup_index, .. } => Some(*lookup_index),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert_eq!(lookup_argument_count, 2);
+    assert_eq!(manifest.lookup_identities, 6);
+    assert_eq!(manifest.trash_identities, 1);
+}
+
+#[derive(Clone, Debug)]
+struct RustFormatVkKeccakHashes {
+    le: [u8; 32],
+    be: [u8; 32],
+    field_elements: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SolidityVkKeccakBench {
+    creation_size: usize,
+    runtime_size: usize,
+    runtime_codehash: String,
+    empty_call_gas: u64,
+    hash_call_gas: u64,
+    net_hash_gas: u64,
+    output: [u8; 32],
+}
+
+/// Builds the same field-element input vector as Midfall's
+/// `compute_vk_hash`: `transcript_repr || fixed_coms || perm_coms`.
+fn rust_format_vk_hash_inputs(vk: &MidnightVK) -> Vec<F> {
+    let vk = vk.vk();
+    let to_raw = Hashable::<PoseidonState<F>>::to_input;
+
+    let vk_repr = vec![vk.transcript_repr()];
+    let fixed_coms: Vec<F> = vk.fixed_commitments().iter().flat_map(to_raw).collect();
+    let perm_coms: Vec<F> = vk
+        .permutation()
+        .commitments()
+        .iter()
+        .flat_map(to_raw)
+        .collect();
+
+    [vk_repr, fixed_coms, perm_coms].concat()
+}
+
+fn compute_rust_format_vk_keccak_hashes(vk: &MidnightVK) -> RustFormatVkKeccakHashes {
+    let inputs = rust_format_vk_hash_inputs(vk);
+    let mut le_hasher = sha3::Keccak256::new();
+    let mut be_hasher = sha3::Keccak256::new();
+
+    for input in &inputs {
+        let repr = input.to_repr();
+        le_hasher.update(repr.as_ref());
+
+        let mut be = repr.as_ref().to_vec();
+        be.reverse();
+        be_hasher.update(&be);
+    }
+
+    RustFormatVkKeccakHashes {
+        le: le_hasher.finalize().into(),
+        be: be_hasher.finalize().into(),
+        field_elements: inputs.len(),
+    }
+}
+
+fn rust_format_vk_keccak_hash_summary(hashes: &RustFormatVkKeccakHashes) -> String {
+    format!(
+        "decider VK Rust-format input field elements: {}\n\
+         decider VK Rust-format Keccak256 (field repr LE): 0x{}\n\
+         decider VK Rust-format Keccak256 (field repr BE): 0x{}\n",
+        hashes.field_elements,
+        hex::encode(hashes.le),
+        hex::encode(hashes.be)
+    )
+}
+
+fn render_rust_format_vk_keccak_bench_solidity(vk: &MidnightVK) -> String {
+    let inputs = rust_format_vk_hash_inputs(vk);
+    let input_bytes = inputs.len() * 32;
+    let mut solidity = String::from(
+        "// SPDX-License-Identifier: MIT\n\
+         pragma solidity ^0.8.24;\n\n\
+         contract IvcVkKeccakBench {\n\
+             function empty() external pure returns (bytes32 digest) {\n\
+                 assembly {\n\
+                     digest := sub(calldatasize(), 4)\n\
+                 }\n\
+             }\n\n\
+             function hashVk() external pure returns (bytes32 digest) {\n\
+                 assembly {\n\
+                     let ptr := 0x80\n\
+                     let runtime_zero := sub(calldatasize(), 4)\n",
+    );
+
+    for (i, input) in inputs.iter().enumerate() {
+        let mut be = input.to_repr().as_ref().to_vec();
+        be.reverse();
+        let value = format!("0x{}", hex::encode(be));
+        let value = if i == 0 {
+            format!("add({value}, runtime_zero)")
+        } else {
+            value
+        };
+        solidity.push_str(&format!(
+            "                    mstore(add(ptr, {:#x}), {value})\n",
+            i * 32
+        ));
+    }
+
+    solidity.push_str(&format!(
+        "                    digest := keccak256(ptr, {input_bytes:#x})\n\
+                 }}\n\
+             }}\n\
+         }}\n"
+    ));
+    solidity
+}
+
+fn solidity_selector(signature: &str) -> Vec<u8> {
+    sha3::Keccak256::digest(signature.as_bytes())[..4].to_vec()
+}
+
+fn run_solidity_vk_keccak_bench(
+    evm: &mut Evm,
+    creation_code: Vec<u8>,
+    expected_hash: [u8; 32],
+) -> SolidityVkKeccakBench {
+    let creation_size = creation_code.len();
+    let address = evm.create(creation_code);
+    let runtime_size = evm.code_size(address);
+    let runtime_codehash = format!("0x{:064x}", evm.code_hash(address));
+
+    let (empty_call_gas, empty_output) = evm.call(address, solidity_selector("empty()"));
+    let empty_expected = vec![0u8; 32];
+    assert_eq!(
+        empty_output, empty_expected,
+        "VK Keccak bench empty baseline returned unexpected bytes"
+    );
+
+    let (hash_call_gas, output) = evm.call(address, solidity_selector("hashVk()"));
+    assert_eq!(
+        output.as_slice(),
+        expected_hash.as_slice(),
+        "Solidity VK Keccak hash must match the host-computed BE hash"
+    );
+    let output = output.as_slice().try_into().expect("bytes32 output length");
+
+    SolidityVkKeccakBench {
+        creation_size,
+        runtime_size,
+        runtime_codehash,
+        empty_call_gas,
+        hash_call_gas,
+        net_hash_gas: hash_call_gas.saturating_sub(empty_call_gas),
+        output,
+    }
+}
+
+fn solidity_vk_keccak_bench_summary(bench: &SolidityVkKeccakBench) -> String {
+    format!(
+        "Solidity VK Rust-format Keccak bench creation bytecode bytes: {}\n\
+         Solidity VK Rust-format Keccak bench deployed runtime bytes: {}\n\
+         Solidity VK Rust-format Keccak bench deployed runtime keccak256: {}\n\
+         Solidity VK Rust-format Keccak256 output: 0x{}\n\
+         Solidity VK Rust-format Keccak256 total call gas: {}\n\
+         Solidity VK Rust-format Keccak256 empty-call baseline gas: {}\n\
+         Solidity VK Rust-format Keccak256 net gas over empty: {}\n",
+        bench.creation_size,
+        bench.runtime_size,
+        bench.runtime_codehash,
+        hex::encode(bench.output),
+        bench.hash_call_gas,
+        bench.empty_call_gas,
+        bench.net_hash_gas
+    )
+}
+
 fn setup_and_prove_ivc_leaves(
     ivc_srs: &ParamsKZG<E>,
     ivc_k: u32,
@@ -971,6 +1209,10 @@ fn ivc_final_keccak_solidity_e2e() {
         "[ivc-keccak-solidity] tree decider setup completed in {:.2?}",
         start.elapsed()
     );
+    let decider_vk_keccak_hashes = compute_rust_format_vk_keccak_hashes(&decider_vk);
+    for line in rust_format_vk_keccak_hash_summary(&decider_vk_keccak_hashes).lines() {
+        println!("[ivc-keccak-solidity][vk-hash] {line}");
+    }
 
     let outer_fewer_point_sets = halo2_solidity_verifier::OUTER_FEWER_POINT_SETS_ENABLED;
     if outer_single_h {
@@ -1058,6 +1300,7 @@ fn ivc_final_keccak_solidity_e2e() {
         TREE_LEAVES * Chain::format_public_input(&decider_instance.leaf_states[0]).len();
     let generator = SolidityGenerator::new(&decider_srs, decider_vk.vk(), num_instances, 1)
         .set_acc_encoding(Some(AccumulatorEncoding::new(final_acc_offset, 7, 56)));
+    assert_ivc_aggregation_quotient_manifest(&generator);
     let proof_evaluation_counts = generator.proof_evaluation_counts();
     print_proof_evaluation_counts(&proof_evaluation_counts);
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
@@ -1114,6 +1357,11 @@ fn ivc_final_keccak_solidity_e2e() {
     std::fs::write(
         format!("{dump_dir}/proof-evaluation-counts.txt"),
         proof_evaluation_count_summary(&proof_evaluation_counts),
+    )
+    .ok();
+    std::fs::write(
+        format!("{dump_dir}/vk-keccak-hashes.txt"),
+        rust_format_vk_keccak_hash_summary(&decider_vk_keccak_hashes),
     )
     .ok();
     let pi_bytes: Vec<u8> = pi
@@ -1186,6 +1434,7 @@ fn ivc_final_keccak_solidity_e2e() {
          Halo2VerifyingKey deployed runtime bytes: {vk_runtime_size}\n\
          Halo2QuotientEvaluator deployed runtime bytes: {quotient_runtime_size}\n\
          total deployed runtime bytes: {}\n\
+         {}\
          Halo2Verifier deployed runtime keccak256: 0x{verifier_codehash:064x}\n\
          Halo2VerifyingKey deployed runtime keccak256: 0x{vk_codehash:064x}\n\
          Halo2QuotientEvaluator deployed runtime keccak256: 0x{quotient_codehash:064x}\n",
@@ -1193,7 +1442,8 @@ fn ivc_final_keccak_solidity_e2e() {
         verifier_solidity.len(),
         vk_solidity.len(),
         quotient_solidity.len(),
-        verifier_runtime_size + vk_runtime_size + quotient_runtime_size
+        verifier_runtime_size + vk_runtime_size + quotient_runtime_size,
+        rust_format_vk_keccak_hash_summary(&decider_vk_keccak_hashes)
     );
     std::fs::write(
         format!("{dump_dir}/contract-sizes.txt"),

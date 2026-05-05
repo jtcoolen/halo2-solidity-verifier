@@ -180,6 +180,128 @@ impl<'a> SolidityGenerator<'a> {
         );
         counts
     }
+
+    /// Return a stable host-side manifest of quotient numerator identities.
+    ///
+    /// This diagnostic API follows the same source ordering as the generated
+    /// quotient evaluator: normal gates, permutation, lookup, then trash.
+    pub fn quotient_identity_manifest(&self) -> QuotientIdentityManifest {
+        self.quotient_identity_manifest_for_meta(&self.meta)
+    }
+
+    fn quotient_identity_manifest_for_meta(
+        &self,
+        meta: &ConstraintSystemMeta,
+    ) -> QuotientIdentityManifest {
+        let mut simple_selector_cols: Vec<usize> =
+            meta.simple_selector_cols.iter().copied().collect();
+        simple_selector_cols.sort_unstable();
+
+        let mut entries = Vec::new();
+        let mut global_index = 0usize;
+        for (gate_index, gate) in self.vk.cs().gates().iter().enumerate() {
+            let target = gate
+                .queried_selectors()
+                .iter()
+                .find(|selector| selector.is_simple())
+                .map(|selector| {
+                    let selector_index = simple_selector_cols
+                        .iter()
+                        .position(|fixed| *fixed == selector.index())
+                        .expect("simple selector fixed column present");
+                    QuotientIdentityManifestTarget::Selector {
+                        selector_index,
+                        fixed_column: selector.index(),
+                    }
+                })
+                .unwrap_or(QuotientIdentityManifestTarget::Main);
+
+            for polynomial_index in 0..gate.polynomials().len() {
+                entries.push(QuotientIdentityManifestEntry {
+                    global_index,
+                    source: QuotientIdentitySource::Gate {
+                        gate_index,
+                        gate_name: gate.name().to_string(),
+                        constraint_index: polynomial_index,
+                        constraint_name: gate.constraint_name(polynomial_index).to_string(),
+                        polynomial_index,
+                    },
+                    target,
+                });
+                global_index += 1;
+            }
+        }
+
+        for identity_index in 0..meta.protocol.quotient.permutation {
+            entries.push(QuotientIdentityManifestEntry {
+                global_index,
+                source: QuotientIdentitySource::Permutation { identity_index },
+                target: QuotientIdentityManifestTarget::Main,
+            });
+            global_index += 1;
+        }
+
+        for identity_index in 0..meta.protocol.quotient.lookup {
+            let lookup_index = identity_index / 3;
+            let lookup_name = format!("lookup_{lookup_index}");
+            entries.push(QuotientIdentityManifestEntry {
+                global_index,
+                source: QuotientIdentitySource::Lookup {
+                    identity_index,
+                    lookup_index,
+                    lookup_name,
+                },
+                target: QuotientIdentityManifestTarget::Main,
+            });
+            global_index += 1;
+        }
+
+        for trash_index in 0..meta.protocol.quotient.trash {
+            let trash_name = self.trash_manifest_name(trash_index);
+            entries.push(QuotientIdentityManifestEntry {
+                global_index,
+                source: QuotientIdentitySource::Trash {
+                    trash_index,
+                    trash_name,
+                },
+                target: QuotientIdentityManifestTarget::Main,
+            });
+            global_index += 1;
+        }
+
+        QuotientIdentityManifest {
+            entries,
+            gate_identities: meta.protocol.quotient.gates,
+            permutation_identities: meta.protocol.quotient.permutation,
+            lookup_identities: meta.protocol.quotient.lookup,
+            trash_identities: meta.protocol.quotient.trash,
+            simple_selector_cols,
+        }
+    }
+
+    fn trash_manifest_name(&self, trash_index: usize) -> String {
+        // Additive-selector `create_gate` calls still leave a zero-polynomial
+        // gate record in `cs.gates()`. The trash argument name itself is built
+        // from constraint names and can be just separators for unnamed
+        // constraints, so prefer the source gate name for diagnostics.
+        if let Some(gate) = self
+            .vk
+            .cs()
+            .gates()
+            .iter()
+            .filter(|gate| gate.polynomials().is_empty())
+            .nth(trash_index)
+        {
+            return gate.name().to_string();
+        }
+
+        self.vk
+            .cs()
+            .trashcans()
+            .get(trash_index)
+            .map(|trash| trash.name().to_string())
+            .unwrap_or_else(|| format!("trash_{trash_index}"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,15 +877,46 @@ impl<'a> SolidityGenerator<'a> {
             return vk;
         }
 
-        let (_vk_mptr, pre_meta, pre_data, _) =
-            self.meta_data_for_stable_static_layout(&vk, proof_cptr);
-        let (pre_quotient_program_build, _) =
-            self.compact_quotient_program_for(&pre_meta, &pre_data);
-        let quotient_const_words = pre_quotient_program_build.consts.len();
-        let quotient_program_words =
-            PackedProgramCodec::word_len_for_bytes(pre_quotient_program_build.bytes.len());
+        let header_words = vk.constants.len();
+        let mut quotient_const_words = 0usize;
+        let mut quotient_program_words = 0usize;
+        let mut quotient_program_build = None;
+
+        for _ in 0..8 {
+            vk.constants.truncate(header_words);
+            vk.constants
+                .extend((0..quotient_const_words).map(|_| ("quotient_const", U256::ZERO)));
+            vk.constants
+                .extend((0..quotient_program_words).map(|_| ("quotient_program", U256::ZERO)));
+            vk.quotient_const_offset_words = None;
+            vk.quotient_const_words = 0;
+            vk.quotient_program_offset_words = None;
+            vk.quotient_program_words = 0;
+
+            let (_, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
+            let (candidate, _) = self.compact_quotient_program_for(&meta, &data);
+            let candidate_const_words = candidate.consts.len();
+            let candidate_program_words =
+                PackedProgramCodec::word_len_for_bytes(candidate.bytes.len());
+
+            if candidate_const_words <= quotient_const_words
+                && candidate_program_words <= quotient_program_words
+            {
+                quotient_program_build = Some(candidate);
+                break;
+            }
+
+            quotient_const_words = quotient_const_words.max(candidate_const_words);
+            quotient_program_words = quotient_program_words.max(candidate_program_words);
+        }
+
+        let quotient_program_build = quotient_program_build.unwrap_or_else(|| {
+            panic!(
+                "quotient VK payload reservation did not converge after 8 iterations: const_words={quotient_const_words}, program_words={quotient_program_words}"
+            )
+        });
         let payload_layout = VkPayloadLayout::for_vk(
-            vk.constants.len(),
+            header_words,
             quotient_const_words,
             quotient_program_words,
             vk.fixed_comms.len(),
@@ -790,28 +943,19 @@ impl<'a> SolidityGenerator<'a> {
         );
         assert_eq!(
             payload_layout.total_bytes(),
-            vk.len() + (quotient_const_words + quotient_program_words) * WORD_BYTES,
+            vk.len(),
             "typed VK payload layout must preserve the emitted byte length"
         );
 
-        vk.constants
-            .extend((0..quotient_const_words).map(|_| ("quotient_const", U256::ZERO)));
-        vk.constants
-            .extend((0..quotient_program_words).map(|_| ("quotient_program", U256::ZERO)));
-
-        let (_, meta, data, _) = self.meta_data_for_stable_static_layout(&vk, proof_cptr);
-        let (quotient_program_build, _) = self.compact_quotient_program_for(&meta, &data);
         let quotient_program_chunks =
             PackedProgramCodec::encode_words(&quotient_program_build.bytes);
-        assert_eq!(
-            quotient_program_build.consts.len(),
-            quotient_const_words,
-            "quotient const table changed after VK payload reservation"
+        assert!(
+            quotient_program_build.consts.len() <= quotient_const_words,
+            "quotient const table exceeded VK payload reservation"
         );
-        assert_eq!(
-            quotient_program_chunks.len(),
-            quotient_program_words,
-            "quotient program length changed after VK payload reservation"
+        assert!(
+            quotient_program_chunks.len() <= quotient_program_words,
+            "quotient program length exceeded VK payload reservation"
         );
 
         for (i, value) in quotient_program_build.consts.iter().copied().enumerate() {
@@ -970,6 +1114,7 @@ impl<'a> SolidityGenerator<'a> {
             lin7: has(Q_OP_LIN7),
             bilin7_row: has(Q_OP_BILIN7_ROW),
             bilin7_pairwise: has(Q_OP_BILIN7_PAIRWISE),
+            pow5: has(Q_OP_POW5),
         }
     }
 
@@ -1190,9 +1335,10 @@ impl<'a> SolidityGenerator<'a> {
         let mut sorted_simple: Vec<usize> = meta.simple_selector_cols.iter().copied().collect();
         sorted_simple.sort_unstable();
 
+        let mut global_index = 0usize;
         let mut gates = Vec::with_capacity(gate_items.len());
-        for ((lines, var, sel_idx), expr) in gate_items.into_iter().zip(gate_exprs) {
-            let target = match sel_idx {
+        for (item, expr) in gate_items.into_iter().zip(gate_exprs) {
+            let target = match item.simple_selector_index {
                 Some(col) => {
                     let idx = sorted_simple
                         .iter()
@@ -1203,38 +1349,74 @@ impl<'a> SolidityGenerator<'a> {
                 None => QuotientTarget::Main,
             };
             gates.push(QuotientIdentity {
-                lines,
-                var,
+                meta: QuotientIdentityMetadata {
+                    global_index,
+                    source: QuotientIdentitySource::Gate {
+                        gate_index: item.gate_index,
+                        gate_name: item.gate_name,
+                        constraint_index: item.constraint_index,
+                        constraint_name: item.constraint_name,
+                        polynomial_index: item.polynomial_index,
+                    },
+                },
+                lines: item.lines,
+                var: item.var,
                 target,
                 expr: Some(expr),
             });
+            global_index += 1;
         }
         let mut permutation = Vec::with_capacity(perm_items.len());
-        for (lines, var) in perm_items {
+        for (identity_index, (lines, var)) in perm_items.into_iter().enumerate() {
             permutation.push(QuotientIdentity {
+                meta: QuotientIdentityMetadata {
+                    global_index,
+                    source: QuotientIdentitySource::Permutation { identity_index },
+                },
                 lines,
                 var,
                 target: QuotientTarget::Main,
                 expr: None,
             });
+            global_index += 1;
         }
         let mut lookup = Vec::with_capacity(lookup_items.len());
-        for (lines, var) in lookup_items {
+        for (identity_index, (lines, var)) in lookup_items.into_iter().enumerate() {
+            let lookup_index = identity_index / 3;
+            let lookup_name = format!("lookup_{lookup_index}");
             lookup.push(QuotientIdentity {
+                meta: QuotientIdentityMetadata {
+                    global_index,
+                    source: QuotientIdentitySource::Lookup {
+                        identity_index,
+                        lookup_index,
+                        lookup_name,
+                    },
+                },
                 lines,
                 var,
                 target: QuotientTarget::Main,
                 expr: None,
             });
+            global_index += 1;
         }
         let mut trash = Vec::with_capacity(trash_items.len());
-        for (lines, var) in trash_items {
+        for (trash_index, (lines, var)) in trash_items.into_iter().enumerate() {
+            let trash_name = self.trash_manifest_name(trash_index);
             trash.push(QuotientIdentity {
+                meta: QuotientIdentityMetadata {
+                    global_index,
+                    source: QuotientIdentitySource::Trash {
+                        trash_index,
+                        trash_name,
+                    },
+                },
                 lines,
                 var,
                 target: QuotientTarget::Main,
                 expr: None,
             });
+            global_index += 1;
         }
 
         assert_eq!(
@@ -2570,8 +2752,8 @@ impl<'a> SolidityGenerator<'a> {
 
         let mut pending_selector = None;
         let mut pending_selector_run: Vec<(Vec<String>, String)> = Vec::new();
-        for (lines, var, target) in gate_items {
-            let target = match target {
+        for item in gate_items {
+            let target = match item.simple_selector_index {
                 Some(col) => {
                     let idx = sorted_simple
                         .iter()
@@ -2584,7 +2766,7 @@ impl<'a> SolidityGenerator<'a> {
             match target {
                 QuotientTarget::Selector(idx) => {
                     if pending_selector == Some(idx) {
-                        pending_selector_run.push((lines, var));
+                        pending_selector_run.push((item.lines, item.var));
                     } else {
                         Self::flush_structured_selector_run(
                             &mut computations,
@@ -2596,7 +2778,7 @@ impl<'a> SolidityGenerator<'a> {
                             trace,
                         );
                         pending_selector = Some(idx);
-                        pending_selector_run.push((lines, var));
+                        pending_selector_run.push((item.lines, item.var));
                     }
                 }
                 QuotientTarget::Main => {
@@ -2610,8 +2792,8 @@ impl<'a> SolidityGenerator<'a> {
                         trace,
                     );
                     computations.push(Self::direct_quotient_block(
-                        &lines,
-                        &var,
+                        &item.lines,
+                        &item.var,
                         target,
                         sorted_simple,
                         eval_scratch_slot,
@@ -2726,15 +2908,13 @@ impl<'a> SolidityGenerator<'a> {
         let quotient_program_offset_words = vk
             .quotient_program_offset_words
             .expect("VK must carry quotient program");
-        assert_eq!(
-            quotient_program_build.consts.len(),
-            quotient_const_words,
-            "quotient const table changed after VK payload reservation"
+        assert!(
+            quotient_program_build.consts.len() <= quotient_const_words,
+            "quotient const table exceeded VK payload reservation"
         );
-        assert_eq!(
-            quotient_program_chunks.len(),
-            quotient_program_words,
-            "quotient program length changed after VK payload reservation"
+        assert!(
+            quotient_program_chunks.len() <= quotient_program_words,
+            "quotient program length exceeded VK payload reservation"
         );
         let quotient_stack_mptr = memory.quotient_stack_mptr;
         let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
@@ -3014,15 +3194,13 @@ impl<'a> SolidityGenerator<'a> {
                 let quotient_program_offset_words = vk
                     .quotient_program_offset_words
                     .expect("VK must carry quotient program");
-                assert_eq!(
-                    quotient_program_build.consts.len(),
-                    quotient_const_words,
-                    "quotient const table changed after VK payload reservation"
+                assert!(
+                    quotient_program_build.consts.len() <= quotient_const_words,
+                    "quotient const table exceeded VK payload reservation"
                 );
-                assert_eq!(
-                    quotient_program_chunks.len(),
-                    quotient_program_words,
-                    "quotient program length changed after VK payload reservation"
+                assert!(
+                    quotient_program_chunks.len() <= quotient_program_words,
+                    "quotient program length exceeded VK payload reservation"
                 );
                 let quotient_stack_mptr = memory.quotient_stack_mptr;
                 let const_mptr = (vk_mptr + quotient_const_offset_words).value().as_usize();
@@ -3430,8 +3608,17 @@ impl<'a> SolidityGenerator<'a> {
         for item in items {
             match item {
                 QuotientProgramItem::Identity(identity) => {
+                    let before_profile =
+                        quotient_shape_profile_enabled().then(|| builder.profile.clone());
                     let expr = Self::quotient_identity_expr(identity);
                     builder.identity_expr(&expr, identity.target, cse.as_mut());
+                    if let Some(before_profile) = before_profile {
+                        Self::print_identity_shape_profile(
+                            identity,
+                            &before_profile,
+                            &builder.profile,
+                        );
+                    }
                 }
                 QuotientProgramItem::NativePermutation => builder.native_permutation(),
                 QuotientProgramItem::NativeLookup => builder.native_lookup(),
@@ -3442,6 +3629,56 @@ impl<'a> SolidityGenerator<'a> {
         }
 
         builder.finish(quotient_program_encoding())
+    }
+
+    fn print_identity_shape_profile(
+        identity: &QuotientIdentity,
+        before: &QuotientShapeProfile,
+        after: &QuotientShapeProfile,
+    ) {
+        let lin7 = after.lin7.saturating_sub(before.lin7);
+        let bilin7_row = after.bilin7_row.saturating_sub(before.bilin7_row);
+        let bilin7_pairwise = after.bilin7_pairwise.saturating_sub(before.bilin7_pairwise);
+        let pow5 = after.pow5.saturating_sub(before.pow5);
+        let fallback_vm_ops = after.fallback_vm_ops.saturating_sub(before.fallback_vm_ops);
+        eprintln!(
+            "quotient identity shape profile: idx={} source={} lin7={} bilin7_row={} bilin7_pairwise={} pow5={} fallback_vm_ops={}",
+            identity.meta.global_index,
+            Self::quotient_identity_source_label(&identity.meta.source),
+            lin7,
+            bilin7_row,
+            bilin7_pairwise,
+            pow5,
+            fallback_vm_ops,
+        );
+    }
+
+    fn quotient_identity_source_label(source: &QuotientIdentitySource) -> String {
+        match source {
+            QuotientIdentitySource::Gate {
+                gate_index,
+                gate_name,
+                constraint_index,
+                constraint_name,
+                ..
+            } => format!(
+                "gate[{gate_index}]/{gate_name}/constraint[{constraint_index}]/{constraint_name}"
+            ),
+            QuotientIdentitySource::Permutation { identity_index } => {
+                format!("permutation[{identity_index}]")
+            }
+            QuotientIdentitySource::Lookup {
+                identity_index,
+                lookup_index,
+                ..
+            } => format!("lookup[{lookup_index}]/identity[{identity_index}]"),
+            QuotientIdentitySource::Trash {
+                trash_index,
+                trash_name,
+            } => {
+                format!("trash[{trash_index}]/{trash_name}")
+            }
+        }
     }
 
     /// Repack a midnight-proofs proof from the on-the-wire compressed

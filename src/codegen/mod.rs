@@ -176,6 +176,91 @@ impl AccumulatorEncoding {
     }
 }
 
+/// Stable diagnostic view of the identities folded into the quotient numerator.
+///
+/// This is not part of the Solidity verifier ABI. It is a host-side inspection
+/// API for confirming which custom gates and argument identities a generated
+/// verifier will evaluate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotientIdentityManifest {
+    /// Identities in the exact global `y`-batch order used by the verifier.
+    pub entries: Vec<QuotientIdentityManifestEntry>,
+    /// Number of normal custom-gate polynomial identities.
+    pub gate_identities: usize,
+    /// Number of permutation identities.
+    pub permutation_identities: usize,
+    /// Number of lookup identities.
+    pub lookup_identities: usize,
+    /// Number of trash argument identities.
+    pub trash_identities: usize,
+    /// Fixed-column indices for simple selector buckets, sorted by column.
+    pub simple_selector_cols: Vec<usize>,
+}
+
+/// One identity in the quotient numerator manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotientIdentityManifestEntry {
+    /// Position in the global `y`-batch.
+    pub global_index: usize,
+    /// Source family and source-local metadata.
+    pub source: QuotientIdentitySource,
+    /// Accumulation target for this identity.
+    pub target: QuotientIdentityManifestTarget,
+}
+
+/// Source family for a quotient numerator identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuotientIdentitySource {
+    /// A normal custom-gate polynomial from `vk.cs().gates()`.
+    Gate {
+        /// Index in `ConstraintSystem::gates()`.
+        gate_index: usize,
+        /// Gate name recorded by `create_gate`.
+        gate_name: String,
+        /// Constraint/polynomial index inside the gate.
+        constraint_index: usize,
+        /// Constraint name recorded by the gate builder.
+        constraint_name: String,
+        /// Polynomial index inside the gate.
+        polynomial_index: usize,
+    },
+    /// A permutation argument identity.
+    Permutation {
+        /// Identity index inside the permutation family.
+        identity_index: usize,
+    },
+    /// A LogUp lookup argument identity.
+    Lookup {
+        /// Identity index inside the lookup family.
+        identity_index: usize,
+        /// Lookup argument index.
+        lookup_index: usize,
+        /// Lookup name recorded by the constraint system.
+        lookup_name: String,
+    },
+    /// A trash argument identity.
+    Trash {
+        /// Trash argument index.
+        trash_index: usize,
+        /// Trash argument name, usually the source additive-selector gate name.
+        trash_name: String,
+    },
+}
+
+/// Destination of one manifest identity after its `y` position is consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotientIdentityManifestTarget {
+    /// Fully evaluated identity accumulated into the quotient numerator scalar.
+    Main,
+    /// Simple-selector identity accumulated into a selector commitment bucket.
+    Selector {
+        /// Bucket index in the sorted simple-selector list.
+        selector_index: usize,
+        /// Fixed column backing that simple selector.
+        fixed_column: usize,
+    },
+}
+
 /// Errors returned when a constraint system is outside the currently
 /// supported Midfall Solidity verifier shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -480,6 +565,74 @@ mod tests {
         }
 
         assert_eq!(solidity_selector_acc, rust_selector_acc);
+    }
+
+    #[test]
+    fn quotient_identity_manifest_preserves_order_and_metadata() {
+        let gate_source = QuotientIdentitySource::Gate {
+            gate_index: 2,
+            gate_name: "custom_gate".to_string(),
+            constraint_index: 1,
+            constraint_name: "constraint_b".to_string(),
+            polynomial_index: 1,
+        };
+        let parts = QuotientIdentityParts {
+            gates: vec![test_quotient_identity(
+                0,
+                gate_source.clone(),
+                QuotientTarget::Selector(0),
+            )],
+            permutation: vec![test_quotient_identity(
+                1,
+                QuotientIdentitySource::Permutation { identity_index: 0 },
+                QuotientTarget::Main,
+            )],
+            lookup: vec![test_quotient_identity(
+                2,
+                QuotientIdentitySource::Lookup {
+                    identity_index: 0,
+                    lookup_index: 0,
+                    lookup_name: "lookup_0".to_string(),
+                },
+                QuotientTarget::Main,
+            )],
+            trash: vec![test_quotient_identity(
+                3,
+                QuotientIdentitySource::Trash {
+                    trash_index: 0,
+                    trash_name: "partial_round_gate".to_string(),
+                },
+                QuotientTarget::Main,
+            )],
+            sorted_simple: vec![42],
+        };
+
+        let manifest = parts.manifest();
+
+        assert_eq!(manifest.gate_identities, 1);
+        assert_eq!(manifest.permutation_identities, 1);
+        assert_eq!(manifest.lookup_identities, 1);
+        assert_eq!(manifest.trash_identities, 1);
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|entry| entry.global_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(manifest.entries[0].source, gate_source);
+        assert_eq!(
+            manifest.entries[0].target,
+            QuotientIdentityManifestTarget::Selector {
+                selector_index: 0,
+                fixed_column: 42,
+            }
+        );
+        assert!(matches!(
+            manifest.entries[3].source,
+            QuotientIdentitySource::Trash { ref trash_name, .. } if trash_name == "partial_round_gate"
+        ));
     }
 
     #[test]
@@ -1846,6 +1999,107 @@ mod tests {
     }
 
     #[test]
+    fn quotient_vm_pow5_matches_direct_expr_eval() {
+        let ptr = 0xa20;
+        let mut values = HashMap::new();
+        values.insert(ptr, Fq::from(131u64));
+        let base = QuotientExpr::Mem(QuotientMem::Literal(ptr));
+        let expr = quotient_mul_expr(
+            quotient_mul_expr(base.clone(), base.clone()),
+            quotient_mul_expr(base.clone(), quotient_mul_expr(base.clone(), base)),
+        );
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::default();
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[3], Q_OP_POW5);
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_limb_subshape_matches_direct_expr_eval() {
+        let mut values = HashMap::new();
+        let mut expr = QuotientExpr::Const(U256::ZERO);
+        let residue = quotient_mul_expr(
+            QuotientExpr::Mem(QuotientMem::Literal(0xc00)),
+            QuotientExpr::Mem(QuotientMem::Literal(0xc20)),
+        );
+        values.insert(0xc00, Fq::from(211u64));
+        values.insert(0xc20, Fq::from(223u64));
+
+        for i in 0..7u32 {
+            let ptr = 0xb00 + i * 0x20;
+            values.insert(ptr, Fq::from(151 + i as u64));
+            if i == 1 {
+                expr = quotient_add_expr(expr, QuotientExpr::Const(U256::from(9u64)));
+            }
+            if i == 4 {
+                expr = quotient_add_expr(expr, residue.clone());
+            }
+            expr = quotient_add_expr(
+                expr,
+                quotient_scale_expr(
+                    Fq::from(19 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(ptr)),
+                ),
+            );
+        }
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert!(
+            builder.bytes.contains(&Q_OP_LIN7),
+            "larger affine sums should still extract LIN7 subshapes"
+        );
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_limb_subshape_inside_conditional_product_matches_direct_expr_eval() {
+        let mut values = HashMap::new();
+        let cond_ptr = 0xd00;
+        values.insert(cond_ptr, Fq::from(3u64));
+        let mut inner = QuotientExpr::Const(U256::ZERO);
+        for i in 0..7u32 {
+            let ptr = 0xe00 + i * 0x20;
+            values.insert(ptr, Fq::from(251 + i as u64));
+            if i == 2 {
+                inner = quotient_add_expr(inner, QuotientExpr::Const(U256::from(17u64)));
+            }
+            inner = quotient_add_expr(
+                inner,
+                quotient_scale_expr(
+                    Fq::from(31 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(ptr)),
+                ),
+            );
+        }
+        let expr = quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond_ptr)), inner);
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert!(
+            builder.bytes.contains(&Q_OP_LIN7),
+            "conditional affine factors should still extract LIN7 subshapes"
+        );
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
     fn unmatched_limb_shape_falls_back_to_existing_vm_ops() {
         let mut values = HashMap::new();
         let mut expr = QuotientExpr::Const(U256::ZERO);
@@ -1964,6 +2218,23 @@ mod tests {
         )
     }
 
+    fn test_quotient_identity(
+        global_index: usize,
+        source: QuotientIdentitySource,
+        target: QuotientTarget,
+    ) -> QuotientIdentity {
+        QuotientIdentity {
+            meta: QuotientIdentityMetadata {
+                global_index,
+                source,
+            },
+            lines: Vec::new(),
+            var: "eval".to_string(),
+            target,
+            expr: Some(QuotientExpr::Const(U256::ZERO)),
+        }
+    }
+
     fn eval_quotient_expr_for_test(expr: &QuotientExpr, mem: &HashMap<u32, Fq>) -> Fq {
         match expr {
             QuotientExpr::Const(value) => fq_from_u256(*value),
@@ -2023,6 +2294,12 @@ mod tests {
                 Q_OP_NEG => {
                     let value = stack.pop().expect("value");
                     stack.push(-value);
+                    idx += 1;
+                }
+                Q_OP_POW5 => {
+                    let value = stack.pop().expect("value");
+                    let value2 = value * value;
+                    stack.push(value * value2 * value2);
                     idx += 1;
                 }
                 Q_OP_ADD_CONST_U8 => {

@@ -45,7 +45,8 @@ use rand_chacha::ChaCha8Rng;
 use sha3::Keccak256;
 
 use halo2_solidity_verifier::{
-    compile_solidity, encode_calldata_bls_padded, pinned_solc_available, Evm, SolidityGenerator,
+    compile_solidity, encode_calldata_bls_padded, pinned_solc_available, Evm,
+    QuotientIdentitySource, SolidityGenerator,
 };
 
 type F = Fq;
@@ -165,6 +166,7 @@ fn poseidon_renders_compiles_and_verifies() {
     // one non-committed); set num_committed_instances accordingly.
     let num_instances = 1;
     let generator = SolidityGenerator::new(&srs, vk.vk(), num_instances, 1);
+    assert_poseidon_quotient_manifest(&generator);
     let trace_solidity = halo2_solidity_verifier::SOLIDITY_TRACE_ENABLED;
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
     let (verifier_solidity, vk_solidity) = generator
@@ -253,6 +255,53 @@ fn poseidon_renders_compiles_and_verifies() {
             panic!("verifier halted with gas_used = {gas_used}, reason = {reason}");
         }
     }
+}
+
+fn assert_poseidon_quotient_manifest(generator: &SolidityGenerator<'_>) {
+    let manifest = generator.quotient_identity_manifest();
+    let gate_names = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.source {
+            QuotientIdentitySource::Gate { gate_name, .. } => Some(gate_name.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for expected in [
+        "arith_gate",
+        "12_minus_34",
+        "parallel_add_gate",
+        "full_round_gate",
+    ] {
+        assert!(
+            gate_names.contains(expected),
+            "Poseidon manifest should include normal gate {expected}; got {gate_names:?}"
+        );
+    }
+    assert!(
+        !gate_names.contains("partial_round_gate"),
+        "partial_round_gate should be represented by trash, not normal gate identities"
+    );
+    let trash_names = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.source {
+            QuotientIdentitySource::Trash { trash_name, .. } => Some(trash_name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(manifest.trash_identities, 1);
+    assert!(
+        trash_names
+            .iter()
+            .any(|name| name.contains("partial_round_gate")),
+        "Poseidon trash manifest should name partial_round_gate; got {trash_names:?}"
+    );
+    assert_eq!(manifest.lookup_identities, 3);
+    assert!(
+        manifest.permutation_identities > 0,
+        "Poseidon fixture should include copy/permutation identities"
+    );
 }
 
 fn env_flag_enabled(name: &str) -> bool {

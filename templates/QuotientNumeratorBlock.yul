@@ -124,6 +124,7 @@
                 //   0x19 native permutation    0x1b native heavy identity
                 //   0x1c LIN7                 0x1d BILIN7_ROW
                 //   0x1e BILIN7_PAIRWISE      0x1f native lookup
+                //   0x20 POW5
                 //
                 // There are two physical encodings for the same logical VM:
                 // packed32 and byte-oriented. Packed32 implements the fixed
@@ -270,6 +271,9 @@
                 0x1f native_lookup
                   effect: evaluate and fold LogUp boundary/helper/accumulator
                           identities at this VM stream position
+
+                0x20 pow5
+                  effect: q_top = q_top^5
 
                 Memory token map used by 0x03/0x04:
                 0x01 L_0_MPTR
@@ -434,6 +438,13 @@
                     {# VM 0x08 NEG: replace q_top with its Fr negation. #}
                     case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
+                    }
+                    {%- endif %}
+                    {%- if program.op_usage.pow5 %}
+                    {# VM 0x20 POW5: replace q_top with q_top^5. #}
+                    case {{ template_constants.quotient_vm.op.pow5|hex() }} {
+                        let q2 := mulmod(q_top, q_top, r)
+                        q_top := mulmod(q_top, mulmod(q2, q2, r), r)
                     }
                     {%- endif %}
                     {%- if program.op_usage.push_const_u8 %}
@@ -803,6 +814,13 @@
                     {# VM 0x08 NEG: replace q_top with its Fr negation. #}
                     case {{ template_constants.quotient_vm.op.neg|hex() }} {
                         q_top := addmod(0, sub(r, q_top), r)
+                    }
+                    {%- endif %}
+                    {%- if program.op_usage.pow5 %}
+                    {# VM 0x20 POW5: replace q_top with q_top^5. #}
+                    case {{ template_constants.quotient_vm.op.pow5|hex() }} {
+                        let q2 := mulmod(q_top, q_top, r)
+                        q_top := mulmod(q_top, mulmod(q2, q2, r), r)
                     }
                     {%- endif %}
                     {%- if program.op_usage.push_const_u8 %}
