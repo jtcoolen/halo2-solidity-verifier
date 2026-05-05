@@ -317,6 +317,174 @@ Every generated verifier should pass three oracles:
    evaluator, and feature profile.
 3. Every targeted mutation either reverts or fails, never returns true.
 
+## Fixed-Artifact Correctness Strategy
+
+For a single production circuit, do not claim that the generator is correct for
+all possible circuits. Claim correctness of the specific generated verifier
+artifact under review.
+
+The clean two-way claim is:
+
+```text
+For this fixed circuit, fixed VK, fixed Solidity source/bytecode, fixed compiler
+settings, and documented calldata encoding, verifyProof(proof, instances)
+returns true if and only if the Rust Halo2/Midfall verifier accepts the
+corresponding proof and instances.
+```
+
+For on-chain security, the most important claim is the one-way no-false-accepts
+property:
+
+```text
+If the Solidity verifier returns true, then the Rust verifier would accept the
+same mathematical proof for the same VK and public inputs.
+```
+
+### Artifact Manifest
+
+Freeze and record every artifact input that affects verification:
+
+- Generated Solidity file hash.
+- Deployed runtime bytecode hash.
+- Solidity compiler version.
+- Optimizer settings and EVM target.
+- VK hash and embedded constant digest.
+- External VK bytecode hash, if used.
+- External quotient evaluator bytecode hash, if used.
+- Exact ABI: `verifyProof(bytes proof, uint256[] instances)`.
+
+This makes the proof about a concrete verifier artifact, not about the
+generator as a whole.
+
+### Decoding Relation
+
+Document how calldata maps to mathematical verifier objects and Rust verifier
+objects:
+
+| Solidity input | Mathematical object | Rust equivalent |
+| --- | --- | --- |
+| `uint256` scalar word | Element of `Fr`, checked `< r` | `Scalar` |
+| G1 coordinates | Affine BLS12-381 point, checked on curve/subgroup as required | Commitment or proof point |
+| Public input words | Instance field values | `instances` |
+| Embedded constants | Fixed VK commitments and parameters | `VerifyingKey` |
+
+This relation is the bridge between Solidity ABI bytes and Rust verifier types;
+it should explicitly cover endianness, field modulus checks, point encoding,
+dynamic ABI heads, and committed versus uncommitted instance layout.
+
+### Parser Equivalence
+
+Prove every `calldataload` offset reads the same proof field that Rust reads, in
+the same order. Required checks:
+
+- Scalars satisfy `0 <= a < r`.
+- Commitment coordinates are canonical and valid before use, with subgroup
+  requirements documented at the exact EIP-2537 operation that enforces them.
+- Calldata length is exact.
+- Trailing bytes are rejected.
+- Dynamic ABI regions do not overlap and have canonical offsets.
+- No unused calldata word can change transcript or PCS semantics while escaping
+  validation.
+
+### Transcript Equivalence
+
+Show Solidity absorbs the same mathematical objects in the same order as Rust.
+Then prove every challenge agrees:
+
+```text
+theta_sol = theta_rust
+beta_sol  = beta_rust
+gamma_sol = gamma_rust
+y_sol     = y_rust
+x_sol     = x_rust
+x1..x4_sol = x1..x4_rust
+```
+
+This is usually the highest-risk area, so trace it byte-for-byte. The trace
+should identify the absorbed object, its encoded bytes, and the resulting
+challenge for each transcript round.
+
+### Quotient Numerator Equivalence
+
+For the fixed circuit, write the exact generated quotient numerator:
+
+```text
+E(x) = sum_i y^i e_i(x)
+```
+
+where each `e_i` is the concrete gate, permutation, lookup, and trash identity
+for this circuit. Then show the Solidity evaluator computes the same `E(x)`
+using the same advice, fixed, instance, and rotated evaluations:
+
+```text
+a_j(omega^r x)
+```
+
+For one circuit, this can be fully explicit. The argument does not need to cover
+all possible gates or all possible generator outputs.
+
+### Quotient and Linearization Equivalence
+
+The Rust verifier checks, in linearized form:
+
+```text
+E(x) = H(x)(x^n - 1)
+```
+
+with quotient chunks recombined as:
+
+```text
+H(x) = sum_k x^(k(n - 1)) H_k(x)
+```
+
+Show the Solidity artifact computes the same scalar side and the same
+commitment side, including the exact selector folds, quotient chunk order,
+rotation powers, and any external quotient evaluator return values.
+
+### KZG Check Equivalence
+
+Show the Solidity PCS batching constructs the same final KZG opening equation
+as Rust. In essence, it must check:
+
+```text
+C_star - v_star G1 = (s - x3) pi
+```
+
+via the pairing equation:
+
+```text
+e(pi, [s]G2) * e(C_star - v_star G1 + x3 pi, -G2) = 1
+```
+
+For the fixed artifact, prove Solidity computes the same `C_star`, `v_star`,
+and `pi` as Rust.
+
+### Differential Trace Evidence
+
+Back the proof with paired Rust and Solidity traces. They should compare:
+
+- Transcript challenges.
+- Quotient numerator.
+- Selector folds.
+- Linearization scalar.
+- PCS intermediate values.
+- Final pairing inputs.
+- Valid proofs accepted by both verifiers.
+- Mutated proofs rejected by both verifiers, or rejected earlier by stricter
+  Solidity artifact validation.
+
+The intended framing for review is:
+
+```text
+We are not relying on the generator being correct for all circuits. For this one
+circuit, we prove the emitted verifier artifact refines the Rust verifier stage
+by stage. The Solidity parser decodes the same proof object, the transcript
+derives the same challenges, the quotient evaluator computes the same batched
+PLONK numerator, and the PCS code checks the same KZG pairing equation.
+Differential traces compare the Rust and Solidity executions at each semantic
+checkpoint.
+```
+
 ## Proposed Test Suite
 
 | Layer | Tests |
