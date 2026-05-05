@@ -898,8 +898,14 @@ pub(super) enum QuotientLimbShape {
 ///   + sum row-bilinear blocks
 ///   + sum pairwise-bilinear blocks
 ///   + sum scalar_coeff_i * mload(ptr_i)
+///   + sum product_coeff_i * mload(lhs_i) * mload(rhs_i)
 /// )
 /// ```
+///
+/// Some first-modulus residues reduce to sparse affine product identities with
+/// no dense seven-limb block left. Those are still encoded here when they are
+/// conditionally gated, which keeps the opcode tied to ModArith-style custom
+/// gate checks rather than tiny generic arithmetic snippets.
 #[derive(Clone, Debug)]
 pub(super) struct QuotientModarith7Shape {
     cond: Option<u16>,
@@ -908,6 +914,7 @@ pub(super) struct QuotientModarith7Shape {
     rows: Vec<(u16, Vec<(U256, u16)>)>,
     pairwise: Vec<(u16, u16, Vec<U256>)>,
     mem_terms: Vec<(U256, u16)>,
+    product_terms: Vec<(U256, u16, u16)>,
 }
 
 #[derive(Debug, Default)]
@@ -1802,10 +1809,13 @@ impl QuotientProgramBuilder {
         let pairwise_count =
             u8::try_from(shape.pairwise.len()).expect("modarith7 pairwise count checked");
         let mem_count = u8::try_from(shape.mem_terms.len()).expect("modarith7 mem count checked");
+        let product_count =
+            u8::try_from(shape.product_terms.len()).expect("modarith7 product count checked");
         self.bytes.push(lin_count);
         self.bytes.push(row_count);
         self.bytes.push(pairwise_count);
         self.bytes.push(mem_count);
+        self.bytes.push(product_count);
 
         for terms in shape.lin {
             for (coeff, ptr) in terms {
@@ -1838,6 +1848,13 @@ impl QuotientProgramBuilder {
             let slot = u8::try_from(slot).expect("modarith7 mem const slot checked");
             self.bytes.push(slot);
             self.u16(ptr as usize);
+        }
+        for (coeff, lhs, rhs) in shape.product_terms {
+            let slot = self.const_slot(coeff);
+            let slot = u8::try_from(slot).expect("modarith7 product const slot checked");
+            self.bytes.push(slot);
+            self.u16(lhs as usize);
+            self.u16(rhs as usize);
         }
 
         self.profile.modarith7 += 1;
@@ -2874,12 +2891,14 @@ fn quotient_modarith7_op_len(bytes: &[u8], idx: usize) -> usize {
     let row_count = bytes[cursor + 1] as usize;
     let pairwise_count = bytes[cursor + 2] as usize;
     let mem_count = bytes[cursor + 3] as usize;
-    cursor += 4;
+    let product_count = bytes[cursor + 4] as usize;
+    cursor += 5;
     cursor += lin_count * QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
     cursor += row_count
         * (QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES));
     cursor += pairwise_count * (2 * QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_PAIRWISE_COEFFS);
     cursor += mem_count * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
+    cursor += product_count * (1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES);
     cursor - idx
 }
 
@@ -3069,6 +3088,18 @@ fn quotient_modarith7_affine_shape(
             remove_quotient_terms(&mut terms, &used);
             continue;
         }
+        if let Some((shape, used)) = try_quotient_factored_bilin7_row_subshape(&terms) {
+            if used.is_empty() {
+                break;
+            }
+            if let QuotientLimbShape::Bilin7Row { lhs, terms } = shape {
+                rows.push((lhs, terms));
+            } else {
+                unreachable!("factored row recognizer returned non-row shape");
+            }
+            remove_quotient_terms(&mut terms, &used);
+            continue;
+        }
         if let Some((shape, used)) = try_quotient_bilin7_row_subshape(&terms) {
             if used.is_empty() {
                 break;
@@ -3096,9 +3127,6 @@ fn quotient_modarith7_affine_shape(
         break;
     }
 
-    if lin.is_empty() && rows.is_empty() && pairwise.is_empty() {
-        return None;
-    }
     if lin.len() > u8::MAX as usize
         || rows.len() > u8::MAX as usize
         || pairwise.len() > u8::MAX as usize
@@ -3107,19 +3135,47 @@ fn quotient_modarith7_affine_shape(
     }
 
     let mut grouped_mem = Vec::<(u16, Fq)>::new();
+    let mut grouped_products = Vec::<(u16, u16, Fq)>::new();
     for (coeff, term) in terms {
-        let (inner_coeff, ptr) = quotient_mem_term(term)?;
-        add_grouped_limb_coeff(&mut grouped_mem, ptr, coeff * inner_coeff);
+        if let Some((inner_coeff, ptr)) = quotient_mem_term(term) {
+            add_grouped_limb_coeff(&mut grouped_mem, ptr, coeff * inner_coeff);
+        } else if let Some((inner_coeff, lhs, rhs)) = quotient_product_mem_pair(term) {
+            add_grouped_product_coeff(&mut grouped_products, lhs, rhs, coeff * inner_coeff);
+        } else if add_factored_affine_product_terms(
+            &mut grouped_mem,
+            &mut grouped_products,
+            coeff,
+            term,
+        )
+        .is_none()
+        {
+            return None;
+        }
     }
     grouped_mem.retain(|(_, coeff)| *coeff != Fq::ZERO);
     grouped_mem.sort_by_key(|(ptr, _)| *ptr);
-    if grouped_mem.len() > u8::MAX as usize {
+    grouped_products.retain(|(_, _, coeff)| *coeff != Fq::ZERO);
+    grouped_products.sort_by_key(|(lhs, rhs, _)| (*lhs, *rhs));
+    if grouped_mem.len() > u8::MAX as usize || grouped_products.len() > u8::MAX as usize {
         return None;
     }
 
     let nonzero_constant = usize::from(constant != Fq::ZERO);
-    let component_count =
-        lin.len() + rows.len() + pairwise.len() + grouped_mem.len() + nonzero_constant;
+    let component_count = lin.len()
+        + rows.len()
+        + pairwise.len()
+        + grouped_mem.len()
+        + grouped_products.len()
+        + nonzero_constant;
+    if component_count == 0 {
+        return None;
+    }
+    let has_limb_component = !lin.is_empty() || !rows.is_empty() || !pairwise.is_empty();
+    let has_sparse_conditional_products =
+        cond.is_some() && !grouped_products.is_empty() && component_count >= 2;
+    if !has_limb_component && !has_sparse_conditional_products {
+        return None;
+    }
     if cond.is_none() && component_count < 2 {
         return None;
     }
@@ -3134,6 +3190,10 @@ fn quotient_modarith7_affine_shape(
             .into_iter()
             .map(|(ptr, coeff)| (quotient_fq_to_u256(coeff), ptr))
             .collect(),
+        product_terms: grouped_products
+            .into_iter()
+            .map(|(lhs, rhs, coeff)| (quotient_fq_to_u256(coeff), lhs, rhs))
+            .collect(),
     })
 }
 
@@ -3145,6 +3205,122 @@ fn remove_quotient_terms<'a>(terms: &mut Vec<(Fq, &'a QuotientExpr)>, used: &[us
         idx += 1;
         keep
     });
+}
+
+fn add_grouped_product_coeff(grouped: &mut Vec<(u16, u16, Fq)>, lhs: u16, rhs: u16, coeff: Fq) {
+    let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
+    if let Some((_, _, existing)) = grouped
+        .iter_mut()
+        .find(|(existing_lhs, existing_rhs, _)| *existing_lhs == lhs && *existing_rhs == rhs)
+    {
+        *existing += coeff;
+    } else {
+        grouped.push((lhs, rhs, coeff));
+    }
+}
+
+fn add_factored_affine_product_terms(
+    grouped_mem: &mut Vec<(u16, Fq)>,
+    grouped_products: &mut Vec<(u16, u16, Fq)>,
+    term_coeff: Fq,
+    expr: &QuotientExpr,
+) -> Option<()> {
+    let mut factors = Vec::new();
+    collect_product_expr_factors(expr, &mut factors);
+    if factors.len() < 2 {
+        return None;
+    }
+
+    let mut coeff = term_coeff;
+    let mut lhs = None;
+    let mut affine_expr = None;
+    for factor in factors {
+        match factor {
+            QuotientExpr::Const(value) => coeff *= quotient_fq_from_u256(*value)?,
+            QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+                if lhs.replace(u16::try_from(*ptr).ok()?).is_some() {
+                    return None;
+                }
+            }
+            QuotientExpr::Mem(QuotientMem::Token(_))
+            | QuotientExpr::Mem(QuotientMem::TokenOffset(_, _)) => return None,
+            QuotientExpr::Add(_, _) | QuotientExpr::Mul(_, _) | QuotientExpr::Neg(_) => {
+                if affine_expr.replace(factor).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let lhs = lhs?;
+    let affine_expr = affine_expr?;
+    let mut terms = Vec::new();
+    let mut constant = Fq::ZERO;
+    if !collect_quotient_affine_terms(affine_expr, Fq::ONE, &mut terms, &mut constant) {
+        return None;
+    }
+    if constant != Fq::ZERO {
+        add_grouped_limb_coeff(grouped_mem, lhs, coeff * constant);
+    }
+    for (inner_coeff, term) in terms {
+        let (mem_coeff, rhs) = quotient_mem_term(term)?;
+        add_grouped_product_coeff(grouped_products, lhs, rhs, coeff * inner_coeff * mem_coeff);
+    }
+    Some(())
+}
+
+fn try_quotient_factored_bilin7_row_subshape(
+    terms: &[(Fq, &QuotientExpr)],
+) -> Option<(QuotientLimbShape, Vec<usize>)> {
+    for (idx, (coeff, expr)) in terms.iter().enumerate() {
+        if let Some(shape) = quotient_factored_bilin7_row_shape(*coeff, expr) {
+            return Some((shape, vec![idx]));
+        }
+    }
+    None
+}
+
+fn quotient_factored_bilin7_row_shape(
+    term_coeff: Fq,
+    expr: &QuotientExpr,
+) -> Option<QuotientLimbShape> {
+    let mut factors = Vec::new();
+    collect_product_expr_factors(expr, &mut factors);
+    if factors.len() < 2 {
+        return None;
+    }
+
+    let mut coeff = term_coeff;
+    let mut lhs = None;
+    let mut lin_expr = None;
+    for factor in factors {
+        match factor {
+            QuotientExpr::Const(value) => coeff *= quotient_fq_from_u256(*value)?,
+            QuotientExpr::Mem(QuotientMem::Literal(ptr)) => {
+                if lhs.replace(u16::try_from(*ptr).ok()?).is_some() {
+                    return None;
+                }
+            }
+            QuotientExpr::Mem(QuotientMem::Token(_))
+            | QuotientExpr::Mem(QuotientMem::TokenOffset(_, _)) => return None,
+            QuotientExpr::Add(_, _) | QuotientExpr::Mul(_, _) | QuotientExpr::Neg(_) => {
+                if lin_expr.replace(factor).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let lhs = lhs?;
+    let lin_expr = lin_expr?;
+    let mut lin_terms = Vec::new();
+    if !collect_quotient_sum_terms(lin_expr, coeff, &mut lin_terms) {
+        return None;
+    }
+    match try_quotient_lin7_shape(&lin_terms)? {
+        QuotientLimbShape::Lin7 { terms } => Some(QuotientLimbShape::Bilin7Row { lhs, terms }),
+        QuotientLimbShape::Bilin7Row { .. } | QuotientLimbShape::Bilin7Pairwise { .. } => None,
+    }
 }
 
 fn modarith7_coeffs(shape: &QuotientModarith7Shape) -> Vec<U256> {
@@ -3162,6 +3338,7 @@ fn modarith7_coeffs(shape: &QuotientModarith7Shape) -> Vec<U256> {
         coeffs.extend(terms.iter().copied());
     }
     coeffs.extend(shape.mem_terms.iter().map(|(coeff, _)| *coeff));
+    coeffs.extend(shape.product_terms.iter().map(|(coeff, _, _)| *coeff));
     coeffs
 }
 

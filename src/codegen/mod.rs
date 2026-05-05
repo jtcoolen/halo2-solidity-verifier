@@ -2026,10 +2026,14 @@ mod tests {
         let mut expr = QuotientExpr::Const(U256::ZERO);
         let residue = quotient_mul_expr(
             QuotientExpr::Mem(QuotientMem::Literal(0xc00)),
-            QuotientExpr::Mem(QuotientMem::Literal(0xc20)),
+            quotient_mul_expr(
+                QuotientExpr::Mem(QuotientMem::Literal(0xc20)),
+                QuotientExpr::Mem(QuotientMem::Literal(0xc40)),
+            ),
         );
         values.insert(0xc00, Fq::from(211u64));
         values.insert(0xc20, Fq::from(223u64));
+        values.insert(0xc40, Fq::from(227u64));
 
         for i in 0..7u32 {
             let ptr = 0xb00 + i * 0x20;
@@ -2104,15 +2108,24 @@ mod tests {
         let lhs_base = 0xf00;
         let rhs_base = 0x1100;
         let lin_base = 0x1300;
+        let factored_lin_base = 0x1700;
         let cond = 0x1500;
         let scalar = 0x1520;
+        let product_lhs = 0x1540;
+        let product_rhs = 0x1560;
         let mut values = HashMap::new();
         values.insert(cond, Fq::from(3u64));
         values.insert(scalar, Fq::from(5u64));
+        values.insert(product_lhs, Fq::from(11u64));
+        values.insert(product_rhs, Fq::from(13u64));
         for i in 0..7u32 {
             values.insert(lhs_base + i * WORD_BYTES as u32, Fq::from(7 + i as u64));
             values.insert(rhs_base + i * WORD_BYTES as u32, Fq::from(17 + i as u64));
             values.insert(lin_base + i * WORD_BYTES as u32, Fq::from(29 + i as u64));
+            values.insert(
+                factored_lin_base + i * WORD_BYTES as u32,
+                Fq::from(31 + i as u64),
+            );
         }
 
         let mut inner = QuotientExpr::Const(U256::from(41u64));
@@ -2125,6 +2138,22 @@ mod tests {
                 ),
             );
         }
+        let mut factored_lin = QuotientExpr::Const(U256::ZERO);
+        for i in 0..7u32 {
+            factored_lin = quotient_add_expr(
+                factored_lin,
+                quotient_scale_expr(
+                    Fq::from(47 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(
+                        factored_lin_base + i * WORD_BYTES as u32,
+                    )),
+                ),
+            );
+        }
+        inner = quotient_add_expr(
+            inner,
+            quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond)), factored_lin),
+        );
         for i in 0..7u32 {
             for j in 0..7u32 {
                 inner = quotient_add_expr(
@@ -2148,6 +2177,102 @@ mod tests {
             quotient_scale_expr(
                 Fq::from(97u64),
                 QuotientExpr::Mem(QuotientMem::Literal(scalar)),
+            ),
+        );
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(101u64),
+                quotient_mul_expr(
+                    QuotientExpr::Mem(QuotientMem::Literal(product_lhs)),
+                    QuotientExpr::Mem(QuotientMem::Literal(product_rhs)),
+                ),
+            ),
+        );
+        let expr = quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond)), inner);
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_MODARITH7);
+        assert_eq!(quotient_op_len(&builder.bytes, 0), builder.bytes.len());
+        let (ops, mem_tokens) =
+            quotient_program_usage(&builder.bytes, QuotientProgramEncoding::Bytes);
+        assert_eq!(ops, vec![Q_OP_MODARITH7]);
+        assert!(mem_tokens.is_empty());
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_modarith7_sparse_affine_product_matches_direct_expr_eval() {
+        let cond = 0x1800;
+        let linear = 0x1820;
+        let lhs0 = 0x1840;
+        let rhs0 = 0x1860;
+        let lhs1 = 0x1880;
+        let rhs1 = 0x18a0;
+        let factored0 = 0x18c0;
+        let factored1 = 0x18e0;
+        let mut values = HashMap::new();
+        values.insert(cond, Fq::from(3u64));
+        values.insert(linear, Fq::from(5u64));
+        values.insert(lhs0, Fq::from(7u64));
+        values.insert(rhs0, Fq::from(11u64));
+        values.insert(lhs1, Fq::from(13u64));
+        values.insert(rhs1, Fq::from(17u64));
+        values.insert(factored0, Fq::from(19u64));
+        values.insert(factored1, Fq::from(23u64));
+
+        let mut inner = QuotientExpr::Const(U256::from(19u64));
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(23u64),
+                QuotientExpr::Mem(QuotientMem::Literal(linear)),
+            ),
+        );
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(29u64),
+                quotient_mul_expr(
+                    QuotientExpr::Mem(QuotientMem::Literal(lhs0)),
+                    QuotientExpr::Mem(QuotientMem::Literal(rhs0)),
+                ),
+            ),
+        );
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(31u64),
+                quotient_mul_expr(
+                    QuotientExpr::Mem(QuotientMem::Literal(lhs1)),
+                    QuotientExpr::Mem(QuotientMem::Literal(rhs1)),
+                ),
+            ),
+        );
+        let factored = quotient_add_expr(
+            QuotientExpr::Const(U256::from(37u64)),
+            quotient_add_expr(
+                quotient_scale_expr(
+                    Fq::from(41u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(factored0)),
+                ),
+                quotient_scale_expr(
+                    Fq::from(43u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(factored1)),
+                ),
+            ),
+        );
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(47u64),
+                quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond)), factored),
             ),
         );
         let expr = quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond)), inner);
@@ -2492,7 +2617,8 @@ mod tests {
                     let row_count = bytes[idx + 1] as usize;
                     let pairwise_count = bytes[idx + 2] as usize;
                     let mem_count = bytes[idx + 3] as usize;
-                    idx += 4;
+                    let product_count = bytes[idx + 4] as usize;
+                    idx += 5;
 
                     for _ in 0..lin_count {
                         for _ in 0..7 {
@@ -2533,6 +2659,13 @@ mod tests {
                         let ptr = read_u16(bytes, idx + 1) as u32;
                         acc += fq_from_u256(consts[slot]) * mem[&ptr];
                         idx += 3;
+                    }
+                    for _ in 0..product_count {
+                        let slot = bytes[idx] as usize;
+                        let lhs = read_u16(bytes, idx + 1) as u32;
+                        let rhs = read_u16(bytes, idx + 3) as u32;
+                        acc += fq_from_u256(consts[slot]) * mem[&lhs] * mem[&rhs];
+                        idx += 5;
                     }
 
                     if let Some(cond) = cond {

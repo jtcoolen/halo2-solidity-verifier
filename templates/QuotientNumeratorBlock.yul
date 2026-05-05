@@ -1112,6 +1112,7 @@
                         //     + sum BILIN7_ROW blocks
                         //     + sum BILIN7_PAIRWISE blocks
                         //     + sum coeff[k] * mload(ptr[k])
+                        //     + sum coeff[k] * mload(lhs[k]) * mload(rhs[k])
                         //   )
                         // It is a dispatch/operand-load optimization only;
                         // all coefficients still come from the generated
@@ -1135,7 +1136,8 @@
                         let q_row_count := byte(0, mload(add(q_pc, 1)))
                         let q_pairwise_count := byte(0, mload(add(q_pc, 2)))
                         let q_mem_count := byte(0, mload(add(q_pc, 3)))
-                        q_pc := add(q_pc, 4)
+                        let q_product_count := byte(0, mload(add(q_pc, 4)))
+                        q_pc := add(q_pc, 5)
 
                         if q_has_top {
                             mstore(q_sp, q_top)
@@ -1205,6 +1207,22 @@
                             q_acc := addmod(
                                 q_acc,
                                 mulmod(mload(add(q_const_mptr, shl(5, qconst))), mload(q_ptr), r),
+                                r
+                            )
+                        }
+
+                        for { let q_product_block := 0 } lt(q_product_block, q_product_count) { q_product_block := add(q_product_block, 1) } {
+                            let qconst := byte(0, mload(q_pc))
+                            let q_lhs := shr(240, mload(add(q_pc, 1)))
+                            let q_rhs := shr(240, mload(add(q_pc, 3)))
+                            q_pc := add(q_pc, 5)
+                            q_acc := addmod(
+                                q_acc,
+                                mulmod(
+                                    mulmod(mload(q_lhs), mload(q_rhs), r),
+                                    mload(add(q_const_mptr, shl(5, qconst))),
+                                    r
+                                ),
                                 r
                             )
                         }
