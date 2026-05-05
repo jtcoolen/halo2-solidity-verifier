@@ -2090,9 +2090,78 @@ mod tests {
         builder.emit_expr(&expr);
 
         assert!(
-            builder.bytes.contains(&Q_OP_LIN7),
-            "conditional affine factors should still extract LIN7 subshapes"
+            builder.bytes.contains(&Q_OP_MODARITH7),
+            "conditional affine factors should collapse into the fused mod-arith opcode"
         );
+        assert_eq!(
+            eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
+            expected
+        );
+    }
+
+    #[test]
+    fn quotient_vm_modarith7_mixed_affine_matches_direct_expr_eval() {
+        let lhs_base = 0xf00;
+        let rhs_base = 0x1100;
+        let lin_base = 0x1300;
+        let cond = 0x1500;
+        let scalar = 0x1520;
+        let mut values = HashMap::new();
+        values.insert(cond, Fq::from(3u64));
+        values.insert(scalar, Fq::from(5u64));
+        for i in 0..7u32 {
+            values.insert(lhs_base + i * WORD_BYTES as u32, Fq::from(7 + i as u64));
+            values.insert(rhs_base + i * WORD_BYTES as u32, Fq::from(17 + i as u64));
+            values.insert(lin_base + i * WORD_BYTES as u32, Fq::from(29 + i as u64));
+        }
+
+        let mut inner = QuotientExpr::Const(U256::from(41u64));
+        for i in 0..7u32 {
+            inner = quotient_add_expr(
+                inner,
+                quotient_scale_expr(
+                    Fq::from(43 + i as u64),
+                    QuotientExpr::Mem(QuotientMem::Literal(lin_base + i * WORD_BYTES as u32)),
+                ),
+            );
+        }
+        for i in 0..7u32 {
+            for j in 0..7u32 {
+                inner = quotient_add_expr(
+                    inner,
+                    quotient_scale_expr(
+                        Fq::from(53 + i as u64 + j as u64),
+                        quotient_mul_expr(
+                            QuotientExpr::Mem(QuotientMem::Literal(
+                                lhs_base + i * WORD_BYTES as u32,
+                            )),
+                            QuotientExpr::Mem(QuotientMem::Literal(
+                                rhs_base + j * WORD_BYTES as u32,
+                            )),
+                        ),
+                    ),
+                );
+            }
+        }
+        inner = quotient_add_expr(
+            inner,
+            quotient_scale_expr(
+                Fq::from(97u64),
+                QuotientExpr::Mem(QuotientMem::Literal(scalar)),
+            ),
+        );
+        let expr = quotient_mul_expr(QuotientExpr::Mem(QuotientMem::Literal(cond)), inner);
+
+        let expected = eval_quotient_expr_for_test(&expr, &values);
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_MODARITH7);
+        assert_eq!(quotient_op_len(&builder.bytes, 0), builder.bytes.len());
+        let (ops, mem_tokens) =
+            quotient_program_usage(&builder.bytes, QuotientProgramEncoding::Bytes);
+        assert_eq!(ops, vec![Q_OP_MODARITH7]);
+        assert!(mem_tokens.is_empty());
         assert_eq!(
             eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
             expected
@@ -2398,6 +2467,77 @@ mod tests {
                         }
                     }
                     idx += 18;
+                    stack.push(acc);
+                }
+                Q_OP_MODARITH7 => {
+                    idx += 1;
+                    let flags = bytes[idx];
+                    idx += 1;
+                    let cond = if flags & 0x01 != 0 {
+                        let ptr = read_u16(bytes, idx) as u32;
+                        idx += 2;
+                        Some(ptr)
+                    } else {
+                        None
+                    };
+
+                    let mut acc = Fq::ZERO;
+                    if flags & 0x02 != 0 {
+                        let slot = bytes[idx] as usize;
+                        idx += 1;
+                        acc += fq_from_u256(consts[slot]);
+                    }
+
+                    let lin_count = bytes[idx] as usize;
+                    let row_count = bytes[idx + 1] as usize;
+                    let pairwise_count = bytes[idx + 2] as usize;
+                    let mem_count = bytes[idx + 3] as usize;
+                    idx += 4;
+
+                    for _ in 0..lin_count {
+                        for _ in 0..7 {
+                            let slot = bytes[idx] as usize;
+                            let ptr = read_u16(bytes, idx + 1) as u32;
+                            acc += fq_from_u256(consts[slot]) * mem[&ptr];
+                            idx += 3;
+                        }
+                    }
+                    for _ in 0..row_count {
+                        let lhs = read_u16(bytes, idx) as u32;
+                        let lhs_value = mem[&lhs];
+                        idx += 2;
+                        for _ in 0..7 {
+                            let slot = bytes[idx] as usize;
+                            let rhs = read_u16(bytes, idx + 1) as u32;
+                            acc += lhs_value * mem[&rhs] * fq_from_u256(consts[slot]);
+                            idx += 3;
+                        }
+                    }
+                    for _ in 0..pairwise_count {
+                        let lhs_base = read_u16(bytes, idx) as u32;
+                        let rhs_base = read_u16(bytes, idx + 2) as u32;
+                        idx += 4;
+                        let coeff_idx = idx;
+                        idx += 13;
+                        for i in 0..7u32 {
+                            let lhs = mem[&(lhs_base + i * WORD_BYTES as u32)];
+                            for j in 0..7u32 {
+                                let rhs = mem[&(rhs_base + j * WORD_BYTES as u32)];
+                                let slot = bytes[coeff_idx + i as usize + j as usize] as usize;
+                                acc += lhs * rhs * fq_from_u256(consts[slot]);
+                            }
+                        }
+                    }
+                    for _ in 0..mem_count {
+                        let slot = bytes[idx] as usize;
+                        let ptr = read_u16(bytes, idx + 1) as u32;
+                        acc += fq_from_u256(consts[slot]) * mem[&ptr];
+                        idx += 3;
+                    }
+
+                    if let Some(cond) = cond {
+                        acc *= mem[&cond];
+                    }
                     stack.push(acc);
                 }
                 op => panic!("unsupported test quotient VM op {op:#x} at byte {idx}"),

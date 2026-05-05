@@ -1114,6 +1114,7 @@ impl<'a> SolidityGenerator<'a> {
             lin7: has(Q_OP_LIN7),
             bilin7_row: has(Q_OP_BILIN7_ROW),
             bilin7_pairwise: has(Q_OP_BILIN7_PAIRWISE),
+            modarith7: has(Q_OP_MODARITH7),
             pow5: has(Q_OP_POW5),
         }
     }
@@ -3636,15 +3637,17 @@ impl<'a> SolidityGenerator<'a> {
         before: &QuotientShapeProfile,
         after: &QuotientShapeProfile,
     ) {
+        let modarith7 = after.modarith7.saturating_sub(before.modarith7);
         let lin7 = after.lin7.saturating_sub(before.lin7);
         let bilin7_row = after.bilin7_row.saturating_sub(before.bilin7_row);
         let bilin7_pairwise = after.bilin7_pairwise.saturating_sub(before.bilin7_pairwise);
         let pow5 = after.pow5.saturating_sub(before.pow5);
         let fallback_vm_ops = after.fallback_vm_ops.saturating_sub(before.fallback_vm_ops);
         eprintln!(
-            "quotient identity shape profile: idx={} source={} lin7={} bilin7_row={} bilin7_pairwise={} pow5={} fallback_vm_ops={}",
+            "quotient identity shape profile: idx={} source={} modarith7={} lin7={} bilin7_row={} bilin7_pairwise={} pow5={} fallback_vm_ops={}",
             identity.meta.global_index,
             Self::quotient_identity_source_label(&identity.meta.source),
+            modarith7,
             lin7,
             bilin7_row,
             bilin7_pairwise,

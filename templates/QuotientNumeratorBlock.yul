@@ -986,7 +986,7 @@
                         }
                     }
                     {%- endif %}
-                    {%- if program.op_usage.lin7 || program.op_usage.bilin7_row || program.op_usage.bilin7_pairwise %}
+                    {%- if program.op_usage.lin7 || program.op_usage.bilin7_row || program.op_usage.bilin7_pairwise || program.op_usage.modarith7 %}
                     // Limb-aware opcodes are opt-in compact forms for
                     // structurally recognized non-SHA foreign-field shapes.
                     // Coefficients are indexes into q_const_mptr, which is
@@ -1097,6 +1097,120 @@
                                     r
                                 )
                             }
+                        }
+                        q_top := q_acc
+                        q_has_top := 1
+                    }
+                    {%- endif %}
+                    {%- if program.op_usage.modarith7 %}
+                    {# VM 0x21 MODARITH7: byte-only fused affine 7-limb foreign-field/ECC identity. #}
+                    case {{ template_constants.quotient_vm.op.modarith7|hex() }} {
+                        // MODARITH7:
+                        //   maybe_cond * (
+                        //       c
+                        //     + sum LIN7 blocks
+                        //     + sum BILIN7_ROW blocks
+                        //     + sum BILIN7_PAIRWISE blocks
+                        //     + sum coeff[k] * mload(ptr[k])
+                        //   )
+                        // It is a dispatch/operand-load optimization only;
+                        // all coefficients still come from the generated
+                        // quotient constant table.
+                        let q_flags := byte(0, mload(q_pc))
+                        q_pc := add(q_pc, 1)
+                        let q_cond_ptr := 0
+                        if and(q_flags, 0x01) {
+                            q_cond_ptr := shr(240, mload(q_pc))
+                            q_pc := add(q_pc, 2)
+                        }
+
+                        let q_acc := 0
+                        if and(q_flags, 0x02) {
+                            let qconst := byte(0, mload(q_pc))
+                            q_pc := add(q_pc, 1)
+                            q_acc := mload(add(q_const_mptr, shl(5, qconst)))
+                        }
+
+                        let q_lin_count := byte(0, mload(q_pc))
+                        let q_row_count := byte(0, mload(add(q_pc, 1)))
+                        let q_pairwise_count := byte(0, mload(add(q_pc, 2)))
+                        let q_mem_count := byte(0, mload(add(q_pc, 3)))
+                        q_pc := add(q_pc, 4)
+
+                        if q_has_top {
+                            mstore(q_sp, q_top)
+                            q_sp := add(q_sp, 0x20)
+                        }
+
+                        for { let q_lin_block := 0 } lt(q_lin_block, q_lin_count) { q_lin_block := add(q_lin_block, 1) } {
+                            for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
+                                let qconst := byte(0, mload(q_pc))
+                                let q_ptr := shr(240, mload(add(q_pc, 1)))
+                                q_pc := add(q_pc, 3)
+                                q_acc := addmod(
+                                    q_acc,
+                                    mulmod(mload(add(q_const_mptr, shl(5, qconst))), mload(q_ptr), r),
+                                    r
+                                )
+                            }
+                        }
+
+                        for { let q_row_block := 0 } lt(q_row_block, q_row_count) { q_row_block := add(q_row_block, 1) } {
+                            let q_lhs := shr(240, mload(q_pc))
+                            q_pc := add(q_pc, 2)
+                            let q_lhs_value := mload(q_lhs)
+                            for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
+                                let qconst := byte(0, mload(q_pc))
+                                let q_rhs := shr(240, mload(add(q_pc, 1)))
+                                q_pc := add(q_pc, 3)
+                                q_acc := addmod(
+                                    q_acc,
+                                    mulmod(
+                                        mulmod(q_lhs_value, mload(q_rhs), r),
+                                        mload(add(q_const_mptr, shl(5, qconst))),
+                                        r
+                                    ),
+                                    r
+                                )
+                            }
+                        }
+
+                        for { let q_pair_block := 0 } lt(q_pair_block, q_pairwise_count) { q_pair_block := add(q_pair_block, 1) } {
+                            let q_lhs_base := shr(240, mload(q_pc))
+                            let q_rhs_base := shr(240, mload(add(q_pc, 2)))
+                            q_pc := add(q_pc, {{ template_constants.quotient_vm.packed_instruction_bytes|hex() }})
+                            let q_coeff_pc := q_pc
+                            q_pc := add(q_pc, {{ template_constants.quotient_vm.limb_pairwise_coeffs }})
+                            for { let q_i := 0 } lt(q_i, {{ template_constants.quotient_vm.limb_count }}) { q_i := add(q_i, 1) } {
+                                let q_lhs_value := mload(add(q_lhs_base, shl(5, q_i)))
+                                for { let q_j := 0 } lt(q_j, {{ template_constants.quotient_vm.limb_count }}) { q_j := add(q_j, 1) } {
+                                    let qconst := byte(0, mload(add(q_coeff_pc, add(q_i, q_j))))
+                                    q_acc := addmod(
+                                        q_acc,
+                                        mulmod(
+                                            mulmod(q_lhs_value, mload(add(q_rhs_base, shl(5, q_j))), r),
+                                            mload(add(q_const_mptr, shl(5, qconst))),
+                                            r
+                                        ),
+                                        r
+                                    )
+                                }
+                            }
+                        }
+
+                        for { let q_mem_block := 0 } lt(q_mem_block, q_mem_count) { q_mem_block := add(q_mem_block, 1) } {
+                            let qconst := byte(0, mload(q_pc))
+                            let q_ptr := shr(240, mload(add(q_pc, 1)))
+                            q_pc := add(q_pc, 3)
+                            q_acc := addmod(
+                                q_acc,
+                                mulmod(mload(add(q_const_mptr, shl(5, qconst))), mload(q_ptr), r),
+                                r
+                            )
+                        }
+
+                        if and(q_flags, 0x01) {
+                            q_acc := mulmod(mload(q_cond_ptr), q_acc, r)
                         }
                         q_top := q_acc
                         q_has_top := 1

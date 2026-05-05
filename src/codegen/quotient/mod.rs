@@ -417,6 +417,10 @@ pub(super) const Q_OP_BILIN7_ROW: u8 = 0x1d;
 pub(super) const Q_OP_BILIN7_PAIRWISE: u8 = 0x1e;
 pub(super) const Q_OP_NATIVE_LOOKUP: u8 = 0x1f;
 pub(super) const Q_OP_POW5: u8 = 0x20;
+pub(super) const Q_OP_MODARITH7: u8 = 0x21;
+
+const Q_MODARITH7_FLAG_COND: u8 = 0x01;
+const Q_MODARITH7_FLAG_CONST: u8 = 0x02;
 
 // Memory tokens compress generated Yul symbols whose concrete addresses depend
 // on the memory planner. Literal pointers are used for most proof/VK evals;
@@ -452,6 +456,7 @@ pub(super) enum QuotientOpcodeEncoding {
     LimbLin,
     LimbBilinRow,
     LimbBilinPairwise,
+    LimbModarith7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -712,6 +717,13 @@ pub(super) const QUOTIENT_OPCODE_TABLE: &[QuotientOpcodeSpec] = &[
         packed32: false,
     },
     QuotientOpcodeSpec {
+        name: "modarith7",
+        opcode: Q_OP_MODARITH7,
+        byte_len: 0,
+        encoding: QuotientOpcodeEncoding::LimbModarith7,
+        packed32: false,
+    },
+    QuotientOpcodeSpec {
         name: "pow5",
         opcode: Q_OP_POW5,
         byte_len: 1,
@@ -825,6 +837,8 @@ pub(super) enum QuotientExpr {
 /// the generated verifier ABI.
 #[derive(Clone, Debug, Default)]
 pub(super) struct QuotientShapeProfile {
+    /// Number of whole affine foreign-field/ECC identities emitted.
+    pub(super) modarith7: usize,
     /// Number of `LIN7` expressions emitted.
     pub(super) lin7: usize,
     /// Number of `BILIN7_ROW` expressions emitted.
@@ -868,6 +882,32 @@ pub(super) enum QuotientLimbShape {
         rhs_base: u16,
         coeffs: Vec<U256>,
     },
+}
+
+/// One fused foreign-field/ECC affine identity.
+///
+/// This is a bundled version of the same structural limb blocks as
+/// `QuotientLimbShape`, plus scalar memory terms and an optional outer
+/// condition. It deliberately remains expression-shaped rather than
+/// gate-name-shaped:
+///
+/// ```text
+/// maybe_cond * (
+///     c
+///   + sum lin7 blocks
+///   + sum row-bilinear blocks
+///   + sum pairwise-bilinear blocks
+///   + sum scalar_coeff_i * mload(ptr_i)
+/// )
+/// ```
+#[derive(Clone, Debug)]
+pub(super) struct QuotientModarith7Shape {
+    cond: Option<u16>,
+    constant: U256,
+    lin: Vec<Vec<(U256, u16)>>,
+    rows: Vec<(u16, Vec<(U256, u16)>)>,
+    pairwise: Vec<(u16, u16, Vec<U256>)>,
+    mem_terms: Vec<(U256, u16)>,
 }
 
 #[derive(Debug, Default)]
@@ -1323,7 +1363,8 @@ impl QuotientProgramBuilder {
         let profile = self.profile;
         if quotient_shape_profile_enabled() {
             eprintln!(
-                "quotient shape profile: lin7={} bilin7_row={} bilin7_pairwise={} pow5={} fallback_vm_ops={} raw_program_bytes={} compact_program_bytes={} consts={}",
+                "quotient shape profile: modarith7={} lin7={} bilin7_row={} bilin7_pairwise={} pow5={} fallback_vm_ops={} raw_program_bytes={} compact_program_bytes={} consts={}",
+                profile.modarith7,
                 profile.lin7,
                 profile.bilin7_row,
                 profile.bilin7_pairwise,
@@ -1402,6 +1443,9 @@ impl QuotientProgramBuilder {
     /// and fused product-add opcodes before using generic stack add/mul/neg.
     pub(super) fn emit_expr(&mut self, expr: &QuotientExpr) {
         if self.try_emit_pow5(expr) {
+            return;
+        }
+        if self.try_emit_modarith7_shape(expr) {
             return;
         }
         if self.try_emit_limb_shape(expr) {
@@ -1490,6 +1534,9 @@ impl QuotientProgramBuilder {
     /// an already-materialized temp.
     fn emit_expr_cse_inner(&mut self, expr: &QuotientExpr, cse: &mut QuotientCseState) {
         if self.try_emit_pow5_cse(expr, cse) {
+            return;
+        }
+        if self.try_emit_modarith7_shape(expr) {
             return;
         }
         if self.try_emit_limb_shape(expr) {
@@ -1634,6 +1681,30 @@ impl QuotientProgramBuilder {
         true
     }
 
+    /// Try to replace a whole affine foreign-field/ECC identity with one
+    /// dynamic byte-only opcode.
+    fn try_emit_modarith7_shape(&mut self, expr: &QuotientExpr) -> bool {
+        if !self.limb_vm_ops {
+            return false;
+        }
+
+        let Some(shape) = quotient_modarith7_shape(expr) else {
+            return false;
+        };
+        if !self.modarith7_shape_has_u8_const_slots(&shape) {
+            return false;
+        }
+
+        self.emit_modarith7_shape(shape);
+        true
+    }
+
+    /// Check whether all coefficients of a fused affine limb identity fit
+    /// one-byte constant-table slots without mutating the builder.
+    fn modarith7_shape_has_u8_const_slots(&self, shape: &QuotientModarith7Shape) -> bool {
+        self.peek_u8_const_slots(&modarith7_coeffs(shape)).is_some()
+    }
+
     /// Check whether all coefficients of a recognized limb shape fit `u8`
     /// constant slots without mutating the builder.
     fn limb_shape_has_u8_const_slots(&self, shape: &QuotientLimbShape) -> bool {
@@ -1700,6 +1771,76 @@ impl QuotientProgramBuilder {
                 self.profile.bilin7_pairwise += 1;
             }
         }
+        self.push_stack();
+    }
+
+    /// Emit the dynamic byte-level representation of one fused affine
+    /// foreign-field/ECC identity.
+    fn emit_modarith7_shape(&mut self, shape: QuotientModarith7Shape) {
+        self.bytes.push(Q_OP_MODARITH7);
+
+        let mut flags = 0u8;
+        if shape.cond.is_some() {
+            flags |= Q_MODARITH7_FLAG_COND;
+        }
+        if shape.constant != U256::ZERO {
+            flags |= Q_MODARITH7_FLAG_CONST;
+        }
+        self.bytes.push(flags);
+
+        if let Some(cond) = shape.cond {
+            self.u16(cond as usize);
+        }
+        if shape.constant != U256::ZERO {
+            let slot = self.const_slot(shape.constant);
+            let slot = u8::try_from(slot).expect("modarith7 const slot checked");
+            self.bytes.push(slot);
+        }
+
+        let lin_count = u8::try_from(shape.lin.len()).expect("modarith7 lin count checked");
+        let row_count = u8::try_from(shape.rows.len()).expect("modarith7 row count checked");
+        let pairwise_count =
+            u8::try_from(shape.pairwise.len()).expect("modarith7 pairwise count checked");
+        let mem_count = u8::try_from(shape.mem_terms.len()).expect("modarith7 mem count checked");
+        self.bytes.push(lin_count);
+        self.bytes.push(row_count);
+        self.bytes.push(pairwise_count);
+        self.bytes.push(mem_count);
+
+        for terms in shape.lin {
+            for (coeff, ptr) in terms {
+                let slot = self.const_slot(coeff);
+                let slot = u8::try_from(slot).expect("modarith7 lin const slot checked");
+                self.bytes.push(slot);
+                self.u16(ptr as usize);
+            }
+        }
+        for (lhs, terms) in shape.rows {
+            self.u16(lhs as usize);
+            for (coeff, rhs) in terms {
+                let slot = self.const_slot(coeff);
+                let slot = u8::try_from(slot).expect("modarith7 row const slot checked");
+                self.bytes.push(slot);
+                self.u16(rhs as usize);
+            }
+        }
+        for (lhs_base, rhs_base, coeffs) in shape.pairwise {
+            self.u16(lhs_base as usize);
+            self.u16(rhs_base as usize);
+            for coeff in coeffs {
+                let slot = self.const_slot(coeff);
+                let slot = u8::try_from(slot).expect("modarith7 pairwise const slot checked");
+                self.bytes.push(slot);
+            }
+        }
+        for (coeff, ptr) in shape.mem_terms {
+            let slot = self.const_slot(coeff);
+            let slot = u8::try_from(slot).expect("modarith7 mem const slot checked");
+            self.bytes.push(slot);
+            self.u16(ptr as usize);
+        }
+
+        self.profile.modarith7 += 1;
         self.push_stack();
     }
 
@@ -2189,7 +2330,9 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
                 out.extend_from_slice(&((lhs << 16) | rhs).to_be_bytes());
                 idx += 5;
             }
-            Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 | Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+            Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8
+            | Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16
+            | Q_OP_MODARITH7 => {
                 panic!("packed quotient VM expects un-compacted quotient op stream")
             }
             op => panic!("unknown quotient op {op:#x} at byte {idx}"),
@@ -2204,7 +2347,7 @@ pub(super) fn quotient_program_uses_limb_ops(bytes: &[u8]) -> bool {
     while idx < bytes.len() {
         if matches!(
             bytes[idx],
-            Q_OP_LIN7 | Q_OP_BILIN7_ROW | Q_OP_BILIN7_PAIRWISE
+            Q_OP_LIN7 | Q_OP_BILIN7_ROW | Q_OP_BILIN7_PAIRWISE | Q_OP_MODARITH7
         ) {
             return true;
         }
@@ -2696,14 +2839,48 @@ pub(super) fn quotient_commutative_expr_key(
     }
 }
 
-/// Fixed byte length of the opcode at `idx` in an un-compacted stream.
+/// Byte length of the opcode at `idx`.
 ///
-/// This helper is intentionally used only where dynamic run opcodes cannot be
-/// present or where the caller handles them through a table with fixed lengths.
+/// Fixed-width opcodes are read from the spec table; byte-only run and
+/// MODARITH7 opcodes decode their embedded counts.
 pub(super) fn quotient_op_len(bytes: &[u8], idx: usize) -> usize {
     let op = bytes[idx];
-    quotient_opcode_byte_len(op)
-        .unwrap_or_else(|| panic!("unknown quotient op {op:#x} at byte {idx}"))
+    match op {
+        Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+            1 + QUOTIENT_VM_BYTE_U16_BYTES
+                + (read_u16(bytes, idx + 1) as usize) * (2 * QUOTIENT_VM_BYTE_U16_BYTES + 1)
+        }
+        Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+            1 + QUOTIENT_VM_BYTE_U16_BYTES
+                + (read_u16(bytes, idx + 1) as usize) * (QUOTIENT_VM_BYTE_U16_BYTES + 1)
+        }
+        Q_OP_MODARITH7 => quotient_modarith7_op_len(bytes, idx),
+        _ => quotient_opcode_byte_len(op)
+            .unwrap_or_else(|| panic!("unknown quotient op {op:#x} at byte {idx}")),
+    }
+}
+
+fn quotient_modarith7_op_len(bytes: &[u8], idx: usize) -> usize {
+    let mut cursor = idx + 1;
+    let flags = bytes[cursor];
+    cursor += 1;
+    if flags & Q_MODARITH7_FLAG_COND != 0 {
+        cursor += QUOTIENT_VM_BYTE_U16_BYTES;
+    }
+    if flags & Q_MODARITH7_FLAG_CONST != 0 {
+        cursor += 1;
+    }
+    let lin_count = bytes[cursor] as usize;
+    let row_count = bytes[cursor + 1] as usize;
+    let pairwise_count = bytes[cursor + 2] as usize;
+    let mem_count = bytes[cursor + 3] as usize;
+    cursor += 4;
+    cursor += lin_count * QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
+    cursor += row_count
+        * (QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES));
+    cursor += pairwise_count * (2 * QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_PAIRWISE_COEFFS);
+    cursor += mem_count * (1 + QUOTIENT_VM_BYTE_U16_BYTES);
+    cursor - idx
 }
 
 /// Return the leaf form of an expression, if it has no arithmetic children.
@@ -2830,6 +3007,162 @@ pub(super) fn quotient_limb_subshape(
         residue = quotient_sum_expr(residue, quotient_scaled_term_expr(coeff, (*term).clone()));
     }
     Some((shape, residue))
+}
+
+/// Recognize a whole affine foreign-field/ECC identity that can be evaluated
+/// by the dynamic `MODARITH7` opcode.
+pub(super) fn quotient_modarith7_shape(expr: &QuotientExpr) -> Option<QuotientModarith7Shape> {
+    if let Some((cond, inner)) = quotient_condition_factor(expr) {
+        if let Some(shape) = quotient_modarith7_affine_shape(Some(cond), &inner) {
+            return Some(shape);
+        }
+    }
+    quotient_modarith7_affine_shape(None, expr)
+}
+
+/// Split `cond * inner` when `cond` is a literal memory load, moving any scalar
+/// factor attached to `cond` into `inner`.
+fn quotient_condition_factor(expr: &QuotientExpr) -> Option<(u16, QuotientExpr)> {
+    let QuotientExpr::Mul(lhs, rhs) = expr else {
+        return None;
+    };
+
+    if let Some((coeff, ptr)) = quotient_mem_term(lhs) {
+        return Some((ptr, quotient_scaled_term_expr(coeff, rhs.as_ref().clone())));
+    }
+    if let Some((coeff, ptr)) = quotient_mem_term(rhs) {
+        return Some((ptr, quotient_scaled_term_expr(coeff, lhs.as_ref().clone())));
+    }
+    None
+}
+
+fn quotient_modarith7_affine_shape(
+    cond: Option<u16>,
+    expr: &QuotientExpr,
+) -> Option<QuotientModarith7Shape> {
+    let mut terms = Vec::new();
+    let mut constant = Fq::ZERO;
+    if !collect_quotient_affine_terms(expr, Fq::ONE, &mut terms, &mut constant) {
+        return None;
+    }
+    terms.retain(|(coeff, _)| *coeff != Fq::ZERO);
+
+    let mut lin = Vec::new();
+    let mut rows = Vec::new();
+    let mut pairwise = Vec::new();
+
+    loop {
+        if let Some((shape, used)) = try_quotient_bilin7_pairwise_subshape(&terms) {
+            if used.is_empty() {
+                break;
+            }
+            if let QuotientLimbShape::Bilin7Pairwise {
+                lhs_base,
+                rhs_base,
+                coeffs,
+            } = shape
+            {
+                pairwise.push((lhs_base, rhs_base, coeffs));
+            } else {
+                unreachable!("pairwise recognizer returned non-pairwise shape");
+            }
+            remove_quotient_terms(&mut terms, &used);
+            continue;
+        }
+        if let Some((shape, used)) = try_quotient_bilin7_row_subshape(&terms) {
+            if used.is_empty() {
+                break;
+            }
+            if let QuotientLimbShape::Bilin7Row { lhs, terms } = shape {
+                rows.push((lhs, terms));
+            } else {
+                unreachable!("row recognizer returned non-row shape");
+            }
+            remove_quotient_terms(&mut terms, &used);
+            continue;
+        }
+        if let Some((shape, used)) = try_quotient_lin7_subshape(&terms) {
+            if used.is_empty() {
+                break;
+            }
+            if let QuotientLimbShape::Lin7 { terms } = shape {
+                lin.push(terms);
+            } else {
+                unreachable!("linear recognizer returned non-linear shape");
+            }
+            remove_quotient_terms(&mut terms, &used);
+            continue;
+        }
+        break;
+    }
+
+    if lin.is_empty() && rows.is_empty() && pairwise.is_empty() {
+        return None;
+    }
+    if lin.len() > u8::MAX as usize
+        || rows.len() > u8::MAX as usize
+        || pairwise.len() > u8::MAX as usize
+    {
+        return None;
+    }
+
+    let mut grouped_mem = Vec::<(u16, Fq)>::new();
+    for (coeff, term) in terms {
+        let (inner_coeff, ptr) = quotient_mem_term(term)?;
+        add_grouped_limb_coeff(&mut grouped_mem, ptr, coeff * inner_coeff);
+    }
+    grouped_mem.retain(|(_, coeff)| *coeff != Fq::ZERO);
+    grouped_mem.sort_by_key(|(ptr, _)| *ptr);
+    if grouped_mem.len() > u8::MAX as usize {
+        return None;
+    }
+
+    let nonzero_constant = usize::from(constant != Fq::ZERO);
+    let component_count =
+        lin.len() + rows.len() + pairwise.len() + grouped_mem.len() + nonzero_constant;
+    if cond.is_none() && component_count < 2 {
+        return None;
+    }
+
+    Some(QuotientModarith7Shape {
+        cond,
+        constant: quotient_fq_to_u256(constant),
+        lin,
+        rows,
+        pairwise,
+        mem_terms: grouped_mem
+            .into_iter()
+            .map(|(ptr, coeff)| (quotient_fq_to_u256(coeff), ptr))
+            .collect(),
+    })
+}
+
+fn remove_quotient_terms<'a>(terms: &mut Vec<(Fq, &'a QuotientExpr)>, used: &[usize]) {
+    let used = used.iter().copied().collect::<HashSet<_>>();
+    let mut idx = 0usize;
+    terms.retain(|_| {
+        let keep = !used.contains(&idx);
+        idx += 1;
+        keep
+    });
+}
+
+fn modarith7_coeffs(shape: &QuotientModarith7Shape) -> Vec<U256> {
+    let mut coeffs = Vec::new();
+    if shape.constant != U256::ZERO {
+        coeffs.push(shape.constant);
+    }
+    for terms in &shape.lin {
+        coeffs.extend(terms.iter().map(|(coeff, _)| *coeff));
+    }
+    for (_, terms) in &shape.rows {
+        coeffs.extend(terms.iter().map(|(coeff, _)| *coeff));
+    }
+    for (_, _, terms) in &shape.pairwise {
+        coeffs.extend(terms.iter().copied());
+    }
+    coeffs.extend(shape.mem_terms.iter().map(|(coeff, _)| *coeff));
+    coeffs
 }
 
 /// Collect additive terms for subshape extraction, preserving constants as the

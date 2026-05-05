@@ -166,6 +166,7 @@ pub(crate) struct QuotientVmOpcodeTemplateConstants {
     pub(crate) lin7: u8,
     pub(crate) bilin7_row: u8,
     pub(crate) bilin7_pairwise: u8,
+    pub(crate) modarith7: u8,
     pub(crate) pow5: u8,
 }
 
@@ -280,6 +281,7 @@ impl Default for TemplateConstants {
                     lin7: q::Q_OP_LIN7,
                     bilin7_row: q::Q_OP_BILIN7_ROW,
                     bilin7_pairwise: q::Q_OP_BILIN7_PAIRWISE,
+                    modarith7: q::Q_OP_MODARITH7,
                     pow5: q::Q_OP_POW5,
                 },
                 mem: QuotientVmMemTokenTemplateConstants {
@@ -788,6 +790,7 @@ pub(crate) struct QuotientVmOpcodeUsage {
     pub(crate) lin7: bool,
     pub(crate) bilin7_row: bool,
     pub(crate) bilin7_pairwise: bool,
+    pub(crate) modarith7: bool,
     pub(crate) pow5: bool,
 }
 
