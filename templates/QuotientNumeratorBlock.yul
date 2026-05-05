@@ -55,7 +55,9 @@
                 // After all identities, this is nu_y(x) for the `None`
                 // identity group.
                 mstore({{ program.eval_numer_mptr|hex() }}, 0)
+                {%- if self.trace %}
                 mstore({{ program.trace_id_mptr|hex() }}, {{ quotient_identity_trace_base }})
+                {%- endif %}
                 {%- if simple_selector_cols.len() > 0 %}
                 // Simple selectors are grouped into separate linearization
                 // buckets. They start at zero for every proof.
@@ -620,8 +622,10 @@
                     case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
+                        {%- if self.trace %}
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
+                        {%- endif %}
                         // Fully-evaluated identity: qn = qn*y + eval.
                         // This forward Horner fold matches Rust's reverse
                         // y-power fold after all identities have been read.
@@ -639,8 +643,10 @@
                         let q_sel_idx := q_arg
                         let q_eval := q_top
                         q_has_top := 0
+                        {%- if self.trace %}
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
+                        {%- endif %}
                         // Simple-selector identity: advance the global y
                         // position, then accumulate into the selector bucket
                         // with y^-k. The final selector scaling restores the
@@ -1304,8 +1310,10 @@
                     case {{ template_constants.quotient_vm.op.fold_main|hex() }} {
                         let q_eval := q_top
                         q_has_top := 0
+                        {%- if self.trace %}
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
+                        {%- endif %}
                         // Fully-evaluated identity: qn = qn*y + eval.
                         // This matches the reverse y-power fold in Rust
                         // linearization once all identities have been read.
@@ -1324,8 +1332,10 @@
                         q_pc := add(q_pc, 2)
                         let q_eval := q_top
                         q_has_top := 0
+                        {%- if self.trace %}
                         trace_u256(mload({{ program.trace_id_mptr|hex() }}), q_eval)
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
+                        {%- endif %}
                         // Simple-selector identity: keep the same y-batch
                         // position as main identities, but defer the final
                         // y^m scaling so equal selector commitments are
@@ -1378,7 +1388,9 @@
                 // It is used for monolithic/experimental generation modes.
                 let delta := {{ fr_delta }} // BLS12-381 Fr::DELTA
                 let y := mload(Y_MPTR)
+                {%- if self.trace %}
                 let q_trace_id := {{ quotient_identity_trace_base }}
+                {%- endif %}
 
                 {%- for code_block in quotient_eval_numer_computations %}
                 {%- for line in code_block %}

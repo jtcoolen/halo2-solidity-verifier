@@ -691,19 +691,12 @@ contract Halo2Verifier {
                 }
             }
 
-            // Quotient arithmetic emits this hook in both production and
-            // trace builds so solc via-IR sees the same arithmetic shape.
-            // Production keeps it logless; trace builds emit the value.
+            {%- if self.trace %}
+            // Trace builds emit u256 values through a planned scratch slot.
             function trace_u256(id, value) {
-                {%- if self.trace %}
                 mstore(TRACE_U256_MPTR, value)
                 log1(TRACE_U256_MPTR, 0x20, id)
-                {%- else %}
-                pop(id)
-                mstore(TRACE_U256_MPTR, value)
-                {%- endif %}
             }
-            {%- if self.trace %}
             function trace_point(id, mptr) {
                 log1(mptr, 0x80, id)
             }

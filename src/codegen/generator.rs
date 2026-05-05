@@ -1487,7 +1487,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         cse_mptr: usize,
         helpers: bool,
-        _trace: bool,
+        trace: bool,
     ) -> Vec<Vec<String>> {
         let sel_var = |idx: usize| format!("sel_acc_{}", sorted_simple[idx]);
         let exprs = identities
@@ -1512,10 +1512,12 @@ impl<'a> SolidityGenerator<'a> {
             let value = emitter.emit_identity(expr, &mut block);
             block.push(format!("mstore({eval_scratch_slot:#x}, {value})"));
             block.push("}".to_string());
-            block.push(format!(
-                "trace_u256(q_trace_id, mload({eval_scratch_slot:#x}))"
-            ));
-            block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+            if trace {
+                block.push(format!(
+                    "trace_u256(q_trace_id, mload({eval_scratch_slot:#x}))"
+                ));
+                block.push("q_trace_id := add(q_trace_id, 1)".to_string());
+            }
             block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
             for idx in 0..sorted_simple.len() {
                 block.push(format!(
@@ -1556,7 +1558,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
         state_slots: Option<QuotientStateSlots>,
-        _trace: bool,
+        trace: bool,
     ) -> Vec<String> {
         let mut block = Vec::with_capacity(lines.len() + 6);
         block.push("{".to_string());
@@ -1570,6 +1572,7 @@ impl<'a> SolidityGenerator<'a> {
             &mut block,
             state_slots,
             format!("mload({eval_scratch_slot:#x})"),
+            trace,
         );
         Self::push_structured_fold_advance(
             &mut block,
@@ -1604,7 +1607,12 @@ impl<'a> SolidityGenerator<'a> {
         block: &mut Vec<String>,
         state_slots: Option<QuotientStateSlots>,
         value: impl AsRef<str>,
+        trace: bool,
     ) {
+        if !trace {
+            return;
+        }
+
         let value = value.as_ref();
         if let Some(slots) = state_slots {
             block.push(format!(
@@ -1948,7 +1956,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
         state_slots: Option<QuotientStateSlots>,
-        _trace: bool,
+        trace: bool,
     ) {
         let Some(selector_idx) = pending_selector.take() else {
             return;
@@ -1963,7 +1971,7 @@ impl<'a> SolidityGenerator<'a> {
                 sorted_simple,
                 eval_scratch_slot,
                 state_slots,
-                _trace,
+                trace,
             ));
         } else if !run.is_empty() {
             computations.push(Self::selector_run_quotient_block(
@@ -2117,9 +2125,9 @@ impl<'a> SolidityGenerator<'a> {
         value: impl AsRef<str>,
         sorted_simple: &[usize],
         state_slots: Option<QuotientStateSlots>,
-        _trace: bool,
+        trace: bool,
     ) {
-        Self::push_quotient_trace(block, state_slots, value.as_ref());
+        Self::push_quotient_trace(block, state_slots, value.as_ref(), trace);
         Self::push_structured_fold_advance(block, 1, sorted_simple, "q_main_fold_i", state_slots);
         Self::push_quotient_eval_numer_add(block, state_slots, value.as_ref());
     }
@@ -2193,7 +2201,7 @@ impl<'a> SolidityGenerator<'a> {
         sorted_simple: &[usize],
         scratch_mptr: usize,
         state_slots: Option<QuotientStateSlots>,
-        _trace: bool,
+        trace: bool,
     ) -> Option<Vec<String>> {
         if meta.num_permutation_zs == 0 {
             return None;
@@ -2283,7 +2291,7 @@ impl<'a> SolidityGenerator<'a> {
         );
 
         let fold_eval = |block: &mut Vec<String>| {
-            Self::push_quotient_trace(block, state_slots, "q_perm_eval");
+            Self::push_quotient_trace(block, state_slots, "q_perm_eval", trace);
             Self::push_structured_fold_advance(
                 block,
                 1,

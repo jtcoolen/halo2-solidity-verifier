@@ -115,14 +115,14 @@ contract Halo2QuotientEvaluator {
 
             let r := FR_MODULUS
 
-            // The shared quotient numerator block emits trace hooks in both
-            // embedded and external modes to keep via-IR arithmetic shape
-            // stable. The external evaluator is invoked via STATICCALL, so
-            // this helper is always logless here.
+            {%- if self.trace %}
+            // The external evaluator is invoked via STATICCALL, so trace hooks
+            // are logless here even for trace renders.
             function trace_u256(id, value) {
                 pop(id)
                 mstore(TRACE_U256_MPTR, value)
             }
+            {%- endif %}
 
             // This included block is the main body of the evaluator. It:
             //   1. evaluates gate/permutation/lookup/trash identities in the
