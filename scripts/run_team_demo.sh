@@ -25,6 +25,7 @@ UPDATE_MOONLIGHT=0
 USE_HTTPS=0
 INSTALL_SOLC=1
 PRECHECK_BUILDS=1
+FIX_MOONLIGHT_DEP=1
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\033[1m'
@@ -78,6 +79,7 @@ Options:
   --skip-moonlight         Skip the Moonlight wrap decider bench and trace check.
   --no-solc-install        Do not install .solc/solc automatically.
   --no-precheck-builds     Skip compile-only preflight commands.
+  --no-fix-moonlight-dep   Do not create a local symlink for Moonlight's verifier path dependency.
   -h, --help               Show this help.
 
 Examples:
@@ -163,6 +165,28 @@ abs_path() {
     /*) printf '%s\n' "$1" ;;
     *) printf '%s\n' "$PWD/${1#./}" ;;
   esac
+}
+
+dependency_abs_path() {
+  local base_dir="$1"
+  local dep_path="$2"
+  local parent
+  local leaf
+
+  case "$dep_path" in
+    /*)
+      parent="$(dirname "$dep_path")"
+      leaf="$(basename "$dep_path")"
+      ;;
+    *)
+      parent="$base_dir/$(dirname "$dep_path")"
+      leaf="$(basename "$dep_path")"
+      ;;
+  esac
+
+  local parent_abs
+  parent_abs="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$parent_abs" "$leaf"
 }
 
 solc_version() {
@@ -266,12 +290,41 @@ setup_moonlight() {
   local manifest="$MOONLIGHT_DIR/aggregation/Cargo.toml"
   [[ -f "$manifest" ]] || die "Moonlight manifest not found: $manifest"
 
-  local expected_path="../../$REPO_NAME"
-  if grep -q 'halo2_solidity_verifier.*path *= *"'"$expected_path"'"' "$manifest"; then
-    ok "Moonlight dev dependency points to $expected_path"
+  local manifest_dir
+  manifest_dir="$(dirname "$manifest")"
+  local dep_path
+  dep_path="$(
+    sed -nE '/halo2_solidity_verifier[[:space:]]*=/ {
+      s/.*path[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p
+      q
+    }' "$manifest"
+  )"
+  [[ -n "$dep_path" ]] || die "Moonlight manifest has no halo2_solidity_verifier path dependency: $manifest"
+
+  local dep_abs
+  dep_abs="$(dependency_abs_path "$manifest_dir" "$dep_path")" || die "Could not resolve Moonlight verifier dependency path \"$dep_path\" from $manifest_dir"
+
+  if [[ ! -f "$dep_abs/Cargo.toml" ]]; then
+    if [[ -e "$dep_abs" || -L "$dep_abs" ]]; then
+      die "Moonlight verifier dependency exists but has no Cargo.toml: $dep_abs"
+    fi
+    if [[ "$FIX_MOONLIGHT_DEP" -eq 0 ]]; then
+      die "Moonlight verifier dependency is missing: $dep_abs. Rerun without --no-fix-moonlight-dep or update $manifest."
+    fi
+
+    warn "Moonlight expects halo2_solidity_verifier at $dep_abs, but that path is missing."
+    warn "Creating a local symlink so Moonlight resolves to this checkout: $ROOT_DIR"
+    ln -s "$ROOT_DIR" "$dep_abs"
+  fi
+
+  local root_physical
+  local dep_physical
+  root_physical="$(cd "$ROOT_DIR" && pwd -P)"
+  dep_physical="$(cd "$dep_abs" && pwd -P)"
+  if [[ "$dep_physical" == "$root_physical" ]]; then
+    ok "Moonlight dev dependency path \"$dep_path\" resolves to this checkout"
   else
-    warn "Moonlight dev dependency may not point to this checkout."
-    warn "Expected halo2_solidity_verifier path = \"$expected_path\" in $manifest"
+    die "Moonlight halo2_solidity_verifier path \"$dep_path\" resolves to $dep_physical, not this checkout ($root_physical)"
   fi
 }
 
@@ -411,6 +464,9 @@ while (($#)); do
       ;;
     --no-precheck-builds)
       PRECHECK_BUILDS=0
+      ;;
+    --no-fix-moonlight-dep)
+      FIX_MOONLIGHT_DEP=0
       ;;
     -h|--help)
       usage

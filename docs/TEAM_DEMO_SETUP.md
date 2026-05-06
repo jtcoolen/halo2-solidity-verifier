@@ -195,8 +195,12 @@ parent/
   Moonlight/
 ```
 
-If your checkout names or locations differ, update the path in
-`Moonlight/aggregation/Cargo.toml` before running the bench.
+If your checkout names or locations differ, the one-command runner checks this
+path and creates a local symlink from Moonlight's expected verifier dependency
+path to the current checkout when the target is missing. Pass
+`--no-fix-moonlight-dep` if you prefer the script to fail instead. If you run
+the Cargo command directly, either keep the sibling checkout name above or
+update/create the dependency path yourself before running the bench.
 
 From this verifier repo, run the Moonlight Solidity path with the sibling
 Moonlight manifest path:
