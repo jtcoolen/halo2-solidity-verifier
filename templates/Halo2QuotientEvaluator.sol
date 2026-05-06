@@ -82,14 +82,15 @@ contract Halo2QuotientEvaluator {
     // The numerator block writes one bucket per simple selector, then the
     // fallback copies those buckets into the compact return frame.
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
-    // Callee-local scratch for logless trace hooks. This evaluator is invoked
-    // through STATICCALL, so trace hooks cannot emit LOG records; this word is
-    // overwritten with QUOTIENT_MAGIC immediately before returning.
+    // Callee-local scratch for trace hooks. Trace-enabled verifier builds call
+    // this evaluator with CALL so quotient identity logs can be compared with
+    // the native Rust trace. Production verifier builds keep using STATICCALL
+    // and render this evaluator without trace hooks.
     uint256 internal constant        TRACE_U256_MPTR = {{ memory.quotient_return_mptr|hex() }};
     uint256 internal constant    QUOTIENT_OUTPUT_MPTR = {{ memory.quotient_return_mptr|hex() }};
 
-    // External-call frame metadata. The main verifier staticcalls this
-    // contract with exactly QUOTIENT_FRAME_LEN bytes starting at
+    // External-call frame metadata. The main verifier calls this contract with
+    // exactly QUOTIENT_FRAME_LEN bytes starting at
     // QUOTIENT_FRAME_BASE, then checks the return length and QUOTIENT_MAGIC.
     uint256 internal constant QUOTIENT_FRAME_BASE = {{ quotient_external.frame_base|hex() }};
     uint256 internal constant QUOTIENT_FRAME_LEN = {{ quotient_external.frame_len|hex() }};
@@ -116,11 +117,9 @@ contract Halo2QuotientEvaluator {
             let r := FR_MODULUS
 
             {%- if self.trace %}
-            // The external evaluator is invoked via STATICCALL, so trace hooks
-            // are logless here even for trace renders.
             function trace_u256(id, value) {
-                pop(id)
                 mstore(TRACE_U256_MPTR, value)
+                log1(TRACE_U256_MPTR, 0x20, id)
             }
             {%- endif %}
 

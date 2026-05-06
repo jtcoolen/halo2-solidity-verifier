@@ -1163,7 +1163,11 @@ contract Halo2Verifier {
             // ===============================================================
             {
                 let q_out := SELECTOR_ACC_MPTR
+                {%- if self.trace %}
+                if iszero(call(gas(), quotientEvaluator, 0, {{ qext.frame_base|hex() }}, {{ qext.frame_len|hex() }}, q_out, {{ qext.output_len|hex() }})) { revert(0, 0) }
+                {%- else %}
                 if iszero(staticcall(gas(), quotientEvaluator, {{ qext.frame_base|hex() }}, {{ qext.frame_len|hex() }}, q_out, {{ qext.output_len|hex() }})) { revert(0, 0) }
+                {%- endif %}
                 if iszero(eq(returndatasize(), {{ qext.output_len|hex() }})) { revert(0, 0) }
                 if iszero(eq(mload(q_out), {{ qext.magic|hex_padded(64) }})) { revert(0, 0) }
                 mstore(QUOTIENT_EVAL_MPTR, mload(add(q_out, 0x20)))

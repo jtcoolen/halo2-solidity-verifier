@@ -1093,6 +1093,10 @@ fn poseidon_verifier_variants_compile_with_pinned_solc() {
             fixture.trace_quotient_verifier_solidity.as_str(),
         ),
         (
+            "external quotient trace evaluator",
+            fixture.trace_quotient_evaluator_solidity.as_str(),
+        ),
+        (
             "external quotient trace VK",
             fixture.trace_quotient_vk_solidity.as_str(),
         ),
@@ -1395,6 +1399,7 @@ struct PropertyPoseidonFixture {
     vk_solidity: String,
     quotient_verifier_solidity: String,
     quotient_evaluator_solidity: String,
+    trace_quotient_evaluator_solidity: String,
     trace_quotient_verifier_solidity: String,
     trace_quotient_vk_solidity: String,
     #[allow(dead_code)]
@@ -1474,20 +1479,31 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
     let quotient_address = pin_evm.create(quotient_creation_code);
     let quotient_runtime_size = pin_evm.code_size(quotient_address);
     let quotient_codehash = pin_evm.code_hash(quotient_address);
+    let trace_quotient_evaluator_solidity = generator
+        .render_trace_quotient_evaluator()
+        .expect("trace quotient evaluator render");
+    let trace_quotient_creation_code = compile_solidity(&trace_quotient_evaluator_solidity);
+    let mut trace_pin_evm = Evm::default();
+    let trace_quotient_address = trace_pin_evm.create(trace_quotient_creation_code);
+    let trace_quotient_runtime_size = trace_pin_evm.code_size(trace_quotient_address);
+    let trace_quotient_codehash = trace_pin_evm.code_hash(trace_quotient_address);
     let (quotient_verifier_solidity, quotient_vk_solidity, pinned_quotient_solidity) = generator
         .render_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
         .expect("separate pinned render with quotient evaluator");
     let (trace_quotient_verifier_solidity, trace_quotient_vk_solidity, trace_pinned_quotient) =
         generator
-            .render_trace_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
+            .render_trace_separately_with_pinned_quotient(
+                trace_quotient_runtime_size,
+                trace_quotient_codehash,
+            )
             .expect("trace pinned render with quotient evaluator");
     assert_eq!(
         quotient_evaluator_solidity, pinned_quotient_solidity,
         "pinning the quotient evaluator must not change the evaluator source"
     );
     assert_eq!(
-        quotient_evaluator_solidity, trace_pinned_quotient,
-        "trace pinning must not change the quotient evaluator source"
+        trace_quotient_evaluator_solidity, trace_pinned_quotient,
+        "trace pinning must not change the trace quotient evaluator source"
     );
     assert_eq!(
         vk_solidity, quotient_vk_solidity,
@@ -1518,6 +1534,7 @@ fn load_property_poseidon_fixture() -> PropertyPoseidonFixture {
         vk_solidity,
         quotient_verifier_solidity,
         quotient_evaluator_solidity,
+        trace_quotient_evaluator_solidity,
         trace_quotient_verifier_solidity,
         trace_quotient_vk_solidity,
         trace_verifier_solidity,

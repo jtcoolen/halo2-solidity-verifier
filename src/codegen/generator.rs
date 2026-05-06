@@ -631,13 +631,31 @@ impl<'a> SolidityGenerator<'a> {
         &self,
         quotient_writer: &mut impl fmt::Write,
     ) -> Result<(), fmt::Error> {
-        self.generate_quotient_evaluator().render(quotient_writer)
+        self.generate_quotient_evaluator(false)
+            .render(quotient_writer)
     }
 
     /// Render only `Halo2QuotientEvaluator.sol` and return it as a `String`.
     pub fn render_quotient_evaluator(&self) -> Result<String, fmt::Error> {
         let mut quotient_output = String::new();
         self.render_quotient_evaluator_into(&mut quotient_output)?;
+        Ok(quotient_output)
+    }
+
+    /// Render a trace-enabled `Halo2QuotientEvaluator.sol`.
+    pub fn render_trace_quotient_evaluator_into(
+        &self,
+        quotient_writer: &mut impl fmt::Write,
+    ) -> Result<(), fmt::Error> {
+        self.generate_quotient_evaluator(true)
+            .render(quotient_writer)
+    }
+
+    /// Render a trace-enabled `Halo2QuotientEvaluator.sol` and return it as a
+    /// `String`.
+    pub fn render_trace_quotient_evaluator(&self) -> Result<String, fmt::Error> {
+        let mut quotient_output = String::new();
+        self.render_trace_quotient_evaluator_into(&mut quotient_output)?;
         Ok(quotient_output)
     }
 
@@ -661,7 +679,8 @@ impl<'a> SolidityGenerator<'a> {
         )
         .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
-        self.generate_quotient_evaluator().render(quotient_writer)?;
+        self.generate_quotient_evaluator(crate::SOLIDITY_TRACE_ENABLED)
+            .render(quotient_writer)?;
         Ok(())
     }
 
@@ -705,7 +724,8 @@ impl<'a> SolidityGenerator<'a> {
         )
         .render(verifier_writer)?;
         self.generate_vk().render(vk_writer)?;
-        self.generate_quotient_evaluator().render(quotient_writer)?;
+        self.generate_quotient_evaluator(true)
+            .render(quotient_writer)?;
         Ok(())
     }
 
@@ -3247,7 +3267,7 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     /// Build the Askama model for the standalone quotient evaluator contract.
-    fn generate_quotient_evaluator(&self) -> Halo2QuotientEvaluator {
+    fn generate_quotient_evaluator(&self, trace: bool) -> Halo2QuotientEvaluator {
         let proof_cptr = Ptr::calldata(layout::abi::VERIFY_PROOF_PROOF_CPTR);
 
         let vk = self.generate_vk();
@@ -3351,7 +3371,7 @@ impl<'a> SolidityGenerator<'a> {
                 &sorted_simple,
                 eval_scratch_slot,
                 Some(quotient_state_slots),
-                false,
+                trace,
             ));
         }
         if quotient_plan.has_native_permutation {
@@ -3362,7 +3382,7 @@ impl<'a> SolidityGenerator<'a> {
                 &sorted_simple,
                 quotient_stack_mptr,
                 Some(quotient_state_slots),
-                false,
+                trace,
             ) {
                 quotient_native_permutation_computation = block;
             }
@@ -3375,7 +3395,7 @@ impl<'a> SolidityGenerator<'a> {
                 &sorted_simple,
                 quotient_stack_mptr,
                 Some(quotient_state_slots),
-                false,
+                trace,
             ) {
                 quotient_native_lookup_computation = block;
             }
@@ -3389,7 +3409,7 @@ impl<'a> SolidityGenerator<'a> {
                 &sorted_simple,
                 eval_scratch_slot,
                 Some(quotient_state_slots),
-                false,
+                trace,
             ));
         }
         if quotient_structured_tail_mode() == QuotientStructuredTailMode::Trash
@@ -3401,7 +3421,7 @@ impl<'a> SolidityGenerator<'a> {
                 &evaluator,
                 &sorted_simple,
                 Some(quotient_state_slots),
-                false,
+                trace,
             ) {
                 quotient_post_vm_computations.push(block);
             }
@@ -3439,7 +3459,7 @@ impl<'a> SolidityGenerator<'a> {
 
         let quotient_evaluator = Halo2QuotientEvaluator {
             template_constants: Default::default(),
-            trace: false,
+            trace,
             quotient_yul_helpers: false,
             quotient_pow5_helper,
             quotient_limb7_helper,
