@@ -174,23 +174,21 @@ parent/
 If your checkout names or locations differ, update the path in
 `Moonlight/aggregation/Cargo.toml` before running the bench.
 
-From this verifier repo, run the Moonlight Solidity path with an absolute
-manifest path:
+From this verifier repo, run the Moonlight Solidity path with the sibling
+Moonlight manifest path:
 
 ```bash
-cd /Users/Julien.Coolen/halo2-solidity-verifier-exp
 export SOLC="$PWD/.solc/solc"
 
 MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \
-cargo test --manifest-path /Users/Julien.Coolen/Moonlight/aggregation/Cargo.toml \
+cargo test --manifest-path ../Moonlight/aggregation/Cargo.toml \
   wrap_circuit_composes_two_fold_children_from_four_dummy_fold_proofs --release \
   --lib -- --ignored --nocapture
 ```
 
-Use your own absolute paths if your repos are not under
-`/Users/Julien.Coolen/`. The important part is that Cargo targets Moonlight's
-`aggregation/Cargo.toml` while Moonlight's dev dependency points back to this
-local Solidity verifier checkout.
+The important part is that Cargo targets Moonlight's `aggregation/Cargo.toml`
+while Moonlight's dev dependency points back to this local Solidity verifier
+checkout.
 
 The run is much heavier than the IVC bench. On the demo machine it took about
 23 minutes. The final proof is produced with Midfall's
@@ -222,15 +220,15 @@ public accumulator check enabled, the local demo run was:
 By default, generated Moonlight verifier artifacts are written under:
 
 ```text
-/Users/Julien.Coolen/Moonlight/aggregation/target/moonlight-wrap-solidity-dump
+../Moonlight/aggregation/target/moonlight-wrap-solidity-dump
 ```
 
 To keep the artifacts under this verifier repo instead:
 
 ```bash
 MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \
-MOONLIGHT_WRAP_SOLIDITY_DUMP_DIR=/Users/Julien.Coolen/halo2-solidity-verifier-exp/target/moonlight-wrap-solidity-dump \
-cargo test --manifest-path /Users/Julien.Coolen/Moonlight/aggregation/Cargo.toml \
+MOONLIGHT_WRAP_SOLIDITY_DUMP_DIR=target/moonlight-wrap-solidity-dump \
+cargo test --manifest-path ../Moonlight/aggregation/Cargo.toml \
   wrap_circuit_composes_two_fold_children_from_four_dummy_fold_proofs --release \
   --lib -- --ignored --nocapture
 ```
@@ -373,16 +371,16 @@ meeting. The full bench is faster once dependencies are compiled.
 ### `manifest path aggregation/Cargo.toml does not exist`
 
 You are running the Moonlight command from this verifier repo while using a
-relative Moonlight manifest path. Use the absolute path:
+Moonlight manifest path relative to Moonlight itself. From this verifier repo,
+use the sibling repo path:
 
 ```bash
-cargo test --manifest-path /Users/Julien.Coolen/Moonlight/aggregation/Cargo.toml \
+cargo test --manifest-path ../Moonlight/aggregation/Cargo.toml \
   wrap_circuit_composes_two_fold_children_from_four_dummy_fold_proofs --release \
   --lib -- --ignored --nocapture
 ```
 
-Or `cd /Users/Julien.Coolen/Moonlight` and use
-`--manifest-path aggregation/Cargo.toml`.
+Or `cd ../Moonlight` and use `--manifest-path aggregation/Cargo.toml`.
 
 ### Moonlight cannot find `halo2_solidity_verifier`
 
