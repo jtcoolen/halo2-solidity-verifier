@@ -2430,3 +2430,181 @@ proof bytes, non-canonical scalars, `x_hi`/`y_hi` high-bit pollution, `x = p`,
 `y = p`, off-curve G1s, wrong-subgroup G1s if available, zero-scalar
 accumulator malformed points, VK codehash mismatch, quotient codehash mismatch,
 and forced zero-denominator transcript challenges.
+
+## 2026-05-06 audit addendum: Solidity/Yul verifier shape
+
+I found a few real issues / risky assumptions. I did **not** fully prove the
+Halo2 algebra matches the Rust verifier; this is a manual security pass over
+the Solidity/Yul verifier shape.
+
+### Highest-priority findings
+
+#### 1. **High/Critical on some chains: VK is only codehash-checked in the constructor**
+
+The verifier checks:
+
+```solidity
+authorizedVk.code.length == EXPECTED_VK_LENGTH
+authorizedVk.codehash == EXPECTED_VK_CODEHASH
+```
+
+only once, in the constructor. Later `verifyProof` does:
+
+```yul
+extcodecopy(vk, VK_MPTR, 0x00, 0x4280)
+```
+
+with no fresh `extcodesize` / `extcodehash` check.
+
+On Ethereum-style chains with EIP-6780 semantics, `SELFDESTRUCT` generally no
+longer deletes code except when called in the same transaction as creation, so
+this is much less exploitable there. But on forks/L2s/alt-EVMs without
+equivalent semantics, or in same-transaction edge cases, a metamorphic VK
+address could be changed after verifier deployment. EIP-6780 explicitly says
+same-transaction-created contracts keep old deletion behavior, and older
+`CREATE2` redeploy patterns are not supported after the change. ([Ethereum
+Improvement Proposals][1])
+
+Impact if mutable: catastrophic. The VK payload contains the transcript VK
+digest, quotient VM program/constants, fixed/permutation commitments, and G1/G2
+bases. A replaced VK could likely make the verifier accept attacker-controlled
+proofs or brick all verification.
+
+Fix:
+
+```yul
+if iszero(and(
+    eq(extcodesize(vk), EXPECTED_VK_LENGTH),
+    eq(extcodehash(vk), EXPECTED_VK_CODEHASH)
+)) { revert(0, 0) }
+
+extcodecopy(vk, VK_MPTR, 0x00, EXPECTED_VK_LENGTH)
+```
+
+Or embed the VK payload directly in the verifier.
+
+#### 2. **High/Medium: accumulator decoder appears to accept non-canonical identity encoding**
+
+`load_acc_coord` maps encoded `p - 1` to coordinate zero:
+
+```yul
+let was_p_minus_one := is_bls_p_minus_one(hi, lo)
+if was_p_minus_one {
+    hi := 0
+    lo := 0
+}
+```
+
+For the x-coordinate, `load_acc_coord(... allow_id = 1 ...)` detects the
+explicit identity flag only if subtracting `base` produces `p - 1`. But if the
+public input encodes both coordinates as `p - 1` **without** the x identity
+flag, the decoder can still output EIP-2537 `(0,0)` while `is_id == false`.
+
+EIP-2537 defines `(0,0)` as the point-at-infinity encoding for G1/G2, and
+requires subgroup checks in MSM/pairing precompiles. ([Ethereum Improvement
+Proposals][2]) So the later G1MSM will treat this as identity.
+
+Impact depends on the circuit. If the circuit already enforces the exact
+`AssignedForeignPoint` identity encoding, this is mostly public-input
+malleability. If not, this can become a soundness issue for the public IVC
+accumulator: the verifier may treat an accumulator point as identity even when
+the circuit/public input did not mark it as identity.
+
+Fix: after decoding a non-identity accumulator point, reject decoded `(0,0)`
+unless the canonical identity encoding was used.
+
+Conceptually:
+
+```yul
+let decoded_zero := iszero(or(or(x_hi, x_lo), or(y_hi, y_lo)))
+if and(decoded_zero, iszero(is_id)) {
+    ok := 0
+}
+```
+
+More strictly, require `is_acc_encoded_identity(src)` for any decoded infinity.
+
+#### 3. **Medium: production verifier still emits gas checkpoint logs**
+
+`gas_checkpoint` is active in `verifyProof`:
+
+```yul
+function gas_checkpoint(id) {
+    log1(0, 0, or(shl(248, id), gas()))
+}
+```
+
+This makes valid verification emit many `LOG1`s and prevents use via
+`STATICCALL`. Many verifier integrations expect proof verification to be
+`view`-like; this implementation will revert under static context because `LOG`
+is a state-changing opcode.
+
+Impact: integration breakage and unnecessary gas/event pollution. Not a
+proof-forgery bug.
+
+Fix: compile gas checkpoints only in a trace build, or guard/remove them in
+production.
+
+#### 4. **Medium: strong reliance on exact EIP-2537 semantics and gas schedule**
+
+The verifier calls BLS12-381 precompiles at `0x0b`, `0x0c`, and `0x0f`,
+matching EIP-2537's G1ADD, G1MSM, and pairing addresses. ([Ethereum Improvement
+Proposals][2]) It also relies on field-element encoding rules, including
+64-byte big-endian Fp elements with top 16 bytes zero and `< p`, and on
+MSM/pairing subgroup checks. ([Ethereum Improvement Proposals][2])
+
+The constructor smoke test checks only identity inputs. It does **not** prove
+that the chain's precompiles reject malformed/non-subgroup points, implement
+the same gas schedule, or handle the 78-term MSM used later.
+
+Impact: on a non-conforming fork, this can be either liveness failure or
+soundness failure.
+
+Fix: document exact supported chains/forks, keep the constructor smoke test,
+and add deployment/CI tests for malformed points, non-identity generator
+arithmetic, pairing bilinearity, and the full-size MSM gas path.
+
+### Lower-severity issues / hardening
+
+#### 5. Accumulator validation happens very late
+
+Malformed accumulator public inputs are only decoded and G1MSM-validated after
+the expensive transcript, quotient, identity, and PCS work. A relayer or
+subsidized caller can be griefed with inputs that fail late.
+
+Fix: do accumulator limb packing checks and G1MSM point validation near the
+start, then keep only the final pairing batch until the end.
+
+#### 6. The VK "data-only" runtime is still executable bytecode
+
+For this exact VK, byte 0 is `0x56` (`JUMP`) with an empty stack, so direct
+calls should immediately fail. But the general "runtime contains no callable
+code" claim is fragile: arbitrary data bytecode is still executable. A future
+VK whose first bytes accidentally form a reachable `SELFDESTRUCT` path would be
+dangerous on chains where deletion is possible.
+
+Fix: use a safe runtime wrapper or prefix with an unconditional `STOP`/`INVALID`
+and adjust offsets/hash accordingly.
+
+#### 7. Quotient VM has trusted-program assumptions
+
+The VM has no stack-depth or pointer-range checks, and the comment lists opcode
+`0x20 POW5` although the shown interpreter has no `case 0x20`. Because the
+program is codehash-pinned, this is not directly user-exploitable, but it is a
+codegen/liveness risk.
+
+Fix: add an offline decoder test that proves the pinned `q_program` uses only
+implemented opcodes and never underflows the VM stack; ideally add a known-good
+proof test in constructor-time or deployment CI.
+
+### What I would fix first
+
+1. Re-check `AUTHORIZED_VK` length/hash inside `verifyProof`.
+2. Reject non-canonical accumulator infinity encodings.
+3. Remove `gas_checkpoint` from production.
+4. Add conformance tests for EIP-2537 precompile behavior and full-size MSM gas.
+5. Add generator tests that decode the quotient VM bytecode and compare
+   Solidity outputs against the Rust verifier on valid and invalid proofs.
+
+[1]: https://eips.ethereum.org/EIPS/eip-6780 "EIP-6780: SELFDESTRUCT only in same transaction"
+[2]: https://eips.ethereum.org/EIPS/eip-2537 "EIP-2537: Precompile for BLS12-381 curve operations"
