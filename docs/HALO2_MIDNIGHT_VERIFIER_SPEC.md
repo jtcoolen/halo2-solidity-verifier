@@ -1269,6 +1269,19 @@ let generator = SolidityGenerator::new(params, vk, num_instances, num_committed_
     .set_acc_encoding(Some(AccumulatorEncoding::new(offset, 7, 56)));
 ```
 
+`AccumulatorEncoding::new` matches `AssignedAccumulator<S>::as_public_input`:
+`lhs point, lhs scalar, rhs point, rhs scalar`, with an optional fixed-base
+scalar tail. Moonlight wrap proofs expose an already-collapsed point pair
+instead. For that ABI, use:
+
+```rust
+let generator = SolidityGenerator::new(params, vk, num_instances, num_committed_instances)
+    .set_acc_encoding(Some(AccumulatorEncoding::point_pair(offset, 7, 56)));
+```
+
+The point-pair layout is `lhs point, rhs point`; the generated verifier uses
+implicit unit scalars for both sides and rejects fixed-base scalar tails.
+
 Use `try_set_acc_encoding` instead when the public-input layout comes from
 caller-controlled metadata and should return a typed `GeneratorError` instead
 of panicking. Enabling the accumulator writes the expected accumulator metadata

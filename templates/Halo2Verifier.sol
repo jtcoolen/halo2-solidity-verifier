@@ -1305,14 +1305,19 @@ contract Halo2Verifier {
                 let coord_words := div(add(n, sub(limbs_per_word, 1)), limbs_per_word)
                 let acc_instance_ptr := add(INSTANCE_CPTR, {{ (self.expected_acc_offset * 32)|hex() }})
 
-                // LHS layout: point limbs (x,y), scalar. The collapsed
-                // accumulator has no fixed-base scalars on the LHS.
+                // LHS layout: point limbs (x,y), then either an explicit
+                // scalar word or an implicit unit scalar for already-collapsed
+                // point-pair public inputs.
                 let lhs_scalar_ptr := add(acc_instance_ptr, mul(mul(2, coord_words), 0x20))
                 let lhs_ok, lhs_is_id := load_acc_point(ACC_LHS_MPTR, acc_instance_ptr, bits, n, limb_base)
                 success := and(success, lhs_ok)
                 let acc_scratch := {{ memory.acc_msm_scratch|hex() }}
                 {
+                    {%- if self.expected_acc_has_carried_scalars %}
                     let lhs_scalar := calldataload(lhs_scalar_ptr)
+                    {%- else %}
+                    let lhs_scalar := 1
+                    {%- endif %}
                     pop(lhs_is_id)
                     // Always route the decoded carried point through G1MSM,
                     // even for identity points and zero/one scalars. The
@@ -1328,10 +1333,17 @@ contract Halo2Verifier {
                 }
 
                 {%- if acc_fixed_bases.len() == 0 %}
+                    {%- if self.expected_acc_has_carried_scalars %}
                 // RHS layout for this generated verifier is fully collapsed:
                 // point limbs (x,y), scalar. There is no fixed-base scalar
                 // tail; fixed-base contributions were already folded into
                 // ACC_RHS by the circuit/native accumulator construction.
+                    {%- else %}
+                // RHS layout for this generated verifier is an already
+                // collapsed point pair: lhs point, rhs point. Both carried
+                // scalars are implicit one, and there is no fixed-base scalar
+                // tail.
+                    {%- endif %}
                 {%- else %}
                 // RHS layout for this generated verifier is partially
                 // collapsed: point limbs (x,y), scalar, then fixed-base
@@ -1339,13 +1351,21 @@ contract Halo2Verifier {
                 // lexicographically by name). Each tail scalar is consumed
                 // below and appended to the RHS MSM with its generated base.
                 {%- endif %}
+                {%- if self.expected_acc_has_carried_scalars %}
                 let rhs_instance_ptr := add(lhs_scalar_ptr, 0x20)
+                {%- else %}
+                let rhs_instance_ptr := lhs_scalar_ptr
+                {%- endif %}
                 let rhs_scalar_ptr := add(rhs_instance_ptr, mul(mul(2, coord_words), 0x20))
                 let rhs_ok, rhs_is_id := load_acc_point(ACC_RHS_MPTR, rhs_instance_ptr, bits, n, limb_base)
                 success := and(success, rhs_ok)
                 let acc_pair_ptr := acc_scratch
                 {
+                    {%- if self.expected_acc_has_carried_scalars %}
                     let rhs_scalar := calldataload(rhs_scalar_ptr)
+                    {%- else %}
+                    let rhs_scalar := 1
+                    {%- endif %}
                     pop(rhs_is_id)
                     // Keep the carried RHS point in the MSM input even when
                     // it is encoded as identity or has scalar 0/1, so EIP-2537
@@ -1356,7 +1376,11 @@ contract Halo2Verifier {
                     acc_pair_ptr := add(acc_pair_ptr, {{ template_constants.g1_msm_pair_bytes|hex() }})
                 }
                 {%- if acc_fixed_bases.len() > 0 %}
+                {%- if self.expected_acc_has_carried_scalars %}
                 let fixed_scalar_ptr := add(rhs_scalar_ptr, 0x20)
+                {%- else %}
+                let fixed_scalar_ptr := rhs_scalar_ptr
+                {%- endif %}
                 {%- for (base_mptr, negate_scalar) in acc_fixed_bases %}
                 let fixed_scalar_{{ loop.index0 }} := calldataload(fixed_scalar_ptr)
                 {%- if negate_scalar %}

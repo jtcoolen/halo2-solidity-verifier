@@ -3852,6 +3852,7 @@ impl<'a> SolidityGenerator<'a> {
             expected_acc_offset,
             expected_num_acc_limbs,
             expected_num_acc_limb_bits,
+            expected_acc_has_carried_scalars,
         ) = self
             .acc_encoding
             .map(|acc_encoding| {
@@ -3860,9 +3861,10 @@ impl<'a> SolidityGenerator<'a> {
                     acc_encoding.offset,
                     acc_encoding.num_limbs,
                     acc_encoding.num_limb_bits,
+                    acc_encoding.has_carried_scalars(),
                 )
             })
-            .unwrap_or((false, 0, 0, 0));
+            .unwrap_or((false, 0, 0, 0, false));
 
         let acc_msm_scratch = memory.acc_msm_scratch;
         let g1msm_single_gas_cap = layout::precompile::g1msm_gas_cap(layout::G1_MSM_PAIR_BYTES);
@@ -3966,6 +3968,7 @@ impl<'a> SolidityGenerator<'a> {
             expected_acc_offset,
             expected_num_acc_limbs,
             expected_num_acc_limb_bits,
+            expected_acc_has_carried_scalars,
             acc_fixed_bases,
             acc_msm_scratch,
         };

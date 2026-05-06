@@ -85,7 +85,7 @@ pub struct SolidityGenerator<'a> {
 /// [`SolidityGenerator::try_set_acc_encoding`] is called with `Some`.
 ///
 /// The accumulator is encoded as a tail of the non-committed public-input
-/// vector, starting at [`Self::offset`]. The current Solidity decoder supports
+/// vector, starting at [`Self::offset`]. The default Solidity decoder supports
 /// Midnight's fully-collapsed BLS12-381 accumulator layout:
 ///
 /// ```text
@@ -104,6 +104,20 @@ pub struct AccumulatorEncoding {
     pub num_limbs: usize,
     /// Number of bits per limb.
     pub num_limb_bits: usize,
+    /// Public-input accumulator layout.
+    pub kind: AccumulatorEncodingKind,
+}
+
+/// Public-input layouts supported by the generated accumulator checker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccumulatorEncodingKind {
+    /// `AssignedAccumulator<S>::as_public_input`: lhs point, lhs scalar, rhs
+    /// point, rhs scalar, followed by an optional fixed-base scalar tail.
+    PointAndScalar,
+    /// Already collapsed point-pair layout: lhs point, rhs point. The generated
+    /// verifier treats both carried scalars as one and does not accept a
+    /// fixed-base scalar tail.
+    PointPair,
 }
 
 impl AccumulatorEncoding {
@@ -113,6 +127,8 @@ impl AccumulatorEncoding {
     pub const SUPPORTED_NUM_LIMB_BITS: usize = layout::accumulator::LIMB_BITS;
     /// Public-input words required by the fully collapsed accumulator form.
     pub const FULLY_COLLAPSED_PUBLIC_INPUT_WORDS: usize = 10;
+    /// Public-input words required by an already collapsed `(lhs, rhs)` point pair.
+    pub const POINT_PAIR_PUBLIC_INPUT_WORDS: usize = 8;
 
     /// Return a new `AccumulatorEncoding`.
     pub fn new(offset: usize, num_limbs: usize, num_limb_bits: usize) -> Self {
@@ -120,6 +136,17 @@ impl AccumulatorEncoding {
             offset,
             num_limbs,
             num_limb_bits,
+            kind: AccumulatorEncodingKind::PointAndScalar,
+        }
+    }
+
+    /// Return a point-pair accumulator encoding with implicit unit scalars.
+    pub fn point_pair(offset: usize, num_limbs: usize, num_limb_bits: usize) -> Self {
+        Self {
+            offset,
+            num_limbs,
+            num_limb_bits,
+            kind: AccumulatorEncodingKind::PointPair,
         }
     }
 
@@ -129,16 +156,30 @@ impl AccumulatorEncoding {
         self.num_limbs.div_ceil(limbs_per_instance)
     }
 
-    /// Number of public-input words for two G1 coordinates plus two scalars.
-    fn point_and_scalar_words(self) -> usize {
-        4 * self.coordinate_words() + 2
+    /// Number of public-input words for two G1 coordinates.
+    fn point_pair_words(self) -> usize {
+        4 * self.coordinate_words()
+    }
+
+    fn has_carried_scalars(self) -> bool {
+        matches!(self.kind, AccumulatorEncodingKind::PointAndScalar)
+    }
+
+    /// Number of public-input words occupied by the fixed accumulator payload.
+    fn fixed_payload_words(self) -> usize {
+        self.point_pair_words()
+            + if self.has_carried_scalars() {
+                layout::accumulator::CARRIED_SCALARS
+            } else {
+                0
+            }
     }
 
     /// Minimum number of public-input words occupied by the accumulator tail,
     /// excluding any optional fixed-base scalar tail.
     pub fn fully_collapsed_public_input_words(self) -> Result<usize, GeneratorError> {
         self.validate_for_num_instances(usize::MAX)?;
-        Ok(self.point_and_scalar_words())
+        Ok(self.fixed_payload_words())
     }
 
     /// Validate this encoding against the generated verifier's supported schema.
@@ -155,7 +196,7 @@ impl AccumulatorEncoding {
             });
         }
 
-        let required_words = self.point_and_scalar_words();
+        let required_words = self.fixed_payload_words();
         if self.offset.saturating_add(required_words) > num_instances {
             return Err(GeneratorError::UnsupportedAccumulatorEncoding {
                 offset: self.offset,
@@ -172,7 +213,17 @@ impl AccumulatorEncoding {
     /// Number of optional fixed-base accumulator scalars after the fixed payload.
     fn fixed_scalar_count(self, num_instances: usize) -> Result<usize, GeneratorError> {
         self.validate_for_num_instances(num_instances)?;
-        Ok(num_instances - (self.offset + self.point_and_scalar_words()))
+        let tail = num_instances - (self.offset + self.fixed_payload_words());
+        if self.kind == AccumulatorEncodingKind::PointPair && tail != 0 {
+            return Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                offset: self.offset,
+                num_limbs: self.num_limbs,
+                num_limb_bits: self.num_limb_bits,
+                num_instances,
+                reason: "point-pair accumulator encoding does not support a fixed-base scalar tail",
+            });
+        }
+        Ok(tail)
     }
 }
 
@@ -848,6 +899,10 @@ mod tests {
             "no-tail accumulator renders must explicitly document that no fixed-base scalar tail exists"
         );
         assert!(
+            verifier_template.contains("collapsed point pair"),
+            "point-pair accumulator renders must explicitly document implicit scalar semantics"
+        );
+        assert!(
             verifier_template.contains("RHS layout for this generated verifier is partially"),
             "tail accumulator renders must explicitly document fixed-base scalar tail semantics"
         );
@@ -919,6 +974,21 @@ mod tests {
         assert!(fully_collapsed.validate_for_num_instances(14).is_ok());
         assert_eq!(fully_collapsed.fixed_scalar_count(14), Ok(0));
         assert_eq!(fully_collapsed.fixed_scalar_count(17), Ok(3));
+
+        let point_pair = AccumulatorEncoding::point_pair(4, 7, 56);
+        assert_eq!(
+            point_pair.fully_collapsed_public_input_words(),
+            Ok(AccumulatorEncoding::POINT_PAIR_PUBLIC_INPUT_WORDS)
+        );
+        assert!(point_pair.validate_for_num_instances(12).is_ok());
+        assert_eq!(point_pair.fixed_scalar_count(12), Ok(0));
+        assert!(matches!(
+            point_pair.fixed_scalar_count(13),
+            Err(GeneratorError::UnsupportedAccumulatorEncoding {
+                reason: "point-pair accumulator encoding does not support a fixed-base scalar tail",
+                ..
+            })
+        ));
 
         let wrong_limb_shape = AccumulatorEncoding::new(4, 8, 32);
         assert!(matches!(

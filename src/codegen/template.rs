@@ -629,6 +629,10 @@ pub(crate) struct Halo2Verifier {
     pub(crate) expected_acc_offset: usize,
     pub(crate) expected_num_acc_limbs: usize,
     pub(crate) expected_num_acc_limb_bits: usize,
+    /// Whether the public accumulator payload carries explicit LHS/RHS scalar
+    /// words. Moonlight wrap proofs expose an already collapsed point pair and
+    /// use implicit unit scalars instead.
+    pub(crate) expected_acc_has_carried_scalars: bool,
     /// Fixed bases serialized by `AssignedAccumulator<S>::as_public_input`
     /// for the RHS accumulator MSM, in the exact lexicographic
     /// `BTreeMap` order used by midnight-circuits. This is the public
@@ -1249,6 +1253,7 @@ mod tests {
             expected_acc_offset: 0,
             expected_num_acc_limbs: 0,
             expected_num_acc_limb_bits: 0,
+            expected_acc_has_carried_scalars: false,
             acc_fixed_bases: vec![],
             acc_msm_scratch,
         }

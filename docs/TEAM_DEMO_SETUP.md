@@ -196,6 +196,11 @@ The run is much heavier than the IVC bench. On the demo machine it took about
 23 minutes. The final proof is produced with Midfall's
 `CircuitTranscript<sha3::Keccak256>` and with the final outer proof layout set
 to no fewer-point-sets so it matches the generated Solidity verifier.
+The Solidity path also enables the public accumulator check. Moonlight exposes
+its final wrap accumulator as an already-collapsed `(lhs, rhs)` point pair at
+instance offset `11`, so the verifier uses
+`AccumulatorEncoding::point_pair(offset, 7, 56)` rather than the Midfall IVC
+`point, scalar, point, scalar` layout.
 
 Expected success line:
 
@@ -204,7 +209,15 @@ Expected success line:
 ```
 
 The run also prints an IVC-style gas checkpoint table with section names, gas
-deltas, percentages, measurement overhead, and total transaction gas.
+deltas, percentages, measurement overhead, and total transaction gas. With the
+public accumulator check enabled, the local demo run was:
+
+```text
+[moonlight-wrap-solidity][gas] inferred PCS point sets = 4
+  15   4,998,802,662        64,564     5.6%  public accumulator pairing batch prep
+  total tx gas_used       = 1,302,138 (incl. tx base + calldata + pre-cp1 + post-last)
+[moonlight-wrap-solidity] PASS: final wrap decider proof accepted on-chain in 1302138 gas
+```
 
 By default, generated Moonlight verifier artifacts are written under:
 

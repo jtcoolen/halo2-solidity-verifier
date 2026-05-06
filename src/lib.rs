@@ -15,9 +15,9 @@ mod transcript;
 mod test;
 
 pub use codegen::{
-    encode_calldata_bls_padded, AccumulatorEncoding, GeneratorError, ProofEvaluationCounts,
-    QuotientIdentityManifest, QuotientIdentityManifestEntry, QuotientIdentityManifestTarget,
-    QuotientIdentitySource, SolidityGenerator,
+    encode_calldata_bls_padded, AccumulatorEncoding, AccumulatorEncodingKind, GeneratorError,
+    ProofEvaluationCounts, QuotientIdentityManifest, QuotientIdentityManifestEntry,
+    QuotientIdentityManifestTarget, QuotientIdentitySource, SolidityGenerator,
 };
 pub use evm::{encode_calldata, FN_SIG_VERIFY_PROOF};
 pub use transcript::Keccak256Transcript;

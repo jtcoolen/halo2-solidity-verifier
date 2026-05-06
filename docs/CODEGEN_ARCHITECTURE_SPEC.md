@@ -423,6 +423,15 @@ public input tail. The generated verifier unpacks this data, forms the required
 BLS12-381 points and scalars, and batches the public accumulator pairing work
 with the verifier's pairing path.
 
+Two public-input accumulator layouts are supported:
+
+- `AccumulatorEncoding::new(...)`: Midfall IVC-style accumulator input,
+  encoded as `lhs point, lhs scalar, rhs point, rhs scalar`, with an optional
+  fixed-base scalar tail.
+- `AccumulatorEncoding::point_pair(...)`: already-collapsed Moonlight wrap
+  input, encoded as `lhs point, rhs point`; the generated verifier treats both
+  carried scalars as one and rejects fixed-base scalar tails for this layout.
+
 The accumulator layout is intentionally explicit because public input packing is
 part of the on-chain ABI. Any change to limb count, limb width, point order, or
 public-input placement must update both the Rust-side encoder and the generated
