@@ -1131,37 +1131,19 @@ fn ivc_final_keccak_solidity_e2e() {
     let gas_checkpoints_enabled = halo2_solidity_verifier::SOLIDITY_GAS_CHECKPOINTS_ENABLED;
 
     let t0 = Instant::now();
-    let quotient_solidity = generator
-        .render_quotient_evaluator()
-        .expect("render_quotient_evaluator should succeed");
-    let quotient_creation_code = compile_solidity_with_runs(&quotient_solidity, SOLC_OPTIMIZE_RUNS);
-    let quotient_creation_size = quotient_creation_code.len();
-    let mut evm = Evm::default();
-    let quotient_address = evm.create(quotient_creation_code.clone());
-    let quotient_runtime_size = evm.code_size(quotient_address);
-    let quotient_codehash = evm.code_hash(quotient_address);
-    let (verifier_solidity, vk_solidity, pinned_quotient_solidity) =
-        if cfg!(feature = "rust-verifier-trace") {
-            generator
-                .render_trace_separately_with_pinned_quotient(
-                    quotient_runtime_size,
-                    quotient_codehash,
-                )
-                .expect("render_trace_separately_with_pinned_quotient should succeed")
-        } else {
-            generator
-                .render_separately_with_pinned_quotient(quotient_runtime_size, quotient_codehash)
-                .expect("render_separately_with_pinned_quotient should succeed")
-        };
-    assert_eq!(
-        quotient_solidity, pinned_quotient_solidity,
-        "pinning the quotient evaluator must not change the evaluator source"
-    );
+    let (verifier_solidity, vk_solidity) = if cfg!(feature = "rust-verifier-trace") {
+        generator
+            .render_trace_separately()
+            .expect("render_trace_separately should succeed")
+    } else {
+        generator
+            .render_separately()
+            .expect("render_separately should succeed")
+    };
     println!(
-        "[ivc-keccak-solidity] rendered pinned Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes, Halo2QuotientEvaluator.sol = {} bytes (took {:.2?})",
+        "[ivc-keccak-solidity] rendered merged Halo2Verifier.sol = {} bytes, Halo2VerifyingKey.sol = {} bytes (took {:.2?})",
         verifier_solidity.len(),
         vk_solidity.len(),
-        quotient_solidity.len(),
         t0.elapsed()
     );
 
@@ -1173,11 +1155,7 @@ fn ivc_final_keccak_solidity_e2e() {
     std::fs::create_dir_all(&dump_dir).ok();
     std::fs::write(format!("{dump_dir}/Halo2Verifier.sol"), &verifier_solidity).ok();
     std::fs::write(format!("{dump_dir}/Halo2VerifyingKey.sol"), &vk_solidity).ok();
-    std::fs::write(
-        format!("{dump_dir}/Halo2QuotientEvaluator.sol"),
-        &quotient_solidity,
-    )
-    .ok();
+    std::fs::remove_file(format!("{dump_dir}/Halo2QuotientEvaluator.sol")).ok();
     std::fs::write(format!("{dump_dir}/proof.bin"), &final_proof).ok();
     std::fs::write(
         format!("{dump_dir}/proof-evaluation-counts.txt"),
@@ -1209,22 +1187,17 @@ fn ivc_final_keccak_solidity_e2e() {
         &vk_creation_code,
     )
     .ok();
-    std::fs::write(
-        format!("{dump_dir}/Halo2QuotientEvaluator.creation.bin"),
-        &quotient_creation_code,
-    )
-    .ok();
+    std::fs::remove_file(format!("{dump_dir}/Halo2QuotientEvaluator.creation.bin")).ok();
     println!(
-        "[ivc-keccak-solidity] solc compile completed in {:.2?} (optimize-runs = {SOLC_OPTIMIZE_RUNS}, no CBOR; verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes, quotient creation bytecode = {} bytes)",
+        "[ivc-keccak-solidity] solc compile completed in {:.2?} (optimize-runs = {SOLC_OPTIMIZE_RUNS}, no CBOR; verifier creation bytecode = {} bytes, vk creation bytecode = {} bytes)",
         t0.elapsed(),
         verifier_creation_size,
-        vk_creation_size,
-        quotient_creation_size
+        vk_creation_size
     );
 
+    let mut evm = Evm::default();
     let vk_address = evm.create(vk_creation_code);
-    let verifier_address =
-        evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
+    let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
     let vk_runtime_size = evm.code_size(vk_address);
     let verifier_runtime_size = evm.code_size(verifier_address);
     let vk_codehash = evm.code_hash(vk_address);
@@ -1232,7 +1205,6 @@ fn ivc_final_keccak_solidity_e2e() {
     for (name, runtime_size) in [
         ("Halo2Verifier", verifier_runtime_size),
         ("Halo2VerifyingKey", vk_runtime_size),
-        ("Halo2QuotientEvaluator", quotient_runtime_size),
     ] {
         assert!(
             runtime_size <= EIP170_MAX_RUNTIME_SIZE,
@@ -1246,22 +1218,17 @@ fn ivc_final_keccak_solidity_e2e() {
          solc CBOR metadata: omitted\n\
          Halo2Verifier.sol source bytes: {}\n\
          Halo2VerifyingKey.sol source bytes: {}\n\
-         Halo2QuotientEvaluator.sol source bytes: {}\n\
          Halo2Verifier creation bytecode bytes: {verifier_creation_size}\n\
          Halo2VerifyingKey creation bytecode bytes: {vk_creation_size}\n\
-         Halo2QuotientEvaluator creation bytecode bytes: {quotient_creation_size}\n\
          Halo2Verifier deployed runtime bytes: {verifier_runtime_size}\n\
          Halo2VerifyingKey deployed runtime bytes: {vk_runtime_size}\n\
-         Halo2QuotientEvaluator deployed runtime bytes: {quotient_runtime_size}\n\
          total deployed runtime bytes: {}\n\
          Halo2Verifier deployed runtime keccak256: 0x{verifier_codehash:064x}\n\
-         Halo2VerifyingKey deployed runtime keccak256: 0x{vk_codehash:064x}\n\
-         Halo2QuotientEvaluator deployed runtime keccak256: 0x{quotient_codehash:064x}\n",
+         Halo2VerifyingKey deployed runtime keccak256: 0x{vk_codehash:064x}\n",
         solc_version().expect("pinned solc version already checked"),
         verifier_solidity.len(),
         vk_solidity.len(),
-        quotient_solidity.len(),
-        verifier_runtime_size + vk_runtime_size + quotient_runtime_size
+        verifier_runtime_size + vk_runtime_size
     );
     std::fs::write(
         format!("{dump_dir}/contract-sizes.txt"),
@@ -1269,14 +1236,14 @@ fn ivc_final_keccak_solidity_e2e() {
     )
     .ok();
     println!(
-        "[ivc-keccak-solidity] deployed (vk = {vk_address:?}, quotient = {quotient_address:?}, verifier = {verifier_address:?})"
+        "[ivc-keccak-solidity] deployed (vk = {vk_address:?}, verifier = {verifier_address:?})"
     );
     println!(
-        "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, quotient runtime = {quotient_runtime_size} bytes, total runtime = {} bytes",
-        verifier_runtime_size + vk_runtime_size + quotient_runtime_size
+        "[ivc-keccak-solidity] contract sizes: verifier runtime = {verifier_runtime_size} bytes, vk runtime = {vk_runtime_size} bytes, total runtime = {} bytes",
+        verifier_runtime_size + vk_runtime_size
     );
     println!(
-        "[ivc-keccak-solidity] runtime hashes: verifier = 0x{verifier_codehash:064x}, vk = 0x{vk_codehash:064x}, quotient = 0x{quotient_codehash:064x}"
+        "[ivc-keccak-solidity] runtime hashes: verifier = 0x{verifier_codehash:064x}, vk = 0x{vk_codehash:064x}"
     );
 
     // ----------------------------------------------------------
@@ -1455,7 +1422,6 @@ fn assert_ivc_trace_matches_native_midfall(
     logs: &[halo2_solidity_verifier::revm::primitives::Log],
 ) {
     let solidity_trace = parse_solidity_trace_logs(logs);
-    let external_quotient_trace_id = |id: u64| (30_000..40_000).contains(&id);
     let mut rust_by_id = BTreeMap::new();
     for event in rust_trace {
         assert!(
@@ -1467,14 +1433,12 @@ fn assert_ivc_trace_matches_native_midfall(
         );
     }
 
-    // The IVC verifier uses a pinned external quotient evaluator in trace and
-    // production builds. The evaluator is reached through STATICCALL, so it
-    // cannot emit LOG records for native quotient-arithmetic trace ids.
-    // Transcript, proof, PCS, and pairing trace ids are still emitted by the
-    // main verifier and compared below.
+    // The IVC verifier renders the quotient numerator block directly inside
+    // Halo2Verifier, so quotient trace ids are emitted by the same assembly
+    // frame as transcript, proof, PCS, and pairing trace ids.
     let missing = rust_by_id
         .keys()
-        .filter(|&&id| !external_quotient_trace_id(id) && !solidity_trace.contains_key(&id))
+        .filter(|&&id| !solidity_trace.contains_key(&id))
         .copied()
         .collect::<Vec<_>>();
     assert!(
@@ -1499,9 +1463,6 @@ fn assert_ivc_trace_matches_native_midfall(
 
     let mut matched = 0usize;
     for (id, (name, rust_data)) in rust_by_id {
-        if external_quotient_trace_id(id) {
-            continue;
-        }
         let solidity_data = solidity_trace
             .get(&id)
             .expect("missing Solidity trace id was checked above");

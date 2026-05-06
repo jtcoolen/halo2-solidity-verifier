@@ -3,7 +3,6 @@
 //! Loads the cached
 //!   target/ivc-keccak-solidity-dump/{Halo2Verifier.sol,
 //!                                    Halo2VerifyingKey.sol,
-//!                                    Halo2QuotientEvaluator.sol,
 //!                                    calldata.bin}
 //! produced by the `ivc_keccak_solidity` test, recompiles via solc,
 //! deploys on Prague-spec revm, and calls `verifyProof` with the
@@ -55,9 +54,6 @@ fn main() {
         .expect("Halo2Verifier.sol not found in dump dir; run the test first");
     let vk_solidity = std::fs::read_to_string(format!("{dump_dir}/Halo2VerifyingKey.sol"))
         .expect("Halo2VerifyingKey.sol not found in dump dir; run the test first");
-    let quotient_solidity =
-        std::fs::read_to_string(format!("{dump_dir}/Halo2QuotientEvaluator.sol"))
-            .expect("Halo2QuotientEvaluator.sol not found in dump dir; run the test first");
     let calldata =
         std::fs::read(format!("{dump_dir}/calldata.bin")).expect("calldata.bin not found");
 
@@ -68,24 +64,18 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let vk_creation_code = compile_solidity(&vk_solidity);
-    let quotient_creation_code = compile_solidity(&quotient_solidity);
     let verifier_creation_code = compile_solidity(&verifier_solidity);
     println!(
-        "[ivc-replay] solc compile completed in {:.2?} (verifier bytecode = {} bytes, vk bytecode = {} bytes, quotient bytecode = {} bytes)",
+        "[ivc-replay] solc compile completed in {:.2?} (verifier bytecode = {} bytes, vk bytecode = {} bytes)",
         t0.elapsed(),
         verifier_creation_code.len(),
-        vk_creation_code.len(),
-        quotient_creation_code.len()
+        vk_creation_code.len()
     );
 
     let mut evm = Evm::default();
     let vk_address = evm.create(vk_creation_code);
-    let quotient_address = evm.create(quotient_creation_code);
-    let verifier_address =
-        evm.create_with_two_address_args(verifier_creation_code, vk_address, quotient_address);
-    println!(
-        "[ivc-replay] deployed (vk = {vk_address:?}, quotient = {quotient_address:?}, verifier = {verifier_address:?})"
-    );
+    let verifier_address = evm.create_with_address_arg(verifier_creation_code, vk_address);
+    println!("[ivc-replay] deployed (vk = {vk_address:?}, verifier = {verifier_address:?})");
     println!(
         "[ivc-replay] calldata = {} bytes, gas_cap = {gas_cap}",
         calldata.len()

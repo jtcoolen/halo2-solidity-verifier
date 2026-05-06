@@ -45,10 +45,8 @@ check_hash() {
 
 check_size "Halo2Verifier deployed runtime bytes"
 check_size "Halo2VerifyingKey deployed runtime bytes"
-check_size "Halo2QuotientEvaluator deployed runtime bytes"
 
-check_hash "Halo2Verifier deployed runtime keccak256" "0x444068b6e8ac2ca2a505890f2c1b6c1b92f8695de069562de4c9e7caf26a3640"
-check_hash "Halo2VerifyingKey deployed runtime keccak256" "0x3e935334ddb91f56e302e88a8331e5e639b936e6d2ab1a570cc11f353fb427ce"
-check_hash "Halo2QuotientEvaluator deployed runtime keccak256" "0x414011cf401e996940275baaba5b30fb4bb1fd92d4b440a2f5a17c6d0fc10c59"
+check_hash "Halo2Verifier deployed runtime keccak256" "0x37fca91bd3fe16ac462da8ab79b9891b70d8d7a33af62df713f80a76436fa0b0"
+check_hash "Halo2VerifyingKey deployed runtime keccak256" "0x92dc96f0c5182608e61ac3b9a257294749f67c1306b516b898f6e2456ccfdfc9"
 
 echo "[bytecode-size] release bytecode size and hash checks passed"

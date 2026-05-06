@@ -193,10 +193,10 @@ scripts/run_ivc_bench.sh --no-outer-single-h-commitment
 Native Rust/Solidity trace equivalence is enabled by the `--trace` bench path:
 `scripts/run_ivc_bench.sh --trace`. Custom Midfall overrides must expose the
 `midnight-proofs/solidity-verifier-trace` feature for that leg.
-For the external IVC quotient evaluator, this compares the proof scalar reads
-including `q_evals` and the reconstructed quotient numerator, while internal
-quotient identity trace ids `30_000..40_000` are only available in monolithic
-trace tests because the split evaluator runs under `STATICCALL`.
+The IVC bench renders the quotient numerator block directly inside
+`Halo2Verifier`, so the trace comparison includes quotient identity trace ids
+`30_000..40_000` along with proof scalar reads, `q_evals`, and the reconstructed
+quotient numerator.
 
 Compile-check the IVC bench without running the full proof:
 

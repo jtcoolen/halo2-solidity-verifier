@@ -28,13 +28,15 @@ commitment sign convention.
 
 ## Contract Role
 
-`Halo2QuotientEvaluator` is an external helper contract used by the split
-Solidity verifier. It exists because the batched identity numerator is the
-largest generated arithmetic block. Keeping it in a separate pinned contract
-lets the main verifier and the quotient evaluator each stay below the EIP-170
-runtime-code limit.
+The quotient numerator block can be rendered directly inside `Halo2Verifier` or
+as the external `Halo2QuotientEvaluator` helper used by the split verifier
+mode. The block exists because the batched identity numerator is the largest
+generated arithmetic section. Keeping it internal avoids a `STATICCALL` and
+memory-frame copy when the merged verifier remains below EIP-170; splitting it
+keeps both the main verifier and evaluator below the runtime-code limit for
+larger circuits.
 
-The evaluator:
+In split mode, the evaluator:
 
 1. receives a raw memory frame from `Halo2Verifier`;
 2. copies that frame into the same generated memory addresses;

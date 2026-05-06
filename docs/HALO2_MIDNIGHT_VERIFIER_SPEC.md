@@ -200,9 +200,12 @@ rechecking dependency codehashes on every proof.
 ### 3.3 Split Quotient Mode
 
 For large circuits, quotient numerator reconstruction is the largest generated
-arithmetic block. The generator can split it into `Halo2QuotientEvaluator`.
+arithmetic block. The default separated VK render keeps that block inside
+`Halo2Verifier` when the merged verifier remains below EIP-170. The generator
+can still split it into `Halo2QuotientEvaluator` for larger circuits or
+bytecode experiments.
 
-Production flow:
+Split quotient flow:
 
 1. Render the quotient evaluator with `render_quotient_evaluator()`.
 2. Compile and deploy it.
