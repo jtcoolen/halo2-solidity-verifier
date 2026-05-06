@@ -882,6 +882,26 @@ mod tests {
     }
 
     #[test]
+    fn pinned_dependencies_are_rechecked_during_verification() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+
+        for required in [
+            "eq(extcodesize(vk), EXPECTED_VK_LENGTH)",
+            "eq(extcodehash(vk), EXPECTED_VK_CODEHASH)",
+            "extcodecopy(vk, VK_MPTR, 0x00, EXPECTED_VK_LENGTH)",
+            "eq(extcodesize(quotientEvaluator), EXPECTED_QUOTIENT_LENGTH)",
+            "eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH)",
+            "Re-check the pinned VK dependency on every proof",
+            "Re-check the pinned runtime before every",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "template should re-check pinned dependency at verification time: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn accumulator_schema_is_checked_against_instance_count() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
         let spec = include_str!("../../docs/HALO2_MIDNIGHT_VERIFIER_SPEC.md");

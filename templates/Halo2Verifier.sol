@@ -744,7 +744,16 @@ contract Halo2Verifier {
                 mstore({{ vk_mptr + offset + 4 * loop.index0 + 3 }}, {{ y_lo|hex_padded(64) }})
                 {%- endfor %}
                 {%- when None %}
-                extcodecopy(vk, VK_MPTR, 0x00, {{ vk_len|hex() }})
+                // Re-check the pinned VK dependency on every proof. The
+                // constructor check catches normal deployment mistakes, while
+                // this fresh check hardens forks or same-transaction edge
+                // cases where code at the authorized address could differ
+                // from the runtime originally pinned by this verifier.
+                if iszero(and(
+                    eq(extcodesize(vk), EXPECTED_VK_LENGTH),
+                    eq(extcodehash(vk), EXPECTED_VK_CODEHASH)
+                )) { revert(0, 0) }
+                extcodecopy(vk, VK_MPTR, 0x00, EXPECTED_VK_LENGTH)
                 {%- endmatch %}
 
                 // This verifier is pinned to one generated VK, so schema
@@ -1163,6 +1172,18 @@ contract Halo2Verifier {
             // ===============================================================
             {
                 let q_out := SELECTOR_ACC_MPTR
+                {%- match self.expected_quotient_codehash %}
+                {%- when Some with (_) %}
+                // The quotient evaluator is as correctness-critical as the VK:
+                // it reconstructs the y-batched identity numerator and
+                // selector buckets. Re-check the pinned runtime before every
+                // external call, mirroring the VK freshness guard above.
+                if iszero(and(
+                    eq(extcodesize(quotientEvaluator), EXPECTED_QUOTIENT_LENGTH),
+                    eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH)
+                )) { revert(0, 0) }
+                {%- when None %}
+                {%- endmatch %}
                 {%- if self.trace %}
                 if iszero(call(gas(), quotientEvaluator, 0, {{ qext.frame_base|hex() }}, {{ qext.frame_len|hex() }}, q_out, {{ qext.output_len|hex() }})) { revert(0, 0) }
                 {%- else %}
