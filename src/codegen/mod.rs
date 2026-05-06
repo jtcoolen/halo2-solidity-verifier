@@ -1790,6 +1790,12 @@ mod tests {
             "gas checkpoints should remain an explicit feature flag"
         );
         assert!(
+            lib_source.contains("cfg!(all(")
+                && lib_source.contains("feature = \"solidity-gas-checkpoints\"")
+                && lib_source.contains("feature = \"solidity-trace\""),
+            "default renders should only enable gas checkpoints in trace/profiling builds"
+        );
+        assert!(
             lib_source.contains("render_with_gas_checkpoints*"),
             "docs should call out the explicit benchmarking render helpers"
         );

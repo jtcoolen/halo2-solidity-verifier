@@ -248,7 +248,11 @@ function verifyProof(bytes calldata proof, uint256[] calldata instances)
     returns (bool);
 ```
 
-Trace or gas-checkpoint builds drop `view` because they emit logs.
+Trace builds, and artifacts rendered through the explicit
+`render_with_gas_checkpoints*` profiling helpers, drop `view` because they emit
+logs. Enabling the `solidity-gas-checkpoints` Cargo feature alone does not make
+default renders non-view; checkpoint logging in default renders also requires
+`solidity-trace`.
 
 The function selector is:
 

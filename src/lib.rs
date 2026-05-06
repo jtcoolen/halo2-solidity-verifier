@@ -29,15 +29,19 @@ pub use transcript::Keccak256Transcript;
 /// flag.
 pub const SOLIDITY_TRACE_ENABLED: bool = cfg!(feature = "solidity-trace");
 
-/// Whether the default Solidity renderer emits LOG1 gas() checkpoints
-/// at section boundaries. The host-side test parses these into per-
-/// section gas deltas (see `dump_gas_checkpoints` in
-/// `tests/poseidon_fixture.rs`).
+/// Whether the default Solidity renderer emits LOG1 gas() checkpoints at
+/// section boundaries. The host-side test parses these into per-section gas
+/// deltas (see `dump_gas_checkpoints` in `tests/poseidon_fixture.rs`).
 ///
-/// Enable with `--features solidity-gas-checkpoints`. The explicit
-/// `render_with_gas_checkpoints*` helpers still force checkpoint
-/// emission regardless of this flag.
-pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool = cfg!(feature = "solidity-gas-checkpoints");
+/// Default render paths only honor `solidity-gas-checkpoints` when
+/// `solidity-trace` is also enabled, so a production build that accidentally
+/// enables the checkpoint feature alone still renders a `view` verifier with no
+/// LOG opcodes. The explicit `render_with_gas_checkpoints*` helpers still force
+/// checkpoint emission for profiling artifacts regardless of this flag.
+pub const SOLIDITY_GAS_CHECKPOINTS_ENABLED: bool = cfg!(all(
+    feature = "solidity-gas-checkpoints",
+    feature = "solidity-trace"
+));
 
 /// Whether the generated Solidity verifier expects the outer proof to use
 /// the fewer-point-sets dummy-query PCS layout.
