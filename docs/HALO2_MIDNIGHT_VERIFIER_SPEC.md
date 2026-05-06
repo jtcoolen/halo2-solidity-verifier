@@ -63,6 +63,14 @@ proofs using:
   - `0x0f`: PAIRING_CHECK.
 - EVM modexp precompile `0x05` for scalar inversions.
 
+Supported execution target: an Ethereum-compatible Cancun-or-newer EVM with
+`MCOPY` and Prague/EIP-2537 BLS12-381 precompiles at exactly the addresses
+above, implementing the EIP-2537 input encodings, subgroup checks, return sizes,
+and gas schedule. The repository CI/dev runner exercises this target through
+Prague-spec `revm`; deployers on L2s, forks, or alt-EVMs must run the same
+precompile conformance tests against their target chain before treating the
+verifier as production-safe.
+
 The generated verifier is not a generic reusable verifier. It is
 circuit-specialized. Circuit metadata, proof read order, quotient identity
 program, VK payload, memory layout, and constant offsets are generated together
@@ -1523,8 +1531,11 @@ The generated verifier constructor runs smoke tests:
 - `G1MSM([(identity, 0)]) -> identity`.
 - `PAIRING_CHECK([(identity_g1, identity_g2)]) -> true`.
 
-Deploy only on forks/chains where EIP-2537 and `MCOPY` are available. The test
-runner uses revm Prague.
+Deploy only on forks/chains where EIP-2537 and `MCOPY` are available with the
+exact addresses, encodings, subgroup checks, return-size behavior, and gas
+schedule above. The test runner uses Prague-spec `revm` and includes direct
+precompile conformance coverage for malformed G1 rejection, non-identity G1ADD,
+two-term and 78-term G1MSM, true and false pairings, and pairing bilinearity.
 
 Every EIP-2537 call checks:
 

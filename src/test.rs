@@ -3,12 +3,12 @@ use crate::{
     FN_SIG_VERIFY_PROOF,
 };
 use ff::Field;
-use group::Group as _;
+use group::{Curve as _, Group as _};
 use midnight_circuits::{
     hash::poseidon::PoseidonChip,
     instructions::{hash::HashCPU, AssignmentInstructions, PublicInputInstructions},
 };
-use midnight_curves::{Bls12, G1Projective};
+use midnight_curves::{Bls12, Fq, G1Projective, G2Projective};
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -29,6 +29,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 #[cfg(feature = "rust-verifier-trace")]
 use revm::primitives::B256;
+use ruint::aliases::U256;
 use sha3::Digest;
 #[cfg(feature = "rust-verifier-trace")]
 use std::collections::BTreeMap;
@@ -55,71 +56,118 @@ fn function_signature() {
     );
 }
 
-/// Direct EIP-2537 precompile smoke tests against the bundled Prague-spec
-/// revm. Exercises the runner path independently of the verifier codegen so a
-/// regression in `src/evm.rs` shows up here first.
+/// Direct EIP-2537 precompile conformance tests against the bundled
+/// Prague-spec revm. Exercises the runner path independently of the verifier
+/// codegen so a regression in `src/evm.rs`, malformed-point handling, or the
+/// gas path used by large verifier MSMs shows up here first.
 #[test]
-fn prague_evm_runs_eip2537_identity_smoke_tests() {
+fn prague_evm_runs_eip2537_conformance_smoke_tests() {
     use crate::evm::test::Evm;
     use revm::primitives::Address;
 
     let mut evm = Evm::default();
-    let deploy_proxy = |evm: &mut Evm, precompile: u8, output_len: u8| -> Address {
-        let runtime: Vec<u8> = vec![
-            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // calldatacopy(0, 0, calldatasize())
-            0x60, output_len, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60, precompile, 0x5a, 0xfa, 0x50,
-            0x60, output_len, 0x60, 0x00, 0xf3, // return(0, output_len)
-        ];
-        let len = runtime.len() as u8;
-        let mut deployer = Vec::with_capacity(12 + runtime.len());
-        deployer.extend([0x60, len]);
-        deployer.extend([0x60, 0x0c]);
-        deployer.extend([0x60, 0x00]);
-        deployer.push(0x39);
-        deployer.extend([0x60, len]);
-        deployer.extend([0x60, 0x00]);
-        deployer.push(0xf3);
-        assert_eq!(
-            deployer.len(),
-            12,
-            "deployer prefix should be exactly 12 bytes"
-        );
-        deployer.extend(runtime);
-        evm.create(deployer)
-    };
 
-    let g1add_addr = deploy_proxy(&mut evm, 0x0b, 0x80);
-    let g1_x_hex = "0000000000000000000000000000000017f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
-    let g1_y_hex = "0000000000000000000000000000000008b3f481e3aaa0f1a09e30ed741d8ae4fcf5e095d5d00af600db18cb2c04b3edd03cc744a2888ae40caa232946c5e7e1";
-    let mut calldata = vec![];
-    for hex in [g1_x_hex, g1_y_hex, g1_x_hex, g1_y_hex] {
-        calldata.extend(hex::decode(hex).unwrap());
+    let g1add = Address::with_last_byte(0x0b);
+    let g1msm = Address::with_last_byte(0x0c);
+    let pairing = Address::with_last_byte(0x0f);
+    let g1 = G1Projective::generator();
+    let g2 = G2Projective::generator();
+
+    // G1ADD(identity, identity) -> identity.
+    let (_gas_used, output) = evm.call(g1add, vec![0; 0x100]);
+    assert_eq!(output, vec![0; 0x80]);
+
+    // G1ADD(G, G) -> 2G.
+    let mut g1add_input = g1_bytes(g1);
+    g1add_input.extend(g1_bytes(g1));
+    let (_gas_used, output) = evm.call(g1add, g1add_input);
+    assert_eq!(output, g1_bytes(g1 * Fq::from(2)));
+
+    // G1MSM([(identity, 0)]) -> identity.
+    let (_gas_used, output) = evm.call(g1msm, vec![0; 0xa0]);
+    assert_eq!(output, vec![0; 0x80]);
+
+    // G1MSM([(G, 3), ([2]G, 5)]) -> [13]G.
+    let mut g1msm_input = g1_msm_term(g1, 3);
+    g1msm_input.extend(g1_msm_term(g1 * Fq::from(2), 5));
+    let (_gas_used, output) = evm.call(g1msm, g1msm_input);
+    assert_eq!(output, g1_bytes(g1 * Fq::from(13)));
+
+    // Malformed/off-curve G1 input must be rejected by the MSM precompile.
+    let mut invalid_msm = eip2537_padded_off_curve_g1_bytes().to_vec();
+    invalid_msm.extend(u256_word(1));
+    assert!(
+        !matches!(
+            evm.try_call_with_gas(g1msm, invalid_msm, 200_000),
+            CallOutcome::Success { .. }
+        ),
+        "G1MSM accepted a canonical but off-curve G1 point"
+    );
+
+    // Full-size 78-term MSM path used by wide verifier shapes. The exact gas
+    // number is fork-dependent; this asserts the local Prague runner has a
+    // conforming large-input path and returns a non-identity point.
+    let mut large_msm = Vec::with_capacity(78 * 0xa0);
+    for _ in 0..78 {
+        large_msm.extend(g1_msm_term(g1, 1));
     }
-    assert_eq!(calldata.len(), 256);
+    match evm.try_call_with_gas(g1msm, large_msm, 2_000_000) {
+        CallOutcome::Success { output, .. } => {
+            assert_eq!(output.len(), 0x80);
+            assert!(
+                output.iter().any(|&b| b != 0),
+                "78-term G1MSM unexpectedly returned identity"
+            );
+        }
+        outcome => panic!("78-term G1MSM failed in Prague revm: {outcome:?}"),
+    }
 
-    let (gas_used, output) = evm.call(g1add_addr, calldata);
-    assert_eq!(output.len(), 128, "EIP-2537 G1ADD must return 128 bytes");
-    assert!(
-        output.iter().any(|&b| b != 0),
-        "G1ADD output is all zero; precompile did not run"
-    );
-    assert!(gas_used > 0);
+    // Pairing identity input should return true.
+    let (_gas_used, output) = evm.call(pairing, vec![0; 0x180]);
+    assert_eq!(output, [vec![0; 31], vec![1]].concat());
 
-    let g1msm_addr = deploy_proxy(&mut evm, 0x0c, 0x80);
-    let (_, output) = evm.call(g1msm_addr, vec![0; 0xa0]);
-    assert_eq!(output.len(), 128, "EIP-2537 G1MSM must return 128 bytes");
-    assert!(
-        output.iter().all(|&b| b == 0),
-        "G1MSM(identity, 0) should return the identity encoding"
-    );
-
-    let pairing_addr = deploy_proxy(&mut evm, 0x0f, 0x20);
-    let (_, output) = evm.call(pairing_addr, vec![0; 0x180]);
+    // A single non-identity generator pairing is not the neutral product.
+    let mut invalid_pairing = g1_bytes(g1);
+    invalid_pairing.extend(g2_bytes(g2));
+    let (_gas_used, output) = evm.call(pairing, invalid_pairing);
     assert_eq!(
         output,
-        [vec![0; 31], vec![1]].concat(),
-        "EIP-2537 pairing identity input should return true"
+        vec![0; 0x20],
+        "PAIRING_CHECK([(G1, G2)]) should return false"
     );
+
+    // Bilinearity: e([2]G1, G2) * e(-G1, [2]G2) == 1.
+    let mut bilinear_pairing = g1_bytes(g1 * Fq::from(2));
+    bilinear_pairing.extend(g2_bytes(g2));
+    bilinear_pairing.extend(g1_bytes(-g1));
+    bilinear_pairing.extend(g2_bytes(g2 * Fq::from(2)));
+    let (_gas_used, output) = evm.call(pairing, bilinear_pairing);
+    assert_eq!(output, [vec![0; 31], vec![1]].concat());
+}
+
+fn g1_bytes(point: G1Projective) -> Vec<u8> {
+    words_to_bytes(crate::__test_only_g1_to_u256s(&point.to_affine()))
+}
+
+fn g2_bytes(point: G2Projective) -> Vec<u8> {
+    words_to_bytes(crate::__test_only_g2_to_u256s(&point.to_affine()))
+}
+
+fn g1_msm_term(point: G1Projective, scalar: u64) -> Vec<u8> {
+    let mut out = g1_bytes(point);
+    out.extend(u256_word(scalar));
+    out
+}
+
+fn u256_word(value: u64) -> [u8; 32] {
+    U256::from(value).to_be_bytes()
+}
+
+fn words_to_bytes<const N: usize>(words: [U256; N]) -> Vec<u8> {
+    words
+        .into_iter()
+        .flat_map(|word| word.to_be_bytes::<32>())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default)]

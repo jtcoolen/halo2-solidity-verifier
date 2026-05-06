@@ -72,3 +72,8 @@ pub use evm::test::{
 pub fn __test_only_g1_to_u256s(point: &midnight_curves::G1Affine) -> [ruint::aliases::U256; 4] {
     crate::codegen::util::g1_to_u256s(point)
 }
+
+#[doc(hidden)]
+pub fn __test_only_g2_to_u256s(point: &midnight_curves::G2Affine) -> [ruint::aliases::U256; 8] {
+    crate::codegen::util::g2_to_u256s(point)
+}
