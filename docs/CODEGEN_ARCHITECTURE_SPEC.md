@@ -400,15 +400,18 @@ Runtime execution follows this shape:
 
 1. Validate calldata shape.
 2. Load or reference the verifying-key payload.
-3. Initialize transcript memory.
-4. Absorb VK digest, committed public input material, and instance material.
-5. Read proof commitments and evaluations into the static proof layout.
-6. Squeeze challenges in the expected order.
-7. Reconstruct quotient numerator and linearization scalars.
-8. Run PCS multi-open preparation.
-9. Optionally verify public accumulator material.
-10. Run final pairing checks through EIP-2537 precompiles.
-11. Return the verifier result.
+3. Prevalidate public accumulator material, when enabled, before transcript,
+   quotient, PCS, and final pairing work.
+4. Initialize transcript memory.
+5. Absorb VK digest, committed public input material, and instance material.
+6. Read proof commitments and evaluations into the static proof layout.
+7. Squeeze challenges in the expected order.
+8. Reconstruct quotient numerator and linearization scalars.
+9. Run PCS multi-open preparation.
+10. Optionally batch the already-validated public accumulator equation into the
+    final pairing inputs.
+11. Run final pairing checks through EIP-2537 precompiles.
+12. Return the verifier result.
 
 Gas-checkpoint builds insert measurement points into this flow. Trace builds
 insert diagnostic events or hooks. These modes should not change the verifier's
@@ -419,9 +422,10 @@ semantic result.
 Accumulator support is represented by `AccumulatorEncoding`.
 
 When enabled, the generator knows how to locate packed accumulator limbs in the
-public input tail. The generated verifier unpacks this data, forms the required
-BLS12-381 points and scalars, and batches the public accumulator pairing work
-with the verifier's pairing path.
+public input tail. The generated verifier unpacks this data and routes each
+decoded carried point through EIP-2537 G1MSM near the start of verification,
+then later batches the resulting accumulator pairing equation with the
+verifier's KZG pairing path.
 
 Two public-input accumulator layouts are supported:
 

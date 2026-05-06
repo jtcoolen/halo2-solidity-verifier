@@ -985,6 +985,24 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_points_are_prevalidated_before_transcript_work() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+
+        for required in [
+            "function validate_public_accumulator(success, r) -> out",
+            "Fail malformed accumulator public inputs before transcript",
+            "success := validate_public_accumulator(success, r)",
+            "gas_checkpoint(2) // after VK loading + accumulator public-input precheck",
+            "Batch the prevalidated public IVC accumulator pairing equation",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "accumulator validation should be split into early precheck and late pairing batch: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn accumulator_decoder_rejects_noncanonical_infinity() {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 

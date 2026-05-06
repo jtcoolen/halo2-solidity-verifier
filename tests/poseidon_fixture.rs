@@ -414,7 +414,7 @@ fn dump_gas_checkpoints(logs: &[halo2_solidity_verifier::revm::primitives::Log],
     fn name_of(id: u8) -> &'static str {
         match id {
             1 => "entry (before VK loading)",
-            2 => "VK loading",
+            2 => "VK loading + accumulator public-input precheck",
             3 => "VK digest + committed_pi + instance absorbs",
             4 => "user-phase advice reads + user challenge squeezes",
             5 => "theta squeeze + lookup multiplicities",

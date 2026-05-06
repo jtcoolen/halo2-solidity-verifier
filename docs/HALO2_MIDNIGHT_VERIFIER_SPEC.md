@@ -1608,10 +1608,12 @@ This is the complete verifier flow:
 1. Check ABI head offsets.
 2. Check pinned VK and quotient evaluator code, if external.
 3. Load or materialize VK payload.
-4. Check VK accumulator header words match generator configuration.
-5. Check `proof.length == proof_len`.
-6. Check `instances.length == VK.num_instances`.
-7. Check total calldata length exactly.
+4. Check `proof.length == proof_len`.
+5. Check `instances.length == VK.num_instances`.
+6. Check total calldata length exactly.
+7. If accumulator is enabled, decode public accumulator points and run the
+   G1MSM validation/scaling work before transcript, quotient, PCS, and final
+   pairing work.
 8. Initialize transcript.
 9. Absorb VK digest, committed identity, instance count, and instances.
 10. Parse proof commitments and scalars in the order in section 5, absorbing
@@ -1630,8 +1632,8 @@ This is the complete verifier flow:
 21. Compute `final_com` and `v`.
 22. Stage KZG pairing inputs:
     `pi` and `final_com - v*G + x3*pi`.
-23. If accumulator is enabled, decode public accumulator points, evaluate its
-    MSMs, derive batching alpha, and add alpha-weighted accumulator pairing
+23. If accumulator is enabled, derive batching alpha from the KZG and already
+    validated accumulator G1 inputs, then add alpha-weighted accumulator pairing
     inputs into the KZG pairing inputs.
 24. Run final two-pair BLS12-381 pairing check.
 25. Return `true`.
