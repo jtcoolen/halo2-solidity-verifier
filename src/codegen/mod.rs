@@ -795,8 +795,12 @@ mod tests {
         let pcs_codegen = include_str!("pcs.rs");
 
         assert!(
-            verifier_template.contains("if iszero(success) { revert(0, 0) }\n            }\n\n            {%- if self.gas_checkpoints %}\n            gas_checkpoint(2)"),
-            "ABI/proof length/instance shape checks should fail before transcript parsing"
+            verifier_template.contains("if iszero(success) { revert(0, 0) }\n            }\n\n            {%- if self.expected_has_accumulator %}\n            // Fail malformed accumulator public inputs before transcript"),
+            "ABI/proof length/instance shape checks should fail before accumulator or transcript parsing"
+        );
+        assert!(
+            verifier_template.contains("success := validate_public_accumulator(success, r)\n            if iszero(success) { revert(0, 0) }\n            {%- endif %}\n\n            {%- if self.gas_checkpoints %}\n            gas_checkpoint(2)"),
+            "accumulator precheck should fail before transcript parsing"
         );
         assert!(
             verifier_template.contains(
