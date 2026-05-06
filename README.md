@@ -95,6 +95,8 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 The pinned Midfall revision, solc version, canonical IVC bench command, and
 published verifier/VK/quotient runtime hashes are recorded in
 [`docs/REPRODUCIBLE_BUILDS.md`](./docs/REPRODUCIBLE_BUILDS.md).
+For a high-level architecture and codegen pipeline specification, see
+[`docs/CODEGEN_ARCHITECTURE_SPEC.md`](./docs/CODEGEN_ARCHITECTURE_SPEC.md).
 The map between the Askama templates, generated Solidity/Yul, Midfall Rust
 verifier, and optimization choices is documented in
 [`docs/ASKAMA_TEMPLATE_RUST_MAPPING.md`](./docs/ASKAMA_TEMPLATE_RUST_MAPPING.md).
