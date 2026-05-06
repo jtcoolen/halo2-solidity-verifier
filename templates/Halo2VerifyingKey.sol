@@ -3,17 +3,18 @@
 pragma solidity ^0.8.24;
 
 /// @title Halo2 BLS12-381 verifying-key payload.
-/// @notice Data-only contract whose deployed runtime is the generated verifier-key payload.
-/// @dev The linked verifier loads this runtime with `extcodecopy` and pins it by length and codehash.
+/// @notice Contract whose deployed runtime is `INVALID || generated verifier-key payload`.
+/// @dev Byte 0 is an unconditional INVALID opcode so direct calls cannot execute payload bytes as code. The linked verifier pins the full runtime by length/codehash and copies the payload starting at byte 1.
 /// @dev The layout follows the verifier inputs derived from
 /// `midfall/proofs/src/plonk/mod.rs::VerifyingKey` and the transcript
 /// `vk.hash_into` behavior used by `midfall/proofs/src/plonk/verifier.rs`.
 ///
 /// Layout (in 32-byte words, big-endian). The header slots are generated from
 /// Rust's `VkHeaderLayout`; the byte offsets are absolute from the start of the
-/// VK contract's runtime bytecode. The verifier loads the entire VK via
-/// `extcodecopy(vk, VK_MPTR, 0x00, vk_len)` and then references each slot by
-/// `VK_MPTR + i`.
+/// VK payload, not from byte 0 of the runtime. Runtime byte 0 is the INVALID
+/// prefix; the verifier loads the payload via
+/// `extcodecopy(vk, VK_MPTR, 0x01, vk_payload_len)` and then references each
+/// slot by `VK_MPTR + i`.
 ///
 ///   word  0  : vk_digest                    (Fq, transcript_repr of the CS)
 ///   word  1  : num_instances
@@ -45,11 +46,13 @@ pragma solidity ^0.8.24;
 ///   structure, and `num_simple_selectors` into the generated verifier code.
 contract Halo2VerifyingKey {
     /// @notice Deploy the verifying-key payload as this contract's runtime bytecode.
-    /// @dev The constructor writes generated words into memory and returns only that payload, so the runtime contains no callable code.
+    /// @dev The constructor writes an INVALID byte followed by generated words into memory and returns that prefixed runtime.
     /// @dev The transient construction buffer starts at `0x80`, preserving Solidity's reserved memory words.
     constructor() {
         assembly {
-            let payload := {{ constructor_payload_mptr|hex() }}
+            let runtime := {{ constructor_payload_mptr|hex() }}
+            let payload := add(runtime, 0x01)
+            mstore8(runtime, 0xfe)
             {%- for (name, chunk) in constants %}
             mstore(add(payload, {{ (32 * loop.index0)|hex_padded(4) }}), {{ chunk|hex_padded(64) }}) // {{ name }}
             {%- endfor %}
@@ -68,7 +71,7 @@ contract Halo2VerifyingKey {
             mstore(add(payload, {{ (32 * (offset + 4 * loop.index0 + 3))|hex_padded(4) }}), {{ y_lo|hex_padded(64) }}) // permutation_comms[{{ loop.index0 }}].y_lo
             {%- endfor %}
 
-            return(payload, {{ (32 * (constants.len() + 4 * fixed_comms.len() + 4 * permutation_comms.len()))|hex() }})
+            return(runtime, {{ (1 + 32 * (constants.len() + 4 * fixed_comms.len() + 4 * permutation_comms.len()))|hex() }})
         }
     }
 }

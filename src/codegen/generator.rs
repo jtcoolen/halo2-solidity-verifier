@@ -936,7 +936,8 @@ impl<'a> SolidityGenerator<'a> {
             .collect();
         let constructor_payload_len =
             constants.len() * WORD_BYTES + (fixed_comms.len() + permutation_comms.len()) * G1_BYTES;
-        let constructor_memory = VkConstructorMemoryLayout::new(constructor_payload_len);
+        let constructor_memory =
+            VkConstructorMemoryLayout::new(constructor_payload_len + VK_RUNTIME_PREFIX_LEN);
         constructor_memory
             .validate()
             .unwrap_or_else(|err| panic!("invalid VK constructor memory layout: {err}"));
@@ -3575,7 +3576,7 @@ impl<'a> SolidityGenerator<'a> {
         let selector_acc_mptr = memory.selector_acc_mptr;
         let batch_invert_scratch_mptr = memory.batch_invert_scratch_mptr;
         let expected_vk_codehash = separate.then(|| {
-            let digest: [u8; 32] = Keccak256::digest(vk.bytes()).into();
+            let digest: [u8; 32] = Keccak256::digest(vk.runtime_bytes()).into();
             U256::from_be_bytes(digest)
         });
         let vk_len = vk.len();

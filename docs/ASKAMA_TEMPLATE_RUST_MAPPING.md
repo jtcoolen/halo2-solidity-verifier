@@ -73,7 +73,7 @@ with Midfall transcript and KZG details rendered directly into Yul.
 | Constructors and EIP-2537 smoke tests | Checks G1ADD, G1MSM, and pairing precompiles, then pins VK and optional quotient evaluator | Deployment-only safety wrapper around the verifier params | `templates/Halo2Verifier.sol`, `layout::precompile` |
 | `verifyProof` ABI head checks | Confirms ABI offsets, generated proof length, instance length, and calldata end | `verifier.rs` instance-shape checks before transcript work | `proof_layout.rs`, `generator.rs` |
 | Helper functions | Implements scalar inverse, transcript append/squeeze, G1 validation/copy, G1MSM/g1add/pairing wrappers, batch inversion, accumulator decoding, trace/gas hooks | `transcript/*`, `poly/domain.rs::l_i_range`, KZG verifier helpers | `templates/Halo2Verifier.sol`, `TemplateConstants` |
-| VK loading | Either emits `mstore` constants or `extcodecopy`s the data-only VK runtime, then validates accumulator header fields | `vk.hash_into(transcript)` uses `vk.transcript_repr`; fixed/permutation commitments are verifier key data | `generate_vk`, `Halo2VerifyingKey`, `VkPayloadLayout` |
+| VK loading | Either emits `mstore` constants or `extcodecopy`s the payload from the pinned `INVALID || VK payload` runtime, then validates accumulator header fields | `vk.hash_into(transcript)` uses `vk.transcript_repr`; fixed/permutation commitments are verifier key data | `generate_vk`, `Halo2VerifyingKey`, `VkPayloadLayout` |
 | VK digest and public input transcript absorption | Absorbs `vk_digest`, committed-instance identity commitment, public input length, and public input scalars | `verifier.rs::parse_trace`, from `vk.hash_into` through instance `transcript.common` calls | `proof_layout.rs::TranscriptBufferLayout`, `common_word`, `common_uncompressed_g1` |
 | Per-user-phase advice reads | Reads and absorbs advice commitments by phase, then squeezes user challenges | `parse_trace`: phase loop over advice commitments and `challenge_phase` | `Protocol` metadata, `UserPhase` |
 | `theta`, lookup multiplicities | Squeezes `theta`, then reads lookup multiplicity commitments | `parse_trace`: `theta`, `ChunkedArgument::read_multiplicities` | `proof_layout.rs`, `logup/verifier.rs` mapping |
@@ -100,11 +100,13 @@ Two naming caveats matter while reading the generated Solidity:
 
 ## `Halo2VerifyingKey.sol`
 
-The VK template emits a constructor that returns data as runtime bytecode. The
-runtime is not meant to be called. The verifier loads it with:
+The VK template emits a constructor that returns `INVALID || payload` as runtime
+bytecode. Runtime byte `0` is an unconditional `INVALID` opcode so direct calls
+cannot execute payload bytes as EVM instructions. The verifier pins the full
+prefixed runtime length/codehash but loads only the payload with:
 
 ```yul
-extcodecopy(vk, VK_MPTR, 0x00, vk_len)
+extcodecopy(vk, VK_MPTR, 0x01, vk_payload_len)
 ```
 
 Its payload layout is:
@@ -117,8 +119,8 @@ Its payload layout is:
 
 This mirrors the Rust `VerifyingKey` inputs used by `vk.hash_into(transcript)`
 and by `verify_algebraic_constraints`. The local `VkPayloadLayout` keeps the
-payload section map append-only so `Halo2VerifyingKey.bytes()`, rendered runtime
-length, `extcodecopy`, and tests all agree.
+payload section map append-only so `Halo2VerifyingKey.bytes()`, the prefixed
+runtime length/codehash, `extcodecopy`, and tests all agree.
 
 Important optimisation: quotient constants and bytecode live in the pinned VK
 payload rather than as verifier `PUSH32`/`mstore` immediates. That reduces main
@@ -384,7 +386,7 @@ comparison against the instrumented Rust verifier.
 
 | Optimisation | Where | Benefit | Tradeoff / invariant |
 | --- | --- | --- | --- |
-| Separate VK payload contract | `Halo2VerifyingKey.sol`, `VkPayloadLayout` | Moves large constants and commitments out of verifier runtime | Constructor pins runtime length/codehash; per-proof codehash rechecks are omitted |
+| Separate VK payload contract | `Halo2VerifyingKey.sol`, `VkPayloadLayout` | Moves large constants and commitments out of verifier runtime | Runtime is prefixed with `INVALID`; constructor and per-proof checks pin length/codehash |
 | Split quotient evaluator | `Halo2QuotientEvaluator.sol` | Moves the largest scalar arithmetic body out of main verifier bytecode | Evaluator is correctness-critical and constructor-pinned |
 | Compact quotient VM | `quotient/mod.rs`, `QuotientNumeratorBlock.yul` | Reduces Solidity/Yul bytecode and improves compile stability | Higher runtime gas for interpreted identities |
 | Inline identity prefix | `quotient_program_plan` | Lowers gas for the first expensive identities | Increases verifier/evaluator runtime size |

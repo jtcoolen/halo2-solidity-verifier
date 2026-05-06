@@ -39,8 +39,10 @@ contract Halo2Verifier {
     /// @notice Verifying-key contract address authorized for this verifier.
     /// @dev The runtime length and codehash are pinned by generated constants and checked at construction time.
     address public immutable AUTHORIZED_VK;
-    uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len }};
-    bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32({{ expected_vk_codehash|hex_padded(64) }});
+    uint256 internal constant EXPECTED_VK_PAYLOAD_LENGTH = {{ vk_len }};
+    uint256 internal constant EXPECTED_VK_LENGTH = {{ vk_len + 1 }};
+    uint256 internal constant EXPECTED_VK_CODEHASH_WORD = {{ expected_vk_codehash|hex_padded(64) }};
+    bytes32 internal constant EXPECTED_VK_CODEHASH = bytes32(EXPECTED_VK_CODEHASH_WORD);
     {%- when None %}
     {%- endmatch %}
     {%- match quotient_external %}
@@ -51,7 +53,8 @@ contract Halo2Verifier {
     {%- match self.expected_quotient_codehash %}
     {%- when Some with (expected_quotient_codehash) %}
     uint256 internal constant EXPECTED_QUOTIENT_LENGTH = {{ self.expected_quotient_len.unwrap() }};
-    bytes32 internal constant EXPECTED_QUOTIENT_CODEHASH = bytes32({{ expected_quotient_codehash|hex_padded(64) }});
+    uint256 internal constant EXPECTED_QUOTIENT_CODEHASH_WORD = {{ expected_quotient_codehash|hex_padded(64) }};
+    bytes32 internal constant EXPECTED_QUOTIENT_CODEHASH = bytes32(EXPECTED_QUOTIENT_CODEHASH_WORD);
     {%- when None %}
     {%- endmatch %}
     {%- when None %}
@@ -876,9 +879,9 @@ contract Halo2Verifier {
                 // from the runtime originally pinned by this verifier.
                 if iszero(and(
                     eq(extcodesize(vk), EXPECTED_VK_LENGTH),
-                    eq(extcodehash(vk), EXPECTED_VK_CODEHASH)
+                    eq(extcodehash(vk), EXPECTED_VK_CODEHASH_WORD)
                 )) { revert(0, 0) }
-                extcodecopy(vk, VK_MPTR, 0x00, EXPECTED_VK_LENGTH)
+                extcodecopy(vk, VK_MPTR, 0x01, EXPECTED_VK_PAYLOAD_LENGTH)
                 {%- endmatch %}
 
                 // This verifier is pinned to one generated VK, so schema
@@ -1314,7 +1317,7 @@ contract Halo2Verifier {
                 // external call, mirroring the VK freshness guard above.
                 if iszero(and(
                     eq(extcodesize(quotientEvaluator), EXPECTED_QUOTIENT_LENGTH),
-                    eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH)
+                    eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH_WORD)
                 )) { revert(0, 0) }
                 {%- when None %}
                 {%- endmatch %}

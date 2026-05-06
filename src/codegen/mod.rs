@@ -9,7 +9,7 @@ use crate::codegen::{
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
         QuotientProgram, QuotientSelectorTail, QuotientVmMemUsage, QuotientVmOpcodeUsage,
-        UserPhase, VerifierCodegenLayout,
+        UserPhase, VerifierCodegenLayout, VK_RUNTIME_PREFIX_LEN,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
@@ -886,11 +886,12 @@ mod tests {
         let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
 
         for required in [
+            "EXPECTED_VK_PAYLOAD_LENGTH",
             "eq(extcodesize(vk), EXPECTED_VK_LENGTH)",
-            "eq(extcodehash(vk), EXPECTED_VK_CODEHASH)",
-            "extcodecopy(vk, VK_MPTR, 0x00, EXPECTED_VK_LENGTH)",
+            "eq(extcodehash(vk), EXPECTED_VK_CODEHASH_WORD)",
+            "extcodecopy(vk, VK_MPTR, 0x01, EXPECTED_VK_PAYLOAD_LENGTH)",
             "eq(extcodesize(quotientEvaluator), EXPECTED_QUOTIENT_LENGTH)",
-            "eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH)",
+            "eq(extcodehash(quotientEvaluator), EXPECTED_QUOTIENT_CODEHASH_WORD)",
             "Re-check the pinned VK dependency on every proof",
             "Re-check the pinned runtime before every",
         ] {
@@ -899,6 +900,30 @@ mod tests {
                 "template should re-check pinned dependency at verification time: {required}"
             );
         }
+    }
+
+    #[test]
+    fn separate_vk_runtime_is_prefixed_with_invalid_opcode() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        let vk_template = include_str!("../../templates/Halo2VerifyingKey.sol");
+
+        assert!(
+            vk_template.contains("mstore8(runtime, 0xfe)"),
+            "VK runtime must start with an unconditional INVALID opcode"
+        );
+        assert!(
+            vk_template.contains("return(runtime,"),
+            "VK constructor must return the prefixed runtime, not just the payload"
+        );
+        assert!(
+            verifier_template.contains("EXPECTED_VK_LENGTH = {{ vk_len + 1 }}"),
+            "verifier must pin the full INVALID-prefixed VK runtime length"
+        );
+        assert!(
+            verifier_template
+                .contains("extcodecopy(vk, VK_MPTR, 0x01, EXPECTED_VK_PAYLOAD_LENGTH)"),
+            "verifier must skip the INVALID prefix while loading the VK payload"
+        );
     }
 
     #[test]

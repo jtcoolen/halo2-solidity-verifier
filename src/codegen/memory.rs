@@ -518,18 +518,19 @@ pub(crate) struct VerifierMemoryLayout {
 #[derive(Clone, Debug)]
 pub(crate) struct VkConstructorMemoryLayout {
     pub(crate) map: MemoryMap,
-    /// Constructor return-payload buffer.
+    /// Constructor return-runtime buffer.
     pub(crate) payload_mptr: usize,
 }
 
 impl VkConstructorMemoryLayout {
-    /// Register the fixed constructor payload buffer for a VK runtime length.
-    pub(crate) fn new(payload_len: usize) -> Self {
+    /// Register the fixed constructor runtime buffer for a VK runtime length.
+    pub(crate) fn new(runtime_len: usize) -> Self {
         let mut arena = MemoryArena::default();
+        let reserved_len = runtime_len.next_multiple_of(WORD_BYTES);
         let payload_mptr = arena.alloc_phase_scratch(
             "vk_constructor_payload",
             VK_CONSTRUCTOR_PAYLOAD_START,
-            payload_len,
+            reserved_len,
             MemoryPhase::VkConstructorPayload,
         );
         Self {
@@ -1180,6 +1181,22 @@ mod tests {
         assert_eq!(region.start, VK_CONSTRUCTOR_PAYLOAD_START);
         assert_eq!(region.len, 0x660);
         layout.validate().expect("VK constructor layout is valid");
+    }
+
+    #[test]
+    fn vk_constructor_runtime_region_rounds_up_unaligned_length() {
+        let layout = VkConstructorMemoryLayout::new(0x661);
+        let region = layout
+            .map
+            .region("vk_constructor_payload")
+            .expect("VK constructor payload registered");
+
+        assert_eq!(layout.payload_mptr, VK_CONSTRUCTOR_PAYLOAD_START);
+        assert_eq!(region.start, VK_CONSTRUCTOR_PAYLOAD_START);
+        assert_eq!(region.len, 0x680);
+        layout
+            .validate()
+            .expect("unaligned runtime length reserves aligned memory");
     }
 
     fn synthetic_vk() -> Halo2VerifyingKey {

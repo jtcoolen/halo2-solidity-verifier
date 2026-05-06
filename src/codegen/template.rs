@@ -325,6 +325,9 @@ pub(crate) struct Halo2VerifyingKey {
     pub(crate) quotient_program_words: usize,
 }
 
+pub(crate) const VK_RUNTIME_PREFIX: u8 = 0xfe;
+pub(crate) const VK_RUNTIME_PREFIX_LEN: usize = 1;
+
 impl Halo2VerifyingKey {
     /// Reconstruct and validate the typed VK payload layout.
     pub(crate) fn payload_layout(&self) -> Result<VkPayloadLayout, String> {
@@ -377,7 +380,7 @@ impl Halo2VerifyingKey {
                 self.len()
             ));
         }
-        let constructor_memory = VkConstructorMemoryLayout::new(self.len());
+        let constructor_memory = VkConstructorMemoryLayout::new(self.runtime_len());
         constructor_memory.validate()?;
         if self.constructor_payload_mptr != constructor_memory.payload_mptr {
             return Err(format!(
@@ -393,6 +396,11 @@ impl Halo2VerifyingKey {
         // 32 bytes per scalar constant + 128 bytes per G1 point (EIP-2537 padded).
         (self.constants.len() * WORD_BYTES)
             + (self.fixed_comms.len() + self.permutation_comms.len()) * G1_BYTES
+    }
+
+    /// Deployed VK runtime length in bytes.
+    pub(crate) fn runtime_len(&self) -> usize {
+        VK_RUNTIME_PREFIX_LEN + self.len()
     }
 
     /// Rendered VK payload bytes in the exact contract return order.
@@ -412,6 +420,15 @@ impl Halo2VerifyingKey {
             )
             .flat_map(|value| value.to_be_bytes::<32>())
             .collect()
+    }
+
+    /// Deployed VK runtime bytes. Byte 0 is an unconditional INVALID opcode;
+    /// the payload copied by the verifier starts at byte 1.
+    pub(crate) fn runtime_bytes(&self) -> Vec<u8> {
+        let mut runtime = Vec::with_capacity(self.runtime_len());
+        runtime.push(VK_RUNTIME_PREFIX);
+        runtime.extend(self.bytes());
+        runtime
     }
 }
 
@@ -1028,7 +1045,7 @@ mod filters {
 
 #[cfg(test)]
 mod tests {
-    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey};
+    use super::{G1Words, Halo2Verifier, Halo2VerifyingKey, VK_RUNTIME_PREFIX};
     use crate::codegen::artifact::PayloadSectionKind;
     use crate::codegen::{
         memory::{
@@ -1419,25 +1436,37 @@ mod tests {
         let vk = synthetic_vk(2, 3);
         let mut s = String::new();
         vk.render(&mut s).expect("VK render");
-        // The constructor must return exactly the byte length the verifier
-        // loads via `extcodecopy`, but the transient payload buffer starts at
-        // 0x80 so it preserves Solidity's reserved memory words. Our `hex`
-        // filter left-pads odd-length hex literals with a leading zero, so
-        // 0x660 (3 hex digits) renders as "0x0660".
-        let raw_hex = format!("{:x}", vk.len());
+        // The constructor returns one INVALID byte followed by the payload. The
+        // verifier pins that full runtime but copies only the payload from
+        // byte offset 1. Our `hex` filter left-pads odd-length hex literals
+        // with a leading zero, so 0x661 (3 hex digits) renders as "0x0661".
+        let runtime = vk.runtime_bytes();
+        assert_eq!(runtime.len(), vk.runtime_len());
+        assert_eq!(runtime[0], VK_RUNTIME_PREFIX);
+        assert_eq!(&runtime[1..], vk.bytes().as_slice());
+
+        let raw_hex = format!("{:x}", vk.runtime_len());
         let padded_hex = if raw_hex.len() % 2 == 1 {
             format!("0{raw_hex}")
         } else {
             raw_hex
         };
-        let expected_return = format!("return(payload, 0x{padded_hex})");
+        let expected_return = format!("return(runtime, 0x{padded_hex})");
         assert!(
             s.contains(&expected_return),
             "rendered VK missing expected return statement {expected_return} in:\n{s}"
         );
         assert!(
-            s.contains("let payload := 0x80"),
-            "VK constructor payload must start after Solidity's reserved words"
+            s.contains("let runtime := 0x80"),
+            "VK constructor runtime buffer must start after Solidity's reserved words"
+        );
+        assert!(
+            s.contains("let payload := add(runtime, 0x01)"),
+            "VK payload must start after the INVALID runtime prefix"
+        );
+        assert!(
+            s.contains("mstore8(runtime, 0xfe)"),
+            "VK runtime must start with an unconditional INVALID opcode"
         );
         // It should `mstore` the very first scalar (vk_digest) at payload + 0.
         assert!(

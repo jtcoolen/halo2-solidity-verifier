@@ -49,8 +49,9 @@ The verifier still has a constrained generated-contract shape:
 4. The split `Halo2QuotientEvaluator` fallback has its own fresh EVM memory
    frame, copies the verifier frame into generated absolute addresses, writes
    its compact return frame at `0x80`, and immediately returns.
-5. The `Halo2VerifyingKey` constructor writes the runtime payload starting at
-   `0x80` and immediately returns that payload as contract code.
+5. The `Halo2VerifyingKey` constructor writes `INVALID || runtime payload`
+   starting at `0x80` and immediately returns that prefixed runtime as contract
+   code. The verifier later skips byte `0` and copies only the payload.
 
 Do not move the generated verifier assembly into a reusable internal Solidity
 function, library routine, or wrapper that continues executing high-level
