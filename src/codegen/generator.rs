@@ -333,6 +333,21 @@ impl QuotientStateSlots {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NativeGateCandidate {
+    gate_idx: usize,
+    vm_bytes: usize,
+    native_bytes: usize,
+    gas_saved: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NativeGateSelectionState {
+    gas_saved: u64,
+    native_bytes: usize,
+    gate_indices: Vec<usize>,
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -376,6 +391,64 @@ mod tests {
         assert_eq!(
             SolidityGenerator::quotient_stack_words_for_build(&build, 8),
             8
+        );
+    }
+
+    #[test]
+    fn native_gate_knapsack_prefers_gas_under_byte_budget() {
+        let candidates = vec![
+            NativeGateCandidate {
+                gate_idx: 0,
+                vm_bytes: 100,
+                native_bytes: 320,
+                gas_saved: 100,
+            },
+            NativeGateCandidate {
+                gate_idx: 1,
+                vm_bytes: 80,
+                native_bytes: 160,
+                gas_saved: 60,
+            },
+            NativeGateCandidate {
+                gate_idx: 2,
+                vm_bytes: 70,
+                native_bytes: 160,
+                gas_saved: 55,
+            },
+        ];
+
+        let selection = SolidityGenerator::select_native_gate_candidates(&candidates, 2, 320);
+        assert_eq!(selection.gate_indices, vec![1, 2]);
+        assert_eq!(selection.gas_saved, 115);
+        assert_eq!(selection.native_bytes, 320);
+    }
+
+    #[test]
+    fn native_gate_default_budget_preserves_old_top_n_byte_envelope() {
+        let candidates = vec![
+            NativeGateCandidate {
+                gate_idx: 0,
+                vm_bytes: 100,
+                native_bytes: 300,
+                gas_saved: 1,
+            },
+            NativeGateCandidate {
+                gate_idx: 1,
+                vm_bytes: 80,
+                native_bytes: 200,
+                gas_saved: 1,
+            },
+            NativeGateCandidate {
+                gate_idx: 2,
+                vm_bytes: 70,
+                native_bytes: 100,
+                gas_saved: 1,
+            },
+        ];
+
+        assert_eq!(
+            SolidityGenerator::default_native_gate_byte_budget(&candidates, 2),
+            500
         );
     }
 }
@@ -1296,22 +1369,257 @@ impl<'a> SolidityGenerator<'a> {
         }
     }
 
-    /// Pick the heaviest remaining gate identities for native callbacks.
+    /// Pick native gate callbacks by estimated gas saved under a byte budget.
     fn native_gate_indices(gates: &[QuotientIdentity]) -> HashSet<usize> {
-        let count = quotient_native_gate_count(gates);
-        if count == 0 {
+        let max_count = quotient_native_gate_count(gates);
+        if max_count == 0 {
             return HashSet::new();
         }
 
-        let mut costs = gates
+        let candidates = Self::native_gate_candidates(gates);
+        let byte_budget = quotient_native_gate_byte_budget()
+            .unwrap_or_else(|| Self::default_native_gate_byte_budget(&candidates, max_count));
+        let selection = Self::select_native_gate_candidates(&candidates, max_count, byte_budget);
+
+        if quotient_shape_profile_enabled() {
+            eprintln!(
+                "native gate knapsack: candidates={} max_count={} byte_budget={} selected={:?} estimated_gas_saved={} estimated_native_bytes={}",
+                candidates.len(),
+                max_count,
+                byte_budget,
+                selection.gate_indices,
+                selection.gas_saved,
+                selection.native_bytes,
+            );
+        }
+
+        selection.gate_indices.into_iter().collect()
+    }
+
+    /// Build per-gate native-callback selection metrics.
+    fn native_gate_candidates(gates: &[QuotientIdentity]) -> Vec<NativeGateCandidate> {
+        gates
             .iter()
             .enumerate()
-            .map(|(idx, identity)| (Self::quotient_identity_program_cost(identity), idx))
+            .map(|(gate_idx, identity)| {
+                let (vm_bytes, vm_gas) = Self::quotient_identity_program_metrics(identity);
+                let native_block = Self::native_identity_estimate_block(identity);
+                let native_bytes = Self::yul_block_source_bytes(&native_block);
+                let native_gas = Self::estimate_native_yul_gas(&native_block);
+                NativeGateCandidate {
+                    gate_idx,
+                    vm_bytes,
+                    native_bytes,
+                    gas_saved: vm_gas.saturating_sub(native_gas),
+                }
+            })
+            .collect()
+    }
+
+    /// Preserve the previous top-N byte envelope as the default native budget.
+    fn default_native_gate_byte_budget(
+        candidates: &[NativeGateCandidate],
+        max_count: usize,
+    ) -> usize {
+        let mut ranked = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.vm_bytes,
+                    candidate.gate_idx,
+                    candidate.native_bytes,
+                )
+            })
             .collect::<Vec<_>>();
-        costs.sort_by(|(lhs_cost, lhs_idx), (rhs_cost, rhs_idx)| {
-            rhs_cost.cmp(lhs_cost).then_with(|| lhs_idx.cmp(rhs_idx))
+        ranked.sort_by(|(lhs_bytes, lhs_idx, _), (rhs_bytes, rhs_idx, _)| {
+            rhs_bytes.cmp(lhs_bytes).then_with(|| lhs_idx.cmp(rhs_idx))
         });
-        costs.into_iter().take(count).map(|(_, idx)| idx).collect()
+        ranked
+            .into_iter()
+            .take(max_count)
+            .map(|(_, _, native_bytes)| native_bytes)
+            .sum()
+    }
+
+    /// Solve a small 0/1 knapsack: maximize estimated gas saved under bytes.
+    fn select_native_gate_candidates(
+        candidates: &[NativeGateCandidate],
+        max_count: usize,
+        byte_budget: usize,
+    ) -> NativeGateSelectionState {
+        if max_count == 0 || byte_budget == 0 {
+            return NativeGateSelectionState::default();
+        }
+
+        const BYTE_UNIT: usize = 32;
+        let budget_units = byte_budget.div_ceil(BYTE_UNIT);
+        let mut dp = vec![vec![None::<NativeGateSelectionState>; budget_units + 1]; max_count + 1];
+        dp[0][0] = Some(NativeGateSelectionState::default());
+
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.gas_saved > 0 && candidate.native_bytes > 0)
+        {
+            let cost_units = candidate.native_bytes.div_ceil(BYTE_UNIT).max(1);
+            if cost_units > budget_units {
+                continue;
+            }
+
+            for count in (0..max_count).rev() {
+                for used in (0..=budget_units - cost_units).rev() {
+                    let Some(state) = dp[count][used].clone() else {
+                        continue;
+                    };
+                    let mut next = state;
+                    next.gas_saved += candidate.gas_saved;
+                    next.native_bytes += candidate.native_bytes;
+                    next.gate_indices.push(candidate.gate_idx);
+
+                    let next_count = count + 1;
+                    let next_used = used + cost_units;
+                    if Self::native_gate_selection_better(&next, dp[next_count][next_used].as_ref())
+                    {
+                        dp[next_count][next_used] = Some(next);
+                    }
+                }
+            }
+        }
+
+        let mut best = NativeGateSelectionState::default();
+        for count_states in dp {
+            for state in count_states.into_iter().flatten() {
+                if Self::native_gate_selection_better(&state, Some(&best)) {
+                    best = state;
+                }
+            }
+        }
+        best
+    }
+
+    /// Deterministic tie-breaker for native gate knapsack states.
+    fn native_gate_selection_better(
+        candidate: &NativeGateSelectionState,
+        incumbent: Option<&NativeGateSelectionState>,
+    ) -> bool {
+        let Some(incumbent) = incumbent else {
+            return true;
+        };
+        candidate
+            .gas_saved
+            .cmp(&incumbent.gas_saved)
+            .then_with(|| incumbent.native_bytes.cmp(&candidate.native_bytes))
+            .then_with(|| {
+                incumbent
+                    .gate_indices
+                    .len()
+                    .cmp(&candidate.gate_indices.len())
+            })
+            .then_with(|| incumbent.gate_indices.cmp(&candidate.gate_indices))
+            == std::cmp::Ordering::Greater
+    }
+
+    /// Estimate the generated native callback block for one identity.
+    fn native_identity_estimate_block(identity: &QuotientIdentity) -> Vec<String> {
+        let state_slots = QuotientStateSlots {
+            eval_numer_mptr: 0x2000,
+            trace_id_mptr: 0x2020,
+            selector_power_mptr: 0x2040,
+        };
+        let selector_gap = matches!(identity.target, QuotientTarget::Selector(_)).then_some(1);
+        Self::direct_quotient_block(
+            &identity.lines,
+            &identity.var,
+            identity.target,
+            selector_gap,
+            &[],
+            0x1000,
+            Some(state_slots),
+            false,
+        )
+    }
+
+    /// Source-byte proxy for the native callback's contribution to runtime size.
+    fn yul_block_source_bytes(block: &[String]) -> usize {
+        block.iter().map(|line| line.len() + 1).sum()
+    }
+
+    /// Relative gas proxy for a generated native Yul callback.
+    fn estimate_native_yul_gas(block: &[String]) -> u64 {
+        let raw = block
+            .iter()
+            .map(|line| {
+                let mut gas = 4u64;
+                gas += 8 * line.matches("mload(").count() as u64;
+                gas += 10 * line.matches("mstore(").count() as u64;
+                gas += 38 * line.matches("addmod(").count() as u64;
+                gas += 42 * line.matches("mulmod(").count() as u64;
+                gas += 18 * line.matches("add(").count() as u64;
+                gas += 18 * line.matches("sub(").count() as u64;
+                gas += 16 * line.matches("mul(").count() as u64;
+                gas
+            })
+            .sum::<u64>();
+        // This is a relative selector score, not an absolute EVM gas model:
+        // straight-line native Yul avoids the compact VM's dispatch overhead.
+        raw / 2
+    }
+
+    /// Estimate compact-VM byte and gas cost of one identity.
+    fn quotient_identity_program_metrics(identity: &QuotientIdentity) -> (usize, u64) {
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
+        let expr = Self::quotient_identity_expr(identity);
+        let selector_gap = matches!(identity.target, QuotientTarget::Selector(_)).then_some(0);
+        builder.identity_expr(&expr, identity.target, selector_gap, None);
+        let gas = Self::estimate_quotient_vm_gas(&builder.bytes);
+        (builder.bytes.len(), gas)
+    }
+
+    /// Relative gas proxy for the compact quotient VM interpreter.
+    fn estimate_quotient_vm_gas(bytes: &[u8]) -> u64 {
+        let mut gas = 0u64;
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let op = bytes[idx];
+            gas += match op {
+                Q_OP_PUSH_CONST => 54,
+                Q_OP_PUSH_MEM_LITERAL => 56,
+                Q_OP_PUSH_MEM_TOKEN => 60,
+                Q_OP_PUSH_MEM_TOKEN_OFFSET => 66,
+                Q_OP_PUSH_MEM_U16 => 48,
+                Q_OP_ADD => 38,
+                Q_OP_MUL => 42,
+                Q_OP_NEG => 24,
+                Q_OP_PUSH_CONST_U8 => 42,
+                Q_OP_FOLD_MAIN => 70,
+                Q_OP_FOLD_SELECTOR => 92,
+                Q_OP_ADD_CONST_U8 | Q_OP_ADD_CONST => 46,
+                Q_OP_MUL_CONST_U8 | Q_OP_MUL_CONST => 50,
+                Q_OP_ADD_MEM_U16 => 48,
+                Q_OP_MUL_MEM_U16 => 52,
+                Q_OP_ADD_MUL_MEM_MEM_CONST_U8 => 78,
+                Q_OP_ADD_MUL_CONST_U8_MEM_U16 => 66,
+                Q_OP_ADD_MUL_MEM_MEM => 70,
+                Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+                    let count = read_u16(bytes, idx + 1) as u64;
+                    32 + 58 * count
+                }
+                Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+                    let count = read_u16(bytes, idx + 1) as u64;
+                    32 + 48 * count
+                }
+                Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP => 42,
+                Q_OP_NATIVE_PERMUTATION | Q_OP_NATIVE_LOOKUP => 0,
+                Q_OP_NATIVE_IDENTITY => 0,
+                Q_OP_LIN7 => 190,
+                Q_OP_BILIN7_ROW => 260,
+                Q_OP_BILIN7_PAIRWISE => 980,
+                Q_OP_MODARITH7 => 90 + 9 * quotient_op_len(bytes, idx) as u64,
+                Q_OP_POW5 => 58,
+                _ => quotient_op_len(bytes, idx) as u64 * 12,
+            };
+            idx += quotient_op_len(bytes, idx);
+        }
+        gas
     }
 
     /// Compute the copied-memory frame required by the external evaluator.
@@ -1349,15 +1657,6 @@ impl<'a> SolidityGenerator<'a> {
             output_len: 2 * WORD_BYTES + simple_selector_count * WORD_BYTES,
             magic: QUOTIENT_EXTERNAL_MAGIC,
         }
-    }
-
-    /// Estimate compact-VM byte cost of one identity for native selection.
-    fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
-        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
-        let expr = Self::quotient_identity_expr(identity);
-        let selector_gap = matches!(identity.target, QuotientTarget::Selector(_)).then_some(0);
-        builder.identity_expr(&expr, identity.target, selector_gap, None);
-        builder.bytes.len()
     }
 
     /// Split the quotient identity stream into gate/permutation/lookup/trash parts.

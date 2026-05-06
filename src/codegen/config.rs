@@ -17,12 +17,16 @@ pub(super) const HYBRID_QUOTIENT_INLINE_IDENTITIES_ENV: &str =
     "HALO2_SOLIDITY_HYBRID_QUOTIENT_INLINE_IDENTITIES";
 
 // Spend a bounded slice of quotient-evaluator bytecode headroom on native VM
-// callbacks. After the direct prefix, the heaviest N remaining gate identities
-// are emitted as VM opcodes that call generated Yul blocks; everything else
-// stays in the compact interpreter. The default keeps the heaviest callbacks
-// native. Tune with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N.
+// callbacks. After the direct prefix, up to N remaining gate identities are
+// emitted as VM opcodes that call generated Yul blocks; everything else stays
+// in the compact interpreter. Selection is a gas/byte knapsack under an
+// estimated native callback byte budget. Tune the max count with
+// HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES=N and override the estimated byte budget
+// with HALO2_SOLIDITY_QUOTIENT_NATIVE_GATE_BYTE_BUDGET=N.
 pub(super) const DEFAULT_QUOTIENT_NATIVE_GATES: usize = 4;
 pub(super) const QUOTIENT_NATIVE_GATES_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATES";
+pub(super) const QUOTIENT_NATIVE_GATE_BYTE_BUDGET_ENV: &str =
+    "HALO2_SOLIDITY_QUOTIENT_NATIVE_GATE_BYTE_BUDGET";
 pub(super) const QUOTIENT_ENCODING_ENV: &str = "HALO2_SOLIDITY_QUOTIENT_ENCODING";
 // The compact quotient VM path is the default size-oriented emitter: it stores
 // identity arithmetic as data in the VK and interprets it from one small Yul
@@ -53,6 +57,8 @@ pub(super) struct CodegenOptions {
     pub(super) hybrid_quotient_inline_identities: usize,
     /// Number of remaining heavy gate identities emitted as native callbacks.
     pub(super) quotient_native_gates: usize,
+    /// Optional estimated native callback byte budget for gate selection.
+    pub(super) quotient_native_gate_byte_budget: Option<usize>,
     /// Physical encoding used for the compact quotient VM program.
     pub(super) quotient_encoding: QuotientProgramEncoding,
     /// Whether the direct quotient path stores repeated expressions in memory.
@@ -89,6 +95,9 @@ impl CodegenOptions {
             quotient_native_gates: parse_usize_env(
                 QUOTIENT_NATIVE_GATES_ENV,
                 DEFAULT_QUOTIENT_NATIVE_GATES,
+            ),
+            quotient_native_gate_byte_budget: parse_optional_usize_env(
+                QUOTIENT_NATIVE_GATE_BYTE_BUDGET_ENV,
             ),
             quotient_encoding,
             quotient_inline_cse: parse_bool_env(QUOTIENT_CSE_ENV, false, "0/1", &["cse"]),
@@ -140,6 +149,13 @@ fn parse_usize_env(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+/// Parse an optional unsigned integer environment variable.
+fn parse_optional_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
 }
 
 /// Parse a boolean/toggle environment variable with optional named aliases.

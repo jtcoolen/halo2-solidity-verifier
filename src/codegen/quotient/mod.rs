@@ -2567,6 +2567,11 @@ pub(super) fn quotient_native_gate_count(gates: &[QuotientIdentity]) -> usize {
         .min(config::CodegenOptions::from_env().quotient_native_gates)
 }
 
+/// Optional estimated native callback byte budget for gate selection.
+pub(super) fn quotient_native_gate_byte_budget() -> Option<usize> {
+    config::CodegenOptions::from_env().quotient_native_gate_byte_budget
+}
+
 /// Configured physical VM encoding.
 pub(super) fn quotient_program_encoding() -> QuotientProgramEncoding {
     config::CodegenOptions::from_env().quotient_encoding
