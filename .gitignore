@@ -16,3 +16,4 @@ Cargo.lock
 .vscode
 generated/
 .srs/
+.solc/

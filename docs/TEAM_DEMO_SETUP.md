@@ -78,6 +78,29 @@ If you open a new terminal later, run this again from the repo root:
 export SOLC="$PWD/.solc/solc"
 ```
 
+## One-Command Demo Runner
+
+The scripted path performs the setup checks, installs pinned `solc` when needed,
+checks/downloads SRS assets, checks the sibling Moonlight checkout, prints
+colored progress logs, and writes full command logs under
+`target/team-demo-logs`.
+
+Run setup and compile preflights only:
+
+```bash
+scripts/run_team_demo.sh --check-only
+```
+
+Run the full demo path:
+
+```bash
+scripts/run_team_demo.sh
+```
+
+The full path runs both the IVC Rust/Solidity trace equivalence test and the
+Moonlight wrap decider Solidity bench. Use `--help` to see options for custom
+SRS directories, HTTPS Moonlight cloning, or skipping one of the heavy runs.
+
 ## 3. Download SRS Assets
 
 For the demo, we will use the multi-limb outer proof shape so everyone can
