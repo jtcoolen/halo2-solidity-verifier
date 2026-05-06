@@ -45,6 +45,9 @@ quotient evaluator runtime: 23,448 bytes
 
 ## 2. Remove the selector y^-1 fold scheme
 
+Status: applied, but measured as a bytecode win and a small gas regression for
+the current IVC Keccak bench shape.
+
 When simple selectors exist, the quotient VM computes `y_inv` with modexp and
 updates `sel_scale` / `sel_inv_scale` for every identity. The selector identity
 positions are known at codegen time.
@@ -64,6 +67,26 @@ Risk / caveat:
 
 - The current forward-scan logic carefully matches Rust's reverse y-power
   selector grouping. The replacement needs trace-equivalence tests.
+
+Validation run after applying the gap fold:
+
+```text
+command: scripts/run_ivc_bench.sh --skip-srs-download
+shape: current worktree script default, outer single-H disabled
+result: PASS
+total tx gas: 1,301,676
+real section work: 1,144,410
+batched numerator section: 314,581
+verifier runtime: 12,061 bytes
+VK runtime: 15,168 bytes
+quotient evaluator runtime: 22,698 bytes
+total runtime: 49,927 bytes
+```
+
+Compared with the trace-gated baseline above, this saves 750 bytes in the
+quotient evaluator runtime and 718 bytes overall, but increases checkpoint 12
+by 819 gas and total transaction gas by 975. Keep this change only when runtime
+size is the priority, or use it as a base for a cheaper selector-power scheme.
 
 ## 3. Replace native-gate top-N selection with a byte-budget knapsack
 

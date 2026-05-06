@@ -205,14 +205,14 @@ The compact path is the production path. Its generated assembly sections are:
 | Load batching challenge | `y := mload(Y_MPTR)` | Reads the identity-batching challenge sampled by the main verifier. | `verify_algebraic_constraints` has already squeezed `y`. |
 | Bind VM payload pointers | `q_const_mptr`, `q_program_mptr`, optional `q_tmp_mptr` | Points at quotient constants, quotient bytecode, and CSE temporary scratch. | These are generated from `QuotientProgramBuild` and stored in the VK payload. |
 | Initialize main fold state | `program.eval_numer_mptr`, `program.trace_id_mptr` | Zeros the Horner accumulator for fully evaluated identities and sets the trace id base. | This accumulator becomes `nu_y(x)` for the Rust `None` identity group. |
-| Initialize selector buckets | `SELECTOR_ACC_MPTR`, `q_sel_scale`, `q_sel_inv_scale`, `q_y_inv` | Zeros selector accumulators and computes `y^-1` with modexp when simple selectors exist. | Mirrors Rust's grouped simple-selector scalars in `compute_linearization_commitment`. |
+| Initialize selector buckets | `SELECTOR_ACC_MPTR`, `program.selector_power_mptr` | Zeros selector accumulators and precomputes the `y^k` powers needed by codegen-known selector gaps and tails. | Mirrors Rust's grouped simple-selector scalars in `compute_linearization_commitment`. |
 | Direct inline prefix | `quotient_inline_computations` | Renders a short prefix of generated identity Yul before the VM loop. | Same identity stream, but cheaper than interpreter dispatch. |
 | VM register setup | `q_pc`, `q_end`, `q_sp`, `q_top`, `q_has_top` | Initializes the stack interpreter over the VK-backed bytecode. | Implements lowered `partially_evaluate_identities` fragments. |
 | Packed32 interpreter branch | `program.packed32 == true` | Reads 4-byte instruction words: high byte opcode, low 24 bits operand. | Alternative physical encoding chosen by codegen. |
 | Byte interpreter branch | `program.packed32 == false` | Reads one opcode byte plus variable-width operands. Also supports dynamic run and limb opcodes. | Default compact encoding for the gas-capped verifier. |
 | Native callback cases | generated callback blocks | VM markers reset the stack pointer and run generated Yul for permutation, lookup, or heavy gates. | Replaces regular identity fragments without changing order or y-batch positions. |
 | Structured post-VM suffix | `quotient_post_vm_computations` | Emits regular identity families, currently trash, after the VM. | Keeps identity order while avoiding expensive interpreted tail work. |
-| Final selector scaling | `q_sel_scale` | Multiplies every selector bucket by the final forward y scale. | Converts forward `eval * y^-k` buckets into Rust's reverse-fold powers. |
+| Final selector scaling | `program.selector_tail_updates` | Applies each selector bucket's codegen-known final y-power tail. | Converts gap-folded selector buckets into Rust's reverse-fold powers. |
 | Linearization scalar store | `QUOTIENT_EVAL_MPTR` | Stores `-mload(eval_numer_mptr)`. | This is the expected scalar for the linearization query, not `h(x)`. |
 
 The legacy `None` branch is intentionally smaller conceptually:
@@ -280,8 +280,8 @@ The logical cases are:
 | `0x07` | `mul` | no operand | no operand | Pop one spilled value and set `q_top = popped * q_top mod Fr`. |
 | `0x08` | `neg` | no operand | no operand | Set `q_top = -q_top mod Fr`. |
 | `0x09` | `push_const_u8` | `q_arg` is const index | next byte is const index | Short const load. |
-| `0x0a` | `fold_main` | no operand | no operand | Trace `q_top`, clear it, do `eval_numer = eval_numer * y + q_top`, and advance selector scales if present. |
-| `0x0b` | `fold_selector` | `q_arg` is selector index | next 2 bytes are selector index | Trace `q_top`, clear it, advance the global y position, and add `q_top * q_sel_inv_scale` into the selector bucket. |
+| `0x0a` | `fold_main` | no operand | no operand | Trace `q_top`, clear it, and do `eval_numer = eval_numer * y + q_top`. |
+| `0x0b` | `fold_selector` | `q_arg` packs selector index and gap | next 3 bytes are selector index plus gap | Trace `q_top`, clear it, advance the global y position, multiply that selector bucket by `y^gap`, and add `q_top`. |
 | `0x0c` | `add_const_u8` | `q_arg` is const index | next byte is const index | Mutate `q_top += const[const_idx]`. |
 | `0x0d` | `mul_const_u8` | `q_arg` is const index | next byte is const index | Mutate `q_top *= const[const_idx]`. |
 | `0x0e` | `add_const` | `q_arg` is const index | next 2 bytes are const index | Wider const add. |

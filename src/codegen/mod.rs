@@ -8,8 +8,8 @@ use crate::codegen::{
     proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
     template::{
         Halo2QuotientEvaluator, Halo2Verifier, Halo2VerifyingKey, QuotientExternal,
-        QuotientProgram, QuotientVmMemUsage, QuotientVmOpcodeUsage, UserPhase,
-        VerifierCodegenLayout,
+        QuotientProgram, QuotientSelectorTail, QuotientVmMemUsage, QuotientVmOpcodeUsage,
+        UserPhase, VerifierCodegenLayout,
     },
     util::{
         fe_to_u256, g1_to_u256s, g2_to_u256s, ConstraintSystemMeta, Data, Location, Ptr, Value,
@@ -532,9 +532,8 @@ mod tests {
     }
 
     #[test]
-    fn quotient_selector_inverse_fold_matches_final_scale() {
+    fn quotient_selector_gap_fold_matches_rust_reverse_fold() {
         let y = Fq::from(19u64);
-        let y_inv = y.invert().unwrap();
         let evals = [
             Fq::from(2u64),
             Fq::from(0u64),
@@ -543,17 +542,23 @@ mod tests {
         ];
         let selector_positions = [true, false, true, true];
 
-        let mut scale = Fq::ONE;
-        let mut inv_scale = Fq::ONE;
+        let mut y_powers = vec![Fq::ONE; evals.len()];
+        for idx in 1..y_powers.len() {
+            y_powers[idx] = y_powers[idx - 1] * y;
+        }
+
+        let mut previous = None;
         let mut selector_acc = Fq::ZERO;
-        for (eval, selected) in evals.iter().zip(selector_positions) {
-            scale *= y;
-            inv_scale *= y_inv;
+        for (idx, (eval, selected)) in evals.iter().zip(selector_positions).enumerate() {
             if selected {
-                selector_acc += *eval * inv_scale;
+                let gap = previous.map_or(0, |prev| idx - prev);
+                selector_acc *= y_powers[gap];
+                selector_acc += *eval;
+                previous = Some(idx);
             }
         }
-        let solidity_selector_acc = selector_acc * scale;
+        let tail = evals.len() - 1 - previous.expect("selector identity present");
+        let solidity_selector_acc = selector_acc * y_powers[tail];
 
         let mut rust_selector_acc = Fq::ZERO;
         let mut y_pow = Fq::ONE;

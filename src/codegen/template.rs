@@ -746,16 +746,24 @@ pub(crate) struct QuotientProgram {
     pub(crate) eval_numer_mptr: usize,
     /// Persistent trace-id word.
     pub(crate) trace_id_mptr: usize,
-    /// Persistent selector forward-scale word.
-    pub(crate) sel_scale_mptr: usize,
-    /// Persistent selector inverse-scale word.
-    pub(crate) sel_inv_scale_mptr: usize,
-    /// Persistent `y^-1` word.
-    pub(crate) y_inv_mptr: usize,
+    /// First word of the optional selector `y^k` power table.
+    pub(crate) selector_power_mptr: usize,
+    /// Highest selector gap/tail exponent referenced by generated code.
+    pub(crate) selector_max_power: usize,
+    /// Non-zero final selector y-power tail updates.
+    pub(crate) selector_tail_updates: Vec<QuotientSelectorTail>,
     /// Operand stack / callback scratch base.
     pub(crate) stack_mptr: usize,
     /// Memory pointer to the first encoded program word.
     pub(crate) program_mptr: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuotientSelectorTail {
+    /// Byte offset of the selector bucket under `SELECTOR_ACC_MPTR`.
+    pub(crate) selector_offset: usize,
+    /// Byte offset of the tail power under `selector_power_mptr`.
+    pub(crate) power_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

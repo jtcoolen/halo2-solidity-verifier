@@ -31,9 +31,11 @@
 //! powers of `y`; the Yul VM scans forward with Horner's rule because that is
 //! cheaper and streaming-friendly. A simple-selector identity still advances
 //! the global `y` position, but its value is sent to the selector commitment
-//! bucket instead of the fully evaluated numerator. During the forward scan the
-//! bucket stores `e_i * y^-(i+1)` and a final multiplication by `y^m` restores
-//! `e_i * y^(m-1-i)`, matching the grouped selector MSM.
+//! bucket instead of the fully evaluated numerator. The selector positions are
+//! known at code generation time, so each selector bucket is advanced only by
+//! the gap since the previous identity for the same selector, then by its final
+//! tail. That preserves the same `y^(m-1-i)` powers without computing `y^-1`
+//! or updating every selector bucket position on unrelated identities.
 //!
 //! The VM is intentionally small rather than general-purpose. It has only Fr
 //! arithmetic, memory loads from generated verifier addresses, a deduplicated
@@ -324,6 +326,33 @@ pub(super) struct QuotientProgramPlan {
     pub(super) has_native_permutation: bool,
     /// Whether the stream contains a native lookup callback marker.
     pub(super) has_native_lookup: bool,
+    /// Gap exponents for simple-selector buckets in the global y-batch.
+    pub(super) selector_fold: SelectorFoldPlan,
+}
+
+/// Codegen-time selector-bucket schedule for gap-based forward folding.
+///
+/// Fully evaluated identities still use the ordinary Horner scan. Selector
+/// identities are sparse in that global stream, so each selector bucket only
+/// needs to be advanced across the gap since the previous identity for the same
+/// selector and then across the final tail after the stream ends.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SelectorFoldPlan {
+    /// `Some(gap)` for selector identities by global identity index.
+    pub(super) gaps_by_identity: Vec<Option<usize>>,
+    /// Final y-power tail for each selector bucket.
+    pub(super) tail_exponents: Vec<usize>,
+    /// Largest exponent referenced by either gaps or tails.
+    pub(super) max_power: usize,
+}
+
+impl SelectorFoldPlan {
+    pub(super) fn gap_for(&self, identity: &QuotientIdentity) -> Option<usize> {
+        self.gaps_by_identity
+            .get(identity.meta.global_index)
+            .copied()
+            .flatten()
+    }
 }
 
 pub(super) const QUOTIENT_EXTERNAL_MAGIC: u64 = 0x5155_4556_414c_0001;
@@ -368,6 +397,7 @@ pub(super) const QUOTIENT_VM_PACKED_ARG_BITS: usize = 24;
 pub(super) const QUOTIENT_VM_PACKED_ARG_MASK: u32 = 0x00ff_ffff;
 pub(super) const QUOTIENT_VM_RUN_COMPACTION_MIN_LEN: usize = 4;
 pub(super) const QUOTIENT_VM_BYTE_U16_BYTES: usize = 2;
+pub(super) const QUOTIENT_VM_BYTE_U24_BYTES: usize = 3;
 pub(super) const QUOTIENT_VM_BYTE_U32_BYTES: usize = 4;
 pub(super) const QUOTIENT_VM_LIMBS: usize = layout::quotient_limb::LIMBS;
 pub(super) const QUOTIENT_VM_PAIRWISE_TERMS: usize = layout::quotient_limb::PAIRWISE_TERMS;
@@ -446,6 +476,7 @@ pub(super) enum QuotientOpcodeEncoding {
     None,
     U8,
     U16,
+    U24,
     U32,
     TokenOffset,
     AddMulMemMemConstU8,
@@ -577,8 +608,8 @@ pub(super) const QUOTIENT_OPCODE_TABLE: &[QuotientOpcodeSpec] = &[
     QuotientOpcodeSpec {
         name: "fold_selector",
         opcode: Q_OP_FOLD_SELECTOR,
-        byte_len: 1 + QUOTIENT_VM_BYTE_U16_BYTES,
-        encoding: QuotientOpcodeEncoding::U16,
+        byte_len: 1 + QUOTIENT_VM_BYTE_U24_BYTES,
+        encoding: QuotientOpcodeEncoding::U24,
         packed32: true,
     },
     QuotientOpcodeSpec {
@@ -1261,6 +1292,7 @@ impl QuotientProgramBuilder {
         &mut self,
         expr: &QuotientExpr,
         target: QuotientTarget,
+        selector_gap: Option<usize>,
         cse: Option<&mut QuotientCseState>,
     ) {
         // Each identity is emitted as an isolated stack expression followed by
@@ -1274,13 +1306,13 @@ impl QuotientProgramBuilder {
         } else {
             self.emit_expr(expr);
         }
-        self.fold_identity(target);
+        self.fold_identity(target, selector_gap);
 
         assert_eq!(self.stack_depth, 0, "quotient VM stack leak");
     }
 
     /// Emit the fold opcode for the completed top-of-stack identity value.
-    fn fold_identity(&mut self, target: QuotientTarget) {
+    fn fold_identity(&mut self, target: QuotientTarget, selector_gap: Option<usize>) {
         // Mirrors the Rust `compute_linearization_commitment` y-batch:
         // every emitted identity is first absorbed into the same running
         // power of y, then either accumulated into the fully-evaluated
@@ -1288,8 +1320,17 @@ impl QuotientProgramBuilder {
         match target {
             QuotientTarget::Main => self.op0(Q_OP_FOLD_MAIN),
             QuotientTarget::Selector(idx) => {
+                let gap = selector_gap.expect("selector fold gap for selector identity");
+                assert!(
+                    idx <= u8::MAX as usize,
+                    "selector fold selector index exceeds 8 bits"
+                );
+                assert!(
+                    gap <= u16::MAX as usize,
+                    "selector fold gap exceeds 16 bits"
+                );
                 self.bytes.push(Q_OP_FOLD_SELECTOR);
-                self.u16(idx);
+                self.u24((idx << 16) | gap);
                 self.pop_stack();
             }
         }
@@ -2140,6 +2181,16 @@ impl QuotientProgramBuilder {
         self.bytes.extend_from_slice(&(value as u16).to_be_bytes());
     }
 
+    /// Append a big-endian 24-bit operand.
+    fn u24(&mut self, value: usize) {
+        assert!(
+            value <= QUOTIENT_VM_PACKED_ARG_MASK as usize,
+            "quotient VM u24 overflow"
+        );
+        self.bytes
+            .extend_from_slice(&(value as u32).to_be_bytes()[1..]);
+    }
+
     /// Append a big-endian `u32` operand.
     fn u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
@@ -2283,11 +2334,15 @@ pub(super) fn pack_quotient_u32_program(bytes: &[u8]) -> Vec<u8> {
     while idx < bytes.len() {
         let op = bytes[idx];
         match op {
-            Q_OP_PUSH_CONST | Q_OP_FOLD_SELECTOR | Q_OP_ADD_CONST | Q_OP_MUL_CONST
-            | Q_OP_PUSH_MEM_U16 | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP
-            | Q_OP_STORE_TEMP | Q_OP_NATIVE_IDENTITY => {
+            Q_OP_PUSH_CONST | Q_OP_ADD_CONST | Q_OP_MUL_CONST | Q_OP_PUSH_MEM_U16
+            | Q_OP_ADD_MEM_U16 | Q_OP_MUL_MEM_U16 | Q_OP_PUSH_TEMP | Q_OP_STORE_TEMP
+            | Q_OP_NATIVE_IDENTITY => {
                 push_packed_quotient_op(&mut out, op, read_u16(bytes, idx + 1) as u32);
                 idx += 3;
+            }
+            Q_OP_FOLD_SELECTOR => {
+                push_packed_quotient_op(&mut out, op, read_u24(bytes, idx + 1));
+                idx += 4;
             }
             Q_OP_PUSH_MEM_LITERAL => {
                 let ptr = read_u32(bytes, idx + 1);
@@ -2479,6 +2534,14 @@ pub(super) fn read_u16(bytes: &[u8], idx: usize) -> u16 {
             .try_into()
             .expect("u16 quotient operand"),
     )
+}
+
+/// Read a big-endian 24-bit operand from bytecode.
+pub(super) fn read_u24(bytes: &[u8], idx: usize) -> u32 {
+    let bytes: [u8; 3] = bytes[idx..idx + 3]
+        .try_into()
+        .expect("u24 quotient operand");
+    ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | bytes[2] as u32
 }
 
 /// Read a big-endian `u32` operand from bytecode.

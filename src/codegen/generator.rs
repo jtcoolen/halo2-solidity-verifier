@@ -3,7 +3,7 @@ use super::*;
 impl<'a> SolidityGenerator<'a> {
     const SUPPORTED_COMMITTED_INSTANCE_COLUMNS: usize = 1;
     const SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS: usize = 1;
-    const QUOTIENT_STATE_WORDS: usize = 5;
+    const QUOTIENT_FIXED_STATE_WORDS: usize = 2;
 
     /// Return a new `SolidityGenerator`.
     pub fn new(
@@ -311,9 +311,7 @@ struct QuotientStateSlots {
     // prefixes, bytecode identities, and callbacks advance the same y-batch.
     eval_numer_mptr: usize,
     trace_id_mptr: usize,
-    sel_scale_mptr: usize,
-    sel_inv_scale_mptr: usize,
-    y_inv_mptr: usize,
+    selector_power_mptr: usize,
 }
 
 impl QuotientStateSlots {
@@ -321,7 +319,8 @@ impl QuotientStateSlots {
     fn new(tmp_mptr: usize, cse_temps: usize) -> Self {
         // Layout at `quotient_tmp_mptr`:
         //   [0 .. cse_temps)        VM STORE_TEMP/PUSH_TEMP scratch
-        //   [cse_temps .. +5 words) accumulator and selector-fold state
+        //   [cse_temps .. +2 words) accumulator and trace-id state
+        //   [after state]           optional y^k selector power table
         //
         // Keeping state after CSE temps lets the same template work whether
         // VM CSE is enabled or not.
@@ -329,9 +328,7 @@ impl QuotientStateSlots {
         Self {
             eval_numer_mptr: base,
             trace_id_mptr: base + WORD_BYTES,
-            sel_scale_mptr: base + 2 * WORD_BYTES,
-            sel_inv_scale_mptr: base + 3 * WORD_BYTES,
-            y_inv_mptr: base + 4 * WORD_BYTES,
+            selector_power_mptr: base + 2 * WORD_BYTES,
         }
     }
 }
@@ -1075,7 +1072,8 @@ impl<'a> SolidityGenerator<'a> {
         // deterministic for a fixed VK base and proof shape.
         let plan = self.quotient_program_plan(meta, data);
         let sorted_simple = plan.sorted_simple.clone();
-        let quotient_program_build = self.build_quotient_program_items(&plan.items);
+        let quotient_program_build =
+            self.build_quotient_program_items(&plan.items, &plan.selector_fold);
         let _quotient_max_stack = quotient_program_build.max_stack;
         (quotient_program_build, sorted_simple)
     }
@@ -1146,6 +1144,70 @@ impl<'a> SolidityGenerator<'a> {
         build.max_stack.max(native_callback_scratch_words)
     }
 
+    /// Number of persistent VM temp words needed for state plus selector powers.
+    fn quotient_state_words(selector_fold: &SelectorFoldPlan) -> usize {
+        Self::QUOTIENT_FIXED_STATE_WORDS + Self::selector_power_words(selector_fold)
+    }
+
+    /// Number of `y^k` words needed by selector gap/tail folding.
+    fn selector_power_words(selector_fold: &SelectorFoldPlan) -> usize {
+        if selector_fold.max_power == 0 {
+            0
+        } else {
+            selector_fold.max_power + 1
+        }
+    }
+
+    /// Render-time selector tail updates, omitting zero tails.
+    fn selector_tail_updates(selector_fold: &SelectorFoldPlan) -> Vec<QuotientSelectorTail> {
+        selector_fold
+            .tail_exponents
+            .iter()
+            .enumerate()
+            .filter_map(|(selector_idx, tail)| {
+                (*tail != 0).then_some(QuotientSelectorTail {
+                    selector_offset: selector_idx * WORD_BYTES,
+                    power_offset: tail * WORD_BYTES,
+                })
+            })
+            .collect()
+    }
+
+    /// Build the codegen-time selector gap schedule over the full identity stream.
+    fn selector_fold_plan(
+        identities: &[QuotientIdentity],
+        selector_count: usize,
+    ) -> SelectorFoldPlan {
+        let mut gaps_by_identity = vec![None; identities.len()];
+        let mut previous = vec![None; selector_count];
+        let mut tail_exponents = vec![0; selector_count];
+        let mut max_power = 0usize;
+
+        for identity in identities {
+            if let QuotientTarget::Selector(selector_idx) = identity.target {
+                let index = identity.meta.global_index;
+                let gap = previous[selector_idx].map_or(0, |prev| index - prev);
+                gaps_by_identity[index] = Some(gap);
+                max_power = max_power.max(gap);
+                previous[selector_idx] = Some(index);
+            }
+        }
+
+        for (selector_idx, last) in previous.into_iter().enumerate() {
+            if let Some(last_index) = last {
+                let tail = identities.len() - 1 - last_index;
+                tail_exponents[selector_idx] = tail;
+                max_power = max_power.max(tail);
+            }
+        }
+
+        SelectorFoldPlan {
+            gaps_by_identity,
+            tail_exponents,
+            max_power,
+        }
+    }
+
     /// Choose inline, VM, and native-callback representation for identities.
     fn quotient_program_plan(
         &self,
@@ -1159,6 +1221,8 @@ impl<'a> SolidityGenerator<'a> {
         //   * recognized expensive gates plus regular permutation/lookup
         //     families become native callback markers in the same stream.
         let parts = self.quotient_identity_parts(meta, data);
+        let all_identities = parts.all_identities();
+        let selector_fold = Self::selector_fold_plan(&all_identities, parts.sorted_simple.len());
         let inline_count = hybrid_quotient_inline_count(&parts.gates);
         let inline_identities = parts.gates[..inline_count].to_vec();
         let remaining_gates = &parts.gates[inline_count..];
@@ -1228,6 +1292,7 @@ impl<'a> SolidityGenerator<'a> {
             sorted_simple: parts.sorted_simple,
             has_native_permutation: native_permutation,
             has_native_lookup: native_lookup,
+            selector_fold,
         }
     }
 
@@ -1290,7 +1355,8 @@ impl<'a> SolidityGenerator<'a> {
     fn quotient_identity_program_cost(identity: &QuotientIdentity) -> usize {
         let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         let expr = Self::quotient_identity_expr(identity);
-        builder.identity_expr(&expr, identity.target, None);
+        let selector_gap = matches!(identity.target, QuotientTarget::Selector(_)).then_some(0);
+        builder.identity_expr(&expr, identity.target, selector_gap, None);
         builder.bytes.len()
     }
 
@@ -1555,6 +1621,7 @@ impl<'a> SolidityGenerator<'a> {
         lines: &[String],
         var: &str,
         target: QuotientTarget,
+        selector_gap: Option<usize>,
         sorted_simple: &[usize],
         eval_scratch_slot: usize,
         state_slots: Option<QuotientStateSlots>,
@@ -1591,12 +1658,29 @@ impl<'a> SolidityGenerator<'a> {
             }
             QuotientTarget::Selector(idx) => {
                 let offset = idx * 0x20;
-                let inv_scale = state_slots
-                    .map(|slots| format!("mload({:#x})", slots.sel_inv_scale_mptr))
-                    .unwrap_or_else(|| "q_sel_inv_scale".to_string());
-                block.push(format!(
-                    "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(mload({eval_scratch_slot:#x}), {inv_scale}, r), r))"
-                ));
+                if let Some(slots) = state_slots {
+                    let gap = selector_gap.expect("selector gap for compact direct quotient block");
+                    block.push("{".to_string());
+                    block.push(format!(
+                        "let q_selector_ptr := add(SELECTOR_ACC_MPTR, {offset:#x})"
+                    ));
+                    block.push("let q_selector_acc := mload(q_selector_ptr)".to_string());
+                    if gap != 0 {
+                        block.push(format!(
+                            "q_selector_acc := mulmod(q_selector_acc, mload(add({:#x}, {:#x})), r)",
+                            slots.selector_power_mptr,
+                            gap * WORD_BYTES
+                        ));
+                    }
+                    block.push(format!(
+                        "mstore(q_selector_ptr, addmod(q_selector_acc, mload({eval_scratch_slot:#x}), r))"
+                    ));
+                    block.push("}".to_string());
+                } else {
+                    block.push(format!(
+                        "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(mload({eval_scratch_slot:#x}), q_sel_inv_scale, r), r))"
+                    ));
+                }
             }
         }
         block
@@ -1650,8 +1734,9 @@ impl<'a> SolidityGenerator<'a> {
 
     /// Advance the global y-fold state by `count` identity positions.
     ///
-    /// Selector buckets store inverse-scaled values during a forward scan; the
-    /// final selector scale restores the reverse-fold powers used upstream.
+    /// Compact VM mode advances only the main accumulator here: selector
+    /// buckets use codegen-time gap updates at selector identity positions.
+    /// Legacy/direct modes keep the older inverse-scale selector fold.
     fn push_structured_fold_advance(
         block: &mut Vec<String>,
         count: usize,
@@ -1665,16 +1750,6 @@ impl<'a> SolidityGenerator<'a> {
                     "mstore({:#x}, mulmod(mload({:#x}), y, r))",
                     slots.eval_numer_mptr, slots.eval_numer_mptr
                 ));
-                if !sorted_simple.is_empty() {
-                    block.push(format!(
-                        "mstore({:#x}, mulmod(mload({:#x}), y, r))",
-                        slots.sel_scale_mptr, slots.sel_scale_mptr
-                    ));
-                    block.push(format!(
-                        "mstore({:#x}, mulmod(mload({:#x}), mload({:#x}), r))",
-                        slots.sel_inv_scale_mptr, slots.sel_inv_scale_mptr, slots.y_inv_mptr
-                    ));
-                }
             } else {
                 block.push("quotient_eval_numer := mulmod(quotient_eval_numer, y, r)".to_string());
                 if !sorted_simple.is_empty() {
@@ -1912,6 +1987,10 @@ impl<'a> SolidityGenerator<'a> {
         eval_scratch_slot: usize,
         state_slots: Option<QuotientStateSlots>,
     ) -> Vec<String> {
+        assert!(
+            state_slots.is_none(),
+            "selector-run grouping is only used by the legacy inverse selector fold"
+        );
         let capacity = run.iter().map(|(lines, _)| lines.len() + 5).sum::<usize>() + 10;
         let mut block = Vec::with_capacity(capacity);
         let offset = selector_idx * 0x20;
@@ -1938,11 +2017,8 @@ impl<'a> SolidityGenerator<'a> {
             "q_gate_run_i",
             state_slots,
         );
-        let inv_scale = state_slots
-            .map(|slots| format!("mload({:#x})", slots.sel_inv_scale_mptr))
-            .unwrap_or_else(|| "q_sel_inv_scale".to_string());
         block.push(format!(
-            "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(q_gate_run, {inv_scale}, r), r))"
+            "mstore(add(SELECTOR_ACC_MPTR, {offset:#x}), addmod(mload(add(SELECTOR_ACC_MPTR, {offset:#x})), mulmod(q_gate_run, q_sel_inv_scale, r), r))"
         ));
         block.push("}".to_string());
         block
@@ -1968,6 +2044,7 @@ impl<'a> SolidityGenerator<'a> {
                 &lines,
                 &var,
                 QuotientTarget::Selector(selector_idx),
+                None,
                 sorted_simple,
                 eval_scratch_slot,
                 state_slots,
@@ -2804,6 +2881,7 @@ impl<'a> SolidityGenerator<'a> {
                         &item.lines,
                         &item.var,
                         target,
+                        None,
                         sorted_simple,
                         eval_scratch_slot,
                         None,
@@ -2888,19 +2966,21 @@ impl<'a> SolidityGenerator<'a> {
             "external quotient evaluator is only implemented for the compact VM quotient path"
         );
 
-        let quotient_program_build = self.build_quotient_program_items(&quotient_plan.items);
+        let quotient_program_build =
+            self.build_quotient_program_items(&quotient_plan.items, &quotient_plan.selector_fold);
         let native_callback_scratch_words =
             self.native_callback_scratch_words(&meta, &quotient_plan);
         let quotient_stack_words = Self::quotient_stack_words_for_build(
             &quotient_program_build,
             native_callback_scratch_words,
         );
+        let quotient_state_words = Self::quotient_state_words(&quotient_plan.selector_fold);
         let memory = self.memory_layout_for(
             &meta,
             &vk,
             vk_mptr,
             VerifierMemoryLayoutConfig {
-                quotient_cse_temps: quotient_program_build.cse_temps + Self::QUOTIENT_STATE_WORDS,
+                quotient_cse_temps: quotient_program_build.cse_temps + quotient_state_words,
                 quotient_stack_words,
                 ..VerifierMemoryLayoutConfig::default()
             },
@@ -2942,9 +3022,9 @@ impl<'a> SolidityGenerator<'a> {
             tmp_mptr: quotient_tmp_mptr,
             eval_numer_mptr: quotient_state_slots.eval_numer_mptr,
             trace_id_mptr: quotient_state_slots.trace_id_mptr,
-            sel_scale_mptr: quotient_state_slots.sel_scale_mptr,
-            sel_inv_scale_mptr: quotient_state_slots.sel_inv_scale_mptr,
-            y_inv_mptr: quotient_state_slots.y_inv_mptr,
+            selector_power_mptr: quotient_state_slots.selector_power_mptr,
+            selector_max_power: quotient_plan.selector_fold.max_power,
+            selector_tail_updates: Self::selector_tail_updates(&quotient_plan.selector_fold),
             stack_mptr: quotient_stack_mptr,
             program_mptr,
         });
@@ -2968,6 +3048,7 @@ impl<'a> SolidityGenerator<'a> {
                 &identity.lines,
                 &identity.var,
                 identity.target,
+                quotient_plan.selector_fold.gap_for(identity),
                 &sorted_simple,
                 eval_scratch_slot,
                 Some(quotient_state_slots),
@@ -3005,6 +3086,7 @@ impl<'a> SolidityGenerator<'a> {
                 &identity.lines,
                 &identity.var,
                 identity.target,
+                quotient_plan.selector_fold.gap_for(identity),
                 &sorted_simple,
                 eval_scratch_slot,
                 Some(quotient_state_slots),
@@ -3131,8 +3213,9 @@ impl<'a> SolidityGenerator<'a> {
             "{QUOTIENT_CSE_ENV}=1 and {QUOTIENT_STRUCTURED_LOOPS_ENV}=1 are mutually exclusive"
         );
         let quotient_yul_helpers = use_inline_cse && quotient_yul_helpers_enabled();
-        let quotient_program_build = (!(use_inline_cse || use_structured_loops))
-            .then(|| self.build_quotient_program_items(&quotient_plan.items));
+        let quotient_program_build = (!(use_inline_cse || use_structured_loops)).then(|| {
+            self.build_quotient_program_items(&quotient_plan.items, &quotient_plan.selector_fold)
+        });
 
         let lookup_helper_chunks_total: usize = meta.lookup_chunks.iter().sum();
         let total_advices: usize = meta.num_user_advices.iter().sum();
@@ -3148,7 +3231,7 @@ impl<'a> SolidityGenerator<'a> {
         let pcs_memory_requirements = pcs::memory_requirements(&meta, &data);
         let quotient_cse_temps = quotient_program_build
             .as_ref()
-            .map(|build| build.cse_temps + Self::QUOTIENT_STATE_WORDS)
+            .map(|build| build.cse_temps + Self::quotient_state_words(&quotient_plan.selector_fold))
             .unwrap_or(0);
         let quotient_stack_words = quotient_program_build
             .as_ref()
@@ -3231,9 +3314,11 @@ impl<'a> SolidityGenerator<'a> {
                         tmp_mptr: quotient_tmp_mptr,
                         eval_numer_mptr: state_slots.eval_numer_mptr,
                         trace_id_mptr: state_slots.trace_id_mptr,
-                        sel_scale_mptr: state_slots.sel_scale_mptr,
-                        sel_inv_scale_mptr: state_slots.sel_inv_scale_mptr,
-                        y_inv_mptr: state_slots.y_inv_mptr,
+                        selector_power_mptr: state_slots.selector_power_mptr,
+                        selector_max_power: quotient_plan.selector_fold.max_power,
+                        selector_tail_updates: Self::selector_tail_updates(
+                            &quotient_plan.selector_fold,
+                        ),
                         stack_mptr: quotient_stack_mptr,
                         program_mptr,
                     }),
@@ -3284,6 +3369,7 @@ impl<'a> SolidityGenerator<'a> {
                     &identity.lines,
                     &identity.var,
                     identity.target,
+                    quotient_plan.selector_fold.gap_for(identity),
                     &sorted_simple,
                     eval_scratch_slot,
                     quotient_state_slots,
@@ -3324,6 +3410,7 @@ impl<'a> SolidityGenerator<'a> {
                     &identity.lines,
                     &identity.var,
                     identity.target,
+                    quotient_plan.selector_fold.gap_for(identity),
                     &sorted_simple,
                     eval_scratch_slot,
                     quotient_state_slots,
@@ -3590,7 +3677,11 @@ impl<'a> SolidityGenerator<'a> {
     }
 
     /// Lower a logical quotient item stream into compact VM bytecode.
-    fn build_quotient_program_items(&self, items: &[QuotientProgramItem]) -> QuotientProgramBuild {
+    fn build_quotient_program_items(
+        &self,
+        items: &[QuotientProgramItem],
+        selector_fold: &SelectorFoldPlan,
+    ) -> QuotientProgramBuild {
         let mut builder = QuotientProgramBuilder::with_limb_vm_ops(quotient_limb_vm_ops_enabled());
         // Lower the logical plan into bytecode in one pass. CSE planning looks
         // at all interpreted identities first, but native callbacks remain
@@ -3620,7 +3711,12 @@ impl<'a> SolidityGenerator<'a> {
                     let before_profile =
                         quotient_shape_profile_enabled().then(|| builder.profile.clone());
                     let expr = Self::quotient_identity_expr(identity);
-                    builder.identity_expr(&expr, identity.target, cse.as_mut());
+                    builder.identity_expr(
+                        &expr,
+                        identity.target,
+                        selector_fold.gap_for(identity),
+                        cse.as_mut(),
+                    );
                     if let Some(before_profile) = before_profile {
                         Self::print_identity_shape_profile(
                             identity,

@@ -855,28 +855,21 @@ The compact VM keeps:
 
 ```text
 selector_bucket[j]
-q_sel_scale
-q_sel_inv_scale
-y_inv
+y_power[k] = y^k
 ```
 
-At each identity:
+Codegen knows the global positions of selector identities. For a
+selector-targeted identity with scalar `e`, it emits the gap since the previous
+identity for the same selector:
 
 ```text
-q_sel_scale     *= y
-q_sel_inv_scale *= y_inv
+selector_bucket[j] = selector_bucket[j] * y_power[gap] + e
 ```
 
-For a selector-targeted identity with scalar `e`:
+After all identities it applies the final tail for each selector:
 
 ```text
-selector_bucket[j] += e * q_sel_inv_scale
-```
-
-After all identities:
-
-```text
-selector_bucket[j] *= q_sel_scale
+selector_bucket[j] *= y_power[tail[j]]
 ```
 
 This matches Rust's grouped selector accumulators.

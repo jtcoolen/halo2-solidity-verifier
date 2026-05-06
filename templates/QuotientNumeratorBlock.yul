@@ -65,28 +65,19 @@
                     mstore(add(SELECTOR_ACC_MPTR, q_sel_zero_off), 0)
                 }
 
-                // q_sel_scale tracks the final y^m multiplier for selector
-                // buckets. q_sel_inv_scale tracks y^-k at each identity so a
-                // selector bucket can be accumulated during a forward scan and
-                // scaled once at the end to match Rust's reverse y-fold.
-                mstore({{ program.sel_scale_mptr|hex() }}, 1)
-                mstore({{ program.sel_inv_scale_mptr|hex() }}, 1)
-                mstore({{ program.y_inv_mptr|hex() }}, 0)
+                {%- if program.selector_max_power > 0 %}
+                // Codegen knows the selector identity positions. Precompute
+                // the y^k powers needed for selector gap and tail updates,
+                // avoiding a runtime y^-1 modexp and per-identity selector
+                // scale maintenance.
                 {
-                    // Keep this inversion away from scalar_inv's fixed 0x6000
-                    // scratch: large separated VKs occupy that range.
-                    let q_inv_scratch := {{ program.stack_mptr|hex() }}
-                    if iszero(y) { revert(0, 0) }
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.base_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.exp_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.mod_len_offset|hex() }}), {{ template_constants.word_bytes|hex() }})
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.base_offset|hex() }}), y)
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.exp_offset|hex() }}), sub(FR_MODULUS, 2))
-                    mstore(add(q_inv_scratch, {{ template_constants.modexp.mod_offset|hex() }}), FR_MODULUS)
-                    if iszero(staticcall(gas(), {{ template_constants.modexp.address|hex() }}, q_inv_scratch, {{ template_constants.modexp.frame_bytes|hex() }}, q_inv_scratch, {{ template_constants.modexp.output_bytes|hex() }})) { revert(0, 0) }
-                    if iszero(eq(returndatasize(), {{ template_constants.modexp.output_bytes|hex() }})) { revert(0, 0) }
-                    mstore({{ program.y_inv_mptr|hex() }}, mload(q_inv_scratch))
+                    let q_y_power := 1
+                    for { let q_y_power_i := 1 } lt(q_y_power_i, {{ program.selector_max_power + 1 }}) { q_y_power_i := add(q_y_power_i, 1) } {
+                        q_y_power := mulmod(q_y_power, y, r)
+                        mstore(add({{ program.selector_power_mptr|hex() }}, shl(5, q_y_power_i)), q_y_power)
+                    }
                 }
+                {%- endif %}
                 {%- endif %}
 
                 // Direct inline prefix. These identities are generated as Yul
@@ -193,13 +184,14 @@
 
                 0x0a fold_main
                   effect: trace q_top, advance q_eval_numer = q_eval_numer*y
-                          + q_top, and advance selector scaling if present
+                          + q_top
 
                 0x0b fold_selector
-                  bytes:    u16 selector_idx
-                  packed32: q_arg = selector_idx
+                  bytes:    u8 selector_idx, u16 selector_gap
+                  packed32: q_arg = (selector_idx << 16) | selector_gap
                   effect: trace q_top, advance the global y position, and add
-                          q_top * q_sel_inv_scale to selector bucket
+                          q_top into a selector bucket after applying its
+                          codegen-known y^gap
 
                 0x0c add_const_u8
                   effect: q_top += q_const_mptr[u8 const_idx]
@@ -630,17 +622,14 @@
                         // This forward Horner fold matches Rust's reverse
                         // y-power fold after all identities have been read.
                         mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
-                        {%- if simple_selector_cols.len() > 0 %}
-                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
-                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
-                        {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
                     {%- endif %}
                     {%- if program.op_usage.fold_selector %}
                     {# VM 0x0b FOLD_SELECTOR: consume q_top into one simple-selector bucket. #}
                     case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
-                        let q_sel_idx := q_arg
+                        let q_sel_idx := shr(16, q_arg)
+                        let q_sel_gap := and(q_arg, 0xffff)
                         let q_eval := q_top
                         q_has_top := 0
                         {%- if self.trace %}
@@ -648,16 +637,15 @@
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         {%- endif %}
                         // Simple-selector identity: advance the global y
-                        // position, then accumulate into the selector bucket
-                        // with y^-k. The final selector scaling restores the
-                        // same y power used by Rust's grouped selector MSM.
+                        // position, then advance only this selector bucket by
+                        // the codegen-known gap since its previous identity.
                         mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
-                        {%- if simple_selector_cols.len() > 0 %}
-                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
-                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
-                        {%- endif %}
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
-                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
+                        let q_sel_acc := mload(q_target_ptr)
+                        if q_sel_gap {
+                            q_sel_acc := mulmod(q_sel_acc, mload(add({{ program.selector_power_mptr|hex() }}, shl(5, q_sel_gap))), r)
+                        }
+                        mstore(q_target_ptr, addmod(q_sel_acc, q_eval, r))
                     }
                     {%- endif %}
                     {# Invalid generated bytecode should fail closed. 0x1a intentionally lands here. #}
@@ -1318,18 +1306,16 @@
                         // This matches the reverse y-power fold in Rust
                         // linearization once all identities have been read.
                         mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
-                        {%- if simple_selector_cols.len() > 0 %}
-                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
-                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
-                        {%- endif %}
                         mstore({{ program.eval_numer_mptr|hex() }}, addmod(mload({{ program.eval_numer_mptr|hex() }}), q_eval, r))
                     }
                     {%- endif %}
                     {%- if program.op_usage.fold_selector %}
                     {# VM 0x0b FOLD_SELECTOR: consume q_top into one simple-selector bucket. #}
                     case {{ template_constants.quotient_vm.op.fold_selector|hex() }} {
-                        let q_sel_idx := shr(240, mload(q_pc))
-                        q_pc := add(q_pc, 2)
+                        let q_selector_payload := shr(232, mload(q_pc))
+                        q_pc := add(q_pc, 3)
+                        let q_sel_idx := shr(16, q_selector_payload)
+                        let q_sel_gap := and(q_selector_payload, 0xffff)
                         let q_eval := q_top
                         q_has_top := 0
                         {%- if self.trace %}
@@ -1337,16 +1323,15 @@
                         mstore({{ program.trace_id_mptr|hex() }}, add(mload({{ program.trace_id_mptr|hex() }}), 1))
                         {%- endif %}
                         // Simple-selector identity: keep the same y-batch
-                        // position as main identities, but defer the final
-                        // y^m scaling so equal selector commitments are
-                        // grouped like Rust's BTreeMap accumulator.
+                        // position as main identities, then advance only this
+                        // selector bucket by its codegen-known gap.
                         mstore({{ program.eval_numer_mptr|hex() }}, mulmod(mload({{ program.eval_numer_mptr|hex() }}), y, r))
-                        {%- if simple_selector_cols.len() > 0 %}
-                        mstore({{ program.sel_scale_mptr|hex() }}, mulmod(mload({{ program.sel_scale_mptr|hex() }}), y, r))
-                        mstore({{ program.sel_inv_scale_mptr|hex() }}, mulmod(mload({{ program.sel_inv_scale_mptr|hex() }}), mload({{ program.y_inv_mptr|hex() }}), r))
-                        {%- endif %}
                         let q_target_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_sel_idx))
-                        mstore(q_target_ptr, addmod(mload(q_target_ptr), mulmod(q_eval, mload({{ program.sel_inv_scale_mptr|hex() }}), r), r))
+                        let q_sel_acc := mload(q_target_ptr)
+                        if q_sel_gap {
+                            q_sel_acc := mulmod(q_sel_acc, mload(add({{ program.selector_power_mptr|hex() }}, shl(5, q_sel_gap))), r)
+                        }
+                        mstore(q_target_ptr, addmod(q_sel_acc, q_eval, r))
                     }
                     {%- endif %}
                     {# Invalid generated bytecode should fail closed. 0x1a intentionally lands here. #}
@@ -1366,14 +1351,15 @@
                 {%- endfor %}
 
                 {%- if simple_selector_cols.len() > 0 %}
-                // Finish selector buckets. During the forward scan each
-                // selector contribution was multiplied by y^-k. Multiplying
-                // all buckets by the final q_sel_scale restores the same
-                // y power that Rust's reverse fold assigns to that identity.
-                for { let q_i := 0 } lt(q_i, {{ simple_selector_cols.len() }}) { q_i := add(q_i, 1) } {
-                    let q_sel_ptr := add(SELECTOR_ACC_MPTR, shl(5, q_i))
-                    mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), mload({{ program.sel_scale_mptr|hex() }}), r))
+                // Finish selector buckets by applying the codegen-known tail
+                // from each selector's last identity to the end of the global
+                // y-batch.
+                {%- for tail in program.selector_tail_updates %}
+                {
+                    let q_sel_ptr := add(SELECTOR_ACC_MPTR, {{ tail.selector_offset|hex() }})
+                    mstore(q_sel_ptr, mulmod(mload(q_sel_ptr), mload(add({{ program.selector_power_mptr|hex() }}, {{ tail.power_offset|hex() }})), r))
                 }
+                {%- endfor %}
                 {%- endif %}
 
                 // Fully evaluated identities are the constant-polynomial side
