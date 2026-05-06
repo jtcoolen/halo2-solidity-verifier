@@ -117,7 +117,7 @@
                 //   0x19 native permutation    0x1b native heavy identity
                 //   0x1c LIN7                 0x1d BILIN7_ROW
                 //   0x1e BILIN7_PAIRWISE      0x1f native lookup
-                //   0x20 POW5
+                //   0x20 POW5                 0x21 MODARITH7
                 //
                 // There are two physical encodings for the same logical VM:
                 // packed32 and byte-oriented. Packed32 implements the fixed
@@ -268,6 +268,11 @@
 
                 0x20 pow5
                   effect: q_top = q_top^5
+
+                0x21 modarith7
+                  bytes only: flags, optional cond/constant, count header,
+                              then fused LIN7/BILIN7/mem/product blocks
+                  effect: push one fused affine 7-limb identity value
 
                 Memory token map used by 0x03/0x04:
                 0x01 L_0_MPTR

@@ -915,6 +915,12 @@ The evaluator reverts if:
 - the quotient VM sees an invalid opcode or malformed native callback index;
 - a generated arithmetic path explicitly detects an impossible state.
 
+Generated quotient VM bytecode is also decoded during code generation before it
+is pinned into the VK payload. That offline pass rejects unknown opcodes,
+truncated operands, unknown memory tokens, stack underflow, native-callback stack
+leaks, and non-empty fold boundaries, so production Yul does not need those
+checks in the hot path.
+
 The main verifier reverts if:
 
 - the quotient contract length/codehash is wrong;

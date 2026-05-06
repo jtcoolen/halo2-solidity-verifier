@@ -269,6 +269,11 @@ The compact quotient VM bytecode is packed into big-endian U256 words. Padding
 is explicit and checked on decode, which keeps the Solidity-side byte slicing
 predictable.
 
+Before bytecode is written into the VK payload, the generator re-decodes the
+final physical program and validates opcode support, operand length, memory
+tokens, stack depth, and identity-boundary emptiness. This keeps the lean Yul VM
+from depending on unchecked generator assumptions.
+
 Separated verifier mode emits a verifier contract plus a VK contract. Embedded
 mode emits one contract with the VK constants in the same artifact. The runtime
 protocol is the same in both modes.
@@ -547,9 +552,10 @@ For quotient VM changes:
 
 1. Extend the opcode, token, or constant model in Rust.
 2. Update the packed-program codec if byte encoding changes.
-3. Update the runtime Yul VM.
-4. Add bytecode round-trip tests.
-5. Add an end-to-end verifier test for the affected identity shape.
+3. Update the physical-program safety validator.
+4. Update the runtime Yul VM.
+5. Add bytecode round-trip and safety tests.
+6. Add an end-to-end verifier test for the affected identity shape.
 
 For transcript changes:
 

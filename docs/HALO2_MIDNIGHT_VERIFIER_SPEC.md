@@ -925,6 +925,10 @@ VK payload and interprets it with a small Yul stack VM.
 A reimplementation may emit straight-line code instead, but it must produce
 the same identity values in the same order and the same selector/main folds.
 To reproduce this repository's split artifact shape, implement the VM below.
+The generator decodes the finalized physical bytecode after run compaction or
+packed32 lowering and rejects unknown opcodes, truncated operands, unknown
+memory tokens, stack underflow, native-callback stack leaks, and non-empty
+identity boundaries before pinning the program into the VK payload.
 
 ### 11.1 VM State
 
@@ -1006,8 +1010,8 @@ big-endian.
 0x0a:
     fold main identity with q_eval = q_top
 
-0x0b u16 selector_idx:
-    fold selector identity with q_eval = q_top
+0x0b u8 selector_idx, u16 gap:
+    advance that selector bucket by gap and fold q_eval = q_top
 
 0x0c u8 const_idx:
     q_top += const[const_idx]
@@ -1072,6 +1076,12 @@ big-endian.
 
 0x1f:
     native lookup callback
+
+0x20:
+    q_top = q_top^5
+
+0x21 flags, optional cond/constant, count header, fused 7-limb blocks:
+    push one fused affine 7-limb identity value
 ```
 
 The packed32 encoding is an alternate physical encoding where each base

@@ -1329,6 +1329,62 @@ mod tests {
     }
 
     #[test]
+    fn quotient_vm_safety_validator_rejects_malformed_programs() {
+        let underflow = validate_quotient_program(&[Q_OP_ADD], QuotientProgramEncoding::Bytes)
+            .expect_err("ADD without operands must underflow");
+        assert!(
+            underflow.contains("stack underflow"),
+            "unexpected underflow error: {underflow}"
+        );
+
+        let leak = validate_quotient_program(
+            &[Q_OP_PUSH_CONST_U8, 0, Q_OP_PUSH_CONST_U8, 0, Q_OP_FOLD_MAIN],
+            QuotientProgramEncoding::Bytes,
+        )
+        .expect_err("fold with leaked spilled stack value must fail");
+        assert!(
+            leak.contains("requires exactly 1 stack value"),
+            "unexpected leak error: {leak}"
+        );
+
+        let bad_token = validate_quotient_program(
+            &[Q_OP_PUSH_MEM_TOKEN, 0xff, Q_OP_FOLD_MAIN],
+            QuotientProgramEncoding::Bytes,
+        )
+        .expect_err("unknown memory token must fail");
+        assert!(
+            bad_token.contains("unknown quotient VM memory token"),
+            "unexpected token error: {bad_token}"
+        );
+
+        let truncated =
+            validate_quotient_program(&[Q_OP_PUSH_CONST, 0], QuotientProgramEncoding::Bytes)
+                .expect_err("truncated operand must fail");
+        assert!(
+            truncated.contains("truncated quotient VM"),
+            "unexpected truncation error: {truncated}"
+        );
+    }
+
+    #[test]
+    fn quotient_vm_safety_validator_accepts_byte_and_packed_programs() {
+        let bytes = [Q_OP_PUSH_CONST_U8, 0, Q_OP_POW5, Q_OP_FOLD_MAIN];
+        assert_eq!(
+            validate_quotient_program(&bytes, QuotientProgramEncoding::Bytes).unwrap(),
+            1
+        );
+
+        let mut packed = Vec::new();
+        push_packed_quotient_op(&mut packed, Q_OP_PUSH_CONST_U8, 0);
+        push_packed_quotient_op(&mut packed, Q_OP_POW5, 0);
+        push_packed_quotient_op(&mut packed, Q_OP_FOLD_MAIN, 0);
+        assert_eq!(
+            validate_quotient_program(&packed, QuotientProgramEncoding::Packed32).unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn normalized_yul_assignment_parser_tolerates_formatting_variants() {
         assert_eq!(
             yul_let_assignment("  let   z:=addmod(a, b, r)  "),

@@ -47,6 +47,11 @@
 //! opcodes are justified as structural compression of foreign-field limb
 //! expressions; they do not change the source of truth and they still evaluate
 //! the resulting PLONK identity over BLS12-381 Fr.
+//!
+//! Finalized bytecode is decoded again after run compaction or packed32
+//! lowering. That safety pass rejects unknown opcodes, truncated operands,
+//! unknown memory tokens, stack underflow, and identity-boundary stack leaks
+//! before the bytes can be pinned into a VK runtime.
 
 use super::*;
 
@@ -1407,6 +1412,12 @@ impl QuotientProgramBuilder {
             QuotientProgramEncoding::Bytes => compact_quotient_runs(&self.bytes),
             QuotientProgramEncoding::Packed32 => pack_quotient_u32_program(&self.bytes),
         };
+        let validated_max_stack = validate_quotient_program(&bytes, encoding)
+            .unwrap_or_else(|err| panic!("invalid finalized quotient VM program: {err}"));
+        assert_eq!(
+            validated_max_stack, self.max_stack,
+            "quotient VM physical program stack depth diverged from builder accounting"
+        );
         let (used_ops, used_mem_tokens) = quotient_program_usage(&bytes, encoding);
         let profile = self.profile;
         if quotient_shape_profile_enabled() {
@@ -2516,6 +2527,370 @@ fn push_unique_u8(values: &mut Vec<u8>, value: u8) {
         values.push(value);
         values.sort_unstable();
     }
+}
+
+/// Decode a finalized physical quotient program and verify stack safety.
+///
+/// This is an offline safety check for the VK-pinned program, not a runtime
+/// verifier feature. The Yul VM stays lean and assumes codegen emitted a valid
+/// stream; this pass proves that assumption before the program is embedded.
+pub(super) fn validate_quotient_program(
+    bytes: &[u8],
+    encoding: QuotientProgramEncoding,
+) -> Result<usize, String> {
+    let mut idx = 0usize;
+    let mut depth = 0usize;
+    let mut max_stack = 0usize;
+
+    if encoding == QuotientProgramEncoding::Packed32
+        && bytes.len() % QUOTIENT_VM_PACKED_INSTRUCTION_BYTES != 0
+    {
+        return Err(format!(
+            "packed32 quotient program length {} is not a multiple of {}",
+            bytes.len(),
+            QUOTIENT_VM_PACKED_INSTRUCTION_BYTES
+        ));
+    }
+
+    while idx < bytes.len() {
+        let (op, len) = match encoding {
+            QuotientProgramEncoding::Bytes => decode_byte_quotient_instruction(bytes, idx)?,
+            QuotientProgramEncoding::Packed32 => decode_packed_quotient_instruction(bytes, idx)?,
+        };
+        apply_quotient_stack_effect(op, idx, &mut depth, &mut max_stack)?;
+        idx += len;
+    }
+
+    if depth != 0 {
+        return Err(format!(
+            "quotient VM stack leak at end of program: {depth} value(s) remain"
+        ));
+    }
+
+    Ok(max_stack)
+}
+
+fn decode_byte_quotient_instruction(bytes: &[u8], idx: usize) -> Result<(u8, usize), String> {
+    require_quotient_bytes(bytes, idx, 1, "opcode")?;
+    let op = bytes[idx];
+    let spec = quotient_opcode_spec(op)
+        .ok_or_else(|| format!("unknown quotient VM opcode {op:#x} at byte {idx}"))?;
+    let len = quotient_byte_instruction_len_checked(bytes, idx)?;
+
+    match op {
+        Q_OP_PUSH_MEM_TOKEN => {
+            let token = bytes[idx + 1];
+            validate_quotient_mem_token(token, idx)?;
+        }
+        Q_OP_PUSH_MEM_TOKEN_OFFSET => {
+            let token = bytes[idx + 1];
+            validate_quotient_mem_token(token, idx)?;
+        }
+        _ => {}
+    }
+
+    if len == 0 {
+        return Err(format!(
+            "quotient VM opcode {} ({op:#x}) decoded to zero length at byte {idx}",
+            spec.name
+        ));
+    }
+    Ok((op, len))
+}
+
+fn decode_packed_quotient_instruction(bytes: &[u8], idx: usize) -> Result<(u8, usize), String> {
+    require_quotient_bytes(
+        bytes,
+        idx,
+        QUOTIENT_VM_PACKED_INSTRUCTION_BYTES,
+        "packed32 instruction",
+    )?;
+    let word = read_u32(bytes, idx);
+    let op = (word >> QUOTIENT_VM_PACKED_ARG_BITS) as u8;
+    let arg = word & QUOTIENT_VM_PACKED_ARG_MASK;
+    let spec = quotient_opcode_spec(op)
+        .ok_or_else(|| format!("unknown quotient VM opcode {op:#x} at byte {idx}"))?;
+    if !spec.packed32 {
+        return Err(format!(
+            "opcode {} ({op:#x}) is not supported by packed32 encoding at byte {idx}",
+            spec.name
+        ));
+    }
+
+    match op {
+        Q_OP_PUSH_MEM_TOKEN => {
+            let token = u8::try_from(arg).map_err(|_| {
+                format!("packed32 PUSH_MEM_TOKEN operand {arg:#x} exceeds u8 at byte {idx}")
+            })?;
+            validate_quotient_mem_token(token, idx)?;
+        }
+        Q_OP_PUSH_MEM_TOKEN_OFFSET => {
+            validate_quotient_mem_token((arg >> 16) as u8, idx)?;
+        }
+        Q_OP_ADD_MUL_MEM_MEM_CONST_U8 | Q_OP_ADD_MUL_MEM_MEM => {
+            require_quotient_bytes(
+                bytes,
+                idx,
+                2 * QUOTIENT_VM_PACKED_INSTRUCTION_BYTES,
+                "packed32 fused two-pointer instruction",
+            )?;
+            return Ok((op, 2 * QUOTIENT_VM_PACKED_INSTRUCTION_BYTES));
+        }
+        _ => {}
+    }
+
+    Ok((op, QUOTIENT_VM_PACKED_INSTRUCTION_BYTES))
+}
+
+fn quotient_byte_instruction_len_checked(bytes: &[u8], idx: usize) -> Result<usize, String> {
+    let op = bytes[idx];
+    let len = match op {
+        Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8 => {
+            require_quotient_bytes(bytes, idx, 1 + QUOTIENT_VM_BYTE_U16_BYTES, "run count")?;
+            let count = read_u16(bytes, idx + 1) as usize;
+            if count == 0 {
+                return Err(format!("zero-length quotient VM run at byte {idx}"));
+            }
+            let payload_len =
+                checked_quotient_len_mul(count, 2 * QUOTIENT_VM_BYTE_U16_BYTES + 1, op, idx)?;
+            checked_quotient_len_add(1 + QUOTIENT_VM_BYTE_U16_BYTES, payload_len, op, idx)?
+        }
+        Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16 => {
+            require_quotient_bytes(bytes, idx, 1 + QUOTIENT_VM_BYTE_U16_BYTES, "run count")?;
+            let count = read_u16(bytes, idx + 1) as usize;
+            if count == 0 {
+                return Err(format!("zero-length quotient VM run at byte {idx}"));
+            }
+            let payload_len =
+                checked_quotient_len_mul(count, QUOTIENT_VM_BYTE_U16_BYTES + 1, op, idx)?;
+            checked_quotient_len_add(1 + QUOTIENT_VM_BYTE_U16_BYTES, payload_len, op, idx)?
+        }
+        Q_OP_MODARITH7 => quotient_modarith7_op_len_checked(bytes, idx)?,
+        _ => quotient_opcode_byte_len(op)
+            .ok_or_else(|| format!("unknown quotient VM opcode {op:#x} at byte {idx}"))?,
+    };
+    require_quotient_bytes(bytes, idx, len, "instruction")?;
+    Ok(len)
+}
+
+fn quotient_modarith7_op_len_checked(bytes: &[u8], idx: usize) -> Result<usize, String> {
+    let op = Q_OP_MODARITH7;
+    let mut cursor = idx;
+    advance_quotient_cursor(bytes, &mut cursor, 1, op, idx)?; // opcode
+    require_quotient_bytes(bytes, cursor, 1, "MODARITH7 flags")?;
+    let flags = bytes[cursor];
+    if flags & !(Q_MODARITH7_FLAG_COND | Q_MODARITH7_FLAG_CONST) != 0 {
+        return Err(format!(
+            "MODARITH7 has unknown flag bits {flags:#x} at byte {idx}"
+        ));
+    }
+    advance_quotient_cursor(bytes, &mut cursor, 1, op, idx)?;
+    if flags & Q_MODARITH7_FLAG_COND != 0 {
+        advance_quotient_cursor(bytes, &mut cursor, QUOTIENT_VM_BYTE_U16_BYTES, op, idx)?;
+    }
+    if flags & Q_MODARITH7_FLAG_CONST != 0 {
+        advance_quotient_cursor(bytes, &mut cursor, 1, op, idx)?;
+    }
+
+    require_quotient_bytes(bytes, cursor, 5, "MODARITH7 count header")?;
+    let lin_count = bytes[cursor] as usize;
+    let row_count = bytes[cursor + 1] as usize;
+    let pairwise_count = bytes[cursor + 2] as usize;
+    let mem_count = bytes[cursor + 3] as usize;
+    let product_count = bytes[cursor + 4] as usize;
+    advance_quotient_cursor(bytes, &mut cursor, 5, op, idx)?;
+
+    advance_quotient_cursor(
+        bytes,
+        &mut cursor,
+        checked_quotient_len_mul(
+            lin_count,
+            QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES),
+            op,
+            idx,
+        )?,
+        op,
+        idx,
+    )?;
+    advance_quotient_cursor(
+        bytes,
+        &mut cursor,
+        checked_quotient_len_mul(
+            row_count,
+            QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_LIMBS * (1 + QUOTIENT_VM_BYTE_U16_BYTES),
+            op,
+            idx,
+        )?,
+        op,
+        idx,
+    )?;
+    advance_quotient_cursor(
+        bytes,
+        &mut cursor,
+        checked_quotient_len_mul(
+            pairwise_count,
+            2 * QUOTIENT_VM_BYTE_U16_BYTES + QUOTIENT_VM_PAIRWISE_COEFFS,
+            op,
+            idx,
+        )?,
+        op,
+        idx,
+    )?;
+    advance_quotient_cursor(
+        bytes,
+        &mut cursor,
+        checked_quotient_len_mul(mem_count, 1 + QUOTIENT_VM_BYTE_U16_BYTES, op, idx)?,
+        op,
+        idx,
+    )?;
+    advance_quotient_cursor(
+        bytes,
+        &mut cursor,
+        checked_quotient_len_mul(product_count, 1 + 2 * QUOTIENT_VM_BYTE_U16_BYTES, op, idx)?,
+        op,
+        idx,
+    )?;
+
+    Ok(cursor - idx)
+}
+
+fn apply_quotient_stack_effect(
+    op: u8,
+    idx: usize,
+    depth: &mut usize,
+    max_stack: &mut usize,
+) -> Result<(), String> {
+    match op {
+        Q_OP_PUSH_CONST
+        | Q_OP_PUSH_MEM_LITERAL
+        | Q_OP_PUSH_MEM_TOKEN
+        | Q_OP_PUSH_MEM_TOKEN_OFFSET
+        | Q_OP_PUSH_MEM_U16
+        | Q_OP_PUSH_CONST_U8
+        | Q_OP_PUSH_TEMP
+        | Q_OP_LIN7
+        | Q_OP_BILIN7_ROW
+        | Q_OP_BILIN7_PAIRWISE
+        | Q_OP_MODARITH7 => {
+            *depth = depth
+                .checked_add(1)
+                .ok_or_else(|| format!("quotient VM stack depth overflow at byte {idx}"))?;
+            *max_stack = (*max_stack).max(*depth);
+        }
+        Q_OP_ADD | Q_OP_MUL => {
+            require_quotient_stack_depth(op, idx, *depth, 2)?;
+            *depth -= 1;
+        }
+        Q_OP_NEG
+        | Q_OP_ADD_CONST_U8
+        | Q_OP_MUL_CONST_U8
+        | Q_OP_ADD_CONST
+        | Q_OP_MUL_CONST
+        | Q_OP_ADD_MEM_U16
+        | Q_OP_MUL_MEM_U16
+        | Q_OP_ADD_MUL_MEM_MEM_CONST_U8
+        | Q_OP_ADD_MUL_CONST_U8_MEM_U16
+        | Q_OP_ADD_MUL_MEM_MEM
+        | Q_OP_RUN_ADD_MUL_MEM_MEM_CONST_U8
+        | Q_OP_RUN_ADD_MUL_CONST_U8_MEM_U16
+        | Q_OP_STORE_TEMP
+        | Q_OP_POW5 => {
+            require_quotient_stack_depth(op, idx, *depth, 1)?;
+        }
+        Q_OP_FOLD_MAIN | Q_OP_FOLD_SELECTOR => {
+            if *depth != 1 {
+                return Err(format!(
+                    "quotient VM stack boundary error at byte {idx}: opcode {op:#x} requires exactly 1 stack value, found {depth}"
+                ));
+            }
+            *depth = 0;
+        }
+        Q_OP_NATIVE_PERMUTATION | Q_OP_NATIVE_LOOKUP | Q_OP_NATIVE_IDENTITY => {
+            if *depth != 0 {
+                return Err(format!(
+                    "quotient VM native callback at byte {idx}: opcode {op:#x} requires an empty stack, found {depth}"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "unknown quotient VM opcode {op:#x} reached stack validator at byte {idx}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_quotient_stack_depth(
+    op: u8,
+    idx: usize,
+    depth: usize,
+    required: usize,
+) -> Result<(), String> {
+    if depth < required {
+        return Err(format!(
+            "quotient VM stack underflow at byte {idx}: opcode {op:#x} requires {required} stack value(s), found {depth}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quotient_mem_token(token: u8, idx: usize) -> Result<(), String> {
+    if QUOTIENT_VM_SPEC
+        .mem_tokens
+        .iter()
+        .any(|spec| spec.token == token)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown quotient VM memory token {token:#x} at byte {idx}"
+        ))
+    }
+}
+
+fn require_quotient_bytes(
+    bytes: &[u8],
+    idx: usize,
+    len: usize,
+    context: &str,
+) -> Result<(), String> {
+    let end = idx
+        .checked_add(len)
+        .ok_or_else(|| format!("quotient VM {context} length overflows at byte {idx}"))?;
+    if end > bytes.len() {
+        return Err(format!(
+            "truncated quotient VM {context} at byte {idx}: need {len} byte(s), program has {} byte(s) remaining",
+            bytes.len().saturating_sub(idx)
+        ));
+    }
+    Ok(())
+}
+
+fn advance_quotient_cursor(
+    bytes: &[u8],
+    cursor: &mut usize,
+    amount: usize,
+    op: u8,
+    op_idx: usize,
+) -> Result<(), String> {
+    require_quotient_bytes(bytes, *cursor, amount, "dynamic instruction operand")?;
+    *cursor = cursor.checked_add(amount).ok_or_else(|| {
+        format!("quotient VM opcode {op:#x} length overflows while decoding byte {op_idx}")
+    })?;
+    Ok(())
+}
+
+fn checked_quotient_len_mul(lhs: usize, rhs: usize, op: u8, idx: usize) -> Result<usize, String> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        format!("quotient VM opcode {op:#x} length multiplication overflows at byte {idx}")
+    })
+}
+
+fn checked_quotient_len_add(lhs: usize, rhs: usize, op: u8, idx: usize) -> Result<usize, String> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        format!("quotient VM opcode {op:#x} length addition overflows at byte {idx}")
+    })
 }
 
 /// Append one packed32 instruction word.
