@@ -985,6 +985,23 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_decoder_rejects_noncanonical_infinity() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+
+        for required in [
+            "EIP-2537 reserves affine (0,0) for the point",
+            "let decoded_zero := iszero(or(or(x_hi, x_lo), or(y_hi, y_lo)))",
+            "ok := and(ok, iszero(decoded_zero))",
+            "is_acc_encoded_identity(src)",
+        ] {
+            assert!(
+                verifier_template.contains(required),
+                "accumulator decoder should reject non-canonical infinity encodings: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn accumulator_encoding_validation_rejects_dead_configs() {
         let fully_collapsed = AccumulatorEncoding::new(4, 7, 56);
         assert_eq!(

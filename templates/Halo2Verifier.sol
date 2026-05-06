@@ -683,6 +683,13 @@ contract Halo2Verifier {
                         mstore(add(dst, 0x60), 0)
                     }
                     if iszero(is_id) {
+                        // The coordinate codec maps encoded p-1 to decoded
+                        // zero. EIP-2537 reserves affine (0,0) for the point
+                        // at infinity, so a decoded infinity is only valid
+                        // when the canonical accumulator identity encoding
+                        // was used above.
+                        let decoded_zero := iszero(or(or(x_hi, x_lo), or(y_hi, y_lo)))
+                        ok := and(ok, iszero(decoded_zero))
                         mstore(dst, x_hi)
                         mstore(add(dst, 0x20), x_lo)
                         mstore(add(dst, 0x40), y_hi)
