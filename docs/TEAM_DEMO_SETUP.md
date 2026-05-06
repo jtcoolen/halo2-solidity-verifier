@@ -97,9 +97,10 @@ Run the full demo path:
 scripts/run_team_demo.sh
 ```
 
-The full path runs both the IVC Rust/Solidity trace equivalence test and the
-Moonlight wrap decider Solidity bench. Use `--help` to see options for custom
-SRS directories, HTTPS Moonlight cloning, or skipping one of the heavy runs.
+The full path runs the IVC Rust/Solidity trace equivalence test plus the
+Moonlight wrap decider Solidity bench and trace equivalence check. Use `--help`
+to see options for custom SRS directories, HTTPS Moonlight cloning, or skipping
+one of the heavy runs.
 
 ## 3. Download SRS Assets
 
@@ -238,6 +239,8 @@ public accumulator check enabled, the local demo run was:
   15   4,998,802,662        64,564     5.6%  public accumulator pairing batch prep
   total tx gas_used       = 1,302,138 (incl. tx base + calldata + pre-cp1 + post-last)
 [moonlight-wrap-solidity] PASS: final wrap decider proof accepted on-chain in 1302138 gas
+[moonlight-wrap-solidity][trace] matched 244 native Rust/Solidity trace points; generator-only accumulator trace ids: [29, 30]
+[moonlight-wrap-solidity][trace] PASS: final wrap decider trace matched native Midfall and accepted on-chain
 ```
 
 By default, generated Moonlight verifier artifacts are written under:
@@ -254,6 +257,18 @@ MOONLIGHT_WRAP_SOLIDITY_DUMP_DIR=target/moonlight-wrap-solidity-dump \
 cargo test --manifest-path ../Moonlight/aggregation/Cargo.toml \
   wrap_circuit_composes_two_fold_children_from_four_dummy_fold_proofs --release \
   --lib -- --ignored --nocapture
+```
+
+The dump includes both the production gas-bench verifier and the trace verifier:
+
+```text
+Halo2Verifier.sol
+Halo2VerifyingKey.sol
+Halo2Verifier.trace.sol
+Halo2VerifyingKey.trace.sol
+proof.bin
+instance.le
+calldata.bin
 ```
 
 ## Expected Demo Output

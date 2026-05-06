@@ -50,7 +50,7 @@ fi
 
 usage() {
   cat <<USAGE
-Run the full team demo setup, trace equivalence test, and Moonlight wrap bench.
+Run the full team demo setup, trace equivalence tests, and Moonlight wrap bench.
 
 Usage:
   scripts/run_team_demo.sh [options]
@@ -61,7 +61,7 @@ Default flow:
   3. Check or clone Moonlight next to this repo.
   4. Compile the trace and Moonlight bench paths as a preflight.
   5. Run the IVC Rust/Solidity trace equivalence test.
-  6. Run the Moonlight wrap decider Solidity bench.
+  6. Run the Moonlight wrap decider Solidity bench and trace equivalence check.
 
 Options:
   --check-only              Run setup checks and compile preflights only.
@@ -75,7 +75,7 @@ Options:
   --update-moonlight       Fetch and switch Moonlight to the requested branch.
   --no-clone-moonlight     Do not clone Moonlight if it is missing.
   --skip-trace             Skip the IVC Rust/Solidity trace equivalence run.
-  --skip-moonlight         Skip the Moonlight wrap decider bench.
+  --skip-moonlight         Skip the Moonlight wrap decider bench and trace check.
   --no-solc-install        Do not install .solc/solc automatically.
   --no-precheck-builds     Skip compile-only preflight commands.
   -h, --help               Show this help.
@@ -320,7 +320,7 @@ run_moonlight_bench() {
   [[ "$RUN_MOONLIGHT" -eq 1 ]] || return 0
 
   run_logged \
-    "Moonlight wrap decider Solidity bench" \
+    "Moonlight wrap decider Solidity bench and trace equivalence" \
     env \
       SOLC="$SOLC" \
       MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \
