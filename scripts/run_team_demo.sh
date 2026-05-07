@@ -377,6 +377,7 @@ run_moonlight_bench() {
     env \
       SOLC="$SOLC" \
       MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \
+      MOONLIGHT_RUN_WRAP_SOLIDITY_TRACE=1 \
       MOONLIGHT_WRAP_SOLIDITY_DUMP_DIR="$MOONLIGHT_DUMP_DIR" \
       cargo test \
         --manifest-path "$MOONLIGHT_DIR/aggregation/Cargo.toml" \
