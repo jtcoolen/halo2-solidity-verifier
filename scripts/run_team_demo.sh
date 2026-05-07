@@ -3,13 +3,14 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_NAME="$(basename "$ROOT_DIR")"
+cd "$ROOT_DIR"
 
 PINNED_SOLC_VERSION="${PINNED_SOLC_VERSION:-0.8.30+commit.73712a01}"
 SOLC_INSTALL_DIR="${SOLC_INSTALL_DIR:-"$ROOT_DIR/.solc"}"
 SRS_DIR="${SRS_DIR:-"$ROOT_DIR/.srs"}"
 LOG_DIR="${LOG_DIR:-"$ROOT_DIR/target/team-demo-logs"}"
 
-MOONLIGHT_DIR="${MOONLIGHT_DIR:-"$ROOT_DIR/../Moonlight"}"
+MOONLIGHT_DIR="${MOONLIGHT_DIR:-../Moonlight}"
 MOONLIGHT_BRANCH="${MOONLIGHT_BRANCH:-codex/wrap-bench-cherry-picks}"
 MOONLIGHT_URL="${MOONLIGHT_URL:-git@github.com:EYBlockchain/Moonlight.git}"
 MOONLIGHT_HTTPS_URL="${MOONLIGHT_HTTPS_URL:-https://github.com/EYBlockchain/Moonlight.git}"
@@ -69,7 +70,7 @@ Options:
   --skip-srs-download      Fail when required SRS assets are missing.
   --srs-dir DIR            SRS directory. Defaults to \$SRS_DIR or .srs.
   --log-dir DIR            Command log directory. Defaults to target/team-demo-logs.
-  --moonlight-dir DIR      Moonlight checkout. Defaults to ../Moonlight.
+  --moonlight-dir DIR      Moonlight checkout, relative to this repo unless absolute. Defaults to ../Moonlight.
   --moonlight-branch NAME  Moonlight branch. Defaults to codex/wrap-bench-cherry-picks.
   --moonlight-url URL      SSH clone URL for Moonlight.
   --https                  Clone Moonlight with the HTTPS URL.
@@ -86,6 +87,12 @@ Examples:
   scripts/run_team_demo.sh --check-only
   scripts/run_team_demo.sh
   scripts/run_team_demo.sh --https --update-moonlight
+
+Standalone Moonlight gas bench command:
+  MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \\
+  cargo test --manifest-path ../Moonlight/aggregation/Cargo.toml \\
+    wrap_circuit_composes_two_fold_children_from_four_dummy_fold_proofs --release \\
+    --lib -- --ignored --nocapture
 USAGE
 }
 
@@ -126,6 +133,20 @@ quote_cmd() {
 
 slugify() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//'
+}
+
+moonlight_manifest_path() {
+  printf '%s/aggregation/Cargo.toml' "$MOONLIGHT_DIR"
+}
+
+print_moonlight_gas_command() {
+  [[ "$RUN_MOONLIGHT" -eq 1 ]] || return 0
+
+  printf '%s\n' "Moonlight gas bench command:"
+  printf '%s\n' "  MOONLIGHT_RUN_WRAP_SOLIDITY_BENCH=1 \\"
+  printf '%s\n' "  cargo test --manifest-path $(moonlight_manifest_path) \\"
+  printf '%s\n' "    $MOONLIGHT_WRAP_TEST --release \\"
+  printf '%s\n' "    --lib -- --ignored --nocapture"
 }
 
 run_logged() {
@@ -287,7 +308,8 @@ setup_moonlight() {
   current_branch="$(git -C "$MOONLIGHT_DIR" branch --show-current || true)"
   ok "Moonlight branch: $current_branch"
 
-  local manifest="$MOONLIGHT_DIR/aggregation/Cargo.toml"
+  local manifest
+  manifest="$(moonlight_manifest_path)"
   [[ -f "$manifest" ]] || die "Moonlight manifest not found: $manifest"
 
   local manifest_dir
@@ -349,7 +371,7 @@ preflight_moonlight() {
   run_logged \
     "Preflight Moonlight wrap bench compile" \
     env SOLC="$SOLC" cargo test \
-      --manifest-path "$MOONLIGHT_DIR/aggregation/Cargo.toml" \
+      --manifest-path "$(moonlight_manifest_path)" \
       "$MOONLIGHT_WRAP_TEST" \
       --release \
       --lib \
@@ -380,7 +402,7 @@ run_moonlight_bench() {
       MOONLIGHT_RUN_WRAP_SOLIDITY_TRACE=1 \
       MOONLIGHT_WRAP_SOLIDITY_DUMP_DIR="$MOONLIGHT_DUMP_DIR" \
       cargo test \
-        --manifest-path "$MOONLIGHT_DIR/aggregation/Cargo.toml" \
+        --manifest-path "$(moonlight_manifest_path)" \
         "$MOONLIGHT_WRAP_TEST" \
         --release \
         --lib \
@@ -399,6 +421,8 @@ print_intro() {
   printf '\n'
   printf '%s\n' "${YELLOW}This can take a while.${RESET} The trace run and Moonlight wrap bench both generate real proofs."
   printf '%s\n' "Use --check-only for setup and compile checks without the slow proof runs."
+  printf '\n'
+  print_moonlight_gas_command
 }
 
 print_done() {
@@ -482,7 +506,6 @@ done
 
 SRS_DIR="$(abs_path "$SRS_DIR")"
 LOG_DIR="$(abs_path "$LOG_DIR")"
-MOONLIGHT_DIR="$(abs_path "$MOONLIGHT_DIR")"
 MOONLIGHT_DUMP_DIR="$(abs_path "$MOONLIGHT_DUMP_DIR")"
 
 print_intro
