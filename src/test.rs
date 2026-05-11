@@ -1622,6 +1622,87 @@ fn every_proof_scalar_rejects_fr_modulus() {
 }
 
 #[test]
+fn every_proof_scalar_rejects_boundary_values() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let scalar_offsets = proof_scalar_offsets(&fixture);
+    assert!(
+        !scalar_offsets.is_empty(),
+        "fixture proof should expose scalar fields to mutate"
+    );
+
+    let mut evm = deployed_separate_verifier(&fixture);
+    if !deployed_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof") {
+        return;
+    }
+
+    let r = fr_modulus_u256();
+    let static_variants = [
+        ("zero", U256::from(0u64).to_be_bytes::<32>()),
+        ("one", U256::from(1u64).to_be_bytes::<32>()),
+        ("Fr_minus_one", (r - U256::from(1u64)).to_be_bytes::<32>()),
+    ];
+
+    for (name, offset) in scalar_offsets {
+        let original_word: [u8; 32] = fixture.proof[offset..offset + 0x20]
+            .try_into()
+            .expect("proof scalar word");
+        let original = U256::from_be_bytes(original_word);
+        let original_plus_r = original + r;
+
+        for (variant, word) in static_variants
+            .into_iter()
+            .chain([("original_plus_Fr", original_plus_r.to_be_bytes::<32>())])
+        {
+            if word == original_word {
+                continue;
+            }
+            let mut bad_proof = fixture.proof.clone();
+            bad_proof[offset..offset + 0x20].copy_from_slice(&word);
+            assert_deployed_call_rejects(
+                &mut evm,
+                &fixture,
+                &bad_proof,
+                &format!("{name} scalar replaced with {variant} at proof offset {offset}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn representative_proof_section_mutations_are_rejected() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let sections = representative_proof_section_offsets(&fixture);
+    assert!(
+        !sections.is_empty(),
+        "fixture should expose representative proof sections"
+    );
+
+    let mut evm = deployed_separate_verifier(&fixture);
+    if !deployed_call_accepts(&mut evm, &fixture, &fixture.proof, "valid proof") {
+        return;
+    }
+
+    for (section, offset) in sections {
+        let mut bad_proof = fixture.proof.clone();
+        bad_proof[offset] ^= 0x01;
+        assert_deployed_call_rejects(
+            &mut evm,
+            &fixture,
+            &bad_proof,
+            &format!("mutated proof section `{section}` at proof offset {offset}"),
+        );
+    }
+}
+
+#[test]
 fn separate_verifier_adversarial_calldata_variants_are_rejected() {
     if !poseidon_inputs_available_for_evm() {
         return;
@@ -1648,6 +1729,21 @@ fn separate_verifier_adversarial_calldata_variants_are_rejected() {
     assert_solidity_rejects(
         call_deployed_verifier_raw(&mut evm, noncanonical_instance),
         "instance scalar equal to Fr modulus",
+    );
+
+    let mut endian_swapped_instance = valid.clone();
+    let mut swapped_word: [u8; 32] = valid[instance_word_start..instance_word_start + 0x20]
+        .try_into()
+        .expect("instance word");
+    swapped_word.reverse();
+    if swapped_word == valid[instance_word_start..instance_word_start + 0x20] {
+        swapped_word[31] ^= 0x01;
+    }
+    endian_swapped_instance[instance_word_start..instance_word_start + 0x20]
+        .copy_from_slice(&swapped_word);
+    assert_solidity_rejects(
+        call_deployed_verifier_raw(&mut evm, endian_swapped_instance),
+        "public input encoded with reversed endianness",
     );
 
     let mut trailing_bytes = valid.clone();
@@ -1687,6 +1783,23 @@ fn separate_verifier_adversarial_calldata_variants_are_rejected() {
     ] {
         assert_solidity_rejects(call_deployed_verifier_raw(&mut evm, calldata), name);
     }
+}
+
+#[test]
+fn verifier_rejects_when_x_is_forced_to_domain_root() {
+    if !poseidon_inputs_available_for_evm() {
+        return;
+    }
+
+    let fixture = create_property_poseidon_fixture();
+    let forced_x_verifier =
+        verifier_source_with_x_forced_to_one(&fixture.separate_verifier_solidity);
+    let mut evm = deploy_separate_verifier_from_sources(&forced_x_verifier, &fixture.vk_solidity);
+
+    assert_solidity_rejects(
+        call_deployed_verifier(&mut evm, &fixture.proof, &fixture.instances),
+        "verifier with x forced to domain root should hit zero Lagrange denominator",
+    );
 }
 
 #[test]
@@ -2396,6 +2509,92 @@ fn fr_modulus_be_word() -> [u8; 32] {
         .expect("fr modulus hex")
         .try_into()
         .expect("Fr modulus is one word")
+}
+
+fn fr_modulus_u256() -> U256 {
+    U256::from_be_bytes(fr_modulus_be_word())
+}
+
+fn push_unique_section(
+    sections: &mut Vec<(String, usize)>,
+    name: impl Into<String>,
+    offset: usize,
+) {
+    if sections.iter().all(|(_, existing)| *existing != offset) {
+        sections.push((name.into(), offset));
+    }
+}
+
+fn representative_proof_section_offsets(fixture: &PropertyPoseidonFixture) -> Vec<(String, usize)> {
+    let layout = fixture.scalar_layout;
+    assert!(
+        layout.eval_offset >= 0x80,
+        "fixture proof should contain at least one leading G1 commitment"
+    );
+
+    let mut sections = Vec::new();
+    push_unique_section(&mut sections, "first transcript commitment", 0);
+    push_unique_section(
+        &mut sections,
+        "last quotient limb commitment",
+        layout.eval_offset - 0x80,
+    );
+    if layout.num_evals != 0 {
+        push_unique_section(
+            &mut sections,
+            "first main evaluation scalar",
+            layout.eval_offset,
+        );
+        push_unique_section(
+            &mut sections,
+            "last main evaluation scalar",
+            layout.eval_offset + (layout.num_evals - 1) * 0x20,
+        );
+    }
+
+    let f_com_offset = layout.eval_offset + layout.num_evals * 0x20;
+    push_unique_section(&mut sections, "KZG f_com commitment", f_com_offset);
+
+    if layout.num_point_sets != 0 {
+        push_unique_section(
+            &mut sections,
+            "first KZG point-set evaluation scalar",
+            layout.q_eval_offset,
+        );
+        push_unique_section(
+            &mut sections,
+            "last KZG point-set evaluation scalar",
+            layout.q_eval_offset + (layout.num_point_sets - 1) * 0x20,
+        );
+    }
+
+    push_unique_section(
+        &mut sections,
+        "KZG proof commitment pi",
+        layout.q_eval_offset + layout.num_point_sets * 0x20,
+    );
+
+    assert!(
+        sections
+            .iter()
+            .all(|(_, offset)| *offset < fixture.proof.len()),
+        "representative proof section offsets must be inside the proof"
+    );
+    sections
+}
+
+fn verifier_source_with_x_forced_to_one(solidity: &str) -> String {
+    let needle = "buf_len := squeeze_to(buf_len, X_MPTR)";
+    assert_eq!(
+        solidity.matches(needle).count(),
+        1,
+        "expected exactly one x challenge squeeze to patch"
+    );
+    solidity.replacen(
+        needle,
+        "buf_len := squeeze_to(buf_len, X_MPTR)\n            mstore(X_MPTR, 1)",
+        1,
+    )
 }
 
 fn canonical_instances_head(proof: &[u8]) -> usize {
