@@ -464,3 +464,213 @@ auditor can skip the hot paths I already burned time on:
 
 No production-blocking finding. The verifier should be safe to deploy
 at the current revision, modulo the engineering hygiene items above.
+
+---
+
+## 2026-05-11 additional audit findings
+
+I found several real issues worth fixing.
+
+### High-confidence bugs
+
+1. **Lookup quotient identity count is wrong for chunked lookups**
+
+`ProtocolPlan::from_constraint_system` uses:
+
+```rust
+let lookup_identity_count = num_lookups * 3;
+```
+
+But `Evaluator::lookup_computations()` emits:
+
+```text
+boundary + one helper per chunk + accumulator
+= 2 + lookup_chunks[lookup]
+```
+
+So any lookup with more than one helper chunk will make this assertion fail:
+
+```rust
+assert_eq!(lookup.len(), meta.protocol.quotient.lookup)
+```
+
+Fix:
+
+```rust
+let lookup_identity_count: usize =
+    lookup_chunks.iter().map(|chunks| chunks + 2).sum();
+```
+
+Also fix lookup metadata currently using:
+
+```rust
+let lookup_index = identity_index / 3;
+```
+
+That is wrong for variable chunk counts.
+
+---
+
+2. **`proof_evaluation_counts().fixed` counts columns, not fixed eval queries**
+
+This is wrong:
+
+```rust
+fixed: meta.num_fixeds - meta.num_simple_selectors,
+```
+
+Proof evals are query-based, not column-count-based. A fixed column can be queried at multiple rotations, or not queried at all.
+
+Use the protocol plan instead:
+
+```rust
+fixed: meta.protocol.proof.evals.iter()
+    .filter(|e| matches!(e, EvalRead::Fixed(_)))
+    .count(),
+```
+
+Otherwise the public diagnostic API can panic on valid circuits because:
+
+```rust
+counts.proof_total() == meta.num_evals
+```
+
+will fail.
+
+---
+
+3. **Challenge phase remapping can panic if challenges use a phase beyond advice phases**
+
+`ProtocolPlan::from_constraint_system` computes:
+
+```rust
+let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
+```
+
+Then it uses that same `num_phase` for `cs.challenge_phase()`. If a challenge phase exceeds the max advice phase, indexing can go out of bounds.
+
+Safer:
+
+```rust
+let max_advice_phase = cs.advice_column_phase().iter().copied().max().unwrap_or(0);
+let max_challenge_phase = cs.challenge_phase().iter().copied().max().unwrap_or(0);
+let num_phase = max_advice_phase.max(max_challenge_phase) as usize + 1;
+```
+
+---
+
+4. **Packed32 VM validator does not enforce operand widths**
+
+`decode_packed_quotient_instruction()` validates opcode support, but many operands are allowed to contain arbitrary 24-bit values even when the logical operand is `u8` or `u16`.
+
+Examples that should be rejected:
+
+```rust
+Q_OP_PUSH_CONST_U8        // arg must be <= u8::MAX
+Q_OP_ADD_CONST_U8         // arg must be <= u8::MAX
+Q_OP_MUL_CONST_U8         // arg must be <= u8::MAX
+Q_OP_PUSH_CONST           // arg must be <= u16::MAX
+Q_OP_ADD_CONST            // arg must be <= u16::MAX
+Q_OP_MUL_CONST            // arg must be <= u16::MAX
+Q_OP_PUSH_MEM_U16         // arg must be <= u16::MAX
+Q_OP_ADD_MUL_MEM_MEM_CONST_U8 // scalar arg must be <= u8::MAX
+```
+
+The packer emits valid values, but the "safety validator" claims to reject malformed finalized programs. Right now it misses these packed operand-width corruptions.
+
+---
+
+5. **Trace-only paths still write to memory slot `0`**
+
+You have tests/comments saying templates should not write Solidity-reserved memory, but trace failure paths do:
+
+```solidity
+mstore(0, 34)
+revert(0, 0x20)
+```
+
+and generated PCS trace code emits:
+
+```rust
+"mstore(0, {}) revert(0, {WORD_BYTES:#x})"
+```
+
+Your string test only catches `"mstore(0x00,"`, not `"mstore(0,"`.
+
+Use `RETURN_MPTR` or `TRACE_U256_MPTR` instead.
+
+---
+
+6. **External quotient return buffer is not modeled in the memory planner**
+
+Main verifier writes external quotient output to:
+
+```solidity
+let q_out := SELECTOR_ACC_MPTR
+...
+staticcall(..., q_out, qext.output_len)
+```
+
+But `selector_accumulators` is registered with length:
+
+```rust
+selector_len = num_simple_selectors * WORD_BYTES
+```
+
+while the output length is:
+
+```rust
+2 * WORD_BYTES + selector_len
+```
+
+So the first two words of output intentionally overlap the following quotient temp/state area. This may be safe temporally, but the memory planner does not model it. Add a phase-scoped region for the external quotient output or use the low-memory `QUOTIENT_RETURN_BUFFER_START`.
+
+---
+
+7. **Structured selector-run trace drops per-identity trace events**
+
+In structured-loop mode, grouped selector runs go through:
+
+```rust
+selector_run_quotient_block(...)
+```
+
+but that path does not take `trace` and does not emit `push_quotient_trace` per identity. Trace builds with `HALO2_SOLIDITY_QUOTIENT_STRUCTURED_LOOPS=1` can miss quotient identity trace IDs.
+
+Fix by disabling selector-run grouping under trace, or by emitting trace events inside the grouped loop.
+
+---
+
+### Design / hardening issues
+
+8. **Proof layout still recomputes commitment order from counts**
+
+`ProofCalldataLayout::from_protocol()` receives `ProtocolPlan`, but it does not actually replay `protocol.proof.commitments`; it reconstructs the order from counts. If protocol order changes later, layout can silently drift.
+
+Better: build sections by walking `protocol.proof.commitments`, then validate category grouping.
+
+---
+
+9. **Committed-instance commitment is hard-coded to identity**
+
+`Data::new()` does:
+
+```rust
+let committed_instance_comms =
+    (0..meta.num_committed_instances)
+        .map(|_| EcPoint::new(Ptr::memory("G1_IDENTITY_MPTR")))
+```
+
+and the Solidity transcript always absorbs identity committed_pi. That is fine for the zk_stdlib identity-commitment shape, but it is not a general "one committed instance column" verifier. This should be surfaced as an explicit generator restriction/API name, not only comments.
+
+---
+
+10. **Shape profiling undercounts fallback VM ops**
+
+`emit_acc_leaf()` emits accumulator ops but does not call:
+
+```rust
+record_fallback_vm_op()
+```
+
+So `fallback_vm_ops` is misleading when limb profiling is enabled. Not a correctness bug, but it weakens tuning data.
