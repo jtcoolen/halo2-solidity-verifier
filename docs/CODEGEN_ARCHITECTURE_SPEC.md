@@ -20,6 +20,11 @@ derives a deterministic verifier plan, renders Solidity from Askama/Yul
 templates, and provides helper APIs to repack native Halo2 proof bytes into the
 generated verifier ABI.
 
+For the audit-facing correctness and security argument, use
+[`CODEGEN_ASSURANCE_DOSSIER.md`](./CODEGEN_ASSURANCE_DOSSIER.md). This
+architecture document explains how the system is built; the dossier states the
+bounded claim, artifact manifest, threat model, and required evidence gates.
+
 ## 2. Supported Protocol Envelope
 
 The generator intentionally accepts only the protocol shape it knows how to

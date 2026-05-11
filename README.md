@@ -38,7 +38,7 @@ Note that function selector is already included.
 ### Current status
 
 As of this revision, `cargo test --workspace --all-features --all-targets -- --list`
-reports 106 library tests and 4 integration tests.
+reports 165 library tests and 4 integration tests.
 
 The implemented suite is narrower than the full assurance roadmap in
 [`TESTING_STRATEGY.md`](./TESTING_STRATEGY.md). Today it covers transcript
@@ -95,6 +95,9 @@ cargo test --workspace --all-features --all-targets -- --nocapture
 The pinned Midfall revision, solc version, canonical IVC bench command, and
 published verifier/VK/quotient runtime hashes are recorded in
 [`docs/REPRODUCIBLE_BUILDS.md`](./docs/REPRODUCIBLE_BUILDS.md).
+The bounded correctness and security claim, artifact manifest, threat model,
+and release gates are in
+[`docs/CODEGEN_ASSURANCE_DOSSIER.md`](./docs/CODEGEN_ASSURANCE_DOSSIER.md).
 For a high-level architecture and codegen pipeline specification, see
 [`docs/CODEGEN_ARCHITECTURE_SPEC.md`](./docs/CODEGEN_ARCHITECTURE_SPEC.md).
 The map between the Askama templates, generated Solidity/Yul, Midfall Rust

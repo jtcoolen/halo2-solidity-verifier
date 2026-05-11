@@ -33,6 +33,34 @@ enough to be worth pinning down.
 
 ---
 
+## Current reconciliation status
+
+This file is the open-issues ledger for the assurance dossier in
+[`docs/CODEGEN_ASSURANCE_DOSSIER.md`](docs/CODEGEN_ASSURANCE_DOSSIER.md).
+The older finding text is retained below for audit history; the table here is
+the release-facing status snapshot as of 2026-05-11.
+
+| Finding | Status | Evidence |
+| --- | --- | --- |
+| M1 lookup helper/accumulator cursor grouping | Fixed | `Data::new` now derives section starts from `ProofCalldataLayout`; `proof_layout_preserves_lookup_helper_accumulator_grouping` locks the interleaved helper/accumulator order. |
+| M2 ambiguous advice commitment order metadata | Fixed | `CommitmentRead::Advice` is category-only; column/query identity lives in eval and PCS plans. `ProtocolPlan::validate` and commitment group tests cover plan drift. |
+| 2026-05-11 #1 lookup quotient identity count | Fixed | `lookup_chunks.iter().map(|chunks| chunks + 2).sum()` is used in planning and validation; `lookup_identity_source_handles_variable_chunk_counts` covers variable chunk counts. |
+| 2026-05-11 #2 fixed eval count | Fixed | `proof_evaluation_counts().fixed` counts `EvalRead::Fixed` entries from the protocol plan instead of fixed columns. |
+| 2026-05-11 #3 challenge phase remapping | Fixed | `ProtocolPlan::from_constraint_system` sizes phases by the max of advice and challenge phases; `plan_allows_challenge_phase_beyond_advice_phases` covers this case. |
+| 2026-05-11 #4 packed32 operand widths | Fixed | `validate_packed_quotient_operand` enforces logical `u8` and `u16` bounds; `packed32_validator_rejects_logical_operand_width_corruption` covers corrupted packed operands. |
+| 2026-05-11 #5 reserved memory writes | Fixed | Trace and helper templates avoid Solidity-reserved memory writes; `templates_do_not_write_solidity_reserved_memory_slots` checks `mstore(0,`, `mstore(0x00,`, and related reserved forms. |
+| 2026-05-11 #6 external quotient return overlap | Fixed | External quotient output uses `QUOTIENT_RETURN_MPTR`; template validation checks output length and disjointness from the copied quotient frame. |
+| 2026-05-11 #7 structured selector-run trace | Fixed | Selector-run grouping is disabled when trace is enabled, preserving per-identity trace events through direct quotient blocks. |
+| 2026-05-11 #8 proof layout count reconstruction | Fixed | `ProofCalldataLayout::from_protocol` replays `protocol.proof.commitments` and panics on category drift; `proof_layout_rejects_commitment_order_drift` covers it. |
+| 2026-05-11 #9 identity committed instance policy | Accepted restriction | `SolidityGenerator::SUPPORTED_COMMITTED_INSTANCE_COMMITMENT` exposes the identity policy and shape validation requires exactly one committed and one non-committed instance column. Generic committed-instance commitments remain out of scope. |
+| 2026-05-11 #10 shape profiling undercount | Fixed | `emit_acc_leaf` records fallback VM ops for constant and short-memory accumulator opcodes. |
+
+Production-scope exclusions remain: generic Halo2 circuit support, generic
+committed-instance commitments, application wrapper binding/replay policy, and
+chains without the expected EIP-2537 semantics.
+
+---
+
 ## Critical — None identified
 
 I traced the highest-risk vectors end-to-end and could not find a

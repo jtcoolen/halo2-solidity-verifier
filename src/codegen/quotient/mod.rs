@@ -4592,3 +4592,53 @@ pub(super) fn split_top_level(input: &str) -> Vec<String> {
     args.push(input[start..].trim().to_string());
     args
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packed_instruction(op: u8, arg: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_packed_quotient_op(&mut bytes, op, arg);
+        bytes
+    }
+
+    #[test]
+    fn packed32_validator_rejects_logical_operand_width_corruption() {
+        for (op, arg, expected) in [
+            (Q_OP_PUSH_CONST_U8, 0x100, "exceeds u8"),
+            (Q_OP_ADD_CONST_U8, 0x100, "exceeds u8"),
+            (Q_OP_MUL_CONST_U8, 0x100, "exceeds u8"),
+            (Q_OP_ADD_MUL_MEM_MEM_CONST_U8, 0x100, "exceeds u8"),
+            (Q_OP_PUSH_CONST, 0x1_0000, "exceeds u16"),
+            (Q_OP_ADD_CONST, 0x1_0000, "exceeds u16"),
+            (Q_OP_MUL_CONST, 0x1_0000, "exceeds u16"),
+            (Q_OP_PUSH_MEM_U16, 0x1_0000, "exceeds u16"),
+        ] {
+            let mut bytes = packed_instruction(op, arg);
+            if op == Q_OP_ADD_MUL_MEM_MEM_CONST_U8 {
+                bytes.extend_from_slice(&0u32.to_be_bytes());
+            }
+
+            let err = validate_quotient_program(&bytes, QuotientProgramEncoding::Packed32)
+                .expect_err("malformed packed32 operand should be rejected");
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in error for op {op:#x}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packed32_validator_accepts_max_width_operands_when_stack_balanced() {
+        let mut bytes = Vec::new();
+        push_packed_quotient_op(&mut bytes, Q_OP_PUSH_CONST_U8, u8::MAX as u32);
+        push_packed_quotient_op(&mut bytes, Q_OP_ADD_CONST_U8, u8::MAX as u32);
+        push_packed_quotient_op(&mut bytes, Q_OP_MUL_CONST, u16::MAX as u32);
+        push_packed_quotient_op(&mut bytes, Q_OP_FOLD_MAIN, 0);
+
+        let max_stack = validate_quotient_program(&bytes, QuotientProgramEncoding::Packed32)
+            .expect("valid packed32 program should pass");
+        assert_eq!(max_stack, 1);
+    }
+}

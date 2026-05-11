@@ -1,10 +1,16 @@
 # Solidity Verifier Fidelity Status
 
-Assessed on 2026-05-03 against:
+Assessed on 2026-05-11 against:
 
 - Solidity verifier repo: `halo2-solidity-verifier-exp`
 - Midfall Rust verifier: `../midfall/proofs/src`
 - Midfall revision pinned in `Cargo.toml`: `53dc872f495104046d96bdac0a690f903dc0c537`
+
+The release-facing justification and required evidence gates are consolidated in
+[`docs/CODEGEN_ASSURANCE_DOSSIER.md`](./docs/CODEGEN_ASSURANCE_DOSSIER.md).
+`AUDIT_FINDINGS.md` remains the open-issues ledger; the current codegen
+correctness claim depends on every finding there being fixed, covered by tests,
+or explicitly excluded from production scope.
 
 ## Verdict
 

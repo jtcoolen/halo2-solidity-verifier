@@ -3,6 +3,11 @@
 This document collects the commands needed to exercise the examples and the
 property-based test (PBT) suite shipped with this crate.
 
+The release-facing assurance gates are summarized in
+[`docs/CODEGEN_ASSURANCE_DOSSIER.md`](./docs/CODEGEN_ASSURANCE_DOSSIER.md).
+This file remains the operational runbook for those gates and the broader
+negative-test suite.
+
 The workspace is pinned to the toolchain in [`rust-toolchain.toml`](./rust-toolchain.toml)
 (currently Rust 1.90.0). Solidity-touching tests and examples additionally
 require pinned `solc 0.8.30+commit.73712a01` on `PATH` or via `SOLC`.
