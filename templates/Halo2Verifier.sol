@@ -160,6 +160,7 @@ contract Halo2Verifier {
     // become 3-gas `mload(...)` instead of calldata reads.
     uint256 internal constant     REVERSED_EVALS_MPTR = {{ memory.reversed_evals_mptr }};
     uint256 internal constant      SELECTOR_ACC_MPTR = {{ memory.selector_acc_mptr|hex() }};
+    uint256 internal constant   QUOTIENT_RETURN_MPTR = {{ memory.quotient_return_mptr|hex() }};
     uint256 internal constant  BATCH_INV_SCRATCH_MPTR = {{ memory.batch_invert_scratch_mptr|hex() }};
     uint256 internal constant        TRACE_U256_MPTR = {{ memory.trace_u256_mptr|hex() }};
 
@@ -1308,7 +1309,7 @@ contract Halo2Verifier {
             //   word 2..: simple-selector accumulators
             // ===============================================================
             {
-                let q_out := SELECTOR_ACC_MPTR
+                let q_out := QUOTIENT_RETURN_MPTR
                 {%- match self.expected_quotient_codehash %}
                 {%- when Some with (_) %}
                 // The quotient evaluator is as correctness-critical as the VK:
@@ -1404,8 +1405,8 @@ contract Halo2Verifier {
                 let lin_trace_ok := staticcall({{ lin_trace_g1msm_gas_cap }}, {{ template_constants.eip2537.g1msm_address|hex() }}, lin_scratch, {{ ((num_quotients + simple_selector_cols.len()) * template_constants.g1_msm_pair_bytes)|hex() }}, lin_scratch, {{ template_constants.g1_bytes|hex() }})
                 lin_trace_ok := and(lin_trace_ok, eq(returndatasize(), {{ template_constants.g1_bytes|hex() }}))
                 if iszero(lin_trace_ok) {
-                    mstore(0, 34)
-                    revert(0, 0x20)
+                    mstore(TRACE_U256_MPTR, 34)
+                    revert(TRACE_U256_MPTR, 0x20)
                 }
                 trace_point(34, lin_scratch)
             }

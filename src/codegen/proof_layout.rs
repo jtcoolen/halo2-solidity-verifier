@@ -6,7 +6,7 @@
 
 use crate::codegen::{
     layout::{self, G1_BYTES, WORD_BYTES},
-    protocol::ProtocolPlan,
+    protocol::{CommitmentRead, ProtocolPlan},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -89,6 +89,28 @@ pub(crate) struct ProofCalldataLayout {
 }
 
 impl ProofCalldataLayout {
+    fn take_commitment_section(
+        protocol: &ProtocolPlan,
+        read_idx: &mut usize,
+        cursor: &mut usize,
+        expected: CommitmentRead,
+        count: usize,
+        label: &str,
+    ) -> ProofSection {
+        let section = ProofSection::new(*cursor, count, G1_BYTES);
+        for local in 0..count {
+            let actual = protocol.proof.commitments.get(*read_idx).copied();
+            assert_eq!(
+                actual,
+                Some(expected),
+                "proof commitment plan drift at {label}[{local}]: got {actual:?}, expected {expected:?}"
+            );
+            *read_idx += 1;
+        }
+        *cursor = section.end();
+        section
+    }
+
     /// Build the calldata layout by replaying the protocol proof-read order.
     ///
     /// `num_evals` and `num_point_sets` include feature-dependent dummy evals
@@ -101,11 +123,7 @@ impl ProofCalldataLayout {
         num_point_sets: usize,
     ) -> Self {
         let mut cursor = proof_cptr;
-        let g1_section = |cursor: &mut usize, item_count: usize| {
-            let section = ProofSection::new(*cursor, item_count, G1_BYTES);
-            *cursor = section.end();
-            section
-        };
+        let mut read_idx = 0usize;
         let word_section = |cursor: &mut usize, item_count: usize| {
             let section = ProofSection::new(*cursor, item_count, WORD_BYTES);
             *cursor = section.end();
@@ -116,10 +134,33 @@ impl ProofCalldataLayout {
             .num_user_advices
             .iter()
             .copied()
-            .map(|count| g1_section(&mut cursor, count))
+            .map(|count| {
+                Self::take_commitment_section(
+                    protocol,
+                    &mut read_idx,
+                    &mut cursor,
+                    CommitmentRead::Advice,
+                    count,
+                    "advice phase",
+                )
+            })
             .collect::<Vec<_>>();
-        let lookup_multiplicities = g1_section(&mut cursor, protocol.num_lookups);
-        let permutation_products = g1_section(&mut cursor, protocol.num_permutation_zs);
+        let lookup_multiplicities = Self::take_commitment_section(
+            protocol,
+            &mut read_idx,
+            &mut cursor,
+            CommitmentRead::LookupMultiplicity,
+            protocol.num_lookups,
+            "lookup multiplicity",
+        );
+        let permutation_products = Self::take_commitment_section(
+            protocol,
+            &mut read_idx,
+            &mut cursor,
+            CommitmentRead::PermutationProduct,
+            protocol.num_permutation_zs,
+            "permutation product",
+        );
         let lookups = protocol
             .lookup_chunks
             .iter()
@@ -127,21 +168,56 @@ impl ProofCalldataLayout {
             .enumerate()
             .map(|(lookup, chunks)| ProofLookupCommitmentsLayout {
                 lookup,
-                helpers: g1_section(&mut cursor, chunks),
-                accumulator: g1_section(&mut cursor, 1),
+                helpers: Self::take_commitment_section(
+                    protocol,
+                    &mut read_idx,
+                    &mut cursor,
+                    CommitmentRead::LookupHelper,
+                    chunks,
+                    "lookup helper",
+                ),
+                accumulator: Self::take_commitment_section(
+                    protocol,
+                    &mut read_idx,
+                    &mut cursor,
+                    CommitmentRead::LookupAccumulator,
+                    1,
+                    "lookup accumulator",
+                ),
             })
             .collect::<Vec<_>>();
-        let trash = g1_section(&mut cursor, protocol.num_trashcans);
+        let trash = Self::take_commitment_section(
+            protocol,
+            &mut read_idx,
+            &mut cursor,
+            CommitmentRead::Trash,
+            protocol.num_trashcans,
+            "trash",
+        );
 
         let quotient_comm_cptr = cursor;
-        let quotient_limbs = g1_section(&mut cursor, protocol.num_quotients);
+        let quotient_limbs = Self::take_commitment_section(
+            protocol,
+            &mut read_idx,
+            &mut cursor,
+            CommitmentRead::Quotient,
+            protocol.num_quotients,
+            "quotient limb",
+        );
+        assert_eq!(
+            read_idx,
+            protocol.proof.commitments.len(),
+            "proof commitment layout did not consume the full protocol plan"
+        );
         let eval_cptr = cursor;
         let evals = word_section(&mut cursor, num_evals);
         let w_cptr = cursor;
-        let f_com = g1_section(&mut cursor, 1);
+        let f_com = ProofSection::new(cursor, 1, G1_BYTES);
+        cursor = f_com.end();
         let q_eval_cptr = cursor;
         let q_evals = word_section(&mut cursor, num_point_sets);
-        let pi = g1_section(&mut cursor, 1);
+        let pi = ProofSection::new(cursor, 1, G1_BYTES);
+        cursor = pi.end();
         let proof_end = cursor;
 
         Self {
@@ -359,6 +435,27 @@ mod tests {
         assert_eq!(layout.lookups[1].helpers.item_count, 1);
         assert_eq!(layout.lookups[1].helpers.start, 6 * G1_BYTES);
         assert_eq!(layout.lookups[1].accumulator.start, 7 * G1_BYTES);
+    }
+
+    #[test]
+    #[should_panic(expected = "proof commitment plan drift")]
+    fn proof_layout_rejects_commitment_order_drift() {
+        let mut protocol = protocol_shape(vec![1], vec![1], 1, 0, 1);
+        let lhs = protocol
+            .proof
+            .commitments
+            .iter()
+            .position(|read| matches!(read, CommitmentRead::LookupMultiplicity))
+            .expect("lookup multiplicity");
+        let rhs = protocol
+            .proof
+            .commitments
+            .iter()
+            .position(|read| matches!(read, CommitmentRead::PermutationProduct))
+            .expect("permutation product");
+        protocol.proof.commitments.swap(lhs, rhs);
+
+        let _ = ProofCalldataLayout::from_protocol(&protocol, 0, 0, 0);
     }
 
     #[test]

@@ -120,6 +120,18 @@ pub enum AccumulatorEncodingKind {
     PointPair,
 }
 
+/// Committed-instance commitment policy supported by this generator.
+///
+/// The current Solidity verifier shape mirrors the Midfall/zk-stdlib path
+/// where the committed-instance commitment absorbed into the transcript is the
+/// G1 identity. It is not a generic committed-instance-column verifier for
+/// caller-supplied commitments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedInstanceCommitmentKind {
+    /// Absorb and use `G1::identity()` for every committed instance column.
+    Identity,
+}
+
 impl AccumulatorEncoding {
     /// Supported limb count for one BLS12-381 base-field coordinate.
     pub const SUPPORTED_NUM_LIMBS: usize = layout::accumulator::LIMBS;
@@ -362,7 +374,7 @@ impl fmt::Display for GeneratorError {
                 );
                 write!(
                     f,
-                    "unsupported instance column shape: got total={total}, committed={committed}, non_committed={non_committed}; expected exactly {expected_committed} committed and {expected_non_committed} non-committed"
+                    "unsupported instance column shape: got total={total}, committed={committed}, non_committed={non_committed}; expected exactly {expected_committed} identity-committed and {expected_non_committed} non-committed"
                 )
             }
             Self::RotatedInstanceQuery { column, rotation } => write!(
@@ -528,6 +540,32 @@ mod tests {
         assert_eq!(frame.frame_len, 0x4e0);
         assert_eq!(frame.output_len, 0xa0);
         assert_eq!(frame.magic, QUOTIENT_EXTERNAL_MAGIC);
+    }
+
+    #[test]
+    fn external_quotient_output_uses_planned_return_buffer() {
+        let verifier_template = include_str!("../../templates/Halo2Verifier.sol");
+        assert!(
+            verifier_template.contains("QUOTIENT_RETURN_MPTR"),
+            "main verifier should name the planned external quotient return buffer"
+        );
+        assert!(
+            verifier_template.contains("let q_out := QUOTIENT_RETURN_MPTR"),
+            "external quotient staticcall output must not alias selector accumulators"
+        );
+        assert!(
+            !verifier_template.contains("let q_out := SELECTOR_ACC_MPTR"),
+            "selector accumulators model only selector buckets, not the two-word quotient return header"
+        );
+    }
+
+    #[test]
+    fn structured_selector_runs_do_not_group_trace_identities() {
+        let generator_source = include_str!("generator.rs");
+        assert!(
+            generator_source.contains("if trace {\n            for (lines, var) in run"),
+            "trace builds must emit selector-run identities directly so every identity logs one trace event"
+        );
     }
 
     #[test]
@@ -1389,6 +1427,39 @@ mod tests {
     }
 
     #[test]
+    fn packed32_validator_rejects_wide_logical_operands() {
+        let mut const_u8 = Vec::new();
+        push_packed_quotient_op(&mut const_u8, Q_OP_PUSH_CONST_U8, 0x100);
+        push_packed_quotient_op(&mut const_u8, Q_OP_FOLD_MAIN, 0);
+        let err = validate_quotient_program(&const_u8, QuotientProgramEncoding::Packed32)
+            .expect_err("u8 constant slot overflow must fail");
+        assert!(
+            err.contains("exceeds u8"),
+            "unexpected packed32 u8 error: {err}"
+        );
+
+        let mut const_u16 = Vec::new();
+        push_packed_quotient_op(&mut const_u16, Q_OP_PUSH_CONST, 0x1_0000);
+        push_packed_quotient_op(&mut const_u16, Q_OP_FOLD_MAIN, 0);
+        let err = validate_quotient_program(&const_u16, QuotientProgramEncoding::Packed32)
+            .expect_err("u16 constant slot overflow must fail");
+        assert!(
+            err.contains("exceeds u16"),
+            "unexpected packed32 u16 error: {err}"
+        );
+
+        let mut fused = Vec::new();
+        push_packed_quotient_op(&mut fused, Q_OP_ADD_MUL_MEM_MEM_CONST_U8, 0x100);
+        fused.extend_from_slice(&0u32.to_be_bytes());
+        let err = validate_quotient_program(&fused, QuotientProgramEncoding::Packed32)
+            .expect_err("fused u8 scalar overflow must fail");
+        assert!(
+            err.contains("exceeds u8"),
+            "unexpected packed32 fused scalar error: {err}"
+        );
+    }
+
+    #[test]
     fn normalized_yul_assignment_parser_tolerates_formatting_variants() {
         assert_eq!(
             yul_let_assignment("  let   z:=addmod(a, b, r)  "),
@@ -1582,6 +1653,7 @@ mod tests {
             ("Halo2VerifyingKey.sol", vk_template),
         ] {
             for needle in [
+                "mstore(0,",
                 "mstore(0x00,",
                 "mstore(0x20,",
                 "mstore(0x40,",
@@ -1608,6 +1680,7 @@ mod tests {
         }
         assert!(
             !pcs_source.contains("mcopy(0x0,")
+                && !pcs_source.contains("mstore(0,")
                 && !pcs_source.contains(", 0x00, {G1_MSM_PAIR_BYTES:#x}")
                 && !pcs_source.contains(", 0x00, {G1ADD_INPUT_BYTES:#x}"),
             "generated PCS helper scratch must not be rooted at memory 0"
@@ -1829,7 +1902,7 @@ mod tests {
         );
         for required in [
             "committed instances and normal (non-committed) instances",
-            "(num_fixed_columns - num_simple_selectors) fixed evals",
+            "Fixed evals are query-based proof reads",
             "absorbs this `transcript_repr` digest",
         ] {
             assert!(
@@ -1977,6 +2050,10 @@ mod tests {
     #[test]
     fn generator_restriction_errors_are_typed() {
         assert_eq!(
+            SolidityGenerator::SUPPORTED_COMMITTED_INSTANCE_COMMITMENT,
+            CommittedInstanceCommitmentKind::Identity
+        );
+        assert_eq!(
             GeneratorError::UnsupportedInstanceColumnShape {
                 total: 2,
                 committed: 0,
@@ -1984,7 +2061,7 @@ mod tests {
                 expected_non_committed: 1,
             }
             .to_string(),
-            "unsupported instance column shape: got total=2, committed=0, non_committed=2; expected exactly 1 committed and 1 non-committed"
+            "unsupported instance column shape: got total=2, committed=0, non_committed=2; expected exactly 1 identity-committed and 1 non-committed"
         );
         assert_eq!(
             GeneratorError::UnsupportedInstanceColumnShape {
@@ -1994,7 +2071,7 @@ mod tests {
                 expected_non_committed: 1,
             }
             .to_string(),
-            "unsupported instance column shape: got total=1, committed=2, non_committed=invalid: committed 2 exceeds total 1; expected exactly 1 committed and 1 non-committed"
+            "unsupported instance column shape: got total=1, committed=2, non_committed=invalid: committed 2 exceeds total 1; expected exactly 1 identity-committed and 1 non-committed"
         );
         assert_eq!(
             GeneratorError::RotatedInstanceQuery {
@@ -2538,6 +2615,23 @@ mod tests {
         assert_eq!(
             eval_quotient_vm_for_test(&builder.bytes, &builder.consts, &values),
             expected
+        );
+    }
+
+    #[test]
+    fn quotient_shape_profile_counts_accumulator_leaf_ops() {
+        let expr = quotient_add_expr(
+            QuotientExpr::Mem(QuotientMem::Literal(0x100)),
+            QuotientExpr::Const(U256::from(7u64)),
+        );
+        let mut builder = QuotientProgramBuilder::with_limb_vm_ops(true);
+        builder.emit_expr(&expr);
+
+        assert_eq!(builder.bytes[0], Q_OP_PUSH_MEM_U16);
+        assert_eq!(builder.bytes[3], Q_OP_ADD_CONST_U8);
+        assert_eq!(
+            builder.profile.fallback_vm_ops, 2,
+            "profile should count both the initial push and the accumulator leaf opcode"
         );
     }
 

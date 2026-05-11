@@ -940,14 +940,11 @@ impl Halo2Verifier {
                     qext.output_len
                 ));
             }
-            let selector_output_len = self.simple_selector_cols.len() * WORD_BYTES;
-            if selector_output_len != 0
-                && !qext.disjoint_range(self.selector_acc_mptr, selector_output_len)
-            {
+            if !qext.disjoint_range(self.memory.quotient_return_mptr, expected_output_len) {
                 return Err(format!(
-                    "external quotient selector output overlaps copied frame: selector {:#x}..{:#x}, frame {:#x}..{:#x}",
-                    self.selector_acc_mptr,
-                    self.selector_acc_mptr + selector_output_len,
+                    "external quotient output overlaps copied frame: output {:#x}..{:#x}, frame {:#x}..{:#x}",
+                    self.memory.quotient_return_mptr,
+                    self.memory.quotient_return_mptr + expected_output_len,
                     qext.frame_base,
                     qext.frame_end()
                 ));
@@ -1053,7 +1050,7 @@ mod tests {
             VkConstructorMemoryLayout, G1_BYTES, WORD_BYTES,
         },
         proof_layout::{ProofCalldataLayout, TranscriptBufferLayout},
-        protocol::ProtocolPlan,
+        protocol::{CommitmentRead, ProofReadPlan, ProtocolPlan},
         util::{ConstraintSystemMeta, Ptr},
     };
     use ruint::aliases::U256;
@@ -1167,6 +1164,28 @@ mod tests {
             VerifierMemoryLayoutConfig::default(),
         );
         let acc_msm_scratch = memory.acc_msm_scratch;
+        let mut proof = ProofReadPlan::default();
+        proof
+            .commitments
+            .extend((0..total_advices).map(|_| CommitmentRead::Advice));
+        proof
+            .commitments
+            .extend((0..num_lookups).map(|_| CommitmentRead::LookupMultiplicity));
+        proof
+            .commitments
+            .extend((0..num_permutation_zs).map(|_| CommitmentRead::PermutationProduct));
+        proof
+            .commitments
+            .extend((0..lookup_helper_chunks_total).map(|_| CommitmentRead::LookupHelper));
+        proof
+            .commitments
+            .extend((0..num_lookups).map(|_| CommitmentRead::LookupAccumulator));
+        proof
+            .commitments
+            .extend((0..num_trashcans).map(|_| CommitmentRead::Trash));
+        proof
+            .commitments
+            .extend((0..num_quotients).map(|_| CommitmentRead::Quotient));
         let protocol = ProtocolPlan {
             num_user_advices: vec![total_advices],
             lookup_chunks: vec![lookup_helper_chunks_total],
@@ -1174,6 +1193,7 @@ mod tests {
             num_permutation_zs,
             num_trashcans,
             num_quotients,
+            proof,
             ..ProtocolPlan::default()
         };
         let proof_layout =

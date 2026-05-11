@@ -4,6 +4,10 @@ impl<'a> SolidityGenerator<'a> {
     const SUPPORTED_COMMITTED_INSTANCE_COLUMNS: usize = 1;
     const SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS: usize = 1;
     const QUOTIENT_FIXED_STATE_WORDS: usize = 2;
+    /// Committed-instance commitment policy hard-coded by the generated
+    /// verifier ABI.
+    pub const SUPPORTED_COMMITTED_INSTANCE_COMMITMENT: CommittedInstanceCommitmentKind =
+        CommittedInstanceCommitmentKind::Identity;
 
     /// Return a new `SolidityGenerator`.
     pub fn new(
@@ -103,6 +107,11 @@ impl<'a> SolidityGenerator<'a> {
         self
     }
 
+    /// Return the committed-instance commitment policy for this generator.
+    pub fn committed_instance_commitment_kind(&self) -> CommittedInstanceCommitmentKind {
+        Self::SUPPORTED_COMMITTED_INSTANCE_COMMITMENT
+    }
+
     /// Validate the currently supported committed/non-committed instance split.
     fn validate_instance_column_shape(
         total_instance_columns: usize,
@@ -110,8 +119,10 @@ impl<'a> SolidityGenerator<'a> {
     ) -> Result<(), GeneratorError> {
         // The Rust verifier accepts committed and normal instance arguments
         // separately, with committed instance columns first. The current
-        // Solidity calldata ABI supports exactly one of each so every instance
-        // query can be classified without an extra column-routing table.
+        // Solidity calldata ABI supports exactly one identity-committed column
+        // and one direct public-input column, so every instance query can be
+        // classified without an extra column-routing table or supplied
+        // committed-instance commitment.
         let supported_committed = Self::SUPPORTED_COMMITTED_INSTANCE_COLUMNS;
         let supported_non_committed = Self::SUPPORTED_NON_COMMITTED_INSTANCE_COLUMNS;
         let non_committed = total_instance_columns
@@ -156,12 +167,17 @@ impl<'a> SolidityGenerator<'a> {
             committed_instance,
             computed_instance,
             advice: meta.advice_queries.len(),
-            // The Rust verifier reads
-            // (num_fixed_columns - num_simple_selectors) fixed evals from the
-            // proof, then synthesizes simple selector values locally. Codegen
-            // mirrors that split so selector-gated identities feed the
-            // linearization buckets instead of consuming proof scalars.
-            fixed: meta.num_fixeds - meta.num_simple_selectors,
+            // Fixed evals are query-based proof reads. The Rust verifier
+            // reads the non-simple fixed queries that appear in
+            // `protocol.proof.evals`; simple selector columns are synthesized
+            // locally and feed selector buckets instead of proof scalars.
+            fixed: meta
+                .protocol
+                .proof
+                .evals
+                .iter()
+                .filter(|eval| matches!(eval, protocol::EvalRead::Fixed(_)))
+                .count(),
             simple_selector_fixed: meta.num_simple_selectors,
             permutation_common: meta.permutation_columns.len(),
             permutation_product,
@@ -242,7 +258,10 @@ impl<'a> SolidityGenerator<'a> {
         }
 
         for identity_index in 0..meta.protocol.quotient.lookup {
-            let lookup_index = identity_index / 3;
+            let (lookup_index, _) = meta
+                .protocol
+                .lookup_identity_source(identity_index)
+                .expect("lookup identity index covered by protocol lookup chunks");
             let lookup_name = format!("lookup_{lookup_index}");
             entries.push(QuotientIdentityManifestEntry {
                 global_index,
@@ -1769,7 +1788,10 @@ impl<'a> SolidityGenerator<'a> {
         }
         let mut lookup = Vec::with_capacity(lookup_items.len());
         for (identity_index, (lines, var)) in lookup_items.into_iter().enumerate() {
-            let lookup_index = identity_index / 3;
+            let (lookup_index, _) = meta
+                .protocol
+                .lookup_identity_source(identity_index)
+                .expect("lookup identity index covered by protocol lookup chunks");
             let lookup_name = format!("lookup_{lookup_index}");
             lookup.push(QuotientIdentity {
                 meta: QuotientIdentityMetadata {
@@ -2358,7 +2380,20 @@ impl<'a> SolidityGenerator<'a> {
             return;
         };
         let run = std::mem::take(pending_run);
-        if run.len() == 1 {
+        if trace {
+            for (lines, var) in run {
+                computations.push(Self::direct_quotient_block(
+                    &lines,
+                    &var,
+                    QuotientTarget::Selector(selector_idx),
+                    None,
+                    sorted_simple,
+                    eval_scratch_slot,
+                    state_slots,
+                    trace,
+                ));
+            }
+        } else if run.len() == 1 {
             let (lines, var) = run.into_iter().next().expect("selector run item");
             computations.push(Self::direct_quotient_block(
                 &lines,

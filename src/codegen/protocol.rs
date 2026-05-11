@@ -371,7 +371,9 @@ impl ProtocolPlan {
             .filter(|&idx| cs.has_simple_selector_col(idx))
             .collect();
 
-        let num_phase = *cs.advice_column_phase().iter().max().unwrap_or(&0) as usize + 1;
+        let max_advice_phase = cs.advice_column_phase().iter().copied().max().unwrap_or(0);
+        let max_challenge_phase = cs.challenge_phase().iter().copied().max().unwrap_or(0);
+        let num_phase = max_advice_phase.max(max_challenge_phase) as usize + 1;
         let remapping = |phase: Vec<u8>| {
             // Midnight stores advice/challenge columns in declaration order but
             // verifies them phase by phase. `nums` gives per-phase counts and
@@ -596,7 +598,7 @@ impl ProtocolPlan {
         } else {
             2 + (num_permutation_zs.saturating_sub(1)) + num_permutation_zs
         };
-        let lookup_identity_count = num_lookups * 3;
+        let lookup_identity_count = lookup_chunks.iter().map(|chunks| chunks + 2).sum();
         let quotient = QuotientIdentityPlan {
             gates: cs.gates().iter().map(|gate| gate.polynomials().len()).sum(),
             permutation: permutation_identity_count,
@@ -687,6 +689,24 @@ impl ProtocolPlan {
             "protocol commitment groups must cover the proof commitment plan"
         );
         groups
+    }
+
+    /// Map a source-local lookup identity index to `(lookup_index,
+    /// identity_index_within_lookup)`.
+    ///
+    /// LogUp emits `boundary`, one helper identity per chunk, and an
+    /// accumulator identity for each lookup, so the stride is
+    /// `lookup_chunks[i] + 2`, not a constant.
+    pub(crate) fn lookup_identity_source(&self, identity_index: usize) -> Option<(usize, usize)> {
+        let mut base = 0usize;
+        for (lookup, &chunks) in self.lookup_chunks.iter().enumerate() {
+            let count = chunks + 2;
+            if identity_index < base + count {
+                return Some((lookup, identity_index - base));
+            }
+            base += count;
+        }
+        None
     }
 
     /// Check cross-field invariants of the protocol plan.
@@ -880,6 +900,17 @@ impl ProtocolPlan {
                 self.quotient.total()
             ));
         }
+        let lookup_identity_count = self
+            .lookup_chunks
+            .iter()
+            .map(|chunks| chunks + 2)
+            .sum::<usize>();
+        if self.quotient.lookup != lookup_identity_count {
+            return Err(format!(
+                "lookup quotient identity count mismatch: plan={} expected={lookup_identity_count}",
+                self.quotient.lookup
+            ));
+        }
         if self.pcs_query_trace_ids.len() != self.pcs_queries.len() {
             return Err(format!(
                 "PCS trace id count mismatch: ids={} queries={}",
@@ -924,7 +955,7 @@ impl ProtocolPlan {
 mod tests {
     use super::*;
     use midnight_proofs::{
-        plonk::{Constraints, FirstPhase},
+        plonk::{Constraints, FirstPhase, SecondPhase},
         poly::Rotation,
     };
     use proptest::prelude::*;
@@ -1062,6 +1093,52 @@ mod tests {
                 .count(),
             3 * plan.num_permutation_zs - 1
         );
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn lookup_identity_source_handles_variable_chunk_counts() {
+        let lookup_chunks = vec![1usize, 4, 2];
+        let lookup_count = lookup_chunks.iter().map(|chunks| chunks + 2).sum();
+        let plan = ProtocolPlan {
+            lookup_chunks,
+            quotient: QuotientIdentityPlan {
+                lookup: lookup_count,
+                ..QuotientIdentityPlan::default()
+            },
+            ..ProtocolPlan::default()
+        };
+
+        assert_eq!(plan.lookup_identity_source(0), Some((0, 0)));
+        assert_eq!(plan.lookup_identity_source(2), Some((0, 2)));
+        assert_eq!(plan.lookup_identity_source(3), Some((1, 0)));
+        assert_eq!(plan.lookup_identity_source(8), Some((1, 5)));
+        assert_eq!(plan.lookup_identity_source(9), Some((2, 0)));
+        assert_eq!(plan.lookup_identity_source(12), Some((2, 3)));
+        assert_eq!(plan.lookup_identity_source(13), None);
+    }
+
+    #[test]
+    fn plan_allows_challenge_phase_beyond_advice_phases() {
+        let mut cs = ConstraintSystem::default();
+        let advice_first = cs.advice_column();
+        let advice_second = cs.advice_column_in(SecondPhase);
+        let challenge = cs.challenge_usable_after(SecondPhase);
+        cs.create_gate("late challenge", |meta| {
+            let advice_first = meta.query_advice(advice_first, Rotation::cur());
+            let advice_second = meta.query_advice(advice_second, Rotation::cur());
+            let challenge = meta.query_challenge(challenge);
+            Constraints::without_selector(vec![(
+                "late challenge",
+                advice_first + advice_second + challenge,
+            )])
+        });
+
+        let plan = ProtocolPlan::from_constraint_system(&cs, 0);
+        assert_eq!(plan.num_user_advices[0], 1);
+        assert_eq!(plan.num_user_advices[1], 1);
+        assert_eq!(plan.num_user_challenges.iter().sum::<usize>(), 1);
+        assert_eq!(plan.challenge_indices.len(), 1);
         assert!(plan.validate().is_ok());
     }
 

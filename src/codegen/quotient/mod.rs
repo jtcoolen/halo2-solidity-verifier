@@ -2129,6 +2129,7 @@ impl QuotientProgramBuilder {
         match leaf {
             QuotientLeaf::Const(value) => {
                 let slot = self.const_slot(value);
+                self.record_fallback_vm_op();
                 if let Ok(slot) = u8::try_from(slot) {
                     self.bytes.push(const_u8_op);
                     self.bytes.push(slot);
@@ -2140,6 +2141,7 @@ impl QuotientProgramBuilder {
             }
             QuotientLeaf::Mem(QuotientMem::Literal(ptr)) => {
                 if let Ok(ptr) = u16::try_from(ptr) {
+                    self.record_fallback_vm_op();
                     self.bytes.push(mem_u16_op);
                     self.u16(ptr as usize);
                     true
@@ -2617,6 +2619,8 @@ fn decode_packed_quotient_instruction(bytes: &[u8], idx: usize) -> Result<(u8, u
         ));
     }
 
+    validate_packed_quotient_operand(spec, arg, idx)?;
+
     match op {
         Q_OP_PUSH_MEM_TOKEN => {
             let token = u8::try_from(arg).map_err(|_| {
@@ -2640,6 +2644,63 @@ fn decode_packed_quotient_instruction(bytes: &[u8], idx: usize) -> Result<(u8, u
     }
 
     Ok((op, QUOTIENT_VM_PACKED_INSTRUCTION_BYTES))
+}
+
+fn validate_packed_quotient_operand(
+    spec: &QuotientOpcodeSpec,
+    arg: u32,
+    idx: usize,
+) -> Result<(), String> {
+    let require_max = |bits: u32| {
+        let max = (1u32 << bits) - 1;
+        if arg <= max {
+            Ok(())
+        } else {
+            Err(format!(
+                "packed32 {} operand {arg:#x} exceeds u{bits} at byte {idx}",
+                spec.name
+            ))
+        }
+    };
+
+    match spec.encoding {
+        QuotientOpcodeEncoding::None => {
+            if arg == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "packed32 {} operand must be zero, got {arg:#x} at byte {idx}",
+                    spec.name
+                ))
+            }
+        }
+        QuotientOpcodeEncoding::U8 => require_max(8),
+        QuotientOpcodeEncoding::U16 => require_max(16),
+        QuotientOpcodeEncoding::U24
+        | QuotientOpcodeEncoding::U32
+        | QuotientOpcodeEncoding::TokenOffset
+        | QuotientOpcodeEncoding::AddMulConstU8MemU16 => Ok(()),
+        QuotientOpcodeEncoding::AddMulMemMem => {
+            if arg == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "packed32 {} operand must be zero, got {arg:#x} at byte {idx}",
+                    spec.name
+                ))
+            }
+        }
+        QuotientOpcodeEncoding::AddMulMemMemConstU8 => require_max(8),
+        QuotientOpcodeEncoding::RunAddMulMemMemConstU8
+        | QuotientOpcodeEncoding::RunAddMulConstU8MemU16
+        | QuotientOpcodeEncoding::LimbLin
+        | QuotientOpcodeEncoding::LimbBilinRow
+        | QuotientOpcodeEncoding::LimbBilinPairwise
+        | QuotientOpcodeEncoding::LimbModarith7 => Err(format!(
+            "opcode {} ({:#x}) has no packed32 fixed operand at byte {idx}",
+            spec.name, spec.opcode
+        )),
+    }
 }
 
 fn quotient_byte_instruction_len_checked(bytes: &[u8], idx: usize) -> Result<usize, String> {

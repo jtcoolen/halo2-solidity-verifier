@@ -1109,7 +1109,7 @@ pub(super) fn computations(
                 "q_com_trace_ok_{set_idx} := and(q_com_trace_ok_{set_idx}, eq(returndatasize(), {G1_BYTES:#x}))"
             ));
             lines.push(format!(
-                "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(0, {}) revert(0, {WORD_BYTES:#x}) }}",
+                "if iszero(q_com_trace_ok_{set_idx}) {{ mstore(TRACE_U256_MPTR, {}) revert(TRACE_U256_MPTR, {WORD_BYTES:#x}) }}",
                 40000 + set_idx
             ));
             lines.push(format!(
